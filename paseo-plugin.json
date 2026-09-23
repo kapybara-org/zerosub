@@ -1,6 +1,5 @@
 {
   "id": "zerosub",
-  "description": "ZeroSub: use several Claude and ChatGPT (Codex) subscriptions side by side. Add accounts in-app, pick one per agent, and switch automatically when an account hits its limit.",
   "requirements": {
     "paseo": ">=0.9.1"
   }
