@@ -18,6 +18,7 @@ function account(partial: Partial<StoredAccount> & Pick<StoredAccount, "id">): S
     organization: null,
     identity: null,
     signedIn: true,
+    disabled: false,
     limitedUntil: null,
     limitKind: null,
     limitedAt: null,
@@ -182,5 +183,58 @@ describe("applyEnv", () => {
       KEEP: "1",
       CODEX_HOME: "/homes/work",
     });
+  });
+});
+
+describe("disabled accounts", () => {
+  const main = account({ id: "claude-main", kind: "main", home: null });
+  const work = account({ id: "claude-work" });
+  const off = { disabled: true };
+
+  it("routes around a disabled account but keeps the agent's own binding", () => {
+    const pinned = stateWith([main, account({ id: "claude-work", ...off })], {
+      bindings: { "agent-1": { accountId: "claude-work", source: "user", at: "2026-09-23T00:00:00Z" } },
+    });
+    const decision = chooseAccount(pinned, { ...base, reason: "refresh", usageOf: () => null });
+    expect(decision?.account.id).toBe("claude-main");
+    expect(decision?.skipped?.why).toBe("disabled");
+    expect(decision?.bind).toBeNull(); // so the agent returns once the account is enabled again
+  });
+
+  it("skips a disabled default even with automatic switching off", () => {
+    const state = stateWith([account({ id: "claude-main", kind: "main", home: null, ...off }), work]);
+    const decision = chooseAccount(state, { ...base, autoSwitch: false, reason: "resume", usageOf: () => null });
+    expect(decision?.account.id).toBe("claude-work");
+    expect(decision?.bind).toBeNull();
+  });
+
+  it("pins a new ChatGPT thread where it actually starts", () => {
+    const codexMain = account({ id: "codex-main", family: "codex", kind: "main", home: null, ...off });
+    const codexWork = account({ id: "codex-work", family: "codex" });
+    const decision = chooseAccount(stateWith([codexMain, codexWork]), {
+      ...base,
+      family: "codex",
+      portable: false,
+      reason: "create",
+      usageOf: () => null,
+    });
+    expect(decision?.account.id).toBe("codex-work");
+    expect(decision?.bind).toMatchObject({ accountId: "codex-work", source: "thread" });
+  });
+
+  it("leaves an existing ChatGPT thread on its disabled account, since it can't move", () => {
+    const codexMain = account({ id: "codex-main", family: "codex", kind: "main", home: null });
+    const codexWork = account({ id: "codex-work", family: "codex", ...off });
+    const state = stateWith([codexMain, codexWork], {
+      bindings: { "agent-1": { accountId: "codex-work", source: "thread", at: "2026-09-23T00:00:00Z" } },
+    });
+    const decision = chooseAccount(state, { ...base, family: "codex", portable: false, reason: "resume", usageOf: () => null });
+    expect(decision?.account.id).toBe("codex-work");
+  });
+
+  it("is never the most available account", () => {
+    const state = stateWith([main, account({ id: "claude-work", ...off })]);
+    const usageOf = (id: string) => usage(id === "claude-main" ? 90 : 5);
+    expect(mostAvailable(state, "claude", usageOf, NOW)?.id).toBe("claude-main");
   });
 });

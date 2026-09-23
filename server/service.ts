@@ -230,7 +230,7 @@ export class Service {
       const attempted = this.usageAttemptAt.get(account.id) ?? 0;
       const busy = now - (this.activeAt.get(account.id) ?? 0) < ACTIVE_WINDOW_MS;
       const isDefault = defaultAccount(state, account.family)?.id === account.id;
-      const every = busy ? USAGE_BUSY_MS : isDefault ? USAGE_DEFAULT_MS : USAGE_IDLE_MS;
+      const every = account.disabled ? USAGE_IDLE_MS : busy ? USAGE_BUSY_MS : isDefault ? USAGE_DEFAULT_MS : USAGE_IDLE_MS;
       if (account.signedIn && now - attempted > every) {
         void this.refreshUsage(account.id).catch((error: unknown) => log(`usage refresh for ${account.label} failed`, error));
       }
@@ -555,7 +555,7 @@ export class Service {
     }
     const next = mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]));
     if (!next) {
-      if (problem.kind === "limit" && problem.hit.kind === "window" && this.prefs.autoRedeem) {
+      if (problem.kind === "limit" && problem.hit.kind === "window" && this.prefs.autoRedeem && !account.disabled) {
         // Opt-in: every account is out, so spend a banked reset rather than stop.
         const reply = await this.redeemOn(account, true);
         if (reply.outcome === "reset") {
@@ -1219,7 +1219,7 @@ export class Service {
         email: account.email,
         plan: account.plan,
         organization: account.organization,
-        status: !account.signedIn ? "signed_out" : limited ? "limited" : "ready",
+        status: !account.signedIn ? "signed_out" : account.disabled ? "disabled" : limited ? "limited" : "ready",
         isDefault: defaultAccount(state, account.family)?.id === account.id,
         limitedUntil: limited ? account.limitedUntil : null,
         usage: this.usage.get(account.id) ?? null,
@@ -1291,12 +1291,47 @@ export class Service {
     const account = findAccount(await this.store.read(), accountId);
     if (!account) throw new Error("That account no longer exists.");
     if (!account.signedIn) throw new Error(`${account.label} is signed out. Sign it in first.`);
+    if (account.disabled) throw new Error(`${account.label} is disabled. Enable it before making it the default.`);
     if (!this.adapters[account.family].portable) await this.pinThreads(paseo, account.family);
     await this.store.update((draft) => {
       draft.defaults[account.family] = account.id;
     });
     // Conversations that can't move (Codex threads) are pinned, so this only moves portable ones.
     return this.reconcile(paseo, "default");
+  }
+
+  /**
+   * Sets an account aside for a while, or brings it back. A disabled account stays signed in, but
+   * nothing is routed to it: its agents move to the next account now (busy ones after their turn)
+   * and return when it's enabled again. ChatGPT conversations can't change accounts, so the ones
+   * already on it stay there; `stayed` counts them.
+   */
+  async setAccountEnabled(paseo: PaseoApi, accountId: string, enabled: boolean): Promise<ReopenSummary & { stayed: number }> {
+    this.attach(paseo);
+    const state = await this.store.read();
+    const account = findAccount(state, accountId);
+    if (!account) throw new Error("That account no longer exists.");
+    if (account.disabled === !enabled) return { ...emptySummary(), stayed: 0 };
+    if (!enabled && !accountsOf(state, account.family).some((other) => other.id !== account.id && other.signedIn && !other.disabled)) {
+      // With nothing else to route to, sessions would quietly fall back to the CLI login.
+      throw new Error(`${account.label} is the only ${FAMILY_LABEL[account.family]} account in use. Add or enable another one first.`);
+    }
+    await this.store.update((draft) => {
+      const target = findAccount(draft, accountId);
+      if (target) target.disabled = !enabled;
+    });
+    console.log(`[ZeroSub] ${account.label} is ${enabled ? "enabled" : "disabled"}`);
+    const summary = await this.reconcile(paseo, enabled ? "enabled" : "disabled");
+    let stayed = 0;
+    if (!enabled && !this.adapters[account.family].portable) {
+      const families = await this.families.resolve(paseo);
+      const latest = await this.store.read();
+      stayed = (await listAgents(paseo, false)).agents.filter(
+        (agent) =>
+          families[agent.provider] === account.family && agent.hasHistory && this.targetFor(latest, agent.id, account.family) === accountId,
+      ).length;
+    }
+    return { ...summary, stayed };
   }
 
   /**
@@ -1342,6 +1377,7 @@ export class Service {
     const target = accountId ? findAccount(state, accountId) : defaultAccount(state, family);
     if (!target || target.family !== family) throw new Error("That account can't be used with this agent.");
     if (!target.signedIn) throw new Error(`${target.label} is signed out. Sign it in first.`);
+    if (accountId && target.disabled) throw new Error(`${target.label} is disabled. Enable it in Accounts first.`);
 
     if (!adapter.portable) {
       if (info.status === "running" || info.status === "initializing") {
@@ -1599,6 +1635,7 @@ function newAccount(fields: Pick<StoredAccount, "id" | "family" | "kind" | "home
     organization: null,
     identity: null,
     signedIn: true,
+    disabled: false,
     limitedUntil: null,
     limitKind: null,
     limitedAt: null,

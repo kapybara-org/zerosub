@@ -57,7 +57,7 @@ class AppServer {
     try {
       await server.request(
         "initialize",
-        { clientInfo: { name: CLIENT_NAME, title: "Paseo ZeroSub", version: "1.0.0" }, capabilities: { experimentalApi: false } },
+        { clientInfo: { name: CLIENT_NAME, title: "Paseo ZeroSub", version: "1.1.0" }, capabilities: { experimentalApi: false } },
         60_000,
       );
       server.send({ method: "initialized" });

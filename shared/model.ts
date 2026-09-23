@@ -56,7 +56,8 @@ export const AccountKindSchema = z.enum([
 ]);
 export type AccountKind = z.infer<typeof AccountKindSchema>;
 
-export const AccountStatusSchema = z.enum(["ready", "signed_out", "limited", "checking"]);
+/** `disabled`: the user set it aside for a while; it stays signed in but nothing is routed to it. */
+export const AccountStatusSchema = z.enum(["ready", "signed_out", "limited", "checking", "disabled"]);
 export type AccountStatus = z.infer<typeof AccountStatusSchema>;
 
 export const AccountViewSchema = z.object({

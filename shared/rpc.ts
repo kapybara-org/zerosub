@@ -102,6 +102,16 @@ export const setDefaultAccount = defineRpc({
   output: ReopenSummarySchema,
 });
 
+/** Sets an account aside for a while (nothing is routed to it) or brings it back. */
+export const setAccountEnabled = defineRpc({
+  name: "zerosub.accounts.enabled",
+  input: z.object({ accountId: z.string(), enabled: z.boolean() }),
+  output: ReopenSummarySchema.extend({
+    /** ChatGPT conversations that stay on the disabled account because they can't change accounts. */
+    stayed: z.number(),
+  }),
+});
+
 /** Carries an agent's work on in a new agent on the other provider (Claude ↔ ChatGPT). */
 export const forkAgent = defineRpc({
   name: "zerosub.agents.fork",

@@ -161,7 +161,7 @@ function buttonFor(
   const other: Family = family === "claude" ? "codex" : "claude";
   const offerFork =
     current.status === "limited" &&
-    accounts.every((account) => account.status === "limited" || account.status === "signed_out") &&
+    accounts.every((account) => account.status === "limited" || account.status === "signed_out" || account.status === "disabled") &&
     state.accounts.some((account) => account.family === other && account.status === "ready");
   if (accounts.length < 2 && !(current.status === "limited" && (offerReset || offerFork))) return null;
 
@@ -176,7 +176,7 @@ function buttonFor(
     id: `account-${index}`,
     title: account.id === current.id || movable ? menuTitle(account) : `Continue on ${account.label} (new agent)`,
     icon: account.id === current.id ? "CircleCheck" : movable ? "Circle" : "CopyPlus",
-    disabled: account.status === "signed_out" || account.id === current.id,
+    disabled: account.status === "signed_out" || account.status === "disabled" || account.id === current.id,
     behavior: { kind: "action", onPress: choose(account.id) },
   }));
   // When the agent is stuck on a limit, a way out is the most useful thing in the menu.
@@ -237,6 +237,7 @@ function buttonFor(
 
 function menuTitle(account: AccountView): string {
   if (account.status === "signed_out") return `${account.label} — signed out`;
+  if (account.status === "disabled") return `${account.label} — disabled`;
   if (account.status === "limited") return `${account.label} — limit reached`;
   const peak = account.usage ? peakUsage(account.usage.windows) : null;
   return peak ? `${account.label} — ${formatPercent(peak.usedPercent)} used` : account.label;

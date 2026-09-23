@@ -279,3 +279,32 @@ describe("forking to the other provider", () => {
     expect(notes.at(-1)?.detail).toMatch(/no mode as careful as this agent's \(“Always Ask”\)/);
   });
 });
+
+describe("disabling an account", () => {
+  it("moves its agents off and back, and won't disable the last usable account", async () => {
+    const { service, store, reopened } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: MAIN, codex: null },
+        bindings: { [AGENT]: { accountId: HELLO, source: "user", at: new Date().toISOString() } },
+        sessions: { [AGENT]: { accountId: HELLO, family: "claude", openedAt: new Date().toISOString() } },
+      },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "" }),
+    );
+    const paseo = fakePaseo().paseo as never;
+
+    const off = await service.setAccountEnabled(paseo, HELLO, false);
+    expect(off.reopened).toEqual([AGENT]);
+    let state = await store.read();
+    expect(state.sessions[AGENT]?.accountId).toBe(MAIN);
+    expect(state.bindings[AGENT]?.accountId).toBe(HELLO); // kept for when it's enabled again
+
+    await expect(service.setAccountEnabled(paseo, MAIN, false)).rejects.toThrow(/only Claude account in use/);
+
+    const on = await service.setAccountEnabled(paseo, HELLO, true);
+    expect(on.reopened).toEqual([AGENT]);
+    state = await store.read();
+    expect(state.sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(reopened).toHaveLength(2);
+  });
+});

@@ -10,6 +10,7 @@ import {
   clearAccountLimit,
   removeAccount,
   renameAccount,
+  setAccountEnabled,
   setDefaultAccount,
   type ReopenSummary,
 } from "../shared/rpc";
@@ -222,7 +223,7 @@ function AccountCard({
 }) {
   const text = useText(theme);
   const toast = useToast();
-  const [busy, setBusy] = useState<"default" | "remove" | "clear" | null>(null);
+  const [busy, setBusy] = useState<"default" | "remove" | "clear" | "toggle" | null>(null);
   const [renaming, setRenaming] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
@@ -231,9 +232,30 @@ function AccountCard({
   const summary = usageSummary(account);
   const subtitle = accountSubtitle(account);
   const signedOut = account.status === "signed_out";
+  const disabled = account.status === "disabled";
+  const faded = disabled ? { opacity: 0.55 } : null;
   const windows = account.usage?.windows ?? [];
   const agents = account.agentCount === 0 ? "No agents" : `${account.agentCount} agent${account.agentCount === 1 ? "" : "s"}`;
   const freshness = !signedOut && account.usage && windows.length > 0 ? `updated ${formatAge(account.usage.fetchedAt)}` : null;
+
+  // Sets the account aside for a while, or brings it back; its agents move off it and back.
+  const toggle = useCallback(async () => {
+    const enabling = account.status === "disabled";
+    setBusy("toggle");
+    try {
+      const result = await store.rpc(setAccountEnabled, { accountId: account.id, enabled: enabling });
+      const message = describeReopen(`${account.label} is ${enabling ? "enabled" : "disabled"}`, result);
+      const stayed =
+        result.stayed > 0
+          ? ` · ${result.stayed} ChatGPT conversation${result.stayed === 1 ? " stays" : "s stay"} on it (they can't change accounts)`
+          : "";
+      toast.show(`${message}${stayed}`, { variant: "success", durationMs: 5_000 });
+    } catch (error) {
+      toast.error(describe(error));
+    } finally {
+      setBusy(null);
+    }
+  }, [account, store, toast]);
 
   const makeDefault = useCallback(async () => {
     setBusy("default");
@@ -283,8 +305,10 @@ function AccountCard({
   return (
     <Card theme={theme} fill>
       <View style={{ flexDirection: "row", alignItems: "flex-start", gap: 12 }}>
-        <Avatar theme={theme} label={account.label} />
-        <View style={{ flex: 1, minWidth: 0, gap: 3 }}>
+        <View style={faded}>
+          <Avatar theme={theme} label={account.label} />
+        </View>
+        <View style={[{ flex: 1, minWidth: 0, gap: 3 }, faded]}>
           <Text style={text.strong} numberOfLines={1}>
             {account.label}
           </Text>
@@ -304,7 +328,7 @@ function AccountCard({
               onPress={() => void markAvailable()}
             />
           ) : null}
-          {!account.isDefault && account.status !== "signed_out" ? (
+          {!account.isDefault && !signedOut && !disabled ? (
             <IconButton
               theme={theme}
               icon="Star"
@@ -313,6 +337,13 @@ function AccountCard({
               onPress={() => void makeDefault()}
             />
           ) : null}
+          <IconButton
+            theme={theme}
+            icon={disabled ? "CirclePlay" : "CirclePause"}
+            label={disabled ? "Enable account" : "Disable for now (agents won't use it)"}
+            busy={busy === "toggle"}
+            onPress={() => void toggle()}
+          />
           <IconButton theme={theme} icon="Pencil" label="Rename" onPress={() => setRenaming(true)} />
           {account.kind !== "main" ? (
             <IconButton
@@ -327,8 +358,9 @@ function AccountCard({
         </View>
       </View>
 
-      <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 }}>
+      <View style={[{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 }, faded]}>
         {account.isDefault ? <Badge theme={theme} label="Default" tone="accent" /> : null}
+        {disabled ? <Badge theme={theme} label="Disabled" /> : null}
         {plan ? <Badge theme={theme} label={plan} /> : null}
         {account.kind === "main" ? <Badge theme={theme} label="CLI login" /> : null}
         {account.status === "limited" ? <Badge theme={theme} label="Limit reached" tone="danger" /> : null}
@@ -336,7 +368,7 @@ function AccountCard({
         {resets && !signedOut ? <Badge theme={theme} label={resetBadge(resets)} tone="accent" /> : null}
       </View>
 
-      <View style={{ gap: 10 }}>
+      <View style={[{ gap: 10 }, faded]}>
         {signedOut ? (
           <Text style={text.small}>Sign in again to use this account.</Text>
         ) : windows.length > 0 ? (
@@ -365,10 +397,20 @@ function AccountCard({
         }}
       >
         <Text style={[text.small, { flexShrink: 1 }]} numberOfLines={1}>
-          {freshness ? `${agents} · ${freshness}` : agents}
+          {disabled ? "Disabled · agents won't use it" : freshness ? `${agents} · ${freshness}` : agents}
         </Text>
         {signedOut ? (
           <Button theme={theme} size="small" tone="primary" icon="LogIn" label="Sign in" onPress={onSignIn} />
+        ) : disabled ? (
+          <Button
+            theme={theme}
+            size="small"
+            tone="primary"
+            icon="CirclePlay"
+            label="Enable"
+            busy={busy === "toggle"}
+            onPress={() => void toggle()}
+          />
         ) : resets ? (
           <Button
             theme={theme}

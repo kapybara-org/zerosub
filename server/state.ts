@@ -19,6 +19,8 @@ export const StoredAccountSchema = z.object({
   /** Stable identity used to spot the same account being added twice. */
   identity: z.string().nullable().default(null),
   signedIn: z.boolean().default(true),
+  /** Set aside by the user for a while: stays signed in, but nothing is routed to it. */
+  disabled: z.boolean().default(false),
   limitedUntil: z.string().nullable().default(null),
   /** What kind of limit `limitedUntil` records; only `window` limits clear from usage readings. */
   limitKind: z.enum(["window", "budget"]).nullable().default(null),

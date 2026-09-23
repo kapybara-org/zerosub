@@ -17,7 +17,7 @@ export function isLimited(account: StoredAccount, now: number): boolean {
 }
 
 export function isUsable(account: StoredAccount, now: number): boolean {
-  return account.signedIn && !isLimited(account, now);
+  return account.signedIn && !account.disabled && !isLimited(account, now);
 }
 
 /** Lower is better. Unknown usage ranks in the middle so a known-quiet account wins over a mystery. */
@@ -76,14 +76,15 @@ export interface RouteDecision {
   /** A binding to persist so the agent stays where it was routed. */
   bind: Binding | null;
   /** Why the preferred account was skipped, if it was. */
-  skipped: { account: StoredAccount; why: "limited" | "signed_out" } | null;
+  skipped: { account: StoredAccount; why: "limited" | "signed_out" | "disabled" } | null;
 }
 
 /**
  * Which account a session opens on: the agent's own binding, else (for balanced new agents) the
  * roomiest account, else the default. An exhausted or signed-out choice is swapped for the roomiest
  * usable account when automatic switching is on — for new agents always, and for existing ones
- * only when their conversation can move between accounts.
+ * only when their conversation can move between accounts. A disabled choice is always swapped,
+ * and the agent keeps its own binding so it returns once the account is enabled again.
  */
 export function chooseAccount(state: StoredState, input: RouteInput): RouteDecision | null {
   const accounts = accountsOf(state, input.family);
@@ -110,14 +111,21 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   if (!account) return null;
 
   let skipped: RouteDecision["skipped"] = null;
-  const why = !account.signedIn ? "signed_out" : isLimited(account, input.now) ? "limited" : null;
+  const why = !account.signedIn ? "signed_out" : account.disabled ? "disabled" : isLimited(account, input.now) ? "limited" : null;
   const mayMove = fresh || input.portable;
-  if (why && mayMove && (input.autoSwitch || why === "signed_out")) {
+  if (why && mayMove && (input.autoSwitch || why !== "limited")) {
     const alternative = mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]));
     if (alternative) {
       skipped = { account, why };
       account = alternative;
-      bind = { accountId: alternative.id, source: input.portable ? "auto" : "thread", at };
+      // A thread that can't move lives where it starts. Otherwise a disabled account keeps its
+      // agents' bindings, so they return when it's enabled again; a limit re-pins them.
+      bind =
+        !input.portable
+          ? { accountId: alternative.id, source: "thread", at }
+          : why === "disabled"
+            ? null
+            : { accountId: alternative.id, source: "auto", at };
     }
   }
   return { account, bind, skipped };

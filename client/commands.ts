@@ -46,6 +46,7 @@ export function contributeCommands(client: PluginClientContext, store: ZeroSubSt
           throw new Error(`No ${FAMILY_LABEL[family]} account matches "${query}". Accounts: ${names || "none"}.`);
         }
         if (match.status === "signed_out") throw new Error(`${match.label} is signed out. Sign it in from Accounts first.`);
+        if (match.status === "disabled") throw new Error(`${match.label} is disabled. Enable it in Accounts first.`);
         await store.rpc(setAgentAccount, { agentId: agent.id, accountId: match.id });
       },
     }),
@@ -63,7 +64,7 @@ export function contributeCommands(client: PluginClientContext, store: ZeroSubSt
     dynamic = [];
     if (!state) return;
     state.accounts.forEach((account, index) => {
-      if (account.isDefault || account.status === "signed_out") return;
+      if (account.isDefault || account.status === "signed_out" || account.status === "disabled") return;
       dynamic.push(
         client.addCommandCenterItem({
           id: `default-${index}`,

@@ -19,6 +19,10 @@ export const SwitchRowSchema = z.object({
     "default",
     /** `from` was removed. */
     "removed",
+    /** `from` was disabled for a while. */
+    "disabled",
+    /** `to` was enabled again, and this agent returns to it. */
+    "enabled",
     /** Every account of this provider is at its limit; nothing to switch to. */
     "exhausted",
   ]),

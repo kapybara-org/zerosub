@@ -15,6 +15,10 @@ function cause(row: SwitchRow): string | null {
       return `${from} is signed out — sign it in again from Accounts.`;
     case "removed":
       return `${from} was removed.`;
+    case "disabled":
+      return `${from} was disabled for now.`;
+    case "enabled":
+      return `${row.to} is enabled again.`;
     case "default":
       return "The default account changed.";
     default:
@@ -59,7 +63,8 @@ export function describeRow(row: SwitchRow): string {
     case "pending":
       return `${lead}Moves to ${row.to} when its session next starts.`;
     default: {
-      const from = row.from && row.reason !== "limit" && row.reason !== "signed_out" ? `from ${row.from} ` : "";
+      const from =
+        row.from && row.reason !== "limit" && row.reason !== "signed_out" && row.reason !== "disabled" ? `from ${row.from} ` : "";
       return `${lead}Switched ${from}to ${row.to}${row.continued ? " and carried on" : ""}.`;
     }
   }
