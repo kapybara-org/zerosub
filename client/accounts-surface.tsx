@@ -62,7 +62,15 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
               Subscription accounts
             </Text>
             {state ? (
-              <IconButton theme={theme} icon="RefreshCw" label="Refresh usage" busy={refreshing} onPress={() => void refreshUsage()} />
+              <IconButton
+                theme={theme}
+                icon="RefreshCw"
+                label="Refresh usage"
+                tooltip="Refresh usage for every account now"
+                tooltipPlacement="bottom"
+                busy={refreshing}
+                onPress={() => void refreshUsage()}
+              />
             ) : null}
           </View>
           <Text style={text.muted}>
@@ -82,7 +90,14 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
                   }`
                 : `Could not reach the daemon: ${error}`}
             </Text>
-            <Button theme={theme} label="Try again" icon="RefreshCw" onPress={() => void store.refresh()} />
+            <Button
+              theme={theme}
+              label="Try again"
+              icon="RefreshCw"
+              tooltip="Ask this host for its accounts again"
+              tooltipAlign="start"
+              onPress={() => void store.refresh()}
+            />
           </Card>
         ) : null}
 
@@ -186,6 +201,8 @@ function FamilySection({
           icon="Plus"
           label={compact ? "Add" : "Add account"}
           accessibilityLabel={`Add ${FAMILY_LABEL[family]} account`}
+          tooltip={`Sign in another ${FAMILY_LABEL[family]} account`}
+          tooltipAlign="end"
           onPress={onAdd}
         />
       </View>
@@ -324,6 +341,7 @@ function AccountCard({
               theme={theme}
               icon="CircleCheck"
               label="Mark as available again (it has room)"
+              tooltip="Mark as available: use it again before its limit resets, e.g. after upgrading"
               busy={busy === "clear"}
               onPress={() => void markAvailable()}
             />
@@ -333,6 +351,7 @@ function AccountCard({
               theme={theme}
               icon="Star"
               label="Make default"
+              tooltip="Make default: new agents start on this account"
               busy={busy === "default"}
               onPress={() => void makeDefault()}
             />
@@ -341,15 +360,21 @@ function AccountCard({
             theme={theme}
             icon={disabled ? "CirclePlay" : "CirclePause"}
             label={disabled ? "Enable account" : "Disable for now (agents won't use it)"}
+            tooltip={
+              disabled
+                ? "Enable: agents can use this account again"
+                : "Disable for now: agents stop using it and move to your other accounts"
+            }
             busy={busy === "toggle"}
             onPress={() => void toggle()}
           />
-          <IconButton theme={theme} icon="Pencil" label="Rename" onPress={() => setRenaming(true)} />
+          <IconButton theme={theme} icon="Pencil" label="Rename" tooltip="Rename this account" onPress={() => setRenaming(true)} />
           {account.kind !== "main" ? (
             <IconButton
               theme={theme}
               icon="Trash2"
               label="Remove"
+              tooltip="Remove: sign it out and delete its saved login"
               tone="danger"
               busy={busy === "remove"}
               onPress={() => setConfirmRemove(true)}
@@ -400,7 +425,16 @@ function AccountCard({
           {disabled ? "Disabled · agents won't use it" : freshness ? `${agents} · ${freshness}` : agents}
         </Text>
         {signedOut ? (
-          <Button theme={theme} size="small" tone="primary" icon="LogIn" label="Sign in" onPress={onSignIn} />
+          <Button
+            theme={theme}
+            size="small"
+            tone="primary"
+            icon="LogIn"
+            label="Sign in"
+            tooltip="Sign this account in again"
+            tooltipAlign="end"
+            onPress={onSignIn}
+          />
         ) : disabled ? (
           <Button
             theme={theme}
@@ -408,6 +442,8 @@ function AccountCard({
             tone="primary"
             icon="CirclePlay"
             label="Enable"
+            tooltip="Use this account again; its agents move back to it"
+            tooltipAlign="end"
             busy={busy === "toggle"}
             onPress={() => void toggle()}
           />
@@ -419,6 +455,8 @@ function AccountCard({
             icon="TimerReset"
             label="Use reset"
             accessibilityLabel="Use a banked reset"
+            tooltip="Spend a banked reset to refill this account's limits now"
+            tooltipAlign="end"
             disabled={!resets.usableNow}
             onPress={() => setConfirmReset(true)}
           />
@@ -452,12 +490,14 @@ function AccountCard({
               : "This signs the account out on this machine and deletes its saved login. New agents use the default account. Existing ChatGPT conversations on it can't move, so start new agents for them."}
           </Text>
           <View style={{ flexDirection: "row", gap: 8, justifyContent: "flex-end" }}>
-            <Button theme={theme} label="Cancel" onPress={() => setConfirmRemove(false)} />
+            <Button theme={theme} label="Cancel" tooltip="Keep this account" tooltipAlign="end" onPress={() => setConfirmRemove(false)} />
             <Button
               theme={theme}
               tone="danger"
               icon="Trash2"
               label="Remove"
+              tooltip="Sign it out and delete its saved login; its agents move to the default"
+              tooltipAlign="end"
               busy={busy === "remove"}
               onPress={() => void remove()}
             />
@@ -526,11 +566,13 @@ function RenameModal({
           accessibilityLabel="Account name"
         />
         <View style={{ flexDirection: "row", gap: 8, justifyContent: "flex-end" }}>
-          <Button theme={theme} label="Cancel" onPress={onClose} />
+          <Button theme={theme} label="Cancel" tooltip="Keep the current name" tooltipAlign="end" onPress={onClose} />
           <Button
             theme={theme}
             tone="primary"
             label="Save"
+            tooltip="Save the new name"
+            tooltipAlign="end"
             busy={saving}
             disabled={!label.trim()}
             onPress={() => void save()}

@@ -1,6 +1,6 @@
 import type { PluginHostProps } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/react-native";
-import { useMemo, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ActivityIndicator, Pressable, Text, View } from "react-native";
 import { formatPercent, formatResetIn } from "../shared/format";
 import type { UsageWindow } from "../shared/model";
@@ -8,6 +8,75 @@ import type { UsageWindow } from "../shared/model";
 type Theme = PluginHostProps["theme"];
 
 export type ButtonTone = "primary" | "secondary" | "danger" | "ghost";
+
+/** How a tooltip lines up with its control. `end` keeps a right-hand control's tip out of the next card. */
+export type TooltipAlign = "start" | "center" | "end";
+
+const TOOLTIP_HOVER_MS = 350;
+const TOOLTIP_TOUCH_MS = 1_800;
+const TOOLTIP_WIDTH = 240;
+
+/** Hover (desktop, web) or long-press (touch) shows a short hint; pressing hides it. */
+function useTooltip(text: string | undefined) {
+  const [visible, setVisible] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clear = useCallback(() => {
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = null;
+  }, []);
+  useEffect(() => clear, [clear]);
+  const show = useCallback(
+    (delay: number, hideAfter?: number) => {
+      clear();
+      timer.current = setTimeout(() => {
+        setVisible(true);
+        if (hideAfter) timer.current = setTimeout(() => setVisible(false), hideAfter);
+      }, delay);
+    },
+    [clear],
+  );
+  const hide = useCallback(() => {
+    clear();
+    setVisible(false);
+  }, [clear]);
+  if (!text) return { visible: false, handlers: {} };
+  return {
+    visible,
+    handlers: {
+      onHoverIn: () => show(TOOLTIP_HOVER_MS),
+      onHoverOut: hide,
+      onPressIn: hide,
+      onLongPress: () => show(0, TOOLTIP_TOUCH_MS),
+    },
+  };
+}
+
+function TooltipBubble({
+  theme,
+  text,
+  placement,
+  align,
+}: {
+  theme: Theme;
+  text: string;
+  placement: "top" | "bottom";
+  align: TooltipAlign;
+}) {
+  const vertical = placement === "top" ? { bottom: "100%" as const, marginBottom: 6 } : { top: "100%" as const, marginTop: 6 };
+  const horizontal =
+    align === "end"
+      ? { right: 0, alignItems: "flex-end" as const }
+      : align === "start"
+        ? { left: 0, alignItems: "flex-start" as const }
+        : { left: "50%" as const, marginLeft: -TOOLTIP_WIDTH / 2, alignItems: "center" as const };
+  return (
+    <View pointerEvents="none" style={{ position: "absolute", width: TOOLTIP_WIDTH, zIndex: 1000, ...vertical, ...horizontal }}>
+      <View style={{ paddingHorizontal: 8, paddingVertical: 5, borderRadius: 6, backgroundColor: theme.colors.foreground }}>
+        <Text style={{ color: theme.colors.surface0, fontSize: 12, lineHeight: 16 }}>{text}</Text>
+      </View>
+    </View>
+  );
+}
 
 export function Button({
   theme,
@@ -19,6 +88,9 @@ export function Button({
   disabled,
   busy,
   accessibilityLabel,
+  tooltip,
+  tooltipAlign = "center",
+  tooltipPlacement = "top",
 }: {
   theme: Theme;
   label: string;
@@ -30,8 +102,13 @@ export function Button({
   disabled?: boolean;
   busy?: boolean;
   accessibilityLabel?: string;
+  /** A short explanation shown on hover or long-press. */
+  tooltip?: string;
+  tooltipAlign?: TooltipAlign;
+  tooltipPlacement?: "top" | "bottom";
 }) {
   const small = size === "small";
+  const tip = useTooltip(tooltip);
   const colors = theme.colors;
   const palette = {
     primary: { background: colors.accent, foreground: colors.accentForeground, border: colors.accent },
@@ -41,33 +118,38 @@ export function Button({
   }[tone];
   const inactive = disabled || busy;
   return (
-    <Pressable
-      accessibilityRole="button"
-      accessibilityLabel={accessibilityLabel ?? label}
-      accessibilityState={{ disabled: Boolean(inactive), busy: Boolean(busy) }}
-      disabled={inactive}
-      onPress={onPress}
-      style={({ pressed }) => ({
-        flexDirection: "row",
-        alignItems: "center",
-        justifyContent: "center",
-        gap: small ? 5 : 6,
-        paddingHorizontal: small ? 10 : 12,
-        paddingVertical: small ? 5 : 8,
-        borderRadius: small ? 7 : 8,
-        borderWidth: 1,
-        borderColor: palette.border,
-        backgroundColor: palette.background,
-        opacity: inactive ? 0.55 : pressed ? 0.8 : 1,
-      })}
-    >
-      {busy ? (
-        <ActivityIndicator size="small" color={palette.foreground} />
-      ) : icon ? (
-        <Icon name={icon} size={small ? 13 : 15} color={palette.foreground} />
-      ) : null}
-      <Text style={{ color: palette.foreground, fontSize: small ? 12 : 13, fontWeight: "600" }}>{label}</Text>
-    </Pressable>
+    <View style={{ position: "relative", zIndex: tip.visible ? 1000 : undefined }}>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={accessibilityLabel ?? label}
+        accessibilityHint={tooltip}
+        accessibilityState={{ disabled: Boolean(inactive), busy: Boolean(busy) }}
+        disabled={inactive}
+        onPress={onPress}
+        {...tip.handlers}
+        style={({ pressed }) => ({
+          flexDirection: "row",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: small ? 5 : 6,
+          paddingHorizontal: small ? 10 : 12,
+          paddingVertical: small ? 5 : 8,
+          borderRadius: small ? 7 : 8,
+          borderWidth: 1,
+          borderColor: palette.border,
+          backgroundColor: palette.background,
+          opacity: inactive ? 0.55 : pressed ? 0.8 : 1,
+        })}
+      >
+        {busy ? (
+          <ActivityIndicator size="small" color={palette.foreground} />
+        ) : icon ? (
+          <Icon name={icon} size={small ? 13 : 15} color={palette.foreground} />
+        ) : null}
+        <Text style={{ color: palette.foreground, fontSize: small ? 12 : 13, fontWeight: "600" }}>{label}</Text>
+      </Pressable>
+      {tip.visible && tooltip ? <TooltipBubble theme={theme} text={tooltip} placement={tooltipPlacement} align={tooltipAlign} /> : null}
+    </View>
   );
 }
 
@@ -79,6 +161,9 @@ export function IconButton({
   onPress,
   disabled,
   busy,
+  tooltip,
+  tooltipAlign = "end",
+  tooltipPlacement = "top",
 }: {
   theme: Theme;
   icon: string;
@@ -87,44 +172,55 @@ export function IconButton({
   onPress(): void;
   disabled?: boolean;
   busy?: boolean;
+  /** Shown on hover or long-press; an icon alone never says enough, so it falls back to `label`. */
+  tooltip?: string;
+  tooltipAlign?: TooltipAlign;
+  tooltipPlacement?: "top" | "bottom";
 }) {
   const colors = theme.colors;
   const inactive = disabled || busy;
+  const hint = tooltip ?? label;
+  const tip = useTooltip(hint);
   return (
-    <Pressable
-      accessibilityRole="button"
-      accessibilityLabel={label}
-      accessibilityState={{ disabled: Boolean(inactive), busy: Boolean(busy) }}
-      disabled={inactive}
-      onPress={onPress}
-      hitSlop={4}
-      style={(state) => {
-        const active = state.pressed || (state as { hovered?: boolean }).hovered;
-        return {
-          width: 30,
-          height: 30,
-          borderRadius: 8,
-          alignItems: "center",
-          justifyContent: "center",
-          backgroundColor: active ? colors.surface2 : "transparent",
-          opacity: inactive ? 0.45 : 1,
-        };
-      }}
-    >
-      {({ pressed, hovered }: { pressed: boolean; hovered?: boolean }) =>
-        busy ? (
-          <ActivityIndicator size="small" color={colors.foregroundMuted} />
-        ) : (
-          <Icon
-            name={icon}
-            size={15}
-            color={
-              tone === "danger" && (pressed || hovered) ? colors.statusDanger : colors.foregroundMuted
-            }
-          />
-        )
-      }
-    </Pressable>
+    <View style={{ position: "relative", zIndex: tip.visible ? 1000 : undefined }}>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={label}
+        accessibilityHint={tooltip}
+        accessibilityState={{ disabled: Boolean(inactive), busy: Boolean(busy) }}
+        disabled={inactive}
+        onPress={onPress}
+        hitSlop={4}
+        {...tip.handlers}
+        style={(state) => {
+          const active = state.pressed || (state as { hovered?: boolean }).hovered;
+          return {
+            width: 30,
+            height: 30,
+            borderRadius: 8,
+            alignItems: "center",
+            justifyContent: "center",
+            backgroundColor: active ? colors.surface2 : "transparent",
+            opacity: inactive ? 0.45 : 1,
+          };
+        }}
+      >
+        {({ pressed, hovered }: { pressed: boolean; hovered?: boolean }) =>
+          busy ? (
+            <ActivityIndicator size="small" color={colors.foregroundMuted} />
+          ) : (
+            <Icon
+              name={icon}
+              size={15}
+              color={
+                tone === "danger" && (pressed || hovered) ? colors.statusDanger : colors.foregroundMuted
+              }
+            />
+          )
+        }
+      </Pressable>
+      {tip.visible ? <TooltipBubble theme={theme} text={hint} placement={tooltipPlacement} align={tooltipAlign} /> : null}
+    </View>
   );
 }
 

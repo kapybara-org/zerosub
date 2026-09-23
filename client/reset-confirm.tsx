@@ -73,7 +73,7 @@ export function ResetConfirm({
     return (
       <View style={{ gap: 12 }}>
         <Text style={text.body}>{account.label} has no banked resets right now.</Text>
-        <Button theme={theme} label="Close" onPress={onCancel} />
+        <Button theme={theme} label="Close" tooltip="Close this window" tooltipAlign="end" onPress={onCancel} />
       </View>
     );
   }
@@ -87,12 +87,14 @@ export function ResetConfirm({
       {resets.blockedReason ? <Text style={text.warning}>{resets.blockedReason}</Text> : null}
       {error ? <Text style={text.danger}>{error}</Text> : null}
       <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, justifyContent: "flex-end" }}>
-        <Button theme={theme} label="No, keep it" onPress={onCancel} disabled={busy} />
+        <Button theme={theme} label="No, keep it" tooltip="Keep the reset for later" tooltipAlign="end" onPress={onCancel} disabled={busy} />
         <Button
           theme={theme}
           tone="primary"
           icon="TimerReset"
           label="Yes, use my reset"
+          tooltip="Spend one banked reset now; it can't be undone"
+          tooltipAlign="end"
           busy={busy}
           disabled={!resets.usableNow}
           onPress={() => void confirm()}

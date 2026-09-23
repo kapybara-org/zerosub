@@ -96,8 +96,16 @@ export function AddAccountModal({
       <>
         <Text style={text.danger}>{startError}</Text>
         <Row>
-          <Button theme={theme} label="Close" onPress={close} />
-          <Button theme={theme} tone="primary" icon="RefreshCw" label="Try again" onPress={() => void begin(method)} />
+          <Button theme={theme} label="Close" tooltip="Close without adding an account" tooltipAlign="end" onPress={close} />
+          <Button
+            theme={theme}
+            tone="primary"
+            icon="RefreshCw"
+            label="Try again"
+            tooltip="Start the sign-in again"
+            tooltipAlign="end"
+            onPress={() => void begin(method)}
+          />
         </Row>
       </>
     );
@@ -131,7 +139,7 @@ export function AddAccountModal({
           move an agent to it from the account button in the message box.
         </Text>
         <Row>
-          <Button theme={theme} tone="primary" label="Done" onPress={onClose} />
+          <Button theme={theme} tone="primary" label="Done" tooltip="Close this window" tooltipAlign="end" onPress={onClose} />
         </Row>
       </>
     );
@@ -142,8 +150,16 @@ export function AddAccountModal({
           {login.message ?? (login.step === "canceled" ? "Sign-in was canceled." : "Sign-in failed.")}
         </Text>
         <Row>
-          <Button theme={theme} label="Close" onPress={close} />
-          <Button theme={theme} tone="primary" icon="RefreshCw" label="Try again" onPress={() => void begin(method)} />
+          <Button theme={theme} label="Close" tooltip="Close without adding an account" tooltipAlign="end" onPress={close} />
+          <Button
+            theme={theme}
+            tone="primary"
+            icon="RefreshCw"
+            label="Try again"
+            tooltip="Start the sign-in again"
+            tooltipAlign="end"
+            onPress={() => void begin(method)}
+          />
         </Row>
       </>
     );
@@ -242,8 +258,26 @@ function SignInSteps({
             : "Sign in with the account you want to add, using a browser on the host's own computer. It finishes by itself."}
         </Text>
         <Row start>
-          <Button theme={theme} tone="primary" icon="ExternalLink" label="Open sign-in page" disabled={!link} onPress={open} />
-          {link ? <Button theme={theme} icon="Copy" label="Copy link" onPress={() => void copy(link, "Link")} /> : null}
+          <Button
+            theme={theme}
+            tone="primary"
+            icon="ExternalLink"
+            label="Open sign-in page"
+            tooltip={`Open the ${service} sign-in page in your browser`}
+            tooltipAlign="start"
+            disabled={!link}
+            onPress={open}
+          />
+          {link ? (
+            <Button
+              theme={theme}
+              icon="Copy"
+              label="Copy link"
+              tooltip="Copy the sign-in link, for example to open it on another device"
+              tooltipAlign="start"
+              onPress={() => void copy(link, "Link")}
+            />
+          ) : null}
         </Row>
       </Step>
 
@@ -253,7 +287,14 @@ function SignInSteps({
             {login.userCode}
           </Text>
           <Row start>
-            <Button theme={theme} icon="Copy" label="Copy code" onPress={() => void copy(login.userCode ?? "", "Code")} />
+            <Button
+              theme={theme}
+              icon="Copy"
+              label="Copy code"
+              tooltip="Copy the code to enter on the sign-in page"
+              tooltipAlign="start"
+              onPress={() => void copy(login.userCode ?? "", "Code")}
+            />
           </Row>
           <Text style={text.small}>
             If the page says code sign-in is off, turn on device code sign-in in ChatGPT → Settings → Security (or ask
@@ -281,6 +322,8 @@ function SignInSteps({
               theme={theme}
               tone="primary"
               label="Continue"
+              tooltip="Finish signing in with the pasted code"
+              tooltipAlign="start"
               busy={submitting}
               disabled={!code.trim()}
               onPress={() => void submit()}

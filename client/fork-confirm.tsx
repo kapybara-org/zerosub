@@ -41,12 +41,14 @@ export function forkPopover(store: ZeroSubStore, agentId: string, from: Family, 
         </Text>
         {error ? <Text style={text.danger}>{error}</Text> : null}
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, justifyContent: "flex-end" }}>
-          <Button theme={theme} label="Not now" onPress={close} disabled={busy} />
+          <Button theme={theme} label="Not now" tooltip="Close without starting a new agent" tooltipAlign="end" onPress={close} disabled={busy} />
           <Button
             theme={theme}
             tone="primary"
             icon="GitFork"
             label={`Continue on ${FAMILY_LABEL[to]}`}
+            tooltip={`Start a new ${FAMILY_LABEL[to]} agent with this conversation so far`}
+            tooltipAlign="end"
             busy={busy}
             onPress={() => void start()}
           />
