@@ -55,8 +55,8 @@ const OVERRIDING_AUTH = ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANT
 export class ClaudeAdapter implements FamilyAdapter {
   readonly family = "claude" as const;
   readonly portable = true;
-  /** Anthropic's usage endpoint answers 429 to rapid repeats. */
-  readonly usageSpacingMs = 90_000;
+  /** Anthropic's usage endpoint answers 429 to rapid repeats, and Paseo and Claude Code read it too. */
+  readonly usageSpacingMs = 120_000;
   private readonly renewing = new Map<string, Promise<Credentials | null>>();
   private readonly resetNotes = new Map<string, string>();
 
