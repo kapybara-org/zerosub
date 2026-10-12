@@ -30,6 +30,12 @@ paseo plugin install github:kapybara-org/zerosub
 
 Then open **Accounts (ZeroSub)** in the sidebar.
 
+ChatGPT accounts are distinguished by workspace and member email. Different members of the same
+Team or Business workspace can be added separately; signing in as the same member in the same
+workspace twice is still rejected. Existing workspace-only account records remain compatible and
+are updated when their identity is refreshed or they sign back in. If Codex does not return a member
+email, duplicate detection conservatively treats the workspace as one account.
+
 ## Use it
 
 1. Open **Accounts (ZeroSub)** in the sidebar. Your current Claude Code and Codex logins are already listed.
