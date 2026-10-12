@@ -250,9 +250,11 @@ export class CodexAdapter implements FamilyAdapter {
           email,
           plan,
           organization: null,
-          // The ChatGPT account (workspace) ID tells a personal plan from a Team workspace on the same
-          // email; without it, fall back to email plus plan so those two still stay distinct.
-          identity: accountId ? `chatgpt|${accountId}` : email ? `chatgpt-email|${email.toLowerCase()}|${plan ?? "unknown"}` : null,
+          // A workspace can have several members. Include the email returned by account/read so
+          // each member is distinct while one email's personal and Team workspaces stay separate.
+          identity: accountId
+            ? `chatgpt|${accountId}${email?.trim() ? `|${email.trim().toLowerCase()}` : ""}`
+            : email ? `chatgpt-email|${email.trim().toLowerCase()}|${plan ?? "unknown"}` : null,
         },
         usage,
       };

@@ -31,6 +31,7 @@ import {
   type UsageRead,
 } from "./adapter";
 import { FamilyResolver } from "./families";
+import { sameAccountIdentity } from "./account-identity";
 import { CONTINUED_FROM_LABEL, continueInNewAgent, type Continuation } from "./handoff";
 import { removeHome } from "./homes";
 import { Mutex } from "./json-file";
@@ -1580,7 +1581,7 @@ export class Service {
 
     const state = await this.store.read();
     const existing = findAccount(state, session.accountId);
-    if (existing?.kind === "managed" && existing.identity && identity.identity && existing.identity !== identity.identity) {
+    if (existing?.kind === "managed" && existing.identity && identity.identity && !sameAccountIdentity(session.family, existing, identity)) {
       // Signing an account back in must not quietly turn it into a different login.
       if (session.home) await adapter.logout(session.home).catch(() => undefined);
       const expected = existing.email ?? existing.label;
@@ -1593,7 +1594,7 @@ export class Service {
     const duplicate =
       identity.identity && existing?.kind !== "main"
         ? accountsOf(state, session.family).find(
-            (account) => account.id !== session.accountId && account.identity === identity.identity,
+            (account) => account.id !== session.accountId && sameAccountIdentity(session.family, account, identity, true),
           )
         : undefined;
     if (duplicate) {
