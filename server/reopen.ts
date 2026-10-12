@@ -26,11 +26,16 @@ export class Reopener {
   async reopen(agentId: string): Promise<{ ok: true } | { ok: false; error: string; timedOut: boolean }> {
     const cli = await this.locate();
     if (!cli) return { ok: false, error: "The paseo command-line tool was not found on the daemon machine.", timedOut: false };
+    const args = ["agent", "reload", agentId, "--json", "--home", paseoHome()];
+    // Node refuses to execFile a .cmd/.bat without a shell (spawn EINVAL), so run it through cmd.exe.
+    const viaCmd = process.platform === "win32" && /\.(cmd|bat)$/i.test(cli);
+    const file = viaCmd ? (process.env.ComSpec ?? "cmd.exe") : cli;
+    const argv = viaCmd ? ["/d", "/s", "/c", `"${[cli, ...args].map((part) => `"${part}"`).join(" ")}"`] : args;
     return new Promise((resolve) => {
       execFile(
-        cli,
-        ["agent", "reload", agentId, "--json", "--home", paseoHome()],
-        { timeout: 90_000, maxBuffer: 1024 * 1024, env: process.env },
+        file,
+        argv,
+        { timeout: 90_000, maxBuffer: 1024 * 1024, env: process.env, windowsVerbatimArguments: viaCmd },
         (error, _stdout, stderr) => {
           if (!error) return resolve({ ok: true });
           const detail = `${stderr || error.message}`.trim().split("\n").slice(-3).join(" ");
@@ -57,16 +62,17 @@ async function isExecutable(path: string): Promise<boolean> {
   }
 }
 
-async function findCli(): Promise<string | null> {
+export async function findCli(exec: string = process.execPath): Promise<string | null> {
   const candidates: string[] = [];
   const executable = process.platform === "win32" ? "paseo.cmd" : "paseo";
 
   // The daemon (and this subprocess) usually run inside the desktop app bundle, which ships the CLI.
-  const exec = process.execPath;
   const appContents = exec.match(/^(.*?\.app\/Contents)\//)?.[1];
   if (appContents) candidates.push(join(appContents, "Resources", "bin", "paseo"));
   const resources = findAncestor(exec, "resources");
   if (resources) candidates.push(join(resources, "bin", executable));
+  // The Windows desktop app keeps `resources/` beside Paseo.exe, not above it.
+  candidates.push(join(dirname(exec), "resources", "bin", executable));
 
   for (const directory of (process.env.PATH ?? "").split(delimiter)) {
     if (directory) candidates.push(join(directory, executable));
