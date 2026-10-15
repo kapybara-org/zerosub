@@ -271,6 +271,7 @@ class ClaudeLogin extends ProgressEmitter implements LoginHandle {
   private poll: ReturnType<typeof setInterval> | null = null;
   private canceled = false;
   private exited = false;
+  private killTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(command: string, args: string[], env: NodeJS.ProcessEnv, private readonly capture: string | null) {
     super();
@@ -296,13 +297,13 @@ class ClaudeLogin extends ProgressEmitter implements LoginHandle {
       });
     });
     this.child.stdout.on("data", (chunk: Buffer) => {
-      this.stdout += stripAnsi(chunk.toString("utf8"));
+      this.stdout = (this.stdout + stripAnsi(chunk.toString("utf8"))).slice(-16_384);
       const manual = firstUrl(this.stdout, /\/oauth\/authorize/);
       if (manual && manual !== this.progress.codeUrl) this.update({ codeUrl: manual, step: "waiting" });
     });
     this.child.stderr.on("data", (chunk: Buffer) => {
       const text = stripAnsi(chunk.toString("utf8"));
-      this.stderr += text;
+      this.stderr = (this.stderr + text).slice(-16_384);
       if (/invalid code/i.test(text)) {
         this.update({ message: "That code didn't work. Copy the whole code from the page and paste it again." });
       }
@@ -332,11 +333,17 @@ class ClaudeLogin extends ProgressEmitter implements LoginHandle {
   }
 
   cancel(): void {
+    if (this.exited || this.canceled) return;
     this.canceled = true;
     this.child.kill("SIGTERM");
+    this.killTimer = setTimeout(() => {
+      if (!this.exited) this.child.kill("SIGKILL");
+    }, 3_000);
+    this.killTimer.unref();
   }
 
   private stop(): void {
+    clearTimeout(this.killTimer);
     if (this.poll) clearInterval(this.poll);
     if (this.capture) void rm(this.capture, { force: true });
   }

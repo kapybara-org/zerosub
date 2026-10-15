@@ -3,12 +3,12 @@ import { AccountsSurface } from "./client/accounts-surface";
 import { contributeCommands } from "./client/commands";
 import { contributePills } from "./client/pills";
 import { PreferencesScreen } from "./client/settings-screen";
-import { ZeroSubStore } from "./client/store";
+import { createZeroSubStore } from "./client/store";
 import { SwitchRowView } from "./client/switch-row";
 import { SWITCH_ROW_KIND, SWITCH_ROW_VERSION, SwitchRowSchema } from "./shared/timeline";
 
 export default function contribute(client: PluginClientContext) {
-  const store = new ZeroSubStore(client);
+  const store = createZeroSubStore(client);
   store.start();
 
   client.addSurface("accounts", (props) => <AccountsSurface {...props} store={store} />);

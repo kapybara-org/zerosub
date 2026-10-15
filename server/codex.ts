@@ -20,6 +20,8 @@ const CLIENT_NAME = "codex_cli_rs";
 
 type Json = Record<string, unknown>;
 
+const MAX_FRAME_BYTES = 1024 * 1024;
+
 /** Newline-delimited JSON-RPC with `codex app-server` (no `jsonrpc` field on the wire). */
 class AppServer {
   private nextId = 1;
@@ -113,13 +115,18 @@ class AppServer {
   }
 
   private receive(text: string): void {
+    if (this.closed || this.ending) return;
     this.buffer += text;
     let newline = this.buffer.indexOf("\n");
     while (newline >= 0) {
-      const line = this.buffer.slice(0, newline).trim();
+      const line = this.buffer.slice(0, newline);
       this.buffer = this.buffer.slice(newline + 1);
       newline = this.buffer.indexOf("\n");
-      if (!line) continue;
+      if (Buffer.byteLength(line, "utf8") > MAX_FRAME_BYTES) {
+        this.failOversizedFrame();
+        return;
+      }
+      if (!line.trim()) continue;
       let message: Json;
       try {
         message = JSON.parse(line) as Json;
@@ -128,6 +135,15 @@ class AppServer {
       }
       this.dispatch(message);
     }
+    if (Buffer.byteLength(this.buffer, "utf8") > MAX_FRAME_BYTES) this.failOversizedFrame();
+  }
+
+  private failOversizedFrame(): void {
+    const error = new Error("Codex response exceeded the 1 MiB frame limit");
+    for (const request of this.pending.values()) request.reject(error);
+    this.pending.clear();
+    this.buffer = "";
+    this.close();
   }
 
   private dispatch(message: Json): void {
@@ -162,7 +178,7 @@ export class CodexAdapter implements FamilyAdapter {
   /** ChatGPT accounts can't decrypt each other's reasoning, so threads stay on their account. */
   readonly portable = false;
   readonly usageSpacingMs = 20_000;
-  private readonly snapshots = new Map<string, { at: number; value: Promise<Snapshot> }>();
+  private readonly snapshots = new Map<string, { at: number; pending: boolean; value: Promise<Snapshot> }>();
 
   async env(home: string | null): Promise<EnvPatch> {
     if (!home) return { CODEX_HOME: null, CODEX_SQLITE_HOME: null };
@@ -197,10 +213,18 @@ export class CodexAdapter implements FamilyAdapter {
   private snapshot(home: string | null, fresh = false): Promise<Snapshot> {
     const key = home ?? "";
     const cached = this.snapshots.get(key);
-    if (cached && Date.now() - cached.at < (fresh ? 5_000 : 15_000)) return cached.value;
-    const value = this.readSnapshot(home);
-    this.snapshots.set(key, { at: Date.now(), value });
-    value.catch(() => this.snapshots.delete(key));
+    if (cached && (cached.pending || Date.now() - cached.at < (fresh ? 5_000 : 15_000))) return cached.value;
+    const value = this.readSnapshot(home).finally(() => {
+      const current = this.snapshots.get(key);
+      if (current?.value === value) {
+        current.pending = false;
+        current.at = Date.now();
+      }
+    });
+    this.snapshots.set(key, { at: Date.now(), pending: true, value });
+    value.catch(() => {
+      if (this.snapshots.get(key)?.value === value) this.snapshots.delete(key);
+    });
     return value;
   }
 
