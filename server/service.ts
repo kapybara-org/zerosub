@@ -148,6 +148,8 @@ export class Service {
   /** One failover at a time per exhausted account. */
   private readonly failoverLocks = new Map<string, Mutex>();
   private readonly switchGuard = new SwitchGuard();
+  /** Continuations being started, by original agent, so a second switch joins the first. */
+  private readonly continuing = new Map<string, Promise<Continuation>>();
   /** When the guard last told an agent's timeline it stopped switching, so it says so once. */
   private readonly guardNoticeAt = new Map<string, number>();
   /** When each account's agents last started or ended a turn, to read busy accounts often. */
@@ -986,7 +988,7 @@ export class Service {
     return result.fork;
   }
 
-  private async continueElsewhere(
+  private continueElsewhere(
     paseo: PaseoApi,
     agentId: string,
     target: StoredAccount,
@@ -994,21 +996,41 @@ export class Service {
     timeline: readonly AgentTimelineItem[] | undefined,
     source: "auto" | "user",
   ): Promise<Continuation> {
-    return continueInNewAgent({
-      paseo,
-      sourceAgentId: agentId,
-      timeline,
-      why,
-      bind: async (newAgentId) => {
-        await this.store.update((draft) => {
-          draft.bindings[newAgentId] = {
-            accountId: target.id,
-            source: source === "user" ? "user" : "thread",
-            at: new Date().toISOString(),
-          };
-        });
-      },
-    });
+    // An agent carries on in one place: switching it again, automatically or by hand, mustn't start a second copy of the work.
+    const pending = this.continuing.get(agentId);
+    if (pending) return pending;
+    const started = (async () => {
+      const families = await this.families.resolve(paseo);
+      const earlier = (await listAgents(paseo, false)).agents.filter(
+        (agent) => agent.continuedFrom === agentId && families[agent.provider] === target.family,
+      );
+      const { bindings } = await this.store.read();
+      const existing = earlier.find((agent) => bindings[agent.id]?.accountId === target.id) ?? earlier[0];
+      if (existing) {
+        const title = existing.title ?? "the continued agent";
+        if (source === "user" && bindings[existing.id]?.accountId !== target.id) {
+          throw new Error(`This work already continues in “${title}”. Switch that agent's account instead.`);
+        }
+        return { agentId: existing.id, title };
+      }
+      return continueInNewAgent({
+        paseo,
+        sourceAgentId: agentId,
+        timeline,
+        why,
+        bind: async (newAgentId) => {
+          await this.store.update((draft) => {
+            draft.bindings[newAgentId] = {
+              accountId: target.id,
+              source: source === "user" ? "user" : "thread",
+              at: new Date().toISOString(),
+            };
+          });
+        },
+      });
+    })().finally(() => this.continuing.delete(agentId));
+    this.continuing.set(agentId, started);
+    return started;
   }
 
   // ------------------------------------------------------------------ reopening sessions

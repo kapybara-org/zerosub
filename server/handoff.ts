@@ -9,10 +9,32 @@ export const CONTINUED_FROM_LABEL = "zerosub.continued-from";
 
 const MAX_TRANSCRIPT = 40_000;
 const MAX_FIRST_MESSAGE = 6_000;
+const MAX_EARLIER_HANDOFF = 2_000;
+
+const OPEN = "<previous-session>";
+const CLOSE = "</previous-session>";
 
 function clip(text: string, max: number): string {
   const trimmed = text.trim();
   return trimmed.length <= max ? trimmed : `${trimmed.slice(0, max)}…`;
+}
+
+/**
+ * A continuation's first message quotes the session before it. Quoting that again would nest every
+ * earlier hand-off inside the next, so keep only its opening (the original request) and drop the rest.
+ */
+export function shortenEarlierHandOff(text: string): string {
+  const open = text.indexOf(OPEN);
+  if (open < 0) return text;
+  const close = text.lastIndexOf(CLOSE);
+  const end = close > open ? close : text.length;
+  // Inner tags become plain words, so clipping can't leave one open and break the outer pair.
+  const inner = shortenEarlierHandOff(text.slice(open + OPEN.length, end))
+    .replaceAll(OPEN, "[earlier session:")
+    .replaceAll(CLOSE, "]")
+    .trim();
+  const kept = inner.length <= MAX_EARLIER_HANDOFF ? inner : `${inner.slice(0, MAX_EARLIER_HANDOFF)}\n\n[… rest of that earlier session omitted …]`;
+  return `${text.slice(0, open)}${OPEN}\n${kept}\n${CLOSE}${close > open ? text.slice(close + CLOSE.length) : ""}`;
 }
 
 function describeTool(item: Extract<AgentTimelineItem, { type: "tool_call" }>): string {
@@ -48,10 +70,12 @@ export function buildTranscript(timeline: readonly AgentTimelineItem[], max = MA
   let todos: string | null = null;
   for (const item of timeline) {
     switch (item.type) {
-      case "user_message":
-        if (firstUser === null) firstUser = clip(item.text, MAX_FIRST_MESSAGE);
-        lines.push(`User: ${item.text.trim()}`);
+      case "user_message": {
+        const text = shortenEarlierHandOff(item.text);
+        if (firstUser === null) firstUser = clip(text, MAX_FIRST_MESSAGE);
+        lines.push(`User: ${text.trim()}`);
         break;
+      }
       case "assistant_message":
         if (item.text.trim()) lines.push(`Assistant: ${item.text.trim()}`);
         break;
