@@ -55,9 +55,19 @@ function claudeAdapter(hit: () => LimitHit): FamilyAdapter {
   } as unknown as FamilyAdapter;
 }
 
-function fakePaseo() {
+/** A row of the agent's timeline as Paseo pages it: the item, and the turn Paseo tagged it with. */
+type Row = { item: AgentTimelineItem; turnId?: string };
+
+/** The rows Paseo tags with `turnId` while that turn runs. */
+function inTurn(turnId: string, ...items: AgentTimelineItem[]): Row[] {
+  return items.map((item) => ({ item, turnId }));
+}
+
+/** `recent` is what Paseo hands back when the plugin pages the agent's timeline from its tail, or how it answers. */
+function fakePaseo(recent: readonly Row[] | (() => Promise<{ entries: readonly Row[] }>) = []) {
   const sent: string[] = [];
   const notes: Array<{ from: string | null; to: string; outcome: string; detail: string | null }> = [];
+  const refetches: Array<{ direction?: string; limit?: number }> = [];
   const agent = { id: AGENT, provider: "claude", status: "idle", archivedAt: null, lastUserMessageAt: "2026-09-23T07:00:00.000Z" };
   const paseo = {
     config: { get: async () => ({ config: { providers: {} } }) },
@@ -69,12 +79,15 @@ function fakePaseo() {
         timeline: {
           append: async (item: { data: { from: string | null; to: string; outcome: string; detail: string | null } }) =>
             void notes.push(item.data),
-          refetch: async () => ({ entries: [] }),
+          refetch: async (options: { direction?: string; limit?: number } = {}) => {
+            refetches.push(options);
+            return typeof recent === "function" ? recent() : { entries: recent };
+          },
         },
       }),
     },
   };
-  return { paseo, sent, notes };
+  return { paseo, sent, notes, refetches };
 }
 
 interface SetUpOptions {
@@ -82,13 +95,15 @@ interface SetUpOptions {
   reload?: "works" | "fails" | "times out";
   /** Reads turns with a real detector instead of taking every failed turn for a limit. */
   detectLimit?: FamilyAdapter["detectLimit"];
+  /** The tail of the agent's timeline as Paseo returns it when asked. */
+  recent?: Parameters<typeof fakePaseo>[0];
 }
 
 async function setUp(state: Partial<StoredState>, hit: () => LimitHit, options: SetUpOptions = {}) {
   const store = new StateStore(join(root, "state.json"));
   await store.update((draft) => Object.assign(draft, state));
   const reopened: string[] = [];
-  const fake = fakePaseo();
+  const fake = fakePaseo(options.recent);
   const context = { paseo: fake.paseo } as never;
   // Paseo asks for the new session's environment before it closes the old session, so the hook has
   // run by the time `paseo agent reload` returns, even when the reload then failed.
@@ -219,6 +234,138 @@ describe("failover", () => {
     expect(notes).toHaveLength(1);
   });
 
+  // Paseo 0.13 (getpaseo/paseo#7477) stopped copying the conversation into turn-ended hooks: `timeline`
+  // is always `[]`. Claude reports its limits as an ordinary reply, so the plugin has to page the
+  // tail of the timeline itself or it never sees them again.
+  describe("when the hook arrives without the turn's timeline", () => {
+    const notice = "You've hit your session limit · resets 3pm (UTC)";
+    const twoAccounts = () => ({
+      accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+      defaults: { claude: MAIN, codex: null },
+      sessions: {},
+    });
+    const unused = () => {
+      throw new Error("unused: the real detector reads the turns");
+    };
+    const agent = { id: AGENT, provider: "claude" };
+
+    it("reads the finished turn from Paseo and still switches on a limit", async () => {
+      const recent = inTurn("t1", { type: "user_message", text: "fix the bug" }, { type: "assistant_message", text: notice });
+      const { service, store, reopened, notes, refetches, paseo } = await setUp(twoAccounts(), unused, { detectLimit: detectClaudeLimit, recent });
+      await service.onTurnEnded({ agent, turnId: "t1", outcome: { kind: "completed" }, timeline: [] } as never, { paseo } as never);
+      expect(refetches).toHaveLength(1);
+      expect(refetches[0]).toMatchObject({ direction: "tail" });
+      expect(refetches[0]?.limit).toBeGreaterThan(0);
+      expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+      expect(reopened).toEqual([AGENT]);
+      expect(notes.at(-1)).toMatchObject({ from: "marketing", to: "hello", outcome: "switched" });
+    });
+
+    it("trusts a timeline the hook did send instead of reading it again", async () => {
+      // Paseo 0.12 still sends the turn; a second read would see older rows and could blame the account twice.
+      const recent = inTurn("t1", { type: "assistant_message", text: notice });
+      const { service, store, refetches, paseo } = await setUp(twoAccounts(), unused, { detectLimit: detectClaudeLimit, recent });
+      const sent: AgentTimelineItem[] = [
+        { type: "user_message", text: "fix the bug" },
+        { type: "assistant_message", text: "Done, all tests pass." },
+      ];
+      await service.onTurnEnded({ agent, turnId: "t1", outcome: { kind: "completed" }, timeline: sent } as never, { paseo } as never);
+      expect(refetches).toHaveLength(0);
+      expect((await store.read()).sessions[AGENT]?.accountId ?? MAIN).toBe(MAIN);
+    });
+
+    it("leaves Paseo alone for turns that never started, have no id, or were canceled", async () => {
+      const recent = inTurn("t2", { type: "assistant_message", text: notice });
+      const { service, store, refetches, paseo } = await setUp(twoAccounts(), unused, { detectLimit: detectClaudeLimit, recent });
+      const context = { paseo } as never;
+      await service.onTurnEnded({ agent, turnId: null, outcome: { kind: "failed", error: { message: "Claude session is closed" } }, timeline: [] } as never, context);
+      // Without an id there's nothing to tell this turn's rows by: untagged rows include replayed history.
+      await service.onTurnEnded({ agent, outcome: { kind: "completed" }, timeline: [] } as never, context);
+      await service.onTurnEnded({ agent, turnId: "t2", outcome: { kind: "canceled" }, timeline: [] } as never, context);
+      expect(refetches).toHaveLength(0);
+      expect((await store.read()).sessions[AGENT]?.accountId ?? MAIN).toBe(MAIN);
+    });
+
+    it("doesn't read an earlier turn's limit again", async () => {
+      // The page reaches back into the turn that hit the limit. A turn Claude Code starts by itself,
+      // such as after a background task finishes, has no message to stop at, so only the turn ids
+      // keep the old notice (a reply, or Paseo's untagged error row) from moving the agent again.
+      const endings: Row[][] = [
+        inTurn("t1", { type: "assistant_message", text: notice }),
+        [{ item: { type: "assistant_message", text: `[System Error] ${notice}` } }],
+      ];
+      for (const ending of endings) {
+        const recent = [
+          ...inTurn("t1", { type: "user_message", text: "fix the bug" }),
+          ...ending,
+          ...inTurn("t2", { type: "assistant_message", text: "The background build finished." }),
+        ];
+        const { service, store, reopened, notes, paseo } = await setUp(twoAccounts(), unused, { detectLimit: detectClaudeLimit, recent });
+        await service.onTurnEnded({ agent, turnId: "t2", outcome: { kind: "completed" }, timeline: [] } as never, { paseo } as never);
+        expect((await store.read()).accounts.find((a) => a.id === MAIN)?.limitedUntil).toBeNull();
+        expect(reopened).toEqual([]);
+        expect(notes).toEqual([]);
+      }
+    });
+
+    it("doesn't take an earlier turn with the same id for this one", async () => {
+      // Providers count turns per session, and some session restarts keep the timeline (a voice-mode
+      // toggle does), so an earlier turn can carry this turn's id. The prompt between them ends the turn.
+      const recent = [
+        ...inTurn("autonomous-turn-2", { type: "assistant_message", text: notice }),
+        ...inTurn("foreground-turn-1", { type: "user_message", text: "continue" }, { type: "assistant_message", text: "Restarted the build." }),
+        ...inTurn("autonomous-turn-2", { type: "assistant_message", text: "The build finished." }),
+      ];
+      const { service, store, reopened, paseo } = await setUp(twoAccounts(), unused, { detectLimit: detectClaudeLimit, recent });
+      const turn = { agent, turnId: "autonomous-turn-2", outcome: { kind: "completed" }, timeline: [] };
+      await service.onTurnEnded(turn as never, { paseo } as never);
+      expect((await store.read()).accounts.find((a) => a.id === MAIN)?.limitedUntil).toBeNull();
+      expect(reopened).toEqual([]);
+    });
+
+    it("still finds the limit when the next turn starts before the page is read", async () => {
+      // Another plugin's follow-up, or a queued message, can start the next turn while the hook is on its way.
+      const recent = [
+        ...inTurn("t1", { type: "user_message", text: "fix the bug" }, { type: "assistant_message", text: notice }),
+        ...inTurn("t2", { type: "user_message", text: "Try again." }),
+      ];
+      const { service, store, reopened, paseo } = await setUp(twoAccounts(), unused, { detectLimit: detectClaudeLimit, recent });
+      await service.onTurnEnded({ agent, turnId: "t1", outcome: { kind: "completed" }, timeline: [] } as never, { paseo } as never);
+      expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+      expect(reopened).toEqual([AGENT]);
+    });
+
+    it("goes on with the turn's own failure when the page can't be read", async () => {
+      const failed = { kind: "failed", error: { message: notice } };
+      const recent = () => Promise.reject(new Error("The daemon went away"));
+      const { service, store, paseo } = await setUp(twoAccounts(), unused, { detectLimit: detectClaudeLimit, recent });
+      await service.onTurnEnded({ agent, turnId: "t1", outcome: failed, timeline: [] } as never, { paseo } as never);
+      expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+    });
+
+    it("doesn't wait for a page that never comes", async () => {
+      // The SDK would wait 60 s for an answer, holding up the switch and anything else waiting for the turn to end.
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        let asked = () => {};
+        const reading = new Promise<void>((resolve) => (asked = resolve));
+        const recent = () => {
+          asked();
+          return new Promise<never>(() => {});
+        };
+        const failed = { kind: "failed", error: { message: notice } };
+        const { service, store, paseo } = await setUp(twoAccounts(), unused, { detectLimit: detectClaudeLimit, recent });
+        const ended = service.onTurnEnded({ agent, turnId: "t1", outcome: failed, timeline: [] } as never, { paseo } as never);
+        await Promise.race([reading, ended]); // the page is asked for, or the turn needed none
+        await vi.advanceTimersByTimeAsync(10_000);
+        await ended;
+        expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
   it("keeps an agent's session where it was when Paseo can't reload it", async () => {
     const openedAt = "2026-09-23T07:00:00.000Z";
     const { store, reopened, notes, limitTurn } = await setUp(
@@ -269,7 +416,8 @@ describe("forking to the other provider", () => {
     ],
   };
 
-  async function setUpFork(modeId: string) {
+  /** `conversation` is the agent's timeline, which Paseo pages from its tail. */
+  async function setUpFork(modeId: string, conversation: readonly Row[] = []) {
     const store = new StateStore(join(root, "state.json"));
     await store.update((draft) =>
       Object.assign(draft, {
@@ -314,7 +462,10 @@ describe("forking to the other provider", () => {
         ref: () => ({
           refresh: async () => ({ agent: source }),
           send: async () => undefined,
-          timeline: { append: async (item: { data: (typeof notes)[number] }) => void notes.push(item.data), refetch: async () => ({ entries: [] }) },
+          timeline: {
+            append: async (item: { data: (typeof notes)[number] }) => void notes.push(item.data),
+            refetch: async ({ limit = 0 }: { limit?: number } = {}) => ({ entries: limit > 0 ? conversation.slice(-limit) : conversation }),
+          },
         }),
       },
     };
@@ -364,6 +515,22 @@ describe("forking to the other provider", () => {
     expect(created).toHaveLength(0);
     expect(notes.at(-1)).toMatchObject({ outcome: "stayed" });
     expect(notes.at(-1)?.detail).toMatch(/no mode as careful as this agent's \(“Always Ask”\)/);
+  });
+
+  it("hands the fork the whole conversation when the hook sends none", async () => {
+    // Paseo 0.13 sends turn-ended hooks no timeline. The fork pages the conversation itself instead
+    // of taking the rows the limit was read from, so it still gets the request from 48 rows back.
+    const steps = Array.from({ length: 45 }, (_, step): AgentTimelineItem => ({ type: "assistant_message", text: `Step ${step + 1} done.` }));
+    const conversation = [
+      ...inTurn("t0", { type: "user_message", text: "Fix the build" }, ...steps),
+      ...inTurn("t", { type: "user_message", text: "Now run the linter" }, { type: "assistant_message", text: "You've hit your session limit · resets 3pm (UTC)" }),
+    ];
+    const { created, limitTurn } = await setUpFork("bypassPermissions", conversation);
+    await limitTurn();
+    const prompt = created[0]?.prompt ?? "";
+    expect(prompt.match(/User: Fix the build/g) ?? []).toHaveLength(1);
+    expect(prompt).toContain("Step 45 done.");
+    expect(prompt).toContain("User: Now run the linter");
   });
 });
 

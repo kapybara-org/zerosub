@@ -35,6 +35,7 @@ import { CodexContinuations } from "./continuations";
 import { CONTINUED_FROM_LABEL, continueInNewAgent, type Continuation } from "./handoff";
 import { removeHome } from "./homes";
 import { Mutex } from "./json-file";
+import { turnRows } from "./limits";
 import { canSignInWithBrowser } from "./machine";
 import { equivalentMode } from "./modes";
 import { homesDir } from "./paths";
@@ -83,6 +84,8 @@ const RESET_GRACE_MS = 5 * 60_000;
 const AGENT_LIST_MS = 3_000;
 /** How long a default change waits for sessions already being routed to record their account. */
 const ROUTING_WAIT_MS = 5_000;
+/** How long the end of a turn waits for Paseo to page the agent's timeline. The SDK itself waits 60 s. */
+const TURN_READ_MS = 10_000;
 
 const DEFAULT_PREFERENCES: Preferences = {
   autoSwitch: true,
@@ -436,15 +439,49 @@ export class Service {
     const accountId = this.runningOn(await this.store.read(), agentId, family);
     if (accountId) this.activeAt.set(accountId, Date.now());
     if (event.outcome.kind !== "canceled") {
-      const hit = adapter.detectLimit(event);
-      if (hit) return this.handleUnavailable(context.paseo, agentId, family, event.timeline, { kind: "limit", hit });
-      if (adapter.detectSignOut(event) && (await this.confirmSignedOut(agentId, family))) {
-        return this.handleUnavailable(context.paseo, agentId, family, event.timeline, { kind: "signed_out" });
+      const turn = await this.turnWithTimeline(context.paseo, event);
+      // A hand-off quotes the whole conversation, not just this turn. Paseo 0.13 sends none, so the hand-off pages it.
+      const conversation = event.timeline.length > 0 ? event.timeline : undefined;
+      const hit = adapter.detectLimit(turn);
+      if (hit) return this.handleUnavailable(context.paseo, agentId, family, conversation, { kind: "limit", hit });
+      if (adapter.detectSignOut(turn) && (await this.confirmSignedOut(agentId, family))) {
+        return this.handleUnavailable(context.paseo, agentId, family, conversation, { kind: "signed_out" });
       }
     }
     if (this.deferred.has(agentId)) await this.finishDeferred(context.paseo, agentId, family);
     // The turn just used the account: read its usage again as soon as the provider allows.
     if (accountId) void this.refreshUsage(accountId).catch(() => undefined);
+  }
+
+  /**
+   * Paseo 0.13 (getpaseo/paseo#7477) stopped copying the conversation into turn-ended hooks: `timeline`
+   * is always `[]`. Claude reports its limits as an ordinary reply, so when the hook arrives empty the
+   * tail of the agent's timeline is paged here and read as the turn. A hook that still sends the
+   * conversation (Paseo 0.12 and older) is used as is. A turn that never started (`turnId === null`)
+   * has nothing to read, as `notices()` in limits.ts ignores its timeline anyway, and a hook without
+   * a turn id gives nothing to tell its rows by. If the page can't be read within
+   * `TURN_READ_MS` the event stands: its failure is still read, and a switch waiting for the turn to
+   * end isn't held up.
+   *
+   * The page can reach back into earlier turns, and a later turn may have started by the time it's
+   * read, so only this turn's rows count (`turnRows()` in limits.ts): a turn Claude starts by itself
+   * has no message to stop at, and must not find the last turn's limit again. Paseo's
+   * `[System Error]` row carries no turn id, but it repeats the failure the hook still sends.
+   */
+  private async turnWithTimeline(paseo: PaseoApi, event: TurnEnded): Promise<TurnEnded> {
+    const { turnId } = event;
+    if (!turnId || event.timeline.length > 0) return event;
+    try {
+      const page = await deadline(
+        paseo.agents.ref(event.agent.id).timeline.refetch({ direction: "tail", limit: 40 }),
+        TURN_READ_MS,
+        "Paseo didn't send the agent's timeline in time",
+      );
+      return { ...event, timeline: turnRows(page.entries, turnId) };
+    } catch (error) {
+      log(`could not read the last turn of ${event.agent.id}`, error);
+      return event;
+    }
   }
 
   async onAgentArchived(agentId: string): Promise<void> {
@@ -490,7 +527,7 @@ export class Service {
     paseo: PaseoApi,
     agentId: string,
     family: Family,
-    timeline: readonly AgentTimelineItem[],
+    timeline: readonly AgentTimelineItem[] | undefined,
     problem: Problem,
   ): Promise<void> {
     if (this.switching.has(agentId)) {
@@ -528,7 +565,7 @@ export class Service {
     agentId: string,
     family: Family,
     account: StoredAccount,
-    timeline: readonly AgentTimelineItem[],
+    timeline: readonly AgentTimelineItem[] | undefined,
     problem: Problem,
   ): Promise<void> {
     const adapter = this.adapters[family];
@@ -1896,6 +1933,15 @@ function delay(ms: number): Promise<void> {
 
 async function withTimeout(task: Promise<unknown>, ms: number): Promise<void> {
   await Promise.race([task.catch(() => undefined), delay(ms)]);
+}
+
+/** `task`, or a rejection with `message` once `ms` pass without it settling. */
+function deadline<T>(task: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([task, expired]).finally(() => clearTimeout(timer));
 }
 
 function log(message: string, error: unknown): void {

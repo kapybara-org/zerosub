@@ -1,4 +1,4 @@
-import type { LimitHit, LimitKind, TurnEvent } from "./adapter";
+import type { AgentTimelineItem, LimitHit, LimitKind, TurnEvent } from "./adapter";
 
 /**
  * Claude Code's exact wording for hard limits (2.1.x templates: `You've hit your ${limit}${suffix}`),
@@ -47,6 +47,23 @@ const MAX_NOTICE = 400;
 
 function clean(text: string): string {
   return text.replace(SYSTEM_ERROR, "").replace(/^API Error:\s*/i, "").trim();
+}
+
+/**
+ * A turn's rows in a page of the agent's timeline (oldest first), to read as that turn. Paseo 0.13
+ * tags each row of a live turn with the turn's id, but providers count turns per session, so an
+ * earlier turn can carry the same id. Reading back from the turn's last row, another turn's prompt
+ * is where this one began. Rows of other turns, and rows without an id, are left out.
+ */
+export function turnRows(entries: ReadonlyArray<{ item: AgentTimelineItem; turnId?: string }>, turnId: string): AgentTimelineItem[] {
+  const rows: AgentTimelineItem[] = [];
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (!entry) continue;
+    if (entry.turnId === turnId) rows.push(entry.item);
+    else if (rows.length > 0 && entry.turnId && entry.item.type === "user_message") break;
+  }
+  return rows.reverse();
 }
 
 /**
