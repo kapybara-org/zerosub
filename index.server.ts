@@ -1,25 +1,32 @@
 import type { PluginServerContext, PluginSettingsState } from "@getpaseo/plugin/server";
 import { ClaudeAdapter } from "./server/claude";
 import { CodexAdapter } from "./server/codex";
+import { OmpAccounts } from "./server/omp";
 import { Service, describe } from "./server/service";
 import { preferences } from "./shared/preferences";
 import {
   cancelLogin,
+  cancelOmpLogin,
   clearAccountLimit,
   getState,
+  redeemOmpReset,
   redeemReset,
   removeAccount,
+  removeOmpAccount,
   renameAccount,
   setAgentAccount,
   setDefaultAccount,
   setAccountEnabled,
   forkAgent,
   startLogin,
+  startOmpLogin,
   submitLoginCode,
+  submitOmpLoginCode,
 } from "./shared/rpc";
 
 export default function contribute(server: PluginServerContext) {
   const service = new Service({ claude: new ClaudeAdapter(), codex: new CodexAdapter() });
+  const omp = new OmpAccounts();
 
   const settings = server.registerSettings(preferences);
   const applySettings = (state: PluginSettingsState<typeof preferences.schema>) => {
@@ -64,7 +71,10 @@ export default function contribute(server: PluginServerContext) {
     void service.onAgentArchived(event.agent.id).catch(() => undefined);
   });
 
-  server.handle(getState, ({ refreshUsage }, { paseo }) => service.view(paseo, refreshUsage));
+  server.handle(getState, async ({ refreshUsage }, { paseo }) => {
+    const [view, ompView] = await Promise.all([service.view(paseo, refreshUsage), omp.view(paseo, refreshUsage ?? false)]);
+    return { ...view, omp: ompView };
+  });
   server.handle(startLogin, ({ family, method, accountId }) => service.startLogin(family, method, accountId));
   server.handle(submitLoginCode, ({ loginId, code }) => service.submitCode(loginId, code));
   server.handle(cancelLogin, ({ loginId }) => service.cancelLogin(loginId));
@@ -85,9 +95,30 @@ export default function contribute(server: PluginServerContext) {
   server.handle(setAgentAccount, ({ agentId, accountId }, { paseo }) => service.setAgentAccount(paseo, agentId, accountId));
   server.handle(forkAgent, ({ agentId }, { paseo }) => service.forkAgent(paseo, agentId));
   server.handle(setAccountEnabled, ({ accountId, enabled }, { paseo }) => service.setAccountEnabled(paseo, accountId, enabled));
+  // OMP actions run only while Paseo's OMP provider is on. Canceling a sign-in stays open, so one
+  // started before the provider was turned off can still be stopped.
+  server.handle(startOmpLogin, async ({ provider }, { paseo }) => {
+    await omp.assertEnabled(paseo);
+    return omp.startLogin(provider);
+  });
+  server.handle(submitOmpLoginCode, async ({ loginId, code }, { paseo }) => {
+    await omp.assertEnabled(paseo);
+    return omp.submitCode(loginId, code);
+  });
+  server.handle(cancelOmpLogin, ({ loginId }) => omp.cancelLogin(loginId));
+  server.handle(removeOmpAccount, async ({ provider, credentialId }, { paseo }) => {
+    await omp.assertEnabled(paseo);
+    await omp.remove(provider, credentialId);
+    return { ok: true as const };
+  });
+  server.handle(redeemOmpReset, async ({ provider, credentialId }, { paseo }) => {
+    await omp.assertEnabled(paseo);
+    return omp.redeem(provider, credentialId);
+  });
 
   return async () => {
     stopSettings();
     await service.stop();
+    omp.stop();
   };
 }

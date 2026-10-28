@@ -146,6 +146,42 @@ export const LoginViewSchema = z.object({
 });
 export type LoginView = z.infer<typeof LoginViewSchema>;
 
+/** One OAuth account in OMP's own credential store. OMP picks between them itself; ZeroSub only shows them. */
+export const OmpAccountViewSchema = z.object({
+  /** OMP provider id, e.g. `anthropic`, `openai-codex`. */
+  provider: z.string(),
+  credentialId: z.number().int(),
+  label: z.string(),
+  windows: z.array(UsageWindowSchema),
+  /** When OMP read the usage shown; older than the snapshot when the latest read had none. */
+  usageAt: z.string().nullable(),
+  resets: ResetOfferSchema.nullable(),
+});
+export type OmpAccountView = z.infer<typeof OmpAccountViewSchema>;
+
+export const OmpLoginViewSchema = z.object({
+  id: z.string(),
+  provider: z.string(),
+  step: LoginStepSchema,
+  url: z.string().nullable(),
+  /** OMP's own hint, e.g. the device code to enter on the page. */
+  instructions: z.string().nullable(),
+  /** OMP is waiting for the authorization code or the final redirect URL to be pasted back. */
+  codePrompt: z.string().nullable(),
+  message: z.string().nullable(),
+});
+export type OmpLoginView = z.infer<typeof OmpLoginViewSchema>;
+
+export const OmpViewSchema = z.object({
+  /** Providers with accounts, plus the ones offered for sign-in. */
+  providers: z.array(z.object({ id: z.string(), name: z.string() })),
+  accounts: z.array(OmpAccountViewSchema),
+  logins: z.array(OmpLoginViewSchema),
+  fetchedAt: z.string().nullable(),
+  error: z.string().nullable(),
+});
+export type OmpView = z.infer<typeof OmpViewSchema>;
+
 export const StateViewSchema = z.object({
   accounts: z.array(AccountViewSchema),
   agents: z.array(AgentRouteSchema),
@@ -161,5 +197,7 @@ export const StateViewSchema = z.object({
   browserSignIn: z.boolean().default(true),
   showComposerPill: z.boolean(),
   warnings: z.array(z.string()),
+  /** OMP's accounts; absent when the `omp` CLI isn't installed on this host. */
+  omp: OmpViewSchema.optional(),
 });
 export type StateView = z.infer<typeof StateViewSchema>;

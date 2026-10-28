@@ -1,6 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import { FamilySchema, LoginMethodSchema, LoginViewSchema, StateViewSchema } from "./model";
+import { FamilySchema, LoginMethodSchema, LoginViewSchema, OmpLoginViewSchema, StateViewSchema } from "./model";
 
 export const getState = defineRpc({
   name: "zerosub.state",
@@ -127,4 +127,40 @@ export const setAgentAccount = defineRpc({
     accountId: z.string().nullable(),
   }),
   output: ReopenSummarySchema,
+});
+
+/** OMP provider ids; never a leading `-`, since they end up in `omp` argv. */
+const OmpProviderId = z.string().regex(/^[a-z0-9][a-z0-9.-]*$/);
+const OmpAccountRef = z.object({ provider: OmpProviderId, credentialId: z.number().int().nonnegative() });
+
+/** Signs a new account in to OMP's own store (`omp` rpc `login`). */
+export const startOmpLogin = defineRpc({
+  name: "zerosub.omp.login.start",
+  input: z.object({ provider: OmpProviderId }),
+  output: OmpLoginViewSchema,
+});
+
+export const submitOmpLoginCode = defineRpc({
+  name: "zerosub.omp.login.code",
+  input: z.object({ loginId: z.string(), code: z.string().trim().min(1) }),
+  output: OmpLoginViewSchema,
+});
+
+export const cancelOmpLogin = defineRpc({
+  name: "zerosub.omp.login.cancel",
+  input: z.object({ loginId: z.string() }),
+  output: OmpLoginViewSchema.nullable(),
+});
+
+export const removeOmpAccount = defineRpc({
+  name: "zerosub.omp.remove",
+  input: OmpAccountRef,
+  output: z.object({ ok: z.literal(true) }),
+});
+
+/** Spends one banked reset (`omp usage reset <provider>/<credentialId>`). */
+export const redeemOmpReset = defineRpc({
+  name: "zerosub.omp.redeem",
+  input: OmpAccountRef,
+  output: z.object({ ok: z.boolean(), message: z.string() }),
 });

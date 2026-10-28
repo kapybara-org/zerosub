@@ -15,6 +15,7 @@ import {
   type ReopenSummary,
 } from "../shared/rpc";
 import { AddAccountModal } from "./add-account";
+import { OmpSection } from "./omp-section";
 import { ResetConfirm, redeemToast, resetBadge } from "./reset-confirm";
 import { describe, useStore, VISIBLE_POLL_MS, type ZeroSubStore } from "./store";
 import { Badge, Button, Card, IconButton, UsageBar, useText } from "./ui";
@@ -123,6 +124,16 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
               />
             ))
           : null}
+
+        {state?.omp ? (
+          <OmpSection
+            omp={state.omp}
+            theme={theme}
+            compact={layout.compact}
+            store={store}
+            hostLabel={multiHost ? host.label : null}
+          />
+        ) : null}
 
         <AutomationSettings theme={theme} />
       </ScrollView>
