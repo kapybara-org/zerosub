@@ -3,7 +3,7 @@ import { Icon, Modal, TextInput, useToast } from "@getpaseo/plugin/client/react-
 import { SettingsCard, SettingsSwitch } from "@getpaseo/plugin/client/ui";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ScrollView, Text, View } from "react-native";
-import { accountSubtitle, formatAge, formatCredits, formatPlan, usageSummary } from "../shared/format";
+import { accountSubtitle, describeReopen, formatAge, formatCredits, formatPlan, usageSummary } from "../shared/format";
 import { FAMILY_LABEL, type AccountView, type Family } from "../shared/model";
 import { preferences } from "../shared/preferences";
 import {
@@ -12,11 +12,10 @@ import {
   renameAccount,
   setAccountEnabled,
   setDefaultAccount,
-  type ReopenSummary,
 } from "../shared/rpc";
 import { AddAccountModal } from "./add-account";
 import { ResetConfirm, redeemToast, resetBadge } from "./reset-confirm";
-import { describe, useStore, VISIBLE_POLL_MS, type ZeroSubStore } from "./store";
+import { describe, stoppedWaiting, useStore, VISIBLE_POLL_MS, type ZeroSubStore } from "./store";
 import { Badge, Button, Card, IconButton, UsageBar, useText } from "./ui";
 
 type Theme = PluginSurfaceProps["theme"];
@@ -267,9 +266,10 @@ function AccountCard({
         result.stayed > 0
           ? ` · ${result.stayed} ChatGPT conversation${result.stayed === 1 ? " stays" : "s stay"} on it (they can't change accounts)`
           : "";
-      toast.show(`${message}${stayed}`, { variant: "success", durationMs: 5_000 });
+      toast.show(`${message}${stayed}`, { variant: result.failed.length > 0 ? "warning" : "success", durationMs: 5_000 });
     } catch (error) {
-      toast.error(describe(error));
+      if (stoppedWaiting(error)) toast.show(stillMoving(account.label), { variant: "info", durationMs: 5_000 });
+      else toast.error(describe(error));
     } finally {
       setBusy(null);
     }
@@ -279,10 +279,11 @@ function AccountCard({
     setBusy("default");
     try {
       const summary = await store.rpc(setDefaultAccount, { accountId: account.id });
-      toast.show(describeReopen(`${account.label} is now the default`, summary), { variant: "success" });
+      toast.show(describeReopen(`${account.label} is now the default`, summary), { variant: summary.failed.length > 0 ? "warning" : "success" });
       await store.refresh();
     } catch (error) {
-      toast.error(describe(error));
+      if (stoppedWaiting(error)) toast.show(stillMoving(account.label), { variant: "info", durationMs: 5_000 });
+      else toast.error(describe(error));
     } finally {
       setBusy(null);
     }
@@ -305,15 +306,25 @@ function AccountCard({
     setBusy("remove");
     try {
       const result = await store.rpc(removeAccount, { accountId: account.id });
-      toast.show(
-        result.movedAgents > 0
-          ? `Removed ${account.label}; ${result.movedAgents} agent(s) moved to the default account`
-          : `Removed ${account.label}`,
-        { variant: "success" },
-      );
+      const removed = `Removed ${account.label}`;
+      // An older server only says how many agents ran on it, not how moving them went.
+      const message = result.moves
+        ? describeReopen(removed, result.moves)
+        : result.movedAgents > 0
+          ? `${removed}; ${result.movedAgents} agent(s) move off it`
+          : removed;
+      toast.show(message, { variant: result.moves?.failed.length ? "warning" : "success" });
       await store.refresh();
     } catch (error) {
-      toast.error(describe(error));
+      if (stoppedWaiting(error)) {
+        toast.show(`Still removing ${account.label} and moving its agents off it. Their timelines say when each has switched.`, {
+          variant: "info",
+          durationMs: 5_000,
+        });
+        void store.refresh();
+      } else {
+        toast.error(describe(error));
+      }
     } finally {
       setBusy(null);
       setConfirmRemove(false);
@@ -675,13 +686,9 @@ function AutomationSettings({ theme }: { theme: Theme }) {
   );
 }
 
-export function describeReopen(prefix: string, summary: ReopenSummary): string {
-  const parts = [prefix];
-  if (summary.continuedIn) parts.push(`continuing in “${summary.continuedIn.title}”`);
-  if (summary.reopened.length > 0) parts.push(`${summary.reopened.length} agent(s) switched`);
-  if (summary.deferred.length > 0) parts.push(`${summary.deferred.length} will switch after their current turn`);
-  if (summary.failed.length > 0) parts.push(`${summary.failed.length} will switch on their next restart`);
-  return parts.join(" · ");
+/** Paseo stopped waiting for a change that moves agents; the daemon carries on with it. */
+function stillMoving(label: string): string {
+  return `Still moving agents for ${label}. Their timelines say when each has switched.`;
 }
 
 function chunk<T>(items: T[], size: number): T[][] {
