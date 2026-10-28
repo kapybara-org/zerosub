@@ -1,11 +1,17 @@
 import { existsSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
+import type { PluginSessionOpenRequest } from "@getpaseo/plugin/server";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { OmpAccounts } from "./omp";
+import { overlayPath } from "./omp-controls";
 
 type PaseoApi = Parameters<OmpAccounts["view"]>[0];
+
+async function overlay(): Promise<Record<string, unknown>> {
+  return JSON.parse(await readFile(overlayPath(), "utf8")) as Record<string, unknown>;
+}
 
 /**
  * Stands in for the `omp` CLI: logs every call and answers from `omp.json`, including the few rpc
@@ -117,5 +123,47 @@ describe("OmpAccounts", () => {
       "openai-codex/7",
     ]);
     expect(view?.providers.map((provider) => provider.id)).toEqual(["anthropic", "openai-codex"]);
+  });
+
+  it("adds its overlay after the session's own overlays, and only once", async () => {
+    const omp = new OmpAccounts();
+    const request = { agentId: "a", provider: "omp", env: { PI_CONFIG_FILES: "/team.yml" } } as unknown as PluginSessionOpenRequest;
+    const opened = await omp.openSession(request);
+    expect(opened?.env.PI_CONFIG_FILES).toBe(["/team.yml", overlayPath()].join(delimiter));
+    expect(await omp.openSession(opened!)).toBeUndefined();
+    expect(await overlay()).toEqual({});
+  });
+
+  it("prefers at most one account per provider, and can drop the preference", async () => {
+    const omp = new OmpAccounts();
+    await omp.view(ompOn, true);
+    await omp.prefer("anthropic", 3, true);
+    await omp.prefer("anthropic", 4, true);
+    expect(await overlay()).toEqual({
+      auth: {
+        accountPolicies: [{ provider: "anthropic", account: { accountId: "acct-personal" }, priority: 100, reclaimAbovePct: 25 }],
+      },
+    });
+    const anthropic = (await omp.view(ompOn, false))?.accounts.filter((account) => account.provider === "anthropic");
+    expect(anthropic?.map((account) => account.preferred)).toEqual([false, true]);
+    await omp.prefer("anthropic", 4, false);
+    expect(await overlay()).toEqual({});
+  });
+
+  it("refuses preferences for a login it can't identify", async () => {
+    const omp = new OmpAccounts();
+    await omp.view(ompOn, true);
+    await expect(omp.prefer("openai-codex", 7, true)).rejects.toThrow(/can't set its preferences/);
+  });
+
+  it("leaves account policies to the user's own OMP config, but still applies the other settings", async () => {
+    const omp = new OmpAccounts();
+    await omp.view(ompOn, true);
+    await omp.prefer("anthropic", 3, true);
+    await fakeOmp({ "auth.accountPolicies": { value: [{ provider: "anthropic", account: { email: "x@example.com" } }] } });
+    await omp.setSettings({ "retry.waitForUsageReset": true });
+    const view = await omp.view(ompOn, true);
+    expect(view?.policiesLocked).toBe(true);
+    expect(await overlay()).toEqual({ retry: { waitForUsageReset: true } });
   });
 });

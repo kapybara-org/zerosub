@@ -1,6 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import { FamilySchema, LoginMethodSchema, LoginViewSchema, OmpLoginViewSchema, StateViewSchema } from "./model";
+import { FamilySchema, LoginMethodSchema, LoginViewSchema, OmpLoginViewSchema, OmpSettingsSchema, StateViewSchema } from "./model";
 
 export const getState = defineRpc({
   name: "zerosub.state",
@@ -163,4 +163,24 @@ export const redeemOmpReset = defineRpc({
   name: "zerosub.omp.redeem",
   input: OmpAccountRef,
   output: z.object({ ok: z.boolean(), message: z.string() }),
+});
+
+/** Makes an account the one new OMP agents prefer for its provider, or drops the preference. */
+export const preferOmpAccount = defineRpc({
+  name: "zerosub.omp.prefer",
+  input: OmpAccountRef.extend({ preferred: z.boolean() }),
+  output: z.object({ ok: z.literal(true) }),
+});
+
+/** Quota OMP keeps unused on an account; `null` goes back to OMP's own reserve. */
+export const setOmpReserve = defineRpc({
+  name: "zerosub.omp.reserve",
+  input: OmpAccountRef.extend({ reservePct: z.number().int().min(0).max(90).nullable() }),
+  output: z.object({ ok: z.literal(true) }),
+});
+
+export const setOmpSettings = defineRpc({
+  name: "zerosub.omp.settings",
+  input: z.object({ settings: OmpSettingsSchema }),
+  output: z.object({ ok: z.literal(true) }),
 });

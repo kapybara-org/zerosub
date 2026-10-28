@@ -156,6 +156,12 @@ export const OmpAccountViewSchema = z.object({
   /** When OMP read the usage shown; older than the snapshot when the latest read had none. */
   usageAt: z.string().nullable(),
   resets: ResetOfferSchema.nullable(),
+  /** OMP identifies the account well enough for ZeroSub to set a preference or reserve for it. */
+  controllable: z.boolean(),
+  /** New OMP agents prefer this account while it has room. */
+  preferred: z.boolean(),
+  /** Quota OMP keeps unused on this account; null uses OMP's own reserve. */
+  reservePct: z.number().nullable(),
 });
 export type OmpAccountView = z.infer<typeof OmpAccountViewSchema>;
 
@@ -172,6 +178,20 @@ export const OmpLoginViewSchema = z.object({
 });
 export type OmpLoginView = z.infer<typeof OmpLoginViewSchema>;
 
+/**
+ * OMP settings ZeroSub sets for the OMP agents Paseo starts, keyed by OMP's own setting path.
+ * An absent key leaves OMP's own setting in charge.
+ */
+export const OmpSettingsSchema = z.object({
+  "retry.usageReservePolicy": z.enum(["confirm", "auto", "fail-closed"]).optional(),
+  "retry.waitForUsageReset": z.boolean().optional(),
+  "codexResets.autoRedeem": z.enum(["yes", "no"]).optional(),
+  "codexResets.keepCredits": z.number().int().min(0).optional(),
+  "claudeResets.autoRedeem": z.enum(["yes", "no"]).optional(),
+  "claudeResets.keepCredits": z.number().int().min(0).optional(),
+});
+export type OmpSettings = z.infer<typeof OmpSettingsSchema>;
+
 export const OmpViewSchema = z.object({
   /** Providers with accounts, plus the ones offered for sign-in. */
   providers: z.array(z.object({ id: z.string(), name: z.string() })),
@@ -179,6 +199,15 @@ export const OmpViewSchema = z.object({
   logins: z.array(OmpLoginViewSchema),
   fetchedAt: z.string().nullable(),
   error: z.string().nullable(),
+  settings: OmpSettingsSchema,
+  /** OMP's own values for those settings (and `retry.usageReservePct`), shown as the default. */
+  defaults: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])),
+  /** The user's OMP config has its own `auth.accountPolicies`, so ZeroSub leaves preferences alone. */
+  policiesLocked: z.boolean(),
+  /** Where new OMP sessions would go right now (`omp dry-balance`), per provider with several accounts. */
+  preview: z.array(
+    z.object({ provider: z.string(), model: z.string(), accounts: z.array(z.object({ label: z.string(), percent: z.number() })) }),
+  ),
 });
 export type OmpView = z.infer<typeof OmpViewSchema>;
 

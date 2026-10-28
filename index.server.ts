@@ -14,9 +14,12 @@ import {
   removeAccount,
   removeOmpAccount,
   renameAccount,
+  preferOmpAccount,
   setAgentAccount,
   setDefaultAccount,
   setAccountEnabled,
+  setOmpReserve,
+  setOmpSettings,
   forkAgent,
   startLogin,
   startOmpLogin,
@@ -48,7 +51,9 @@ export default function contribute(server: PluginServerContext) {
       }, 15_000);
     });
     try {
-      return await Promise.race([service.onSessionOpen(request, context), deadline]);
+      // OMP picks its own account; its sessions only get ZeroSub's settings overlay.
+      const routed = request.provider === "omp" ? omp.openSession(request) : service.onSessionOpen(request, context);
+      return await Promise.race([routed, deadline]);
     } catch (error) {
       console.error(`[ZeroSub] could not route ${request.agentId}; using the default login`, describe(error));
       return undefined;
@@ -114,6 +119,21 @@ export default function contribute(server: PluginServerContext) {
   server.handle(redeemOmpReset, async ({ provider, credentialId }, { paseo }) => {
     await omp.assertEnabled(paseo);
     return omp.redeem(provider, credentialId);
+  });
+  server.handle(preferOmpAccount, async ({ provider, credentialId, preferred }, { paseo }) => {
+    await omp.assertEnabled(paseo);
+    await omp.prefer(provider, credentialId, preferred);
+    return { ok: true as const };
+  });
+  server.handle(setOmpReserve, async ({ provider, credentialId, reservePct }, { paseo }) => {
+    await omp.assertEnabled(paseo);
+    await omp.setReserve(provider, credentialId, reservePct);
+    return { ok: true as const };
+  });
+  server.handle(setOmpSettings, async ({ settings }, { paseo }) => {
+    await omp.assertEnabled(paseo);
+    await omp.setSettings(settings);
+    return { ok: true as const };
   });
 
   return async () => {

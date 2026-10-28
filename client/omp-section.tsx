@@ -1,16 +1,28 @@
 import { openExternalUrl, type PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { copyText, Modal, TextInput, useToast } from "@getpaseo/plugin/client/react-native";
+import { SettingsCard, SettingsSelect } from "@getpaseo/plugin/client/ui";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Text, View } from "react-native";
 import { formatAge } from "../shared/format";
-import type { OmpAccountView, OmpView } from "../shared/model";
-import { cancelOmpLogin, redeemOmpReset, removeOmpAccount, startOmpLogin, submitOmpLoginCode } from "../shared/rpc";
+import type { OmpAccountView, OmpSettings, OmpView } from "../shared/model";
+import {
+  cancelOmpLogin,
+  preferOmpAccount,
+  redeemOmpReset,
+  removeOmpAccount,
+  setOmpReserve,
+  setOmpSettings,
+  startOmpLogin,
+  submitOmpLoginCode,
+} from "../shared/rpc";
 import { Row, Step, Waiting } from "./add-account";
 import { resetBadge, resetDetail } from "./reset-confirm";
 import { describe, useStore, type ZeroSubStore } from "./store";
 import { Badge, Button, Card, IconButton, UsageBar, useText } from "./ui";
 
 type Theme = PluginSurfaceProps["theme"];
+
+const RESERVE_CHOICES = [0, 5, 10, 20, 30, 50];
 
 /** OMP's own accounts. OMP balances its agents across them and moves off one at its limit by itself. */
 export function OmpSection({
@@ -33,6 +45,7 @@ export function OmpSection({
     .map((provider) => ({ provider, accounts: omp.accounts.filter((account) => account.provider === provider.id) }))
     .filter((group) => group.accounts.length > 0);
   const perRow = compact ? 1 : 2;
+  const defaultReserve = typeof omp.defaults["retry.usageReservePct"] === "number" ? omp.defaults["retry.usageReservePct"] : 10;
 
   return (
     <View style={{ gap: 10 }}>
@@ -53,6 +66,16 @@ export function OmpSection({
       <Text style={text.muted}>
         OMP keeps its own sign-ins and spreads its agents across them, moving off an account that runs out by itself.
       </Text>
+      <Text style={text.small}>
+        Prefer and reserve apply to OMP agents Paseo starts on this host, from their next start. OMP can still pick
+        another account, for example when it can't read the preferred one's usage.
+      </Text>
+      {omp.policiesLocked ? (
+        <Text style={text.warning}>
+          Your OMP config sets its own account policies (auth.accountPolicies), so ZeroSub leaves preferences and reserves
+          to it.
+        </Text>
+      ) : null}
       {omp.error ? <Text style={text.warning}>{omp.error}</Text> : null}
       {omp.fetchedAt === null && !omp.error ? <Text style={text.muted}>Loading OMP accounts…</Text> : null}
       {omp.fetchedAt !== null && groups.length === 0 ? <Text style={text.muted}>No OMP accounts yet.</Text> : null}
@@ -62,10 +85,23 @@ export function OmpSection({
         return (
           <View key={provider.id} style={{ gap: 10 }}>
             <Text style={text.strong}>{provider.name}</Text>
+            {omp.preview
+              .filter((entry) => entry.provider === provider.id)
+              .map((entry) => (
+                <Text key={entry.model} style={text.small}>
+                  {`New agents on ${entry.model} go to ${entry.accounts.map((account) => `${account.label} ${account.percent}%`).join(", ") || "no account"}`}
+                </Text>
+              ))}
             {rows.map((row) => (
               <View key={row.map((account) => account.credentialId).join()} style={{ flexDirection: "row", gap: 10 }}>
                 {row.map((account) => (
-                  <OmpAccountCard key={account.credentialId} account={account} theme={theme} store={store} />
+                  <OmpAccountCard
+                    key={account.credentialId}
+                    account={account}
+                    theme={theme}
+                    store={store}
+                    controls={account.controllable && !omp.policiesLocked ? { defaultReserve } : null}
+                  />
                 ))}
                 {row.length < perRow ? <View style={{ flex: 1 }} /> : null}
               </View>
@@ -73,6 +109,7 @@ export function OmpSection({
           </View>
         );
       })}
+      {omp.fetchedAt !== null ? <OmpSettingsCard omp={omp} theme={theme} store={store} /> : null}
       {adding ? (
         <OmpSignIn
           theme={theme}
@@ -86,12 +123,40 @@ export function OmpSection({
   );
 }
 
-function OmpAccountCard({ account, theme, store }: { account: OmpAccountView; theme: Theme; store: ZeroSubStore }) {
+function OmpAccountCard({
+  account,
+  theme,
+  store,
+  controls,
+}: {
+  account: OmpAccountView;
+  theme: Theme;
+  store: ZeroSubStore;
+  /** Null when ZeroSub can't set this account's preferences. */
+  controls: { defaultReserve: number } | null;
+}) {
   const text = useText(theme);
   const toast = useToast();
-  const [busy, setBusy] = useState<"remove" | "reset" | null>(null);
+  const [busy, setBusy] = useState<"remove" | "reset" | "prefer" | null>(null);
   const [confirm, setConfirm] = useState<"remove" | "reset" | null>(null);
   const ref = { provider: account.provider, credentialId: account.credentialId };
+
+  const prefer = async () => {
+    setBusy("prefer");
+    try {
+      await store.rpc(preferOmpAccount, { ...ref, preferred: !account.preferred });
+    } catch (error) {
+      toast.error(describe(error));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const setReserve = (value: string) => {
+    store
+      .rpc(setOmpReserve, { ...ref, reservePct: value === "default" ? null : Number(value) })
+      .catch((error: unknown) => toast.error(describe(error)));
+  };
 
   const remove = async () => {
     setBusy("remove");
@@ -127,6 +192,20 @@ function OmpAccountCard({ account, theme, store }: { account: OmpAccountView; th
           {account.label}
         </Text>
         <View style={{ flexDirection: "row", alignItems: "center", gap: 2, marginTop: -4, marginRight: -6 }}>
+          {controls ? (
+            <IconButton
+              theme={theme}
+              icon="Star"
+              label={account.preferred ? "Stop preferring" : "Prefer for new OMP agents"}
+              tooltip={
+                account.preferred
+                  ? "Stop preferring: OMP spreads new agents by itself again"
+                  : "Prefer: new OMP agents start on this account while it has room"
+              }
+              busy={busy === "prefer"}
+              onPress={() => void prefer()}
+            />
+          ) : null}
           <IconButton
             theme={theme}
             icon="Trash2"
@@ -138,9 +217,10 @@ function OmpAccountCard({ account, theme, store }: { account: OmpAccountView; th
           />
         </View>
       </View>
-      {account.resets ? (
-        <View style={{ flexDirection: "row" }}>
-          <Badge theme={theme} label={resetBadge(account.resets)} tone="accent" />
+      {account.preferred || account.resets ? (
+        <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
+          {account.preferred ? <Badge theme={theme} label="Preferred" tone="accent" /> : null}
+          {account.resets ? <Badge theme={theme} label={resetBadge(account.resets)} tone="accent" /> : null}
         </View>
       ) : null}
       <View style={{ gap: 10 }}>
@@ -153,6 +233,18 @@ function OmpAccountCard({ account, theme, store }: { account: OmpAccountView; th
           <Text style={text.small}>{`Read by OMP ${formatAge(account.usageAt)}`}</Text>
         ) : null}
         {account.resets?.blockedReason ? <Text style={text.small}>{account.resets.blockedReason}</Text> : null}
+        {controls ? (
+          <SettingsSelect
+            label="Keep in reserve"
+            hint="OMP moves agents off this account before this much is left."
+            value={account.reservePct === null ? "default" : String(account.reservePct)}
+            options={[
+              { label: `OMP default (${controls.defaultReserve}%)`, value: "default" },
+              ...RESERVE_CHOICES.map((pct) => ({ label: `${pct}%`, value: String(pct) })),
+            ]}
+            onValueChange={setReserve}
+          />
+        ) : null}
       </View>
       {account.resets ? (
         <View style={{ marginTop: "auto", paddingTop: 10, borderTopWidth: 1, borderTopColor: theme.colors.border, alignItems: "flex-end" }}>
@@ -213,6 +305,87 @@ function OmpAccountCard({ account, theme, store }: { account: OmpAccountView; th
         </Modal.Content>
       </Modal>
     </Card>
+  );
+}
+
+type SettingKey = keyof OmpSettings;
+
+/** ZeroSub's choices for OMP's settings; `words` names OMP's own values for the "OMP default" option. */
+const SETTING_ROWS: Array<{ key: SettingKey; label: string; hint: string; words: Record<string, string> }> = [
+  {
+    key: "retry.usageReservePolicy",
+    label: "When every account is down to its reserve",
+    hint: "What OMP does once no account has room left above its reserve.",
+    words: { confirm: "Ask first", auto: "Use the reserve", "fail-closed": "Stop" },
+  },
+  {
+    key: "retry.waitForUsageReset",
+    label: "When an agent hits a limit",
+    hint: "Waiting holds the agent, and its subagents, until the limit resets.",
+    words: { true: "Wait for the reset", false: "Stop with an error" },
+  },
+  {
+    key: "codexResets.autoRedeem",
+    label: "Use banked ChatGPT resets automatically",
+    hint: "When an agent is stuck and no other account can take over, and for resets about to expire.",
+    words: { yes: "Yes", no: "No", unset: "Ask before the first one" },
+  },
+  {
+    key: "codexResets.keepCredits",
+    label: "ChatGPT resets to keep",
+    hint: "Automatic use never goes below this many, except for resets about to expire.",
+    words: { 0: "None", 1: "1", 2: "2", 3: "3" },
+  },
+  {
+    key: "claudeResets.autoRedeem",
+    label: "Use banked Claude resets automatically",
+    hint: "Only for the limits a reset covers.",
+    words: { yes: "Yes", no: "No", unset: "Ask before the first one" },
+  },
+  {
+    key: "claudeResets.keepCredits",
+    label: "Claude resets to keep",
+    hint: "Automatic use never goes below this many, except for resets about to expire.",
+    words: { 0: "None", 1: "1", 2: "2", 3: "3" },
+  },
+];
+
+/** OMP settings for the OMP agents Paseo starts on this host; "OMP default" leaves OMP's own config in charge. */
+function OmpSettingsCard({ omp, theme, store }: { omp: OmpView; theme: Theme; store: ZeroSubStore }) {
+  const text = useText(theme);
+  const toast = useToast();
+  const save = (key: SettingKey, raw: string) => {
+    const next: Record<string, unknown> = { ...omp.settings };
+    if (raw === "default") delete next[key];
+    else next[key] = raw === "true" ? true : raw === "false" ? false : /^\d+$/.test(raw) ? Number(raw) : raw;
+    store.rpc(setOmpSettings, { settings: next as OmpSettings }).catch((error: unknown) => toast.error(describe(error)));
+  };
+  return (
+    <View style={{ gap: 10 }}>
+      <Text style={text.strong}>How OMP uses these accounts</Text>
+      <SettingsCard>
+        {SETTING_ROWS.map((row) => {
+          const current = omp.settings[row.key];
+          const fallback = omp.defaults[row.key];
+          const fallbackWord = fallback === undefined ? "not set" : row.words[String(fallback)] ?? String(fallback);
+          return (
+            <SettingsSelect
+              key={row.key}
+              label={row.label}
+              hint={row.hint}
+              value={current === undefined ? "default" : String(current)}
+              options={[
+                { label: `OMP default (${fallbackWord})`, value: "default" },
+                ...Object.entries(row.words)
+                  .filter(([value]) => value !== "unset")
+                  .map(([value, label]) => ({ label, value })),
+              ]}
+              onValueChange={(value) => save(row.key, value)}
+            />
+          );
+        })}
+      </SettingsCard>
+    </View>
   );
 }
 

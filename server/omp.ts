@@ -1,16 +1,32 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { delimiter } from "node:path";
 import { tmpdir } from "node:os";
 import { createInterface } from "node:readline";
-import type { PluginHandlerContext } from "@getpaseo/plugin/server";
-import type { LoginStep, OmpAccountView, OmpLoginView, OmpView, ResetOffer, UsageWindow } from "../shared/model";
+import type { PluginHandlerContext, PluginSessionOpenRequest } from "@getpaseo/plugin/server";
+import {
+  OmpSettingsSchema,
+  type LoginStep,
+  type OmpAccountView,
+  type OmpLoginView,
+  type OmpSettings,
+  type OmpView,
+  type ResetOffer,
+  type UsageWindow,
+} from "../shared/model";
 import { providerCommand, type Command } from "./binaries";
+import { writeJsonAtomic } from "./json-file";
+import { buildOverlay, OmpControlsStore, overlayPath, sameAccount, type AccountKey, type OmpControls } from "./omp-controls";
 import { run, stripAnsi } from "./process";
 
 type PaseoApi = PluginHandlerContext["paseo"];
 
 /** Offered for sign-in even before they have an account; providers that already have one are offered too. */
 const SIGN_IN_PROVIDERS = ["anthropic", "openai-codex"];
+/** Models `omp dry-balance` previews with, per provider; OMP resolves the short names itself. */
+const PREVIEW_MODELS: Record<string, string> = { anthropic: "anthropic/sonnet", "openai-codex": "openai-codex/gpt" };
+/** OMP settings shown as the default beside ZeroSub's own choice. */
+const DEFAULT_KEYS = [...Object.keys(OmpSettingsSchema.shape), "retry.usageReservePct"];
 const STALE_MS = 60_000;
 const ENABLED_CACHE_MS = 30_000;
 const NOT_INSTALLED_RECHECK_MS = 5 * 60_000;
@@ -262,6 +278,7 @@ export function joinAccounts(
   reports: UsageReport[],
   resets: ResetAccount[],
   history: HistoryEntry[] = [],
+  controls: OmpControls = { preferred: [], reserves: [], settings: {} },
 ): OmpAccountView[] {
   return accounts
     .map((account) => {
@@ -280,6 +297,7 @@ export function joinAccounts(
       const live = toWindows(report);
       const recorded = live.length === 0 && reset?.accountId ? lastRecorded(history, account.provider, reset.accountId) : null;
       const usageAt = recorded?.at ?? report?.fetchedAt;
+      const key = accountKey(reset);
       return {
         provider: account.provider,
         credentialId: account.credentialId,
@@ -287,9 +305,31 @@ export function joinAccounts(
         windows: recorded?.windows ?? live,
         usageAt: usageAt ? new Date(usageAt).toISOString() : null,
         resets: toResets(reset),
+        controllable: key !== null,
+        preferred: key !== null && controls.preferred.some((ref) => sameAccount(ref, key)),
+        reservePct: (key && controls.reserves.find((ref) => sameAccount(ref, key))?.reservePct) ?? null,
       };
     })
     .sort((a, b) => a.provider.localeCompare(b.provider) || a.credentialId - b.credentialId);
+}
+
+/** The ids OMP's account policies select this login by; only known for accounts with reset listings. */
+function accountKey(reset: ResetAccount | undefined): AccountKey | null {
+  return reset?.accountId ? { provider: reset.provider, accountId: reset.accountId, orgId: reset.orgId ?? null } : null;
+}
+
+type Preview = OmpView["preview"][number];
+
+/** Where new sessions would go right now, by OMP's own balancer with the overlay applied. */
+async function previewBalance(omp: Command, provider: string): Promise<Preview | null> {
+  const model = PREVIEW_MODELS[provider];
+  if (!model) return null;
+  const result = await runJson<{ model: string; success: { accounts: Array<{ account: string; percent: number }> } }>(omp, [
+    "dry-balance", model, "--count", "20", "--json", "--config", overlayPath(),
+  ]).catch(() => null);
+  return result
+    ? { provider, model: result.model, accounts: result.success.accounts.map((entry) => ({ label: entry.account, percent: entry.percent })) }
+    : null;
 }
 
 /**
@@ -297,19 +337,88 @@ export function joinAccounts(
  * off one that hits a limit by itself, so ZeroSub only lists, adds, removes and resets them.
  */
 export class OmpAccounts {
-  private snapshot: Omit<OmpView, "logins"> | null = null;
+  private snapshot: Omit<OmpView, "logins" | "settings"> | null = null;
   private loading: Promise<void> | null = null;
   private loadedAt = 0;
   private installed: { at: number; ok: boolean } | null = null;
   private enabled: { at: number; value: boolean } | null = null;
   private readonly logins = new Map<string, Login>();
+  private readonly controls = new OmpControlsStore();
+  /** `omp config list --json`: OMP's own settings, read without ZeroSub's overlay. */
+  private config: Record<string, { value?: unknown }> | null = null;
+  /** `provider/credentialId` → the ids its policies select it by. */
+  private identities = new Map<string, AccountKey>();
+  private overlayWritten: Promise<void> | null = null;
 
   async view(paseo: PaseoApi, refresh: boolean): Promise<OmpView | undefined> {
     if (!(await this.isEnabled(paseo)) || !(await this.isInstalled())) return undefined;
     if (refresh) await this.load(true);
     else if (Date.now() - this.loadedAt > STALE_MS) void this.load(false);
-    const base = this.snapshot ?? { providers: [], accounts: [], fetchedAt: null, error: null };
-    return { ...base, logins: [...this.logins.values()].map(toLoginView) };
+    const base = this.snapshot ?? { providers: [], accounts: [], fetchedAt: null, error: null, defaults: {}, policiesLocked: false, preview: [] };
+    return { ...base, settings: (await this.controls.read()).settings, logins: [...this.logins.values()].map(toLoginView) };
+  }
+
+  /** Adds ZeroSub's overlay to every OMP session Paseo opens, after any overlays already configured. */
+  async openSession(request: PluginSessionOpenRequest): Promise<PluginSessionOpenRequest | undefined> {
+    if (!(await this.isInstalled())) return undefined;
+    await (this.overlayWritten ??= this.writeOverlay());
+    const existing = (request.env.PI_CONFIG_FILES ?? process.env.PI_CONFIG_FILES ?? "").split(delimiter).filter(Boolean);
+    if (existing.includes(overlayPath())) return undefined;
+    return { ...request, env: { ...request.env, PI_CONFIG_FILES: [...existing, overlayPath()].join(delimiter) } };
+  }
+
+  async prefer(provider: string, credentialId: number, preferred: boolean): Promise<void> {
+    const key = this.identityOf(provider, credentialId);
+    await this.change((draft) => {
+      draft.preferred = draft.preferred.filter((ref) => ref.provider !== provider);
+      if (preferred) draft.preferred.push(key);
+    });
+  }
+
+  async setReserve(provider: string, credentialId: number, reservePct: number | null): Promise<void> {
+    const key = this.identityOf(provider, credentialId);
+    await this.change((draft) => {
+      draft.reserves = draft.reserves.filter((ref) => !sameAccount(ref, key));
+      if (reservePct !== null) draft.reserves.push({ ...key, reservePct });
+    });
+  }
+
+  async setSettings(settings: OmpSettings): Promise<void> {
+    await this.change((draft) => {
+      draft.settings = settings;
+    });
+  }
+
+  private identityOf(provider: string, credentialId: number): AccountKey {
+    const key = this.identities.get(`${provider}/${credentialId}`);
+    if (!key) throw new Error("OMP doesn't say which account this login belongs to, so ZeroSub can't set its preferences.");
+    return key;
+  }
+
+  /** Saves a change, rewrites the overlay new OMP sessions read, and refreshes the preview. */
+  private async change(edit: (draft: OmpControls) => void): Promise<void> {
+    await this.controls.update(edit);
+    this.overlayWritten = this.writeOverlay();
+    await this.overlayWritten;
+    await this.reload();
+  }
+
+  private async writeOverlay(): Promise<void> {
+    this.config ??= await this.readConfig(await providerCommand("omp"));
+    const reserve = this.config["retry.usageReservePct"]?.value;
+    await writeJsonAtomic(
+      overlayPath(),
+      buildOverlay(await this.controls.read(), typeof reserve === "number" ? reserve : 10, !this.policiesLocked()),
+    );
+  }
+
+  private readConfig(omp: Command): Promise<Record<string, { value?: unknown }>> {
+    return runJson<Record<string, { value?: unknown }>>(omp, ["config", "list", "--json"]);
+  }
+
+  private policiesLocked(): boolean {
+    const policies = this.config?.["auth.accountPolicies"]?.value;
+    return Array.isArray(policies) && policies.length > 0;
   }
 
   startLogin(provider: string): OmpLoginView {
@@ -431,7 +540,7 @@ export class OmpAccounts {
       // Asks the providers again instead of answering from OMP's usage cache.
       if (invalidate) await run(omp.command, [...omp.prefix, "usage", "invalidate"], { timeoutMs: 30_000, cwd: tmpdir() });
       const usageErrors: string[] = [];
-      const [listing, usage, resets, history] = await Promise.all([
+      const [listing, usage, resets, history, config] = await Promise.all([
         listAccounts(omp),
         runJson<{ reports?: UsageReport[] }>(omp, ["usage", "--json"]).catch((error: unknown) => {
           usageErrors.push(`Usage: ${describe(error)}`);
@@ -443,13 +552,39 @@ export class OmpAccounts {
         }),
         // Local only (OMP's own records), so it is cheap; it stands in for missing live readings.
         runJson<{ entries?: HistoryEntry[] }>(omp, ["usage", "--history", "--json", "--days", "1"]).catch(() => ({ entries: [] })),
+        this.readConfig(omp).catch(() => this.config ?? {}),
       ]);
+      this.config = config;
+      this.identities = new Map(
+        (resets.accounts ?? []).flatMap((reset) => {
+          const key = accountKey(reset);
+          return key ? [[`${reset.provider}/${reset.credentialId}`, key] as const] : [];
+        }),
+      );
+      // OMP's own settings may have changed, and the preview below reads the overlay.
+      this.overlayWritten = this.writeOverlay();
+      await this.overlayWritten;
+      const accounts = joinAccounts(listing.accounts, usage.reports ?? [], resets.accounts ?? [], history.entries ?? [], await this.controls.read());
+      const crowded = [...new Set(accounts.map((account) => account.provider))].filter(
+        (provider) => accounts.filter((account) => account.provider === provider).length > 1,
+      );
+      const preview = (await Promise.all(crowded.map((provider) => previewBalance(omp, provider)))).filter(
+        (entry): entry is Preview => entry !== null,
+      );
+      const defaults: OmpView["defaults"] = {};
+      for (const key of DEFAULT_KEYS) {
+        const value = config[key]?.value;
+        if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") defaults[key] = value;
+      }
       const providerIds = [...new Set([...SIGN_IN_PROVIDERS, ...listing.accounts.map((account) => account.provider)])];
       this.snapshot = {
         providers: providerIds.map((id) => ({ id, name: listing.names.get(id) ?? id })),
-        accounts: joinAccounts(listing.accounts, usage.reports ?? [], resets.accounts ?? [], history.entries ?? []),
+        accounts,
         fetchedAt: new Date().toISOString(),
         error: usageErrors.length > 0 ? usageErrors.join(" · ") : null,
+        defaults,
+        policiesLocked: this.policiesLocked(),
+        preview,
       };
     } catch (error) {
       this.snapshot = {
@@ -457,6 +592,9 @@ export class OmpAccounts {
         accounts: this.snapshot?.accounts ?? [],
         fetchedAt: this.snapshot?.fetchedAt ?? null,
         error: `Could not read OMP's accounts: ${describe(error)}`,
+        defaults: this.snapshot?.defaults ?? {},
+        policiesLocked: this.snapshot?.policiesLocked ?? false,
+        preview: this.snapshot?.preview ?? [],
       };
     }
   }
