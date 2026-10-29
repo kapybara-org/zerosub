@@ -89,7 +89,7 @@ describe("Codex app-server process handling", () => {
       } else if (request.method === "account/rateLimits/read") reply(child, request.id, LIMITS);
     });
     const identity = await new CodexAdapter().identity(null);
-    expect(identity).toMatchObject({ signedIn: true, email: "Ada@Example.com", identity: "chatgpt|acc-1" });
+    expect(identity).toMatchObject({ signedIn: true, email: "Ada@Example.com", identity: "chatgpt|acc-1|ada@example.com" });
     expect(spawn).toHaveBeenCalledTimes(1);
     expect(warn).toHaveBeenCalledTimes(1);
   });
@@ -186,7 +186,7 @@ describe("Codex app-server process handling", () => {
     const adapter = new CodexAdapter();
     await expect(adapter.identity(null)).rejects.toThrow("rateLimits exploded");
     const identity = await adapter.identity(null);
-    expect(identity).toMatchObject({ signedIn: true, email: "Ada@Example.com", identity: "chatgpt|acc-1" });
+    expect(identity).toMatchObject({ signedIn: true, email: "Ada@Example.com", identity: "chatgpt|acc-1|ada@example.com" });
     expect(spawn).toHaveBeenCalledTimes(2);
   });
 
