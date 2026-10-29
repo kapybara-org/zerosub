@@ -41,7 +41,7 @@ import { equivalentMode } from "./modes";
 import { homesDir } from "./paths";
 import { Reopener } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
-import { loadReadings, mergeUsage, saveReadings, showLimit } from "./usage";
+import { loadReadings, markStale, mergeUsage, saveReadings, showLimit, usageReport, type UsageSourceReport } from "./usage";
 import { chooseAccount, isLimited, isUsable, mostAvailable } from "./routing";
 import {
   MAIN_ACCOUNT_ID,
@@ -61,10 +61,13 @@ type TurnEnded = PluginLifecycleEvents["agent.turn_ended"];
 const FAMILIES: readonly Family[] = ["claude", "codex"];
 const PROVIDER_NAME: Record<Family, string> = { claude: "Claude Code", codex: "Codex" };
 const OTHER_FAMILY: Record<Family, Family> = { claude: "codex", codex: "claude" };
-/** How often to read usage: accounts in use, the defaults, and the rest. Adapters space reads further. */
+/**
+ * How often to read usage: accounts in use, the defaults, and the rest. Adapters space reads
+ * further. Idle accounts are read as often as defaults so no reading outlives `STALE_MS`.
+ */
 const USAGE_BUSY_MS = 60_000;
 const USAGE_DEFAULT_MS = 5 * 60_000;
-const USAGE_IDLE_MS = 20 * 60_000;
+const USAGE_IDLE_MS = 5 * 60_000;
 /** An account counts as in use for this long after one of its agents starts or ends a turn. */
 const ACTIVE_WINDOW_MS = 15 * 60_000;
 const UPKEEP_MS = 30_000;
@@ -1279,7 +1282,7 @@ export class Service {
 
   // ------------------------------------------------------------------ usage
 
-  /** `renewLogin` lets the CLI refresh an expired sign-in first (explicit refreshes only: it's slow). */
+  /** `renewLogin` has the CLI refresh an expired sign-in first; background reads do so at a bounded rate. */
   refreshUsage(accountId: string, force = false, renewLogin = false): Promise<void> {
     const pending = this.usageInFlight.get(accountId);
     if (pending) return pending;
@@ -1293,14 +1296,18 @@ export class Service {
       const spacing = this.adapters[account.family].usageSpacingMs;
       if (since < (force ? spacing : Math.max(spacing, 60_000))) return;
       this.usageAttemptAt.set(accountId, Date.now());
-      const { retryAt, ...usage } = await this.adapters[account.family]
+      const read = await this.adapters[account.family]
         .usage(account.home, { renewLogin })
         .catch(
           (error: unknown): UsageRead => ({ fetchedAt: new Date().toISOString(), windows: [], error: describe(error), cached: false, resets: null }),
         );
+      const { retryAt, ...usage } = read;
       if (retryAt) this.usageRetryAt.set(accountId, retryAt);
       else this.usageRetryAt.delete(accountId);
-      this.setUsage(accountId, mergeUsage(this.usage.get(accountId), usage));
+      const previous = this.usage.get(accountId);
+      const shown = markStale(mergeUsage(previous, usage), read);
+      if (shown.error && shown.error !== previous?.error) console.log(`[ZeroSub] usage for ${account.label}: ${shown.error}`);
+      this.setUsage(accountId, shown);
       // Only a live reading may change an account's limit state.
       if (usage.windows.length === 0 || usage.error || usage.cached) return;
       const now = Date.now();
@@ -1336,6 +1343,35 @@ export class Service {
       void saveReadings(this.usage).catch((error: unknown) => log("could not save usage", error));
     }, 3_000);
     this.usageSave.unref?.();
+  }
+
+  // ------------------------------------------------------------------ usage source
+
+  /**
+   * Accounts for Paseo's Usage section. Paseo's own sources only see a managed account while one of
+   * its agents is open, and read the same rate-limited endpoints again; these reuse ZeroSub's reads.
+   */
+  async usageAccounts(): Promise<Array<{ key: string; label: string; harness: string; input: { accountId: string } }>> {
+    const state = await this.store.read();
+    return state.accounts
+      .filter((account) => account.signedIn)
+      .map((account) => ({
+        key: account.id,
+        label: account.email ?? account.label,
+        harness: FAMILY_LABEL[account.family],
+        input: { accountId: account.id },
+      }));
+  }
+
+  /** One account's reading for Paseo's Usage section, read again first when it is due. */
+  async usageSourceReport(accountId: string): Promise<UsageSourceReport> {
+    const account = findAccount(await this.store.read(), accountId);
+    if (!account) return { status: "error", error: "This account is no longer in ZeroSub." };
+    const current = this.usage.get(accountId);
+    if (!current || Date.now() - Date.parse(current.fetchedAt) > USAGE_DEFAULT_MS) {
+      await withTimeout(this.refreshUsage(accountId, true), 15_000);
+    }
+    return usageReport(this.usage.get(accountId), account.plan);
   }
 
   // ------------------------------------------------------------------ RPC: state

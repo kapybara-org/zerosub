@@ -23,6 +23,8 @@ import { firstUrl, run, stripAnsi } from "./process";
 import { retryDelayMs } from "./usage";
 
 const API = "https://api.anthropic.com";
+/** A background read renews an expired sign-in at most this often per account; explicit refreshes always may. */
+const BACKGROUND_RENEW_MS = 30 * 60_000;
 
 function apiHeaders(token: string): Record<string, string> {
   return {
@@ -58,6 +60,7 @@ export class ClaudeAdapter implements FamilyAdapter {
   /** Anthropic's usage endpoint answers 429 to rapid repeats. */
   readonly usageSpacingMs = 90_000;
   private readonly renewing = new Map<string, Promise<Credentials | null>>();
+  private readonly renewedAt = new Map<string, number>();
   private readonly resetNotes = new Map<string, string>();
 
   async env(home: string | null): Promise<EnvPatch> {
@@ -103,7 +106,8 @@ export class ClaudeAdapter implements FamilyAdapter {
   async usage(home: string | null, options: { renewLogin?: boolean } = {}): Promise<UsageRead> {
     const fetchedAt = new Date().toISOString();
     let credentials = await readCredentials(home).catch(() => null);
-    if (!isFresh(credentials) && options.renewLogin) credentials = await this.renewLogin(home);
+    // An idle account's token expires with nothing to refresh it, which would freeze its reading.
+    if (!isFresh(credentials) && (options.renewLogin || this.mayRenewInBackground(home))) credentials = await this.renewLogin(home);
     const profileScope = !credentials?.scopes || credentials.scopes.includes("user:profile");
     if (credentials?.accessToken && isFresh(credentials) && profileScope) {
       try {
@@ -132,8 +136,8 @@ export class ClaudeAdapter implements FamilyAdapter {
         return { fetchedAt, windows: [], error: error instanceof Error ? error.message : String(error), cached: false, resets: null };
       }
     }
-    // An idle account's token may have expired; Claude Code refreshes it on next use. Until then,
-    // show the last utilisation Claude Code itself cached for this account.
+    // The sign-in couldn't be renewed just now (or Anthropic turned it down). Until it is, show the
+    // last utilisation Claude Code itself cached for this account.
     const cached = await cachedUsage(home);
     if (cached) return cached;
     return { fetchedAt, windows: [], error: "Usage shows up after this account is next used.", cached: false, resets: null };
@@ -157,6 +161,7 @@ export class ClaudeAdapter implements FamilyAdapter {
     const key = home ?? "";
     let pending = this.renewing.get(key);
     if (!pending) {
+      this.renewedAt.set(key, Date.now());
       pending = (async () => {
         const { command, prefix } = await providerCommand("claude");
         await run(command, [...prefix, "-p", "/usage", "--no-session-persistence", "--output-format", "json"], {
@@ -169,6 +174,10 @@ export class ClaudeAdapter implements FamilyAdapter {
       this.renewing.set(key, pending);
     }
     return pending;
+  }
+
+  private mayRenewInBackground(home: string | null): boolean {
+    return Date.now() - (this.renewedAt.get(home ?? "") ?? 0) >= BACKGROUND_RENEW_MS;
   }
 
   async redeemReset(home: string | null, options: { onlyAtLimit?: boolean } = {}): Promise<RedeemReply> {

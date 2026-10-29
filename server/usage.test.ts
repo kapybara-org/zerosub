@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Usage } from "../shared/model";
 import { SwitchGuard } from "./switch-guard";
-import { mergeUsage, retryDelayMs, showLimit } from "./usage";
+import { markStale, mergeUsage, retryDelayMs, showLimit, STALE_MS, usageReport } from "./usage";
 
 const reading = (patch: Partial<Usage> = {}): Usage => ({
   fetchedAt: "2026-09-23T08:00:00.000Z",
@@ -47,6 +47,60 @@ describe("mergeUsage", () => {
     const newer = reading({ fetchedAt: "2026-09-23T08:30:00.000Z", cached: true });
     expect(mergeUsage(reading(), newer)).toBe(newer);
     expect(mergeUsage(undefined, older)).toBe(older);
+  });
+});
+
+describe("markStale", () => {
+  const now = Date.parse("2026-09-23T08:00:00.000Z") + STALE_MS + 60_000;
+
+  it("leaves a live reading and a recent kept reading as they are", () => {
+    expect(markStale(reading(), reading(), now)).toEqual(reading());
+    const recent = Date.parse("2026-09-23T08:05:00.000Z");
+    expect(markStale(reading(), reading({ windows: [], error: null, cached: false }), recent)).toEqual(reading());
+  });
+
+  it("says why a reading older than the limit was kept", () => {
+    const limited = markStale(reading(), { ...reading({ cached: true }), retryAt: Date.parse("2026-09-23T08:13:00.000Z") }, now);
+    expect(limited.error).toBe("Stale since 08:00 UTC: usage reads are rate-limited; retrying after 08:13 UTC");
+    expect(limited.windows).toEqual(reading().windows);
+    expect(markStale(reading(), reading({ windows: [], error: "offline" }), now).error).toBe("Stale since 08:00 UTC: offline");
+    expect(markStale(reading(), reading({ fetchedAt: "2026-09-23T07:00:00.000Z", cached: true }), now).error).toBe(
+      "Stale since 08:00 UTC: the sign-in needs renewing, so only the CLI's cached copy is available",
+    );
+  });
+
+  it("never labels an old cached copy as current", () => {
+    const cached = reading({ fetchedAt: "2026-09-23T06:00:00.000Z", cached: true });
+    expect(markStale(cached, cached, now).error).toMatch(/^Stale since 06:00 UTC: /);
+  });
+
+  it("has nothing to mark without windows", () => {
+    const empty = reading({ windows: [], error: "Not signed in." });
+    expect(markStale(empty, empty, now)).toBe(empty);
+  });
+});
+
+describe("usageReport", () => {
+  it("turns a current reading into a Paseo usage report", () => {
+    expect(usageReport(reading(), "pro")).toEqual({
+      status: "available",
+      planLabel: "pro",
+      windows: [
+        { id: "five_hour", label: "5-hour", usedPct: 92, remainingPct: 8, resetsAt: "2026-09-23T08:10:00.000Z", tone: "danger", summary: true },
+        { id: "seven_day", label: "Weekly", usedPct: 9, remainingPct: 91, resetsAt: "2026-09-29T20:00:00.000Z", tone: "ok", summary: true },
+        { id: "weekly_fable", label: "Weekly · Fable", usedPct: 0, remainingPct: 100, resetsAt: "2026-09-29T20:00:00.000Z", tone: "ok" },
+      ],
+      balances: [],
+      details: [],
+    });
+  });
+
+  it("reports a stale or missing reading as an error rather than as current", () => {
+    expect(usageReport(reading({ error: "Stale since 08:00 UTC: offline" }), null)).toEqual({
+      status: "error",
+      error: "Stale since 08:00 UTC: offline",
+    });
+    expect(usageReport(undefined, null)).toEqual({ status: "error", error: "ZeroSub has no usage reading for this account yet." });
   });
 });
 

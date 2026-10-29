@@ -1,7 +1,9 @@
 import type { PluginServerContext, PluginSettingsState } from "@getpaseo/plugin/server";
+import { z } from "zod";
 import { ClaudeAdapter } from "./server/claude";
 import { CodexAdapter } from "./server/codex";
 import { Service, describe } from "./server/service";
+import type { UsageSourceReport } from "./server/usage";
 import { preferences } from "./shared/preferences";
 import {
   cancelLogin,
@@ -64,6 +66,16 @@ export default function contribute(server: PluginServerContext) {
     void service.onAgentArchived(event.agent.id).catch(() => undefined);
   });
 
+  // Paseo 0.11+ lists plugin usage sources in its Usage section; older hosts don't have the hook.
+  const usageHost = server as PluginServerContext & { registerUsageSource?: (source: UsageSource) => void };
+  usageHost.registerUsageSource?.({
+    id: "zerosub",
+    label: "ZeroSub",
+    input: z.object({ accountId: z.string() }),
+    discover: (scope) => (scope.kind === "global" ? service.usageAccounts() : Promise.resolve([])),
+    fetch: ({ accountId }) => service.usageSourceReport(accountId),
+  });
+
   server.handle(getState, ({ refreshUsage }, { paseo }) => service.view(paseo, refreshUsage));
   server.handle(startLogin, ({ family, method, accountId }) => service.startLogin(family, method, accountId));
   server.handle(submitLoginCode, ({ loginId, code }) => service.submitCode(loginId, code));
@@ -90,4 +102,12 @@ export default function contribute(server: PluginServerContext) {
     stopSettings();
     await service.stop();
   };
+}
+
+interface UsageSource {
+  id: string;
+  label: string;
+  input: z.ZodType<{ accountId: string }>;
+  discover(scope: { kind: string }): Promise<Array<{ key: string; label?: string; harness?: string; input: { accountId: string } }>>;
+  fetch(input: { accountId: string }): Promise<UsageSourceReport>;
 }

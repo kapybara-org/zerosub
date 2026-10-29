@@ -87,8 +87,8 @@ export interface FamilyAdapter {
   env(home: string | null): Promise<EnvPatch>;
   identity(home: string | null): Promise<Identity>;
   /**
-   * Usage windows and banked resets. `renewLogin` lets the adapter have the CLI refresh an expired
-   * sign-in first (slow, so only for explicit requests, never background polls).
+   * Usage windows and banked resets. `renewLogin` has the CLI refresh an expired sign-in first;
+   * without it an adapter may still do so for a background read, at a bounded rate.
    */
   usage(home: string | null, options?: { renewLogin?: boolean }): Promise<UsageRead>;
   /** Spends one banked reset. Only called for an explicit user request or the opt-in auto setting. */

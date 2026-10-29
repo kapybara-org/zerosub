@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { UsageSchema, type Usage } from "../shared/model";
+import type { UsageRead } from "./adapter";
 import { readJson, writeJsonAtomic } from "./json-file";
 import { dataDir } from "./paths";
 
@@ -45,6 +46,73 @@ export function mergeUsage(previous: Usage | undefined, next: Usage): Usage {
   if (next.windows.length === 0) return { ...previous, error: next.error };
   if (next.cached && Date.parse(next.fetchedAt) <= Date.parse(previous.fetchedAt)) return previous;
   return next;
+}
+
+/** A reading this old that a refresh couldn't replace says so, rather than passing for current. */
+export const STALE_MS = 10 * 60_000;
+
+/**
+ * The reading to show after a refresh attempt. When the attempt wasn't a live reading and what's
+ * shown is older than `STALE_MS`, the reading keeps its windows but says since when and why.
+ */
+export function markStale(shown: Usage, attempt: UsageRead, now: number = Date.now()): Usage {
+  if (shown.windows.length === 0) return shown;
+  if (!attempt.cached && !attempt.error && attempt.windows.length > 0) return shown;
+  const at = Date.parse(shown.fetchedAt);
+  if (!Number.isFinite(at) || now - at <= STALE_MS) return shown;
+  return { ...shown, error: `Stale since ${clock(at)}: ${staleReason(attempt)}` };
+}
+
+function staleReason(attempt: UsageRead): string {
+  if (attempt.error) return attempt.error;
+  if (attempt.retryAt) return `usage reads are rate-limited; retrying after ${clock(attempt.retryAt)}`;
+  if (attempt.cached) return "the sign-in needs renewing, so only the CLI's cached copy is available";
+  return "no live reading came back";
+}
+
+function clock(at: number): string {
+  return `${new Date(at).toISOString().slice(11, 16)} UTC`;
+}
+
+/** A usage report as Paseo's Usage section takes it (`@getpaseo/plugin/server/usage`, Paseo 0.11+). */
+export type UsageSourceReport =
+  | {
+      status: "available";
+      planLabel?: string;
+      windows: Array<{
+        id: string;
+        label: string;
+        usedPct: number;
+        remainingPct: number;
+        resetsAt: string | null;
+        tone: "ok" | "warning" | "danger";
+        summary?: true;
+      }>;
+      balances: [];
+      details: [];
+    }
+  | { status: "error"; error: string };
+
+/** An account's reading for Paseo's Usage section; one that isn't current is an error there, not a number. */
+export function usageReport(usage: Usage | undefined, plan: string | null): UsageSourceReport {
+  if (!usage) return { status: "error", error: "ZeroSub has no usage reading for this account yet." };
+  if (usage.error) return { status: "error", error: usage.error };
+  if (usage.windows.length === 0) return { status: "error", error: "No usage windows came back." };
+  return {
+    status: "available",
+    ...(plan ? { planLabel: plan } : {}),
+    windows: usage.windows.map((window, index) => ({
+      id: window.id,
+      label: window.label,
+      usedPct: window.usedPercent,
+      remainingPct: Math.max(0, 100 - window.usedPercent),
+      resetsAt: window.resetsAt,
+      tone: window.usedPercent > 90 ? "danger" : window.usedPercent >= 70 ? "warning" : "ok",
+      ...(index < 2 ? { summary: true as const } : {}),
+    })),
+    balances: [],
+    details: [],
+  };
 }
 
 function usagePath(): string {
