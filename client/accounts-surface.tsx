@@ -17,7 +17,7 @@ import {
 import { AddAccountModal } from "./add-account";
 import { ResetConfirm, redeemToast, resetBadge } from "./reset-confirm";
 import { describe, useStore, VISIBLE_POLL_MS, type ZeroSubStore } from "./store";
-import { Badge, Button, Card, IconButton, UsageBar, useText } from "./ui";
+import { ActionsMenu, Badge, Button, Card, IconButton, UsageBar, useText, type MenuAction } from "./ui";
 
 type Theme = PluginSurfaceProps["theme"];
 
@@ -190,8 +190,12 @@ function FamilySection({
   onSignIn(account: AccountView): void;
 }) {
   const text = useText(theme);
+  // Columns follow the width this section really has, not the window's: on a foldable or a split screen the
+  // window is wide while the pane beside Paseo's sidebar is phone-narrow.
+  const [width, setWidth] = useState(0);
+  const columns = columnsFor(width);
   return (
-    <View style={{ gap: 10 }}>
+    <View style={{ gap: 10 }} onLayout={(event) => setWidth(event.nativeEvent.layout.width)}>
       <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
         <Text style={text.heading} accessibilityRole="header">
           {family === "claude" ? "Claude" : "ChatGPT (Codex)"}
@@ -209,7 +213,7 @@ function FamilySection({
       {accounts.length === 0 ? (
         <Text style={text.muted}>No {FAMILY_LABEL[family]} accounts yet.</Text>
       ) : null}
-      {chunk(accounts, compact ? 1 : 2).map((row) => (
+      {chunk(accounts, columns).map((row) => (
         <View key={row.map((account) => account.id).join()} style={{ flexDirection: "row", gap: 10 }}>
           {row.map((account) => (
             <AccountCard
@@ -220,7 +224,7 @@ function FamilySection({
               onSignIn={() => onSignIn(account)}
             />
           ))}
-          {!compact && row.length === 1 ? <View style={{ flex: 1 }} /> : null}
+          {columns > 1 && row.length === 1 ? <View style={{ flex: 1 }} /> : null}
         </View>
       ))}
     </View>
@@ -319,6 +323,47 @@ function AccountCard({
     }
   }, [account, store, toast]);
 
+  const actions: MenuAction[] = [
+    ...(account.status === "limited"
+      ? [{
+          key: "available",
+          icon: "CircleCheck",
+          label: "Mark as available again",
+          hint: "Use it again before its limit resets, e.g. after upgrading",
+          onPress: () => void markAvailable(),
+        }]
+      : []),
+    ...(!account.isDefault && !signedOut && !disabled
+      ? [{
+          key: "default",
+          icon: "Star",
+          label: "Make default",
+          hint: "New agents start on this account",
+          onPress: () => void makeDefault(),
+        }]
+      : []),
+    disabled
+      ? { key: "toggle", icon: "CirclePlay", label: "Enable account", hint: "Agents can use this account again", onPress: () => void toggle() }
+      : {
+          key: "toggle",
+          icon: "CirclePause",
+          label: "Disable for now",
+          hint: "Agents stop using it and move to your other accounts",
+          onPress: () => void toggle(),
+        },
+    { key: "rename", icon: "Pencil", label: "Rename", hint: "Rename this account", onPress: () => setRenaming(true) },
+    ...(account.kind !== "main"
+      ? [{
+          key: "remove",
+          icon: "Trash2",
+          label: "Remove",
+          hint: "Sign it out and delete its saved login",
+          tone: "danger" as const,
+          onPress: () => setConfirmRemove(true),
+        }]
+      : []),
+  ];
+
   return (
     <Card theme={theme} fill>
       <View style={{ flexDirection: "row", alignItems: "flex-start", gap: 12 }}>
@@ -335,51 +380,8 @@ function AccountCard({
             </Text>
           ) : null}
         </View>
-        <View style={{ flexDirection: "row", alignItems: "center", gap: 2, marginTop: -4, marginRight: -6 }}>
-          {account.status === "limited" ? (
-            <IconButton
-              theme={theme}
-              icon="CircleCheck"
-              label="Mark as available again (it has room)"
-              tooltip="Mark as available: use it again before its limit resets, e.g. after upgrading"
-              busy={busy === "clear"}
-              onPress={() => void markAvailable()}
-            />
-          ) : null}
-          {!account.isDefault && !signedOut && !disabled ? (
-            <IconButton
-              theme={theme}
-              icon="Star"
-              label="Make default"
-              tooltip="Make default: new agents start on this account"
-              busy={busy === "default"}
-              onPress={() => void makeDefault()}
-            />
-          ) : null}
-          <IconButton
-            theme={theme}
-            icon={disabled ? "CirclePlay" : "CirclePause"}
-            label={disabled ? "Enable account" : "Disable for now (agents won't use it)"}
-            tooltip={
-              disabled
-                ? "Enable: agents can use this account again"
-                : "Disable for now: agents stop using it and move to your other accounts"
-            }
-            busy={busy === "toggle"}
-            onPress={() => void toggle()}
-          />
-          <IconButton theme={theme} icon="Pencil" label="Rename" tooltip="Rename this account" onPress={() => setRenaming(true)} />
-          {account.kind !== "main" ? (
-            <IconButton
-              theme={theme}
-              icon="Trash2"
-              label="Remove"
-              tooltip="Remove: sign it out and delete its saved login"
-              tone="danger"
-              busy={busy === "remove"}
-              onPress={() => setConfirmRemove(true)}
-            />
-          ) : null}
+        <View style={{ marginTop: -4, marginRight: -6 }}>
+          <ActionsMenu theme={theme} label={`Actions for ${account.label}`} busy={busy !== null} actions={actions} />
         </View>
       </View>
 
@@ -673,6 +675,13 @@ export function describeReopen(prefix: string, summary: ReopenSummary): string {
   if (summary.deferred.length > 0) parts.push(`${summary.deferred.length} will switch after their current turn`);
   if (summary.failed.length > 0) parts.push(`${summary.failed.length} will switch on their next restart`);
   return parts.join(" · ");
+}
+
+/** Two cards side by side only where each still has room for its name, usage lines and menu. */
+export const TWO_COLUMNS_MIN_WIDTH = 640;
+
+export function columnsFor(width: number): 1 | 2 {
+  return width >= TWO_COLUMNS_MIN_WIDTH ? 2 : 1;
 }
 
 function chunk<T>(items: T[], size: number): T[][] {

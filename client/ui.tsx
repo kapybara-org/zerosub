@@ -1,7 +1,7 @@
 import type { PluginHostProps } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/react-native";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { ActivityIndicator, Pressable, Text, View } from "react-native";
+import { ActivityIndicator, Modal, Platform, Pressable, Text, useWindowDimensions, View } from "react-native";
 import { formatPercent, formatResetIn } from "../shared/format";
 import type { UsageWindow } from "../shared/model";
 
@@ -220,6 +220,153 @@ export function IconButton({
         }
       </Pressable>
       {tip.visible ? <TooltipBubble theme={theme} text={hint} placement={tooltipPlacement} align={tooltipAlign} /> : null}
+    </View>
+  );
+}
+
+/** One entry of an ActionsMenu. */
+export interface MenuAction {
+  key: string;
+  icon: string;
+  label: string;
+  /** Read out with the label; a menu row has room for the label only. */
+  hint?: string;
+  tone?: "default" | "danger";
+  onPress(): void;
+}
+
+const MENU_WIDTH = 208;
+
+interface Frame {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+/** A menu row's height, near enough to keep the list on screen without measuring it. */
+const MENU_ROW_HEIGHT = 36;
+
+/**
+ * A ⋯ button that opens its actions as a labelled list under it. A card in a narrow pane has no room for a row of
+ * icons. The list floats above the whole window, so later cards never cover it; an outside tap, Escape or picking an
+ * action closes it.
+ */
+export function ActionsMenu({
+  theme,
+  label,
+  actions,
+  busy,
+}: {
+  theme: Theme;
+  label: string;
+  actions: MenuAction[];
+  busy?: boolean;
+}) {
+  const [anchor, setAnchor] = useState<Frame | null>(null);
+  const [root, setRoot] = useState<Frame | null>(null);
+  const button = useRef<View>(null);
+  const overlay = useRef<View>(null);
+  const picked = useRef<MenuAction | null>(null);
+  const colors = theme.colors;
+  // Until the overlay has measured its own origin, take it to be the window's: exact on the web, where the Modal is
+  // fixed to the viewport (and where that measurement may never arrive), and corrected on native once it does.
+  const windowSize = useWindowDimensions();
+  const frame = root ?? { x: 0, y: 0, width: windowSize.width, height: windowSize.height };
+  const close = () => setAnchor(null);
+  const runPicked = () => {
+    const action = picked.current;
+    picked.current = null;
+    action?.onPress();
+  };
+  const openMenu = () =>
+    button.current?.measureInWindow((x, y, width, height) => setAnchor({ x, y, width, height }));
+  return (
+    <View ref={button} collapsable={false}>
+      <IconButton theme={theme} icon="Ellipsis" label={label} busy={busy} onPress={anchor ? close : openMenu} />
+      <Modal
+        transparent
+        animationType="none"
+        visible={anchor !== null}
+        onRequestClose={close}
+        onDismiss={runPicked}
+      >
+        <View
+          ref={overlay}
+          collapsable={false}
+          style={{ flex: 1 }}
+          onLayout={() =>
+            overlay.current?.measureInWindow((x, y, width, height) => setRoot({ x, y, width, height }))
+          }
+        >
+          <Pressable
+            accessibilityLabel={`Close ${label}`}
+            onPress={close}
+            style={{ position: "absolute", top: 0, right: 0, bottom: 0, left: 0 }}
+          />
+          {anchor ? (
+            <View
+              accessibilityRole="menu"
+              accessibilityLabel={label}
+              style={{
+                position: "absolute",
+                top: Math.max(
+                  8,
+                  Math.min(
+                    anchor.y - frame.y + anchor.height + 4,
+                    frame.height - 8 - (actions.length * MENU_ROW_HEIGHT + 14),
+                  ),
+                ),
+                right: Math.max(
+                  8,
+                  Math.min(frame.x + frame.width - (anchor.x + anchor.width), frame.width - 8 - MENU_WIDTH),
+                ),
+                minWidth: MENU_WIDTH,
+                padding: 6,
+                gap: 2,
+                borderRadius: 10,
+                borderWidth: 1,
+                borderColor: colors.border,
+                backgroundColor: colors.surface2,
+                shadowColor: "#000",
+                shadowOpacity: 0.35,
+                shadowRadius: 12,
+                shadowOffset: { width: 0, height: 6 },
+                elevation: 8,
+              }}
+            >
+              {actions.map((action) => {
+                const color = action.tone === "danger" ? colors.statusDanger : colors.foreground;
+                return (
+                  <Pressable
+                    key={action.key}
+                    accessibilityRole="menuitem"
+                    accessibilityLabel={action.label}
+                    accessibilityHint={action.hint}
+                    onPress={() => {
+                      picked.current = action;
+                      close();
+                      if (Platform.OS !== "ios") runPicked();
+                    }}
+                    style={(state) => ({
+                      flexDirection: "row",
+                      alignItems: "center",
+                      gap: 10,
+                      paddingVertical: 8,
+                      paddingHorizontal: 10,
+                      borderRadius: 7,
+                      backgroundColor:
+                        state.pressed || (state as { hovered?: boolean }).hovered ? colors.surface1 : "transparent",
+                    })}
+                  >
+                    <Icon name={action.icon} size={16} color={color} />
+                    <Text style={{ color, fontSize: 13, fontWeight: "500" }}>{action.label}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+          ) : null}
+        </View>
+      </Modal>
     </View>
   );
 }
