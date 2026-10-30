@@ -4,7 +4,7 @@ import type {
   PluginButtonRegistration,
   PluginClientContext,
 } from "@getpaseo/plugin/client";
-import { formatPercent, peakUsage, shortLabel } from "../shared/format";
+import { formatCredits, formatPercent, peakUsage, shortLabel } from "../shared/format";
 import { FAMILY_LABEL, type AccountView, type Family, type StateView } from "../shared/model";
 import { setAgentAccount } from "../shared/rpc";
 import { forkPopover } from "./fork-confirm";
@@ -240,7 +240,9 @@ function menuTitle(account: AccountView): string {
   if (account.status === "disabled") return `${account.label} — disabled`;
   if (account.status === "limited") return `${account.label} — limit reached`;
   const peak = account.usage ? peakUsage(account.usage.windows) : null;
-  return peak ? `${account.label} — ${formatPercent(peak.usedPercent)} used` : account.label;
+  if (!peak) return account.label;
+  const credits = account.usage?.credits;
+  return `${account.label} — ${formatPercent(peak.usedPercent)} used${credits ? ` · ${formatCredits(credits)}` : ""}`;
 }
 
 function menuKey(button: PluginButton): string {

@@ -35,7 +35,7 @@ function account(id: string, label: string, kind: "main" | "managed") {
 
 /** A Claude adapter whose every failed turn is a session limit resetting at `resetsAt`. */
 function claudeAdapter(hit: () => LimitHit): FamilyAdapter {
-  const reading = (): UsageRead => ({ fetchedAt: new Date().toISOString(), windows: [], error: null, cached: false, resets: null });
+  const reading = (): UsageRead => ({ fetchedAt: new Date().toISOString(), windows: [], error: null, cached: false, resets: null, credits: null });
   return {
     family: "claude",
     portable: true,
@@ -97,6 +97,8 @@ interface SetUpOptions {
   detectLimit?: FamilyAdapter["detectLimit"];
   /** The tail of the agent's timeline as Paseo returns it when asked. */
   recent?: Parameters<typeof fakePaseo>[0];
+  /** What every usage reading returns. */
+  usage?: () => UsageRead;
 }
 
 async function setUp(state: Partial<StoredState>, hit: () => LimitHit, options: SetUpOptions = {}) {
@@ -122,7 +124,11 @@ async function setUp(state: Partial<StoredState>, hit: () => LimitHit, options: 
     },
   };
   const families = { resolve: async () => ({ claude: "claude" as const }) };
-  const claude = { ...claudeAdapter(hit), ...(options.detectLimit ? { detectLimit: options.detectLimit } : {}) };
+  const claude = {
+    ...claudeAdapter(hit),
+    ...(options.detectLimit ? { detectLimit: options.detectLimit } : {}),
+    ...(options.usage ? { usage: async () => options.usage!() } : {}),
+  };
   const service = new Service(
     { claude, codex: claudeAdapter(hit) },
     store,
@@ -560,6 +566,43 @@ describe("disabling an account", () => {
     state = await store.read();
     expect(state.sessions[AGENT]?.accountId).toBe(HELLO);
     expect(reopened).toHaveLength(2);
+  });
+});
+
+describe("usage readings", () => {
+  const full = (credits: UsageRead["credits"]) => (): UsageRead => ({
+    fetchedAt: new Date().toISOString(),
+    windows: [{ id: "primary", label: "Weekly", usedPercent: 100, resetsAt: inFuture() }],
+    error: null,
+    cached: false,
+    resets: null,
+    credits,
+  });
+  const state = (limit: Partial<StoredAccount> = {}) => ({
+    accounts: [{ ...account(MAIN, "marketing", "main"), ...limit }] as never,
+    defaults: { claude: MAIN, codex: null },
+  });
+  const limitedUntil = async (store: StateStore) => (await store.read()).accounts.find((a) => a.id === MAIN)?.limitedUntil ?? null;
+  const unused = () => ({ kind: "window" as const, resetsAt: inFuture(), message: "" });
+
+  it("takes a full window for a limit", async () => {
+    const { service, store } = await setUp(state(), unused, { usage: full(null) });
+    await service.refreshUsage(MAIN, true);
+    expect(await limitedUntil(store)).not.toBeNull();
+  });
+
+  it("doesn't take a full window for a limit while credits cover it", async () => {
+    const { service, store } = await setUp(state(), unused, { usage: full({ balance: 57714.93, unlimited: false }) });
+    await service.refreshUsage(MAIN, true);
+    expect(await limitedUntil(store)).toBeNull();
+  });
+
+  it("clears a settled window limit once credits cover it", async () => {
+    const settled = new Date(Date.now() - 60 * 60_000).toISOString();
+    const limit = { limitedUntil: inFuture(), limitKind: "window" as const, limitedAt: settled };
+    const { service, store } = await setUp(state(limit), unused, { usage: full({ balance: null, unlimited: true }) });
+    await service.refreshUsage(MAIN, true);
+    expect(await limitedUntil(store)).toBeNull();
   });
 });
 

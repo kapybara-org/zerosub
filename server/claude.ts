@@ -116,27 +116,27 @@ export class ClaudeAdapter implements FamilyAdapter {
           const body = (await response.json()) as { cedar_ember?: unknown };
           const windows = parseUsage(body);
           this.noteResetStatus(home, body.cedar_ember);
-          return { fetchedAt, windows, error: null, cached: false, resets: parseClaudeResets(body.cedar_ember).offer };
+          return { fetchedAt, windows, error: null, cached: false, resets: parseClaudeResets(body.cedar_ember).offer, credits: null };
         }
         // Anthropic rate-limits this endpoint (Claude Code and Paseo read it too). Wait as long as it
         // asks; meanwhile the last reading stays up, or Claude Code's own cached copy if it's newer.
         if (response.status === 429) {
           const retryAt = Date.now() + retryDelayMs(response.headers.get("retry-after"));
           const cached = await cachedUsage(home);
-          return { ...(cached ?? { fetchedAt, windows: [], error: null, cached: false, resets: null }), retryAt };
+          return { ...(cached ?? { fetchedAt, windows: [], error: null, cached: false, resets: null, credits: null }), retryAt };
         }
         if (response.status !== 401 && response.status !== 403) {
-          return { fetchedAt, windows: [], error: `Usage request failed (HTTP ${response.status})`, cached: false, resets: null };
+          return { fetchedAt, windows: [], error: `Usage request failed (HTTP ${response.status})`, cached: false, resets: null, credits: null };
         }
       } catch (error) {
-        return { fetchedAt, windows: [], error: error instanceof Error ? error.message : String(error), cached: false, resets: null };
+        return { fetchedAt, windows: [], error: error instanceof Error ? error.message : String(error), cached: false, resets: null, credits: null };
       }
     }
     // An idle account's token may have expired; Claude Code refreshes it on next use. Until then,
     // show the last utilisation Claude Code itself cached for this account.
     const cached = await cachedUsage(home);
     if (cached) return cached;
-    return { fetchedAt, windows: [], error: "Usage shows up after this account is next used.", cached: false, resets: null };
+    return { fetchedAt, windows: [], error: "Usage shows up after this account is next used.", cached: false, resets: null, credits: null };
   }
 
   /** Logs (only when it changes) why an account does or doesn't show a banked reset. */
@@ -428,7 +428,7 @@ async function cachedUsage(home: string | null): Promise<Usage | null> {
   if (!cache || typeof cache.fetchedAtMs !== "number") return null;
   const windows = parseUsage(cache.utilization);
   if (windows.length === 0) return null;
-  return { fetchedAt: new Date(cache.fetchedAtMs).toISOString(), windows, error: null, cached: true, resets: null };
+  return { fetchedAt: new Date(cache.fetchedAtMs).toISOString(), windows, error: null, cached: true, resets: null, credits: null };
 }
 
 const WINDOW_LABELS: Array<[key: string, label: string]> = [

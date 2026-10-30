@@ -1,4 +1,4 @@
-import type { AccountView, UsageWindow } from "./model";
+import type { AccountView, Credits, UsageWindow } from "./model";
 
 /** "in 2h 14m", "in 3d 4h", "now". */
 export function formatResetIn(resetsAt: string | null, now: number = Date.now()): string | null {
@@ -20,6 +20,14 @@ export function formatResetIn(resetsAt: string | null, now: number = Date.now())
 
 export function formatPercent(value: number): string {
   return `${Math.round(Math.min(100, Math.max(0, value)))}%`;
+}
+
+/** "57,715 credits left", "Unlimited credits", or "Credits available" when the balance isn't given. */
+export function formatCredits(credits: Credits): string {
+  if (credits.unlimited) return "Unlimited credits";
+  if (credits.balance === null) return "Credits available";
+  const whole = String(Math.max(0, Math.floor(credits.balance))).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return `${whole} credit${whole === "1" ? "" : "s"} left`;
 }
 
 /** The busiest window decides how close an account is to being cut off. */
@@ -96,5 +104,7 @@ export function usageSummary(account: AccountView, now: number = Date.now()): st
   if (!peak) return null;
   const reset = formatResetIn(peak.resetsAt, now);
   const base = `${formatPercent(peak.usedPercent)} of ${peak.label.toLowerCase()} used`;
+  const credits = account.usage?.credits;
+  if (credits && peak.usedPercent >= 100) return `${base} · ${formatCredits(credits)}`;
   return reset ? `${base} · resets ${reset}` : base;
 }

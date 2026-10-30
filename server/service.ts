@@ -1296,7 +1296,7 @@ export class Service {
       const { retryAt, ...usage } = await this.adapters[account.family]
         .usage(account.home, { renewLogin })
         .catch(
-          (error: unknown): UsageRead => ({ fetchedAt: new Date().toISOString(), windows: [], error: describe(error), cached: false, resets: null }),
+          (error: unknown): UsageRead => ({ fetchedAt: new Date().toISOString(), windows: [], error: describe(error), cached: false, resets: null, credits: null }),
         );
       if (retryAt) this.usageRetryAt.set(accountId, retryAt);
       else this.usageRetryAt.delete(accountId);
@@ -1304,15 +1304,16 @@ export class Service {
       // Only a live reading may change an account's limit state.
       if (usage.windows.length === 0 || usage.error || usage.cached) return;
       const now = Date.now();
-      const full = usage.windows.find((window) => window.usedPercent >= 100 && window.resetsAt);
+      // Credits keep an account going past a full window, so a full window alone isn't a limit then.
+      const full = usage.credits ? undefined : usage.windows.find((window) => window.usedPercent >= 100 && window.resetsAt);
       if (full && !isLimited(account, now)) {
         await this.markLimited(accountId, full.resetsAt ?? new Date(now + WINDOW_LIMIT_MS).toISOString(), "window");
         return;
       }
-      // A window limit clears once usage shows room again. Budget limits never appear in usage
+      // A window limit clears once usage shows room again, or credits cover it. Budget limits never appear in usage
       // windows, and a fresh limit is trusted for a while (it may be on a window we can't see).
       const settled = account.limitedAt ? now - Date.parse(account.limitedAt) > LIMIT_TRUST_MS : true;
-      const roomy = Math.max(...usage.windows.map((window) => window.usedPercent)) < 90;
+      const roomy = usage.credits !== null || Math.max(...usage.windows.map((window) => window.usedPercent)) < 90;
       if (!full && account.limitedUntil && account.limitKind === "window" && settled && roomy) {
         await this.store.update((draft) => {
           const target = findAccount(draft, accountId);
