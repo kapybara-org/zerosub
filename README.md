@@ -99,7 +99,7 @@ ZeroSub tries these in order, and a timeline note says which one happened:
 
 OMP keeps several accounts per provider and moves its agents between them by itself: it spreads new agents across accounts and moves off one that runs out. So ZeroSub doesn't switch OMP agents; it shows OMP's accounts on the same screen and lets you steer how OMP uses them. The OMP section shows up once Paseo's OMP provider is turned on (it's off by default) and `omp` is installed where the daemon runs.
 
-- **Usage and banked resets** show on each account's card, like the Claude and ChatGPT ones. **Use reset** spends one after you confirm.
+- **Usage and banked resets** show on each account's card, like the Claude and ChatGPT ones. ZeroSub reads them from OMP at most every 5 minutes, or straight away when you refresh usage (the ↻ button beside the title). **Use reset** spends one after you confirm.
 - **Add account** signs another account in to OMP, for Claude, ChatGPT or any provider that already has an OMP account. On the host's computer the sign-in page finishes by itself. Anywhere else, paste the code, or the address of the page that failed to load after signing in.
 - **Remove** signs that one account out of OMP. OMP agents carry on with its other accounts.
 - **Prefer** (the star on a card) makes new OMP agents start on that account while it has room, and brings agents back to it once it has room again. OMP still puts an account it can't read usage for, or one in its reserve, behind the others, so a preferred account isn't always used. The line under each provider says where new agents would go right now.
@@ -138,8 +138,9 @@ ZeroSub never implements OAuth itself and never copies credentials between accou
 OMP keeps its own accounts, so ZeroSub asks the `omp` CLI instead of keeping homes for it:
 
 - Accounts, usage and resets come from `omp --mode rpc` (`get_logout_accounts`), `omp usage --json`, `omp usage reset --json` and, when OMP has no live reading for an account, its recorded history (`omp usage --history --json`). Sign-in and removal use the same rpc session's `login` and `logout`; **Use reset** runs `omp usage reset <provider>/<id>`.
-- Your choices become an OMP settings overlay, `$PASEO_HOME/zerosub/omp-overlay.yml`, which the same `before("agent.session_open")` hook adds to `PI_CONFIG_FILES` for OMP sessions, after any overlays already set. **Prefer** and **Keep in reserve** become account policies (`auth.accountPolicies`: priority, `reservePct`, `reclaimAbovePct`); the other choices are OMP's `retry.*`, `codexResets.*` and `claudeResets.*` settings. If your own OMP config sets `auth.accountPolicies`, ZeroSub leaves preferences and reserves to it, since OMP refuses two policies for one account.
+- Your choices become an OMP settings overlay, `$PASEO_HOME/zerosub/omp-overlay.yml`, which the same `before("agent.session_open")` hook adds to `PI_CONFIG_FILES` for OMP sessions, after any overlays already set. **Prefer** and **Keep in reserve** become account policies (`auth.accountPolicies`: priority, `reservePct`, `reclaimAbovePct`); the other choices are OMP's `retry.*`, `codexResets.*` and `claudeResets.*` settings. If your own OMP config sets `auth.accountPolicies`, ZeroSub leaves preferences and reserves to it, since OMP refuses two policies for one account. It does the same while it can't read your OMP config (`omp config list --json`).
 - The line under each provider comes from `omp dry-balance` with the overlay applied.
+- If `omp` is slow or sends something ZeroSub can't read, the OMP section shows the last good reading or the error, and leaves out what it can't read. The rest of the Accounts screen isn't held up.
 - Nothing here runs while Paseo's OMP provider is off.
 
 ## Privacy and security

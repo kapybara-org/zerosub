@@ -77,7 +77,8 @@ export default function contribute(server: PluginServerContext) {
   });
 
   server.handle(getState, async ({ refreshUsage }, { paseo }) => {
-    const [view, ompView] = await Promise.all([service.view(paseo, refreshUsage), omp.view(paseo, refreshUsage ?? false)]);
+    // OMP's part has a short time limit and never throws, so OMP can't hold up or break the rest.
+    const [view, ompView] = await Promise.all([service.view(paseo, refreshUsage), omp.viewWithin(paseo, refreshUsage ?? false)]);
     return { ...view, omp: ompView };
   });
   server.handle(startLogin, ({ family, method, accountId }) => service.startLogin(family, method, accountId));

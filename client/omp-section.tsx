@@ -16,6 +16,7 @@ import {
   submitOmpLoginCode,
 } from "../shared/rpc";
 import { Row, Step, Waiting } from "./add-account";
+import { settingChange, usePendingChoices } from "./omp-choices";
 import { resetBadge, resetDetail } from "./reset-confirm";
 import { describe, useStore, type ZeroSubStore } from "./store";
 import { Badge, Button, Card, IconButton, UsageBar, useText } from "./ui";
@@ -72,8 +73,8 @@ export function OmpSection({
       </Text>
       {omp.policiesLocked ? (
         <Text style={text.warning}>
-          Your OMP config sets its own account policies (auth.accountPolicies), so ZeroSub leaves preferences and reserves
-          to it.
+          Your OMP config sets its own account policies (auth.accountPolicies), or couldn't be read just now, so ZeroSub
+          leaves preferences and reserves alone.
         </Text>
       ) : null}
       {omp.error ? <Text style={text.warning}>{omp.error}</Text> : null}
@@ -140,6 +141,7 @@ function OmpAccountCard({
   const [busy, setBusy] = useState<"remove" | "reset" | "prefer" | null>(null);
   const [confirm, setConfirm] = useState<"remove" | "reset" | null>(null);
   const ref = { provider: account.provider, credentialId: account.credentialId };
+  const reserve = usePendingChoices();
 
   const prefer = async () => {
     setBusy("prefer");
@@ -153,9 +155,9 @@ function OmpAccountCard({
   };
 
   const setReserve = (value: string) => {
-    store
-      .rpc(setOmpReserve, { ...ref, reservePct: value === "default" ? null : Number(value) })
-      .catch((error: unknown) => toast.error(describe(error)));
+    const saving = store.rpc(setOmpReserve, { ...ref, reservePct: value === "default" ? null : Number(value) });
+    saving.catch((error: unknown) => toast.error(describe(error)));
+    reserve.choose("reserve", value, saving.then(() => store.refresh({ fresh: true })));
   };
 
   const remove = async () => {
@@ -237,7 +239,7 @@ function OmpAccountCard({
           <SettingsSelect
             label="Keep in reserve"
             hint="OMP moves agents off this account before this much is left."
-            value={account.reservePct === null ? "default" : String(account.reservePct)}
+            value={reserve.shown("reserve", account.reservePct === null ? "default" : String(account.reservePct))}
             options={[
               { label: `OMP default (${controls.defaultReserve}%)`, value: "default" },
               ...RESERVE_CHOICES.map((pct) => ({ label: `${pct}%`, value: String(pct) })),
@@ -354,11 +356,11 @@ const SETTING_ROWS: Array<{ key: SettingKey; label: string; hint: string; words:
 function OmpSettingsCard({ omp, theme, store }: { omp: OmpView; theme: Theme; store: ZeroSubStore }) {
   const text = useText(theme);
   const toast = useToast();
-  const save = (key: SettingKey, raw: string) => {
-    const next: Record<string, unknown> = { ...omp.settings };
-    if (raw === "default") delete next[key];
-    else next[key] = raw === "true" ? true : raw === "false" ? false : /^\d+$/.test(raw) ? Number(raw) : raw;
-    store.rpc(setOmpSettings, { settings: next as OmpSettings }).catch((error: unknown) => toast.error(describe(error)));
+  const choices = usePendingChoices();
+  const save = (key: SettingKey, choice: string) => {
+    const saving = store.rpc(setOmpSettings, { settings: settingChange(key, choice) });
+    saving.catch((error: unknown) => toast.error(describe(error)));
+    choices.choose(key, choice, saving.then(() => store.refresh({ fresh: true })));
   };
   return (
     <View style={{ gap: 10 }}>
@@ -373,7 +375,7 @@ function OmpSettingsCard({ omp, theme, store }: { omp: OmpView; theme: Theme; st
               key={row.key}
               label={row.label}
               hint={row.hint}
-              value={current === undefined ? "default" : String(current)}
+              value={choices.shown(row.key, current === undefined ? "default" : String(current))}
               options={[
                 { label: `OMP default (${fallbackWord})`, value: "default" },
                 ...Object.entries(row.words)

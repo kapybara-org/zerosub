@@ -192,6 +192,16 @@ export const OmpSettingsSchema = z.object({
 });
 export type OmpSettings = z.infer<typeof OmpSettingsSchema>;
 
+/**
+ * A change to some of those settings. Only the keys given change, so two changes made close together
+ * both stick; `null` leaves a setting to OMP's own config again.
+ */
+export const OmpSettingsChangeSchema = z.partialRecord(
+  OmpSettingsSchema.keyof(),
+  z.union([z.string(), z.number(), z.boolean()]).nullable(),
+);
+export type OmpSettingsChange = z.infer<typeof OmpSettingsChangeSchema>;
+
 export const OmpViewSchema = z.object({
   /** Providers with accounts, plus the ones offered for sign-in. */
   providers: z.array(z.object({ id: z.string(), name: z.string() })),
@@ -202,7 +212,7 @@ export const OmpViewSchema = z.object({
   settings: OmpSettingsSchema,
   /** OMP's own values for those settings (and `retry.usageReservePct`), shown as the default. */
   defaults: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])),
-  /** The user's OMP config has its own `auth.accountPolicies`, so ZeroSub leaves preferences alone. */
+  /** The user's OMP config has its own `auth.accountPolicies`, or couldn't be read, so ZeroSub leaves preferences alone. */
   policiesLocked: z.boolean(),
   /** Where new OMP sessions would go right now (`omp dry-balance`), per provider with several accounts. */
   preview: z.array(

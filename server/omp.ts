@@ -4,18 +4,20 @@ import { delimiter } from "node:path";
 import { tmpdir } from "node:os";
 import { createInterface } from "node:readline";
 import type { PluginHandlerContext, PluginSessionOpenRequest } from "@getpaseo/plugin/server";
+import { z } from "zod";
 import {
   OmpSettingsSchema,
+  OmpViewSchema,
   type LoginStep,
   type OmpAccountView,
   type OmpLoginView,
-  type OmpSettings,
+  type OmpSettingsChange,
   type OmpView,
   type ResetOffer,
   type UsageWindow,
 } from "../shared/model";
 import { providerCommand, type Command } from "./binaries";
-import { writeJsonAtomic } from "./json-file";
+import { Mutex, readJson, writeJsonAtomic } from "./json-file";
 import { buildOverlay, OmpControlsStore, overlayPath, sameAccount, type AccountKey, type OmpControls } from "./omp-controls";
 import { run, stripAnsi } from "./process";
 
@@ -27,7 +29,10 @@ const SIGN_IN_PROVIDERS = ["anthropic", "openai-codex"];
 const PREVIEW_MODELS: Record<string, string> = { anthropic: "anthropic/sonnet", "openai-codex": "openai-codex/gpt" };
 /** OMP settings shown as the default beside ZeroSub's own choice. */
 const DEFAULT_KEYS = [...Object.keys(OmpSettingsSchema.shape), "retry.usageReservePct"];
-const STALE_MS = 60_000;
+/** getState's polls read OMP again at most this often, like a default account's usage. Refreshing usage (↻) reads it now. */
+const REFRESH_MS = 5 * 60_000;
+/** How long getState waits for OMP before answering with its last good view. */
+const VIEW_DEADLINE_MS = 3_000;
 const ENABLED_CACHE_MS = 30_000;
 const NOT_INSTALLED_RECHECK_MS = 5 * 60_000;
 const LOGIN_TIMEOUT_MS = 15 * 60_000;
@@ -38,50 +43,98 @@ const RPC_ARGS = [
   "--no-skills", "--no-rules", "--no-lsp", "--no-title",
 ];
 
-interface Frame {
-  type?: string;
-  id?: string;
-  success?: boolean;
-  data?: unknown;
-  error?: string;
-  method?: string;
-  url?: string;
-  instructions?: string;
-  title?: string;
-  message?: string;
+// Everything `omp` prints goes through these schemas before ZeroSub uses it, since the client
+// rejects the whole state over one field it doesn't expect. An entry that doesn't fit is left out.
+
+/** The entries of a list that `entry` accepts; one odd entry leaves out only itself. */
+function entries<T extends z.ZodType>(entry: T) {
+  return z.array(z.unknown()).transform((items) =>
+    items.flatMap((item) => {
+      const parsed = entry.safeParse(item);
+      return parsed.success ? [parsed.data] : [];
+    }),
+  );
 }
 
-interface StoredAccount {
-  credentialId: number;
-  provider: string;
-  label: string;
-  type: string;
-}
+/** Epoch milliseconds that make a real date. */
+const EpochMs = z.number().refine((ms) => !Number.isNaN(new Date(ms).getTime()));
+/** OMP's used share of a limit, 0–1 and over 1 past it; the bound keeps the percentage shown a real number. */
+const UsedFraction = z.number().min(0).max(100);
+/** A field of the wrong type reads as absent. */
+const OptionalText = z.string().optional().catch(undefined);
 
-interface UsageReport {
-  provider: string;
-  /** Epoch ms when OMP read this report from the provider. */
-  fetchedAt?: number;
-  limits?: Array<{
-    id: string;
-    label: string;
-    window?: { resetsAt?: number };
-    amount?: { usedFraction?: number };
-  }>;
-  metadata?: { accountId?: string; orgId?: string };
-}
+/** One JSON line from `omp --mode rpc`. */
+const FrameSchema = z.object({
+  type: OptionalText,
+  id: OptionalText,
+  success: z.boolean().optional().catch(undefined),
+  data: z.unknown(),
+  error: OptionalText,
+  method: OptionalText,
+  url: OptionalText,
+  instructions: OptionalText,
+  title: OptionalText,
+  message: OptionalText,
+});
+type Frame = z.infer<typeof FrameSchema>;
 
-interface ResetAccount {
-  provider: string;
-  credentialId: number;
-  accountId?: string;
-  orgId?: string;
-  availableCount: number;
-  redeemableCount: number;
-  soonestExpiry?: string;
-  unavailableReason?: string;
-  credits?: Array<{ title?: string }>;
-}
+const LoginProvidersSchema = z.object({
+  providers: entries(z.object({ id: z.string(), name: z.string(), authenticated: z.boolean() })),
+});
+
+const StoredAccountSchema = z.object({
+  credentialId: z.number().int(),
+  provider: z.string(),
+  label: z.string(),
+  type: z.string(),
+});
+type StoredAccount = z.infer<typeof StoredAccountSchema>;
+const LogoutAccountsSchema = z.object({ accounts: entries(StoredAccountSchema) });
+
+const UsageReportSchema = z.object({
+  provider: z.string(),
+  /** When OMP read this report from the provider. */
+  fetchedAt: EpochMs.nullish(),
+  limits: entries(
+    z.object({
+      id: z.string(),
+      label: z.string(),
+      window: z.object({ resetsAt: EpochMs.nullish() }).nullish(),
+      amount: z.object({ usedFraction: UsedFraction.nullish() }).nullish(),
+    }),
+  ).nullish(),
+  metadata: z.object({ accountId: z.string().nullish(), orgId: z.string().nullish() }).nullish(),
+});
+type UsageReport = z.infer<typeof UsageReportSchema>;
+const UsageSchema = z.object({ reports: entries(UsageReportSchema).nullish() });
+
+const ResetAccountSchema = z.object({
+  provider: z.string(),
+  credentialId: z.number().int(),
+  accountId: z.string().nullish(),
+  orgId: z.string().nullish(),
+  availableCount: z.number(),
+  redeemableCount: z.number(),
+  soonestExpiry: z.string().nullish(),
+  unavailableReason: z.string().nullish(),
+  credits: entries(z.object({ title: z.string().nullish() })).nullish(),
+});
+type ResetAccount = z.infer<typeof ResetAccountSchema>;
+const ResetsSchema = z.object({ accounts: entries(ResetAccountSchema).nullish() });
+
+/** `omp config list --json`: each setting's entry, `{ value, … }`, read only where ZeroSub uses it. */
+const ConfigSchema = z.record(z.string(), z.unknown());
+type Config = z.infer<typeof ConfigSchema>;
+const ConfigEntrySchema = z.object({ value: z.unknown() });
+/** An `auth.accountPolicies` entry that sets no policies: an empty or unset list. */
+const NoPoliciesSchema = z.object({ value: z.array(z.unknown()).max(0).nullish() });
+const ReservePctSchema = z.number().min(0).max(100);
+const DefaultValueSchema = z.union([z.string(), z.number(), z.boolean()]);
+
+const BalanceSchema = z.object({
+  model: z.string(),
+  success: z.object({ accounts: entries(z.object({ account: z.string(), percent: z.number() })) }),
+});
 
 interface Login {
   id: string;
@@ -126,9 +179,10 @@ class OmpProcess {
     });
   }
 
-  request<T>(command: Record<string, unknown>, timeoutMs = 30_000): Promise<T> {
+  /** OMP's answer, still unchecked: callers read it through a schema. */
+  request(command: Record<string, unknown>, timeoutMs = 30_000): Promise<unknown> {
     const id = `zerosub-${++this.nextId}`;
-    return new Promise<T>((resolve, reject) => {
+    return new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`omp did not answer ${String(command.type)} in time`));
@@ -136,7 +190,7 @@ class OmpProcess {
       this.pending.set(id, {
         resolve: (data) => {
           clearTimeout(timer);
-          resolve(data as T);
+          resolve(data);
         },
         reject: (error) => {
           clearTimeout(timer);
@@ -156,12 +210,15 @@ class OmpProcess {
   }
 
   private receive(line: string): void {
-    let frame: Frame;
+    let raw: unknown;
     try {
-      frame = JSON.parse(line) as Frame;
+      raw = JSON.parse(line);
     } catch {
       return;
     }
+    const parsed = FrameSchema.safeParse(raw);
+    if (!parsed.success) return;
+    const frame = parsed.data;
     if (frame.type === "response" && frame.id && this.pending.has(frame.id)) {
       const waiter = this.pending.get(frame.id)!;
       this.pending.delete(frame.id);
@@ -182,20 +239,20 @@ class OmpProcess {
 async function listAccounts(omp: Command): Promise<{ names: Map<string, string>; accounts: StoredAccount[] }> {
   const rpc = new OmpProcess(omp);
   try {
-    const { providers } = await rpc.request<{ providers: Array<{ id: string; name: string; authenticated: boolean }> }>({
-      type: "get_login_providers",
-    });
+    const { providers } = readOutput(LoginProvidersSchema, await rpc.request({ type: "get_login_providers" }), "omp get_login_providers");
     const names = new Map(providers.map((provider) => [provider.id, provider.name]));
     const lists = await Promise.all(
       providers
         .filter((provider) => provider.authenticated)
-        .map((provider) =>
-          rpc.request<{ accounts: StoredAccount[] }>({ type: "get_logout_accounts", providerId: provider.id }),
-        ),
+        .map(async (provider) => {
+          // An answer that doesn't fit leaves out only that provider's accounts.
+          const listed = LogoutAccountsSchema.safeParse(await rpc.request({ type: "get_logout_accounts", providerId: provider.id }));
+          return listed.success ? listed.data.accounts : [];
+        }),
     );
     // Login aliases (`openai-codex-device`) list the same credentials as their target.
     const accounts = new Map<string, StoredAccount>();
-    for (const account of lists.flatMap((list) => list.accounts)) {
+    for (const account of lists.flat()) {
       if (account.type === "oauth") accounts.set(`${account.provider}/${account.credentialId}`, account);
     }
     return { names, accounts: [...accounts.values()] };
@@ -204,10 +261,39 @@ async function listAccounts(omp: Command): Promise<{ names: Map<string, string>;
   }
 }
 
-async function runJson<T>(omp: Command, args: string[]): Promise<T> {
+/** `value` read through `schema`; output that doesn't fit is an error, never a cast. */
+function readOutput<T>(schema: z.ZodType<T>, value: unknown, command: string): T {
+  const parsed = schema.safeParse(value);
+  if (!parsed.success) throw new Error(`${command} gave output ZeroSub can't read`);
+  return parsed.data;
+}
+
+async function runJson<T>(omp: Command, args: string[], schema: z.ZodType<T>): Promise<T> {
   const result = await run(omp.command, [...omp.prefix, ...args], { timeoutMs: 60_000, cwd: tmpdir() });
   if (result.code !== 0) throw new Error(stripAnsi(result.stderr || result.stdout).trim() || `omp ${args.join(" ")} failed`);
-  return JSON.parse(result.stdout) as T;
+  let output: unknown;
+  try {
+    output = JSON.parse(result.stdout);
+  } catch {
+    output = undefined;
+  }
+  return readOutput(schema, output, `omp ${args.join(" ")}`);
+}
+
+/** OMP's value for `key` in `omp config list --json`, when its entry reads as `{ value }`. */
+function configValue(config: Config | null, key: string): unknown {
+  const entry = ConfigEntrySchema.safeParse(config?.[key]);
+  return entry.success ? entry.data.value : undefined;
+}
+
+/** OMP's own values for the settings ZeroSub shows, as the "OMP default" beside each choice. */
+function ompDefaults(config: Config): OmpView["defaults"] {
+  const defaults: OmpView["defaults"] = {};
+  for (const key of DEFAULT_KEYS) {
+    const value = DefaultValueSchema.safeParse(configValue(config, key));
+    if (value.success) defaults[key] = value.data;
+  }
+  return defaults;
 }
 
 function toWindows(report: UsageReport | undefined): UsageWindow[] {
@@ -239,15 +325,17 @@ function toResets(reset: ResetAccount | undefined): ResetOffer | null {
 }
 
 /** One recorded limit reading from `omp usage --history --json`. */
-interface HistoryEntry {
-  recordedAt: number;
-  provider: string;
-  accountId?: string;
-  limitId: string;
-  label: string;
-  usedFraction?: number | null;
-  resetsAt?: number | null;
-}
+const HistoryEntrySchema = z.object({
+  recordedAt: EpochMs,
+  provider: z.string(),
+  accountId: z.string().nullish(),
+  limitId: z.string(),
+  label: z.string(),
+  usedFraction: UsedFraction.nullish(),
+  resetsAt: EpochMs.nullish(),
+});
+type HistoryEntry = z.infer<typeof HistoryEntrySchema>;
+const HistorySchema = z.object({ entries: entries(HistoryEntrySchema).nullish() });
 
 /** The account's newest recorded reading, for when OMP has no live one (e.g. the provider refused it for a while). */
 function lastRecorded(history: HistoryEntry[], provider: string, accountId: string): { windows: UsageWindow[]; at: number } | null {
@@ -324,9 +412,12 @@ type Preview = OmpView["preview"][number];
 async function previewBalance(omp: Command, provider: string): Promise<Preview | null> {
   const model = PREVIEW_MODELS[provider];
   if (!model) return null;
-  const result = await runJson<{ model: string; success: { accounts: Array<{ account: string; percent: number }> } }>(omp, [
-    "dry-balance", model, "--count", "20", "--json", "--config", overlayPath(),
-  ]).catch(() => null);
+  // An answer without `success` (OMP couldn't balance) just leaves the line out.
+  const result = await runJson(
+    omp,
+    ["dry-balance", model, "--count", "20", "--json", "--config", overlayPath()],
+    BalanceSchema,
+  ).catch(() => null);
   return result
     ? { provider, model: result.model, accounts: result.success.accounts.map((entry) => ({ label: entry.account, percent: entry.percent })) }
     : null;
@@ -341,27 +432,65 @@ export class OmpAccounts {
   private loading: Promise<void> | null = null;
   private loadedAt = 0;
   private installed: { at: number; ok: boolean } | null = null;
+  private installCheck: Promise<boolean> | null = null;
   private enabled: { at: number; value: boolean } | null = null;
   private readonly logins = new Map<string, Login>();
   private readonly controls = new OmpControlsStore();
-  /** `omp config list --json`: OMP's own settings, read without ZeroSub's overlay. */
-  private config: Record<string, { value?: unknown }> | null = null;
+  /**
+   * `omp config list --json`: OMP's own settings, read without ZeroSub's overlay. Null until a read
+   * succeeds, and again after one fails: then nobody knows whether the user's config sets account policies.
+   */
+  private config: Config | null = null;
   /** `provider/credentialId` → the ids its policies select it by. */
   private identities = new Map<string, AccountKey>();
   private overlayWritten: Promise<void> | null = null;
+  /** One overlay write at a time, so the last one written has every change. */
+  private readonly overlayLock = new Mutex();
+  /** What getState last showed for OMP, for when OMP is slow; `view` is undefined while OMP is off. */
+  private lastGood: { view: OmpView | undefined } | null = null;
 
   async view(paseo: PaseoApi, refresh: boolean): Promise<OmpView | undefined> {
     if (!(await this.isEnabled(paseo)) || !(await this.isInstalled())) return undefined;
-    if (refresh) await this.load(true);
-    else if (Date.now() - this.loadedAt > STALE_MS) void this.load(false);
+    // Refreshing usage asks again even while a poll's read runs, since that one may answer from OMP's cache.
+    if (refresh) await this.reload(true);
+    else if (Date.now() - this.loadedAt > REFRESH_MS) void this.load(false);
     const base = this.snapshot ?? { providers: [], accounts: [], fetchedAt: null, error: null, defaults: {}, policiesLocked: false, preview: [] };
     return { ...base, settings: (await this.controls.read()).settings, logins: [...this.logins.values()].map(toLoginView) };
+  }
+
+  /**
+   * The OMP part of getState. It never throws and answers within `ms`, so OMP can't hold up or break
+   * the Claude and Codex state: when OMP is slow, or its view doesn't fit the schema the client checks,
+   * this gives the last good view, or one that only carries the error.
+   */
+  async viewWithin(paseo: PaseoApi, refresh: boolean, ms = VIEW_DEADLINE_MS): Promise<OmpView | undefined> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<{ error: string }>((resolve) => {
+      timer = setTimeout(() => resolve({ error: "OMP is slow to answer. Its accounts show up here once it does." }), ms);
+    });
+    const answer = await Promise.race([this.checkedView(paseo, refresh), late]).finally(() => clearTimeout(timer));
+    if ("error" in answer) return this.lastGood ? this.lastGood.view : errorView(answer.error);
+    this.lastGood = answer;
+    return answer.view;
+  }
+
+  private async checkedView(paseo: PaseoApi, refresh: boolean): Promise<{ view: OmpView | undefined } | { error: string }> {
+    try {
+      const view = await this.view(paseo, refresh);
+      if (view === undefined) return { view };
+      const checked = OmpViewSchema.safeParse(view);
+      if (checked.success) return { view: checked.data };
+      console.warn("[ZeroSub] OMP's view doesn't fit the state schema", checked.error.message);
+      return { error: "Could not read OMP's accounts: OMP sent something ZeroSub can't show." };
+    } catch (error) {
+      return { error: `Could not read OMP's accounts: ${describe(error)}` };
+    }
   }
 
   /** Adds ZeroSub's overlay to every OMP session Paseo opens, after any overlays already configured. */
   async openSession(request: PluginSessionOpenRequest): Promise<PluginSessionOpenRequest | undefined> {
     if (!(await this.isInstalled())) return undefined;
-    await (this.overlayWritten ??= this.writeOverlay());
+    await (this.overlayWritten ??= this.writeFirstOverlay());
     const existing = (request.env.PI_CONFIG_FILES ?? process.env.PI_CONFIG_FILES ?? "").split(delimiter).filter(Boolean);
     if (existing.includes(overlayPath())) return undefined;
     return { ...request, env: { ...request.env, PI_CONFIG_FILES: [...existing, overlayPath()].join(delimiter) } };
@@ -383,9 +512,17 @@ export class OmpAccounts {
     });
   }
 
-  async setSettings(settings: OmpSettings): Promise<void> {
+  /** Changes only the settings in `change`, so changes made close together all stick; `null` drops one. */
+  async setSettings(change: OmpSettingsChange): Promise<void> {
     await this.change((draft) => {
-      draft.settings = settings;
+      const next: Record<string, unknown> = { ...draft.settings };
+      for (const [key, value] of Object.entries(change)) {
+        if (value === null) delete next[key];
+        else if (value !== undefined) next[key] = value;
+      }
+      const settings = OmpSettingsSchema.safeParse(next);
+      if (!settings.success) throw new Error("OMP doesn't take that value for this setting.");
+      draft.settings = settings.data;
     });
   }
 
@@ -403,22 +540,35 @@ export class OmpAccounts {
     await this.reload();
   }
 
-  private async writeOverlay(): Promise<void> {
-    this.config ??= await this.readConfig(await providerCommand("omp"));
-    const reserve = this.config["retry.usageReservePct"]?.value;
-    await writeJsonAtomic(
-      overlayPath(),
-      buildOverlay(await this.controls.read(), typeof reserve === "number" ? reserve : 10, !this.policiesLocked()),
-    );
+  /** Rewrites the overlay new OMP sessions read, one write at a time, and only when what it says changes. */
+  private writeOverlay(): Promise<void> {
+    return this.overlayLock.run(async () => {
+      const reserve = ReservePctSchema.safeParse(configValue(this.config, "retry.usageReservePct"));
+      const overlay = buildOverlay(await this.controls.read(), reserve.success ? reserve.data : 10, !this.policiesLocked());
+      const written = await readJson(overlayPath()).catch(() => undefined);
+      if (JSON.stringify(written) === JSON.stringify(overlay)) return;
+      await writeJsonAtomic(overlayPath(), overlay);
+    });
   }
 
-  private readConfig(omp: Command): Promise<Record<string, { value?: unknown }>> {
-    return runJson<Record<string, { value?: unknown }>>(omp, ["config", "list", "--json"]);
+  /** A session can open before ZeroSub has read OMP's config, so the first overlay tries to read it first. */
+  private async writeFirstOverlay(): Promise<void> {
+    this.config ??= await this.readConfig(await providerCommand("omp")).catch(() => null);
+    await this.writeOverlay();
   }
 
+  private readConfig(omp: Command): Promise<Config> {
+    return runJson(omp, ["config", "list", "--json"], ConfigSchema);
+  }
+
+  /**
+   * ZeroSub sets account policies only while OMP's config, as last read, sets none of its own. Unread,
+   * a failed read or an entry it can't read all count as set: OMP refuses two policies for one account.
+   */
   private policiesLocked(): boolean {
-    const policies = this.config?.["auth.accountPolicies"]?.value;
-    return Array.isArray(policies) && policies.length > 0;
+    if (!this.config) return true;
+    const entry = this.config["auth.accountPolicies"];
+    return entry !== undefined && !NoPoliciesSchema.safeParse(entry).success;
   }
 
   startLogin(provider: string): OmpLoginView {
@@ -514,10 +664,16 @@ export class OmpAccounts {
     if (this.installed && (this.installed.ok || Date.now() - this.installed.at < NOT_INSTALLED_RECHECK_MS)) {
       return this.installed.ok;
     }
-    const omp = await providerCommand("omp");
-    const result = await run(omp.command, [...omp.prefix, "--version"], { timeoutMs: 15_000 });
-    this.installed = { at: Date.now(), ok: result.code === 0 };
-    return this.installed.ok;
+    // One check at a time: getState stops waiting for a slow one, and its next poll would start another.
+    this.installCheck ??= (async () => {
+      const omp = await providerCommand("omp");
+      const result = await run(omp.command, [...omp.prefix, "--version"], { timeoutMs: 15_000 });
+      this.installed = { at: Date.now(), ok: result.code === 0 };
+      return this.installed.ok;
+    })().finally(() => {
+      this.installCheck = null;
+    });
+    return this.installCheck;
   }
 
   private load(invalidate: boolean): Promise<void> {
@@ -539,21 +695,25 @@ export class OmpAccounts {
       const omp = await providerCommand("omp");
       // Asks the providers again instead of answering from OMP's usage cache.
       if (invalidate) await run(omp.command, [...omp.prefix, "usage", "invalidate"], { timeoutMs: 30_000, cwd: tmpdir() });
-      const usageErrors: string[] = [];
+      const errors: string[] = [];
       const [listing, usage, resets, history, config] = await Promise.all([
         listAccounts(omp),
-        runJson<{ reports?: UsageReport[] }>(omp, ["usage", "--json"]).catch((error: unknown) => {
-          usageErrors.push(`Usage: ${describe(error)}`);
+        runJson(omp, ["usage", "--json"], UsageSchema).catch((error: unknown) => {
+          errors.push(`Usage: ${describe(error)}`);
           return { reports: [] };
         }),
-        runJson<{ accounts?: ResetAccount[] }>(omp, ["usage", "reset", "--json"]).catch((error: unknown) => {
-          usageErrors.push(`Resets: ${describe(error)}`);
+        runJson(omp, ["usage", "reset", "--json"], ResetsSchema).catch((error: unknown) => {
+          errors.push(`Resets: ${describe(error)}`);
           return { accounts: [] };
         }),
         // Local only (OMP's own records), so it is cheap; it stands in for missing live readings.
-        runJson<{ entries?: HistoryEntry[] }>(omp, ["usage", "--history", "--json", "--days", "1"]).catch(() => ({ entries: [] })),
-        this.readConfig(omp).catch(() => this.config ?? {}),
+        runJson(omp, ["usage", "--history", "--json", "--days", "1"], HistorySchema).catch(() => ({ entries: [] })),
+        this.readConfig(omp).catch((error: unknown) => {
+          errors.push(`Settings: ${describe(error)}`);
+          return null;
+        }),
       ]);
+      // A failed read leaves account policies alone until a read succeeds (see policiesLocked).
       this.config = config;
       this.identities = new Map(
         (resets.accounts ?? []).flatMap((reset) => {
@@ -571,18 +731,14 @@ export class OmpAccounts {
       const preview = (await Promise.all(crowded.map((provider) => previewBalance(omp, provider)))).filter(
         (entry): entry is Preview => entry !== null,
       );
-      const defaults: OmpView["defaults"] = {};
-      for (const key of DEFAULT_KEYS) {
-        const value = config[key]?.value;
-        if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") defaults[key] = value;
-      }
       const providerIds = [...new Set([...SIGN_IN_PROVIDERS, ...listing.accounts.map((account) => account.provider)])];
       this.snapshot = {
         providers: providerIds.map((id) => ({ id, name: listing.names.get(id) ?? id })),
         accounts,
         fetchedAt: new Date().toISOString(),
-        error: usageErrors.length > 0 ? usageErrors.join(" · ") : null,
-        defaults,
+        error: errors.length > 0 ? errors.join(" · ") : null,
+        // Without a fresh read, the defaults shown are the last ones read.
+        defaults: config ? ompDefaults(config) : (this.snapshot?.defaults ?? {}),
         policiesLocked: this.policiesLocked(),
         preview,
       };
@@ -593,7 +749,7 @@ export class OmpAccounts {
         fetchedAt: this.snapshot?.fetchedAt ?? null,
         error: `Could not read OMP's accounts: ${describe(error)}`,
         defaults: this.snapshot?.defaults ?? {},
-        policiesLocked: this.snapshot?.policiesLocked ?? false,
+        policiesLocked: this.policiesLocked(),
         preview: this.snapshot?.preview ?? [],
       };
     }
@@ -654,4 +810,9 @@ function toLoginView(login: Login): OmpLoginView {
     codePrompt: login.codePrompt,
     message: login.message,
   };
+}
+
+/** An OMP view that only says what went wrong, for when there's no good one to show yet. */
+function errorView(error: string): OmpView {
+  return { providers: [], accounts: [], logins: [], fetchedAt: null, error, settings: {}, defaults: {}, policiesLocked: false, preview: [] };
 }

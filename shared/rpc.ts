@@ -1,6 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import { FamilySchema, LoginMethodSchema, LoginViewSchema, OmpLoginViewSchema, OmpSettingsSchema, StateViewSchema } from "./model";
+import { FamilySchema, LoginMethodSchema, LoginViewSchema, OmpLoginViewSchema, OmpSettingsChangeSchema, StateViewSchema } from "./model";
 
 export const getState = defineRpc({
   name: "zerosub.state",
@@ -179,8 +179,9 @@ export const setOmpReserve = defineRpc({
   output: z.object({ ok: z.literal(true) }),
 });
 
+/** Changes only the OMP settings given; `null` leaves one to OMP's own config again. */
 export const setOmpSettings = defineRpc({
   name: "zerosub.omp.settings",
-  input: z.object({ settings: OmpSettingsSchema }),
+  input: z.object({ settings: OmpSettingsChangeSchema }),
   output: z.object({ ok: z.literal(true) }),
 });
