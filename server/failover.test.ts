@@ -1088,3 +1088,35 @@ describe("renewing an expired sign-in in the background", () => {
     expect(asked).toEqual([0, 1, 2, 32]);
   });
 });
+
+describe("the account button's reason row", () => {
+  it("names a near weekly reset as why an agent started on its account, only while it's still there", async () => {
+    const { service, store } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: MAIN, codex: null },
+        bindings: { [AGENT]: { accountId: HELLO, source: "balance", at: new Date().toISOString(), selectionReason: "headroom" } },
+        sessions: {},
+      },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "" }),
+    );
+    const paseo = fakePaseo().paseo as never;
+    const route = async () => (await service.view(paseo)).agents.find((entry) => entry.agentId === AGENT);
+
+    // Most room left is how balancing always picks, so it gets no row.
+    expect((await route())?.accountId).toBe(HELLO);
+    expect((await route())?.selectionReason).toBeUndefined();
+
+    await store.update((draft) => {
+      draft.bindings[AGENT]!.selectionReason = "weekly_reset";
+    });
+    expect(await route()).toMatchObject({ accountId: HELLO, selectionReason: "weekly_reset" });
+
+    // Moved off it for now, so the account the menu shows wasn't picked for its reset.
+    await store.update((draft) => {
+      draft.accounts.find((entry) => entry.id === HELLO)!.limitedUntil = inFuture();
+    });
+    expect((await route())?.accountId).toBe(MAIN);
+    expect((await route())?.selectionReason).toBeUndefined();
+  });
+});

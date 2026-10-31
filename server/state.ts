@@ -39,6 +39,7 @@ export const BindingSchema = z.object({
    */
   source: z.enum(["user", "auto", "balance", "thread"]),
   at: z.string(),
+  selectionReason: z.enum(["weekly_reset", "headroom"]).optional(),
 });
 export type Binding = z.infer<typeof BindingSchema>;
 

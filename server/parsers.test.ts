@@ -26,18 +26,18 @@ describe("Claude usage", () => {
 });
 
 describe("Codex rate limits", () => {
-  it("labels windows by their length and converts reset times", () => {
+  it("labels windows by their length, keeps the length and converts reset times", () => {
     expect(
       parseRateLimits({
         primary: { usedPercent: 42, windowDurationMins: 300, resetsAt: 1790150000 },
         secondary: { usedPercent: 84, windowDurationMins: 10080, resetsAt: 1790500000 },
       }),
     ).toEqual([
-      { id: "primary", label: "5-hour", usedPercent: 42, resetsAt: new Date(1790150000 * 1000).toISOString() },
-      { id: "secondary", label: "Weekly", usedPercent: 84, resetsAt: new Date(1790500000 * 1000).toISOString() },
+      { id: "primary", label: "5-hour", usedPercent: 42, resetsAt: new Date(1790150000 * 1000).toISOString(), minutes: 300 },
+      { id: "secondary", label: "Weekly", usedPercent: 84, resetsAt: new Date(1790500000 * 1000).toISOString(), minutes: 10080 },
     ]);
     expect(parseRateLimits({ primary: null, secondary: { usedPercent: 5, windowDurationMins: null, resetsAt: null } })).toEqual([
-      { id: "secondary", label: "Usage", usedPercent: 5, resetsAt: null },
+      { id: "secondary", label: "Usage", usedPercent: 5, resetsAt: null, minutes: null },
     ]);
   });
 });

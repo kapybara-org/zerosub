@@ -94,7 +94,7 @@ export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurface
         <SettingsCard>
           <SettingsSwitch
             label="Spread new agents across accounts"
-            hint="New agents start on the account with the most room instead of the default."
+            hint="New ChatGPT agents prefer a weekly reset within one day when both limits have at least 20% left. Otherwise, new agents use the account with the most room."
             value={settings.values.balanceNewAgents}
             disabled={settings.saving}
             onValueChange={(balanceNewAgents) => save({ balanceNewAgents })}

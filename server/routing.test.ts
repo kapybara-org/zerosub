@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Usage } from "../shared/model";
 import { applyEnv } from "./adapter";
+import { parseRateLimits } from "./codex";
 import { chooseAccount, mostAvailable } from "./routing";
 import { emptyState, type StoredAccount, type StoredState } from "./state";
 
@@ -39,6 +40,13 @@ function usage(percent: number): Usage {
     cached: false,
     resets: null,
   };
+}
+
+/** A ChatGPT plan's 5-hour and weekly windows, `[usedPercent, resetsAt]` each, parsed from what Codex sends. */
+function codexWindows(short: [number, string], weekly: [number, string] | null) {
+  const limit = (windowDurationMins: number, [usedPercent, resetsAt]: [number, string]) =>
+    ({ usedPercent, windowDurationMins, resetsAt: Date.parse(resetsAt) / 1000 });
+  return parseRateLimits({ primary: limit(300, short), secondary: weekly && limit(10_080, weekly) });
 }
 
 const base = {
@@ -117,6 +125,77 @@ describe("chooseAccount", () => {
     });
     expect(decision?.account.id).toBe("claude-work");
     expect(decision?.bind?.source).toBe("balance");
+  });
+
+  it("prefers a near weekly reset for new Codex agents with sufficient headroom", () => {
+    const soon = account({ id: "codex-soon", family: "codex" });
+    const later = account({ id: "codex-later", family: "codex" });
+    const reading = (weekly: number, reset: string): Usage => ({
+      ...usage(30), windows: codexWindows([30, "2026-09-23T16:00:00Z"], [weekly, reset]),
+    });
+    const decision = chooseAccount(stateWith([soon, later]), {
+      ...base, family: "codex", portable: false, balanceNewAgents: true, reason: "create",
+      usageOf: (id) => id === soon.id ? reading(60, "2026-09-24T10:00:00Z") : reading(40, "2026-09-27T10:00:00Z"),
+    });
+    expect(decision?.account.id).toBe(soon.id);
+    expect(decision?.bind?.selectionReason).toBe("weekly_reset");
+  });
+
+  it("tells the ChatGPT windows apart by their length, so renaming a label doesn't turn this off", () => {
+    const soon = account({ id: "codex-soon", family: "codex" });
+    const later = account({ id: "codex-later", family: "codex" });
+    const reading = (weekly: number, reset: string): Usage => ({
+      ...usage(30),
+      windows: codexWindows([30, "2026-09-23T16:00:00Z"], [weekly, reset]).map((limit) => ({ ...limit, label: `Renamed ${limit.label}` })),
+    });
+    const decision = chooseAccount(stateWith([soon, later]), {
+      ...base, family: "codex", portable: false, balanceNewAgents: true, reason: "create",
+      usageOf: (id) => id === soon.id ? reading(60, "2026-09-24T10:00:00Z") : reading(40, "2026-09-27T10:00:00Z"),
+    });
+    expect(decision?.bind).toMatchObject({ accountId: soon.id, selectionReason: "weekly_reset" });
+  });
+
+  it.each(["stale", "cached", "error", "missing", "short-limit", "weekly-limit", "past-reset"]) (
+    "falls back to headroom when near-reset data is %s", (condition) => {
+      const soon = account({ id: "codex-soon", family: "codex" });
+      const later = account({ id: "codex-later", family: "codex" });
+      const reading = (near: boolean): Usage => ({
+        ...usage(30),
+        fetchedAt: near && condition === "stale" ? "2026-09-23T10:00:00Z" : "2026-09-23T11:59:00Z",
+        cached: near && condition === "cached",
+        error: near && condition === "error" ? "offline" : null,
+        windows: codexWindows(
+          [near && condition === "short-limit" ? 90 : near && condition === "missing" ? 60 : 30, "2026-09-23T16:00:00Z"],
+          near && condition === "missing" ? null : [near && condition === "weekly-limit" ? 90 : near ? 60 : 40, near && condition === "past-reset" ? "2026-09-23T11:00:00Z" : near ? "2026-09-24T10:00:00Z" : "2026-09-27T10:00:00Z"],
+        ),
+      });
+      const decision = chooseAccount(stateWith([soon, later]), {
+        ...base, family: "codex", portable: false, balanceNewAgents: true, reason: "create",
+        usageOf: (id) => reading(id === soon.id),
+      });
+      expect(decision?.account.id).toBe(later.id);
+      expect(decision?.bind?.selectionReason).toBe("headroom");
+    },
+  );
+
+  it("never binds a Claude agent to a ChatGPT account, even one whose weekly reset is near", () => {
+    const soon = account({ id: "codex-soon", family: "codex" });
+    const later = account({ id: "codex-later", family: "codex" });
+    const readings: Record<string, Usage> = {
+      [main.id]: usage(50),
+      [work.id]: usage(10),
+      [soon.id]: { ...usage(0), windows: codexWindows([30, "2026-09-23T16:00:00Z"], [60, "2026-09-24T10:00:00Z"]) },
+      [later.id]: { ...usage(0), windows: codexWindows([30, "2026-09-23T16:00:00Z"], [40, "2026-09-27T10:00:00Z"]) },
+    };
+    const state = stateWith([soon, later, main, work]);
+    const create = { ...base, balanceNewAgents: true, reason: "create" as const, usageOf: (id: string) => readings[id] };
+
+    const claude = chooseAccount(state, create);
+    expect(claude?.account.id).toBe(work.id);
+    expect(claude?.bind).toMatchObject({ accountId: work.id, source: "balance", selectionReason: "headroom" });
+    // The same readings do send a new ChatGPT agent to the near reset.
+    const chatgpt = chooseAccount(state, { ...create, family: "codex", portable: false });
+    expect(chatgpt?.bind).toMatchObject({ accountId: soon.id, selectionReason: "weekly_reset" });
   });
 
   it("does not rebalance agents that already exist", () => {

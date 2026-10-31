@@ -1395,6 +1395,11 @@ export class Service {
         family,
         accountId,
         pinned: Boolean(binding && binding.source !== "thread"),
+        // Only while the agent is still on the account that was picked for it.
+        selectionReason:
+          binding?.source === "balance" && binding.selectionReason === "weekly_reset" && binding.accountId === accountId
+            ? "weekly_reset"
+            : undefined,
         pendingAccountId: current && current !== accountId ? current : null,
         movable: this.adapters[family].portable || !agent.hasHistory,
       });

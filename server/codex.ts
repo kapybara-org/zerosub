@@ -447,9 +447,13 @@ function friendlyCodexError(message: string | null): string {
   return message;
 }
 
+/** How long a ChatGPT plan's two windows are, in minutes, as Codex reports them in `windowDurationMins`. */
+export const FIVE_HOUR_MINUTES = 300;
+export const WEEK_MINUTES = 10_080;
+
 function windowLabel(minutes: number | null): string {
   if (!minutes) return "Usage";
-  if (minutes === 10_080) return "Weekly";
+  if (minutes === WEEK_MINUTES) return "Weekly";
   if (minutes % 1_440 === 0) return `${minutes / 1_440}-day`;
   if (minutes % 60 === 0) return `${minutes / 60}-hour`;
   return `${minutes}-minute`;
@@ -468,6 +472,7 @@ export function parseRateLimits(snapshot: unknown): UsageWindow[] {
       label: windowLabel(minutes),
       usedPercent: window.usedPercent,
       resetsAt: typeof window.resetsAt === "number" ? new Date(window.resetsAt * 1000).toISOString() : null,
+      minutes,
     });
   }
   return windows;
