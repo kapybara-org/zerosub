@@ -11,6 +11,7 @@ Use several Claude and ChatGPT (Codex) subscriptions side by side in [Paseo](htt
 - **Set an account aside.** Disable an account for a while and its agents move to your other accounts, then come back when you enable it again.
 - **Several hosts.** Each Paseo host keeps its own accounts, and the Accounts screen says which host you're looking at.
 - **Fork to the other provider (optional).** When every Claude account is out, a stopped chat can carry on in a new ChatGPT agent, and the other way round.
+- **OMP accounts too.** The Accounts screen also lists the accounts signed in to [Oh My Pi](https://omp.sh) (OMP), with their usage and banked resets, and lets you add or remove them.
 - **Everything else stays the same.** Every account shares your settings, skills, plugins, MCP servers, `CLAUDE.md`/`AGENTS.md` and conversation history.
 
 ## Install
@@ -94,6 +95,18 @@ ZeroSub tries these in order, and a timeline note says which one happened:
    - With the option off, a stopped agent's account button offers **Continue on ChatGPT (new agent)…** (or Claude) instead, with a confirmation.
 3. **Stop and say so**, with the time the account frees up.
 
+### Oh My Pi (OMP)
+
+OMP keeps several accounts per provider and moves its agents between them by itself: it spreads new agents across accounts and moves off one that runs out. So ZeroSub doesn't switch OMP agents; it shows OMP's accounts on the same screen and lets you steer how OMP uses them. The OMP section shows up once Paseo's OMP provider is turned on (it's off by default) and `omp` is installed where the daemon runs.
+
+- **Usage and banked resets** show on each account's card, like the Claude and ChatGPT ones. ZeroSub reads them from OMP at most every 5 minutes, or straight away when you refresh usage (the ↻ button beside the title). **Use reset** spends one after you confirm.
+- **Add account** signs another account in to OMP, for Claude, ChatGPT or any provider that already has an OMP account. On the host's computer the sign-in page finishes by itself. Anywhere else, paste the code, or the address of the page that failed to load after signing in.
+- **Remove** signs that one account out of OMP. OMP agents carry on with its other accounts.
+- **Prefer** (the star on a card) makes new OMP agents start on that account while it has room, and brings agents back to it once it has room again. OMP still puts an account it can't read usage for, or one in its reserve, behind the others, so a preferred account isn't always used. The line under each provider says where new agents would go right now.
+- **Keep in reserve** sets how much of an account OMP leaves unused before moving off it.
+- **How OMP uses these accounts** sets what OMP does when every account is down to its reserve, whether an agent waits for a limit to reset, and whether OMP spends banked ChatGPT or Claude resets by itself and how many it keeps. **OMP default** leaves your own OMP settings in charge.
+- These choices apply to the OMP agents Paseo starts on this host, from their next start. `omp` in a terminal is left alone.
+
 ## Several hosts
 
 Paseo installs plugins per host (daemon), so install ZeroSub on each host whose agents should use it. When more than one host has it, Paseo shows a single **Accounts (ZeroSub)** item with a host picker at the top.
@@ -122,9 +135,18 @@ Sign-in runs the official CLIs:
 
 ZeroSub never implements OAuth itself and never copies credentials between accounts.
 
+OMP keeps its own accounts, so ZeroSub asks the `omp` CLI instead of keeping homes for it:
+
+- Accounts, usage and resets come from `omp --mode rpc` (`get_logout_accounts`), `omp usage --json`, `omp usage reset --json` and, when OMP has no live reading for an account, its recorded history (`omp usage --history --json`). Sign-in and removal use the same rpc session's `login` and `logout`; **Use reset** runs `omp usage reset <provider>/<id>`.
+- Your choices become an OMP settings overlay, `$PASEO_HOME/zerosub/omp-overlay.yml`, which the same `before("agent.session_open")` hook adds to `PI_CONFIG_FILES` for OMP sessions, after any overlays already set. **Prefer** and **Keep in reserve** become account policies (`auth.accountPolicies`: priority, `reservePct`, `reclaimAbovePct`); the other choices are OMP's `retry.*`, `codexResets.*` and `claudeResets.*` settings. If your own OMP config sets `auth.accountPolicies`, ZeroSub leaves preferences and reserves to it, since OMP refuses two policies for one account. It does the same while it can't read your OMP config (`omp config list --json`).
+- The line under each provider comes from `omp dry-balance` with the overlay applied.
+- If `omp` is slow or sends something ZeroSub can't read, the OMP section shows the last good reading or the error, and leaves out what it can't read. The rest of the Accounts screen isn't held up.
+- Nothing here runs while Paseo's OMP provider is off.
+
 ## Privacy and security
 
 - Credentials stay in the CLIs' own stores. ZeroSub's registry (`$PASEO_HOME/zerosub/state.json`) holds account names, emails, plans, which agent uses which account, and continuation links with timeline positions. Handoff text stays in the agents' conversation histories; it isn't copied into the registry.
+- OMP accounts stay in OMP's own store. ZeroSub reads only account labels, usage and reset counts through the `omp` CLI, and passes a pasted sign-in code straight to OMP.
 - To show Claude usage, ZeroSub reads each account's current access token and calls Anthropic's usage endpoint, the same way Paseo's built-in usage display and `/usage` do. It never logs or stores tokens and never refreshes them itself. When you refresh usage (the ↻ button beside the title) or use a reset and a token has expired, it runs `claude -p /usage` so Claude Code renews its own sign-in. In the background it does the same at most every 30 minutes per account, and only for a reading that has passed its reset time or an account at its 5-hour or weekly limit. Codex usage comes from `codex app-server`.
 - Using a banked reset calls the provider's own reset endpoint with that account's sign-in, and only after you confirm (or turn on automatic use).
 - Removing an account moves its agents to the default account, then signs it out (`claude auth logout` / `codex` logout) and deletes its home. This happens once no agent is mid-turn on it. Abandoned sign-ins are cleaned up the same way.
@@ -139,7 +161,7 @@ ZeroSub never implements OAuth itself and never copies credentials between accou
 - **Password-protected daemons:** `paseo agent reload` can't authenticate. Agents then switch the next time their session starts, not immediately, and their timeline note says so.
 - **Imported Codex threads** (`paseo agent import`) are assigned to your CLI login, since that's where standalone Codex sessions come from.
 - **ChatGPT device-code sign-in** has to be enabled in ChatGPT → Settings → Security. The browser option works from a browser on the host's own computer.
-- Tested on macOS with Claude Code 2.1.280, Codex 0.156.1 and Paseo 0.9.1. Linux should work. Windows is untested.
+- Tested on macOS with Claude Code 2.1.280, Codex 0.156.1 and Paseo 0.9.1. Linux should work. Windows is untested. OMP support was tested on Linux with omp 18.13.1 and Paseo 0.13.2.
 
 ## Development
 

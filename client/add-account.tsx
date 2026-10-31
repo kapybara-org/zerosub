@@ -351,7 +351,7 @@ function SignInSteps({
   );
 }
 
-function Step({ theme, number, title, children }: { theme: Theme; number: number; title: string; children: ReactNode }) {
+export function Step({ theme, number, title, children }: { theme: Theme; number: number; title: string; children: ReactNode }) {
   const text = useText(theme);
   return (
     <View style={{ flexDirection: "row", gap: 12 }}>
@@ -375,7 +375,7 @@ function Step({ theme, number, title, children }: { theme: Theme; number: number
   );
 }
 
-function Waiting({ theme, label }: { theme: Theme; label: string }) {
+export function Waiting({ theme, label }: { theme: Theme; label: string }) {
   const text = useText(theme);
   return (
     <View style={{ flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 6 }}>
@@ -385,7 +385,7 @@ function Waiting({ theme, label }: { theme: Theme; label: string }) {
   );
 }
 
-function Row({ children, start }: { children: ReactNode; start?: boolean }) {
+export function Row({ children, start }: { children: ReactNode; start?: boolean }) {
   return (
     <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, justifyContent: start ? "flex-start" : "flex-end" }}>
       {children}

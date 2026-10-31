@@ -1,6 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import { FamilySchema, LoginMethodSchema, LoginViewSchema, StateViewSchema } from "./model";
+import { FamilySchema, LoginMethodSchema, LoginViewSchema, OmpLoginViewSchema, OmpSettingsChangeSchema, StateViewSchema } from "./model";
 
 export const getState = defineRpc({
   name: "zerosub.state",
@@ -127,4 +127,61 @@ export const setAgentAccount = defineRpc({
     accountId: z.string().nullable(),
   }),
   output: ReopenSummarySchema,
+});
+
+/** OMP provider ids; never a leading `-`, since they end up in `omp` argv. */
+const OmpProviderId = z.string().regex(/^[a-z0-9][a-z0-9.-]*$/);
+const OmpAccountRef = z.object({ provider: OmpProviderId, credentialId: z.number().int().nonnegative() });
+
+/** Signs a new account in to OMP's own store (`omp` rpc `login`). */
+export const startOmpLogin = defineRpc({
+  name: "zerosub.omp.login.start",
+  input: z.object({ provider: OmpProviderId }),
+  output: OmpLoginViewSchema,
+});
+
+export const submitOmpLoginCode = defineRpc({
+  name: "zerosub.omp.login.code",
+  input: z.object({ loginId: z.string(), code: z.string().trim().min(1) }),
+  output: OmpLoginViewSchema,
+});
+
+export const cancelOmpLogin = defineRpc({
+  name: "zerosub.omp.login.cancel",
+  input: z.object({ loginId: z.string() }),
+  output: OmpLoginViewSchema.nullable(),
+});
+
+export const removeOmpAccount = defineRpc({
+  name: "zerosub.omp.remove",
+  input: OmpAccountRef,
+  output: z.object({ ok: z.literal(true) }),
+});
+
+/** Spends one banked reset (`omp usage reset <provider>/<credentialId>`). */
+export const redeemOmpReset = defineRpc({
+  name: "zerosub.omp.redeem",
+  input: OmpAccountRef,
+  output: z.object({ ok: z.boolean(), message: z.string() }),
+});
+
+/** Makes an account the one new OMP agents prefer for its provider, or drops the preference. */
+export const preferOmpAccount = defineRpc({
+  name: "zerosub.omp.prefer",
+  input: OmpAccountRef.extend({ preferred: z.boolean() }),
+  output: z.object({ ok: z.literal(true) }),
+});
+
+/** Quota OMP keeps unused on an account; `null` goes back to OMP's own reserve. */
+export const setOmpReserve = defineRpc({
+  name: "zerosub.omp.reserve",
+  input: OmpAccountRef.extend({ reservePct: z.number().int().min(0).max(90).nullable() }),
+  output: z.object({ ok: z.literal(true) }),
+});
+
+/** Changes only the OMP settings given; `null` leaves one to OMP's own config again. */
+export const setOmpSettings = defineRpc({
+  name: "zerosub.omp.settings",
+  input: z.object({ settings: OmpSettingsChangeSchema }),
+  output: z.object({ ok: z.literal(true) }),
 });
