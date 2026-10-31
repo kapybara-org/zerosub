@@ -80,16 +80,11 @@ describe("account presentation", () => {
   });
 
   it("names the credits a full window falls back on", () => {
-    expect(formatCredits({ balance: 57714.93, unlimited: false })).toBe("57,714 credits left");
-    expect(formatCredits({ balance: 1, unlimited: false })).toBe("1 credit left");
-    expect(formatCredits({ balance: null, unlimited: false })).toBe("Credits available");
-    expect(formatCredits({ balance: null, unlimited: true })).toBe("Unlimited credits");
-    const usage = account.usage && {
-      ...account.usage,
-      windows: [{ id: "primary", label: "Weekly", usedPercent: 100, resetsAt: "2026-09-25T12:00:00Z" }],
-      credits: { balance: 1200, unlimited: false },
-    };
-    expect(usageSummary({ ...account, usage }, NOW)).toBe("100% of weekly used · 1,200 credits left");
+    expect(formatCredits({ balance: 57714.93, unlimited: false })).toBe("57,714 ChatGPT credits left");
+    expect(formatCredits({ balance: 1, unlimited: false })).toBe("1 ChatGPT credit left");
+    expect(formatCredits({ balance: 0.4, unlimited: false })).toBe("Less than 1 ChatGPT credit left");
+    expect(formatCredits({ balance: null, unlimited: false })).toBe("ChatGPT credits available");
+    expect(formatCredits({ balance: null, unlimited: true })).toBe("Unlimited ChatGPT credits");
   });
 
   it("names plans and trims long labels", () => {

@@ -6,7 +6,7 @@ Use several Claude and ChatGPT (Codex) subscriptions side by side in [Paseo](htt
 - **Your existing CLI logins show up automatically.** Nothing changes until you add a second account.
 - **Pick an account per agent.** An account button in the message box shows which account each Claude or Codex agent uses. Tap it to switch.
 - **Automatic failover.** When an account hits its 5-hour or weekly limit, the agent moves to the account with the most room left and carries on. New agents skip exhausted accounts.
-- **Live usage.** Each account shows its own 5-hour and weekly usage and when they reset. Accounts in use refresh about every minute and after each turn, and a limit shows up the moment it hits.
+- **Live usage.** Each account shows its own 5-hour and weekly usage and when they reset, plus any ChatGPT credits. Accounts in use refresh about every minute and after each turn, and a limit shows up the moment it hits.
 - **Banked resets.** If a provider has banked limit resets on an account, you can use one from the account card or the agent's account button.
 - **Set an account aside.** Disable an account for a while and its agents move to your other accounts, then come back when you enable it again.
 - **Several hosts.** Each Paseo host keeps its own accounts, and the Accounts screen says which host you're looking at.
@@ -49,7 +49,7 @@ Then open **Accounts (ZeroSub)** in the sidebar.
    - Paseo 0.13 and later no longer send the finished turn to plugins, so ZeroSub reads that turn from the agent's timeline instead.
    - A short note in the agent's timeline says what happened.
    - As a safety stop, one agent changes accounts at most 4 times in 10 minutes. If it hits that, its timeline says so; pick an account from its account button to carry on.
-   - An exhausted account is skipped until it resets. If you know it has room again sooner, for example after upgrading or buying credits, press **Mark as available again** (the check mark) on its card.
+   - An exhausted account is skipped until it resets. If you know it has room again sooner, for example after upgrading or buying credits, press **Mark as available again** (the check mark) on its card. For ChatGPT credits, see [ChatGPT credits](#chatgpt-credits).
 
 ### Claude vs. ChatGPT when switching mid-conversation
 
@@ -68,6 +68,14 @@ Some plans come with banked limit resets: ChatGPT's reset credits, and Claude Co
 - **ChatGPT** uses Codex's own reset-credit API, the same one as `/usage` → reset in the Codex CLI. It never spends a credit while nothing is used up.
 - **Claude** uses Claude Code's limit-reset endpoint. Anthropic decides which accounts get resets; so far it reports the tested accounts as not eligible, so the button may not appear for Claude. It shows up by itself once an account has a reset.
 - **Use banked resets when every account is out** (off by default) spends one automatically, but only when every account of that provider is at its limit and the provider confirms the limit at that moment.
+
+### ChatGPT credits
+
+A ChatGPT account can also have prepaid ChatGPT credits, which Codex spends once the account reaches its limit. They aren't the reset credits above. The card shows them under the usage bars, for example "57,714 ChatGPT credits left", and an agent's account button shows them next to the account's usage.
+
+- By default, an account at its limit is skipped until it resets, credits or not, so new agents use the free room on your other accounts first. That room is lost at each reset; credits aren't. **Mark as available again** only lasts until the next usage reading, which still shows the limit reached.
+- **Use ChatGPT credits when a limit is reached** (off by default; in Accounts, or **Settings → Plugins → zerosub → ZeroSub preferences**) keeps an account with credits in use at its limit. New agents may then spend paid credits even while another account still has room.
+- Even with it on, a limit an agent actually ran into stays until it resets: Codex stopped that agent, so the credits didn't cover it.
 
 ### When every account of a provider is out
 

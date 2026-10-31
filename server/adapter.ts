@@ -30,8 +30,11 @@ export interface Identity {
  */
 export type LimitKind = "window" | "budget";
 
-/** A usage reading, plus when to ask again if the provider said to slow down. */
-export type UsageRead = Usage & { retryAt?: number };
+/**
+ * A usage reading, plus when to ask again if the provider said to slow down. An adapter may leave
+ * `credits` out; the reading is stored with `null` then.
+ */
+export type UsageRead = Omit<Usage, "credits"> & { credits?: Usage["credits"]; retryAt?: number };
 
 export interface LimitHit {
   kind: LimitKind;

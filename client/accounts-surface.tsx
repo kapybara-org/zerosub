@@ -656,6 +656,13 @@ function AutomationSettings({ theme }: { theme: Theme }) {
           onValueChange={(autoRedeem) => save({ autoRedeem })}
         />
         <SettingsSwitch
+          label="Use ChatGPT credits when a limit is reached"
+          hint="A ChatGPT account at its limit stays in use while it has credits, so new agents may spend paid credits even while another account still has room."
+          value={settings.values.useCredits}
+          disabled={settings.saving}
+          onValueChange={(useCredits) => save({ useCredits })}
+        />
+        <SettingsSwitch
           label="When every account is out, fork the chat to the other provider"
           hint="A stopped Claude chat carries on in a new ChatGPT agent, or the other way round, with the conversation so far. The new agent gets no more permissions than the original; the original stays as it was."
           value={settings.values.forkOtherProvider}

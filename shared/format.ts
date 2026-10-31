@@ -22,12 +22,14 @@ export function formatPercent(value: number): string {
   return `${Math.round(Math.min(100, Math.max(0, value)))}%`;
 }
 
-/** "57,715 credits left", "Unlimited credits", or "Credits available" when the balance isn't given. */
+/** "57,714 ChatGPT credits left", "Unlimited ChatGPT credits", or "ChatGPT credits available" when the balance isn't given. */
 export function formatCredits(credits: Credits): string {
-  if (credits.unlimited) return "Unlimited credits";
-  if (credits.balance === null) return "Credits available";
-  const whole = String(Math.max(0, Math.floor(credits.balance))).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-  return `${whole} credit${whole === "1" ? "" : "s"} left`;
+  if (credits.unlimited) return "Unlimited ChatGPT credits";
+  if (credits.balance === null) return "ChatGPT credits available";
+  // Rounding a last fraction of a credit down would read as none left.
+  if (credits.balance < 1) return "Less than 1 ChatGPT credit left";
+  const whole = String(Math.floor(credits.balance)).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return `${whole} ChatGPT credit${whole === "1" ? "" : "s"} left`;
 }
 
 /** The busiest window decides how close an account is to being cut off. */
@@ -104,7 +106,5 @@ export function usageSummary(account: AccountView, now: number = Date.now()): st
   if (!peak) return null;
   const reset = formatResetIn(peak.resetsAt, now);
   const base = `${formatPercent(peak.usedPercent)} of ${peak.label.toLowerCase()} used`;
-  const credits = account.usage?.credits;
-  if (credits && peak.usedPercent >= 100) return `${base} · ${formatCredits(credits)}`;
   return reset ? `${base} · resets ${reset}` : base;
 }
