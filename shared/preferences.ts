@@ -22,7 +22,7 @@ export const preferences = defineSettings({
      * open at the time. Codex threads never move either way.
      */
     moveAgentsOnDefaultChange: z.boolean().default(true),
-    /** New agents start on the account with the most headroom instead of the default. */
+    /** New agents choose an account by usage instead of the default. */
     balanceNewAgents: z.boolean().default(false),
     /** When every account of a provider is at its limit, spend a banked reset instead of stopping. */
     autoRedeem: z.boolean().default(false),

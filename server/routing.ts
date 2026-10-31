@@ -1,5 +1,6 @@
 import { peakUsage } from "../shared/format";
 import type { Family, Usage } from "../shared/model";
+import { FIVE_HOUR_MINUTES, WEEK_MINUTES } from "./codex";
 import {
   accountsOf,
   defaultAccount,
@@ -9,6 +10,13 @@ import {
   type StoredAccount,
   type StoredState,
 } from "./state";
+
+/** Weekly resets only steer a new agent when every account it could use was read this recently. */
+const FRESH_READING_MS = 30 * 60_000;
+/** How soon a weekly reset has to be for its account to be preferred. */
+const NEAR_RESET_MS = 24 * 60 * 60_000;
+/** The most a near-reset account may have used of any window, so it still has room to spare. */
+const NEAR_RESET_MAX_USED_PERCENT = 80;
 
 export function isLimited(account: StoredAccount, now: number): boolean {
   if (!account.limitedUntil) return false;
@@ -56,6 +64,28 @@ export function mostAvailable(
   return candidates[0];
 }
 
+/** Prefer a weekly reset within a day only when every usable account has fresh, complete usage. */
+function soonestWeeklyReset(state: StoredState, family: Family, usageOf: RouteInput["usageOf"], now: number): StoredAccount | undefined {
+  const candidates = accountsOf(state, family).filter((account) => isUsable(account, now));
+  const readings = candidates.map((account) => ({ account, usage: usageOf(account.id) }));
+  const complete = readings.every(({ usage }) => {
+    if (!usage || usage.error || usage.cached) return false;
+    const age = now - Date.parse(usage.fetchedAt);
+    const short = usage.windows.find((window) => window.minutes === FIVE_HOUR_MINUTES);
+    const weekly = usage.windows.find((window) => window.minutes === WEEK_MINUTES);
+    return Number.isFinite(age) && age >= 0 && age <= FRESH_READING_MS && !!short && !!weekly &&
+      [short, weekly].every((window) => Number.isFinite(window.usedPercent) && window.usedPercent >= 0 &&
+        window.usedPercent <= 100 && window.resetsAt !== null && Date.parse(window.resetsAt) > now);
+  });
+  if (!complete) return undefined;
+  return readings.filter(({ usage }) => {
+    const weekly = usage!.windows.find((window) => window.minutes === WEEK_MINUTES)!;
+    return usage!.windows.every((window) => window.usedPercent <= NEAR_RESET_MAX_USED_PERCENT) &&
+      Date.parse(weekly.resetsAt!) - now <= NEAR_RESET_MS;
+  }).sort((a, b) => Date.parse(a.usage!.windows.find((window) => window.minutes === WEEK_MINUTES)!.resetsAt!) -
+    Date.parse(b.usage!.windows.find((window) => window.minutes === WEEK_MINUTES)!.resetsAt!))[0]?.account;
+}
+
 export interface RouteInput {
   agentId: string;
   family: Family;
@@ -98,8 +128,9 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   let bind: Binding | null = null;
 
   if (!account && fresh && input.balanceNewAgents && accounts.length > 1) {
-    account = mostAvailable(state, input.family, input.usageOf, input.now);
-    if (account) bind = { accountId: account.id, source: "balance", at };
+    const nearReset = input.family === "codex" ? soonestWeeklyReset(state, input.family, input.usageOf, input.now) : undefined;
+    account = nearReset ?? mostAvailable(state, input.family, input.usageOf, input.now);
+    if (account) bind = { accountId: account.id, source: "balance", at, selectionReason: nearReset ? "weekly_reset" : "headroom" };
   }
   if (!account) {
     // An imported Codex thread most likely came from the user's own CLI, so it belongs to that login.

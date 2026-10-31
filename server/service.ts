@@ -31,6 +31,7 @@ import {
   type UsageRead,
 } from "./adapter";
 import { FamilyResolver } from "./families";
+import { sameAccountIdentity } from "./account-identity";
 import { CodexContinuations } from "./continuations";
 import { CONTINUED_FROM_LABEL, continueInNewAgent, type Continuation } from "./handoff";
 import { removeHome } from "./homes";
@@ -41,7 +42,7 @@ import { equivalentMode } from "./modes";
 import { homesDir } from "./paths";
 import { Reopener } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
-import { loadReadings, mergeUsage, saveReadings, showLimit } from "./usage";
+import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
 import { chooseAccount, isLimited, isUsable, mostAvailable } from "./routing";
 import {
   MAIN_ACCOUNT_ID,
@@ -65,6 +66,8 @@ const OTHER_FAMILY: Record<Family, Family> = { claude: "codex", codex: "claude" 
 const USAGE_BUSY_MS = 60_000;
 const USAGE_DEFAULT_MS = 5 * 60_000;
 const USAGE_IDLE_MS = 20 * 60_000;
+/** Background reads renew an expired sign-in (slow) at most this often per account. Explicit refreshes (↻) aren't limited. */
+const RENEW_LOGIN_MS = 30 * 60_000;
 /** An account counts as in use for this long after one of its agents starts or ends a turn. */
 const ACTIVE_WINDOW_MS = 15 * 60_000;
 const UPKEEP_MS = 30_000;
@@ -161,6 +164,10 @@ export class Service {
   private readonly activeAt = new Map<string, number>();
   /** The provider asked us not to read this account's usage again before then. */
   private readonly usageRetryAt = new Map<string, number>();
+  /** When a usage read last asked each account's CLI to renew its sign-in. */
+  private readonly renewAttemptAt = new Map<string, number>();
+  /** Accounts whose last usage read was live, rather than an error or the CLI's cached copy. */
+  private readonly usageLive = new Set<string>();
   private usageSave: ReturnType<typeof setTimeout> | null = null;
   private readonly lastRedeemAt = new Map<string, number>();
   private readonly redeemLocks = new Map<string, Mutex>();
@@ -1281,7 +1288,10 @@ export class Service {
 
   // ------------------------------------------------------------------ usage
 
-  /** `renewLogin` lets the CLI refresh an expired sign-in first (explicit refreshes only: it's slow). */
+  /**
+   * `renewLogin` lets the CLI refresh an expired sign-in first (explicit refreshes: it's slow). Other
+   * reads may renew it too, at most every RENEW_LOGIN_MS (see `renewsInBackground`).
+   */
   refreshUsage(accountId: string, force = false, renewLogin = false): Promise<void> {
     const pending = this.usageInFlight.get(accountId);
     if (pending) return pending;
@@ -1295,8 +1305,10 @@ export class Service {
       const spacing = this.adapters[account.family].usageSpacingMs;
       if (since < (force ? spacing : Math.max(spacing, 60_000))) return;
       this.usageAttemptAt.set(accountId, Date.now());
+      const renew = renewLogin || this.renewsInBackground(account, Date.now());
+      if (renew) this.renewAttemptAt.set(accountId, Date.now());
       const { retryAt, ...read } = await this.adapters[account.family]
-        .usage(account.home, { renewLogin })
+        .usage(account.home, { renewLogin: renew })
         .catch(
           (error: unknown): UsageRead => ({ fetchedAt: new Date().toISOString(), windows: [], error: describe(error), cached: false, resets: null }),
         );
@@ -1305,7 +1317,11 @@ export class Service {
       const usage: Usage = { ...read, credits: read.credits ?? null };
       this.setUsage(accountId, mergeUsage(this.usage.get(accountId), usage));
       // Only a live reading may change an account's limit state.
-      if (usage.windows.length === 0 || usage.error || usage.cached) return;
+      if (usage.windows.length === 0 || usage.error || usage.cached) {
+        this.usageLive.delete(accountId);
+        return;
+      }
+      this.usageLive.add(accountId);
       const now = Date.now();
       // With "Use ChatGPT credits when a limit is reached" on, credits keep an account going past a
       // full window, so a full window alone isn't a limit then.
@@ -1331,6 +1347,18 @@ export class Service {
     })().finally(() => this.usageInFlight.delete(accountId));
     this.usageInFlight.set(accountId, task);
     return task;
+  }
+
+  /**
+   * A read nobody asked to renew the sign-in for still renews it when the reading is past a reset
+   * (its old numbers would stay up until the account is next used), or when a window limit has no
+   * live reading (a reset used on another machine, or an early one, wouldn't lift it). At most
+   * every RENEW_LOGIN_MS, and not for a disabled account.
+   */
+  private renewsInBackground(account: StoredAccount, now: number): boolean {
+    if (account.disabled || now - (this.renewAttemptAt.get(account.id) ?? 0) < RENEW_LOGIN_MS) return false;
+    const windowLimited = account.limitKind === "window" && isLimited(account, now);
+    return pastReset(this.usage.get(account.id), now) || (windowLimited && !this.usageLive.has(account.id));
   }
 
   /** Records a reading and saves the readings shortly after, so a restart shows them straight away. */
@@ -1374,6 +1402,11 @@ export class Service {
         family,
         accountId,
         pinned: Boolean(binding && binding.source !== "thread"),
+        // Only while the agent is still on the account that was picked for it.
+        selectionReason:
+          binding?.source === "balance" && binding.selectionReason === "weekly_reset" && binding.accountId === accountId
+            ? "weekly_reset"
+            : undefined,
         pendingAccountId: current && current !== accountId ? current : null,
         movable: this.adapters[family].portable || !agent.hasHistory,
       });
@@ -1791,20 +1824,23 @@ export class Service {
 
     const state = await this.store.read();
     const existing = findAccount(state, session.accountId);
-    if (existing?.kind === "managed" && existing.identity && identity.identity && existing.identity !== identity.identity) {
+    if (existing?.kind === "managed" && existing.identity && identity.identity && !sameAccountIdentity(session.family, existing, identity)) {
       // Signing an account back in must not quietly turn it into a different login.
       if (session.home) await adapter.logout(session.home).catch(() => undefined);
       const expected = existing.email ?? existing.label;
+      // Only a Codex key can come without the email, and then it doesn't say which member signed in.
       return this.failLogin(
         session,
-        `You signed in as ${identity.email ?? "a different account"}, but this is ${expected}. Sign in as ${expected}, or use Add account for the other one.`,
+        identity.email
+          ? `You signed in as ${identity.email}, but this is ${expected}. Sign in as ${expected}, or use Add account for the other one.`
+          : `Couldn't tell which workspace member signed in, because Codex didn't return an email. Sign in again as ${expected}.`,
       );
     }
     // The CLI's own login is whatever the user signs it into; only added accounts must be distinct.
     const duplicate =
       identity.identity && existing?.kind !== "main"
         ? accountsOf(state, session.family).find(
-            (account) => account.id !== session.accountId && account.identity === identity.identity,
+            (account) => account.id !== session.accountId && sameAccountIdentity(session.family, account, identity, true),
           )
         : undefined;
     if (duplicate) {

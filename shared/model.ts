@@ -16,6 +16,8 @@ export const UsageWindowSchema = z.object({
   /** 0–100. */
   usedPercent: z.number(),
   resetsAt: z.string().nullable(),
+  /** How long the window is, in minutes. Only Codex readings have it; `null` when Codex doesn't say. */
+  minutes: z.number().nullable().optional(),
 });
 export type UsageWindow = z.infer<typeof UsageWindowSchema>;
 
@@ -102,6 +104,8 @@ export const AgentRouteSchema = z.object({
    * continues the work in a new agent instead.
    */
   movable: z.boolean(),
+  /** The agent started on this account because its weekly reset was near, and is still on it. */
+  selectionReason: z.literal("weekly_reset").optional(),
 });
 export type AgentRoute = z.infer<typeof AgentRouteSchema>;
 

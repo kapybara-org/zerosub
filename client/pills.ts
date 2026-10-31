@@ -202,6 +202,13 @@ function buttonFor(
     });
   }
   if (wayOut.length > 0) items.unshift(...wayOut, { kind: "separator", id: "way-out-divider" });
+  if (route?.selectionReason === "weekly_reset") {
+    items.push({
+      kind: "item", id: "selection-reason",
+      title: "Started here: weekly reset was near",
+      icon: "Info", disabled: true, behavior: { kind: "action", onPress() {} },
+    });
+  }
   items.push({ kind: "separator", id: "manage-divider" });
   if (route?.pinned && movable) {
     const fallback = accounts.find((account) => account.isDefault);

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { PluginHookContext } from "@getpaseo/plugin/server";
+import { sameAccountIdentity } from "./account-identity";
 import type { AgentTimelineItem } from "./adapter";
 import { buildTranscript, CONTINUED_FROM_LABEL, continueInNewAgent, keepEnds, type Continuation } from "./handoff";
 import { Mutex } from "./json-file";
@@ -49,7 +50,9 @@ function boundTo(state: StoredState, agentId: string, accountId: string): boolea
 /** The account still exists, can take work and is still signed in as the same person. */
 function stillUsable(state: StoredState, account: StoredAccount): boolean {
   const current = findAccount(state, account.id);
-  return current !== undefined && isUsable(current, Date.now()) && current.identity === account.identity && current.email === account.email;
+  // Upkeep may add the member's email to an old workspace-only Codex key during the handoff; that's the same person.
+  return current !== undefined && isUsable(current, Date.now()) &&
+    (current.identity === account.identity || sameAccountIdentity(account.family, current, account)) && current.email === account.email;
 }
 
 function member(account: StoredAccount): Member {
@@ -437,7 +440,8 @@ function pickDestination(
 ): Destination {
   const candidate = Object.entries(chain.members).find(([id, entry]) => {
     const agent = snapshots.get(id);
-    return id !== sourceAgent.id && entry.accountId === account.id && entry.identity !== null && entry.identity === account.identity &&
+    // A tab recorded under an old workspace-only Codex key is matched by its saved email.
+    return id !== sourceAgent.id && entry.accountId === account.id && sameAccountIdentity(account.family, entry, account) &&
       entry.email === account.email && boundTo(state, id, account.id) &&
       agent !== undefined && samePlace(sourceAgent, agent) && !agent.archivedAt && !agent.providerUnavailable;
   });

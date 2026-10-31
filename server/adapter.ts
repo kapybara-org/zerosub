@@ -20,7 +20,7 @@ export interface Identity {
   email: string | null;
   plan: string | null;
   organization: string | null;
-  /** Stable key for spotting the same account twice (org + email, or the ChatGPT account ID). */
+  /** Key for spotting the same account twice (org + email, or ChatGPT workspace + member email). */
   identity: string | null;
 }
 
@@ -91,7 +91,7 @@ export interface FamilyAdapter {
   identity(home: string | null): Promise<Identity>;
   /**
    * Usage windows and banked resets. `renewLogin` lets the adapter have the CLI refresh an expired
-   * sign-in first (slow, so only for explicit requests, never background polls).
+   * sign-in first (slow, so only for explicit requests, and at most every 30 minutes in the background).
    */
   usage(home: string | null, options?: { renewLogin?: boolean }): Promise<UsageRead>;
   /** Spends one banked reset. Only called for an explicit user request or the opt-in auto setting. */

@@ -47,6 +47,14 @@ export function mergeUsage(previous: Usage | undefined, next: Usage): Usage {
   return next;
 }
 
+/**
+ * A window in the reading has already reset, so its numbers are out of date. An idle account's
+ * sign-in can expire while it sits full, and only a renewed sign-in reads it again.
+ */
+export function pastReset(usage: Usage | undefined, now: number): boolean {
+  return Boolean(usage?.windows.some((window) => window.resetsAt && Date.parse(window.resetsAt) <= now));
+}
+
 function usagePath(): string {
   return join(dataDir(), "usage.json");
 }
