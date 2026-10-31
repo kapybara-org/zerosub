@@ -962,3 +962,129 @@ describe("a reading past its reset", () => {
     }
   });
 });
+
+describe("renewing an expired sign-in in the background", () => {
+  const NOW = Date.parse("2026-10-24T12:00:00Z");
+  const MINUTE = 60_000;
+  const minutesIn = () => (Date.now() - NOW) / MINUTE;
+  const fiveHour = (usedPercent: number, resetsAt: number) => ({ id: "five_hour", label: "5-hour", usedPercent, resetsAt: new Date(resetsAt).toISOString() });
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** A service whose one account is the Claude CLI login, read through `usage`. */
+  async function setUpAccount(usage: FamilyAdapter["usage"], patch: Partial<StoredAccount> = {}) {
+    const store = new StateStore(join(root, "state.json"));
+    await store.update((draft) =>
+      Object.assign(draft, { accounts: [{ ...account(MAIN, "main", "main"), ...patch }], defaults: { claude: MAIN, codex: null } }),
+    );
+    const claude = { ...claudeAdapter(() => ({ kind: "window", resetsAt: null, message: "" })), usage };
+    const service = new Service(
+      { claude, codex: { ...claude, family: "codex", portable: false } as FamilyAdapter },
+      store,
+      { resolve: async () => ({ claude: "claude" as const }) } as unknown as FamilyResolver,
+      { locate: async () => "/usr/local/bin/paseo" } as unknown as Reopener,
+    );
+    service.setPreferences(preferences.schema.parse({}));
+    return { service, store };
+  }
+
+  /**
+   * An account read full two hours before NOW, in a 5-hour window that reset an hour before NOW.
+   * Its sign-in has expired since, and renewing it never works (revoked, offline, or `claude`
+   * missing), so the reading stays past its reset. `reads` and `asked` are the minutes after NOW at
+   * which it was read, and at which a read asked to renew it.
+   */
+  async function setUpPastReset(patch: Partial<StoredAccount> = {}) {
+    let expired = false;
+    const reads: number[] = [];
+    const asked: number[] = [];
+    const { service, store } = await setUpAccount(async (_home, options = {}) => {
+      const fetchedAt = new Date().toISOString();
+      if (!expired) return { fetchedAt, windows: [fiveHour(100, NOW - 60 * MINUTE)], error: null, cached: false, resets: null };
+      reads.push(minutesIn());
+      if (options.renewLogin) asked.push(minutesIn());
+      return { fetchedAt, windows: [], error: "Usage shows up after this account is next used.", cached: false, resets: null };
+    }, patch);
+    vi.setSystemTime(NOW - 120 * MINUTE);
+    await service.refreshUsage(MAIN);
+    expired = true;
+    return { service, store, reads, asked };
+  }
+
+  /** A read nobody asked to renew the sign-in for, like the upkeep tick's, `minute` minutes after NOW. */
+  async function readAt(service: Service, minute: number) {
+    vi.setSystemTime(NOW + minute * MINUTE);
+    await service.refreshUsage(MAIN);
+  }
+
+  it("asks to renew at most every 30 minutes when renewing never works", async () => {
+    const { service, reads, asked } = await setUpPastReset();
+    // The default account is read every 5 minutes.
+    const minutes = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60];
+    for (const minute of minutes) await readAt(service, minute);
+    expect(reads).toEqual(minutes);
+    expect(asked).toEqual([0, 30, 60]);
+  });
+
+  it("doesn't renew a disabled account's sign-in", async () => {
+    const { service, store, asked } = await setUpPastReset({ disabled: true });
+    for (const minute of [0, 20, 40, 60]) await readAt(service, minute);
+    expect(asked).toEqual([]);
+    // Enabled again, the next read renews it.
+    await store.update((draft) => {
+      draft.accounts[0]!.disabled = false;
+    });
+    await readAt(service, 65);
+    expect(asked).toEqual([65]);
+  });
+
+  it("renews a window-limited account with no live reading, so a reset used elsewhere lifts the limit", async () => {
+    // The 5-hour window filled 10 minutes before NOW and resets 4 hours after it. The sign-in has
+    // expired since, so reads only get Claude Code's cached copy, older than the last live reading,
+    // until one renews it. By then a reset used on another machine has emptied the window.
+    const resetsAt = NOW + 240 * MINUTE;
+    let fresh = true;
+    let used = 100;
+    const asked: number[] = [];
+    const { service, store } = await setUpAccount(async (_home, options = {}) => {
+      if (options.renewLogin) {
+        asked.push(minutesIn());
+        fresh = true;
+      }
+      if (!fresh) return { fetchedAt: new Date(NOW - 15 * MINUTE).toISOString(), windows: [fiveHour(100, resetsAt)], error: null, cached: true, resets: null };
+      return { fetchedAt: new Date().toISOString(), windows: [fiveHour(used, resetsAt)], error: null, cached: false, resets: null };
+    });
+    const limitedUntil = async () => (await store.read()).accounts[0]!.limitedUntil;
+
+    await readAt(service, -10); // full, so the reading records the window limit
+    expect(await limitedUntil()).not.toBeNull();
+    fresh = false;
+    await readAt(service, 0); // only the cached copy
+    used = 0;
+    await readAt(service, 1); // renews and finds room, but a limit 11 minutes old is still trusted (LIMIT_TRUST_MS)
+    expect(await limitedUntil()).not.toBeNull();
+    await readAt(service, 6); // live without renewing now, and the limit is old enough to lift
+    expect(await limitedUntil()).toBeNull();
+    expect(asked).toEqual([1]);
+  });
+
+  it("still renews on every explicit refresh (↻)", async () => {
+    const { service, asked } = await setUpPastReset();
+    const paseo = fakePaseo().paseo as never;
+    await readAt(service, 0);
+    for (const minute of [1, 2]) {
+      vi.setSystemTime(NOW + minute * MINUTE);
+      await service.view(paseo, true);
+    }
+    // An explicit refresh counts as an attempt too, so the next background renewal waits 30 minutes from it.
+    await readAt(service, 30);
+    await readAt(service, 32);
+    expect(asked).toEqual([0, 1, 2, 32]);
+  });
+});

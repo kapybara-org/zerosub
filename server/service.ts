@@ -65,6 +65,8 @@ const OTHER_FAMILY: Record<Family, Family> = { claude: "codex", codex: "claude" 
 const USAGE_BUSY_MS = 60_000;
 const USAGE_DEFAULT_MS = 5 * 60_000;
 const USAGE_IDLE_MS = 20 * 60_000;
+/** Background reads renew an expired sign-in (slow) at most this often per account. Explicit refreshes (↻) aren't limited. */
+const RENEW_LOGIN_MS = 30 * 60_000;
 /** An account counts as in use for this long after one of its agents starts or ends a turn. */
 const ACTIVE_WINDOW_MS = 15 * 60_000;
 const UPKEEP_MS = 30_000;
@@ -160,6 +162,10 @@ export class Service {
   private readonly activeAt = new Map<string, number>();
   /** The provider asked us not to read this account's usage again before then. */
   private readonly usageRetryAt = new Map<string, number>();
+  /** When a usage read last asked each account's CLI to renew its sign-in. */
+  private readonly renewAttemptAt = new Map<string, number>();
+  /** Accounts whose last usage read was live, rather than an error or the CLI's cached copy. */
+  private readonly usageLive = new Set<string>();
   private usageSave: ReturnType<typeof setTimeout> | null = null;
   private readonly lastRedeemAt = new Map<string, number>();
   private readonly redeemLocks = new Map<string, Mutex>();
@@ -1280,8 +1286,8 @@ export class Service {
   // ------------------------------------------------------------------ usage
 
   /**
-   * `renewLogin` lets the CLI refresh an expired sign-in first (it's slow: explicit refreshes, and
-   * readings past a reset, which would otherwise stay full until the account is next used).
+   * `renewLogin` lets the CLI refresh an expired sign-in first (explicit refreshes: it's slow). Other
+   * reads may renew it too, at most every RENEW_LOGIN_MS (see `renewsInBackground`).
    */
   refreshUsage(accountId: string, force = false, renewLogin = false): Promise<void> {
     const pending = this.usageInFlight.get(accountId);
@@ -1296,8 +1302,10 @@ export class Service {
       const spacing = this.adapters[account.family].usageSpacingMs;
       if (since < (force ? spacing : Math.max(spacing, 60_000))) return;
       this.usageAttemptAt.set(accountId, Date.now());
+      const renew = renewLogin || this.renewsInBackground(account, Date.now());
+      if (renew) this.renewAttemptAt.set(accountId, Date.now());
       const { retryAt, ...usage } = await this.adapters[account.family]
-        .usage(account.home, { renewLogin: renewLogin || pastReset(this.usage.get(accountId), Date.now()) })
+        .usage(account.home, { renewLogin: renew })
         .catch(
           (error: unknown): UsageRead => ({ fetchedAt: new Date().toISOString(), windows: [], error: describe(error), cached: false, resets: null }),
         );
@@ -1305,7 +1313,11 @@ export class Service {
       else this.usageRetryAt.delete(accountId);
       this.setUsage(accountId, mergeUsage(this.usage.get(accountId), usage));
       // Only a live reading may change an account's limit state.
-      if (usage.windows.length === 0 || usage.error || usage.cached) return;
+      if (usage.windows.length === 0 || usage.error || usage.cached) {
+        this.usageLive.delete(accountId);
+        return;
+      }
+      this.usageLive.add(accountId);
       const now = Date.now();
       const full = usage.windows.find((window) => window.usedPercent >= 100 && window.resetsAt);
       if (full && !isLimited(account, now)) {
@@ -1327,6 +1339,18 @@ export class Service {
     })().finally(() => this.usageInFlight.delete(accountId));
     this.usageInFlight.set(accountId, task);
     return task;
+  }
+
+  /**
+   * A read nobody asked to renew the sign-in for still renews it when the reading is past a reset
+   * (its old numbers would stay up until the account is next used), or when a window limit has no
+   * live reading (a reset used on another machine, or an early one, wouldn't lift it). At most
+   * every RENEW_LOGIN_MS, and not for a disabled account.
+   */
+  private renewsInBackground(account: StoredAccount, now: number): boolean {
+    if (account.disabled || now - (this.renewAttemptAt.get(account.id) ?? 0) < RENEW_LOGIN_MS) return false;
+    const windowLimited = account.limitKind === "window" && isLimited(account, now);
+    return pastReset(this.usage.get(account.id), now) || (windowLimited && !this.usageLive.has(account.id));
   }
 
   /** Records a reading and saves the readings shortly after, so a restart shows them straight away. */
