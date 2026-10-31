@@ -20,6 +20,12 @@ describe("preferences", () => {
     expect(preferences.schema.parse({}).moveAgentsOnDefaultChange).toBe(true);
   });
 
+  it("doesn't spend ChatGPT credits for preferences saved before that switch existed", () => {
+    const saved = preferences.schema.parse({ autoSwitch: false, moveAgentsOnDefaultChange: false });
+    expect(saved.useCredits).toBe(false);
+    expect(preferences.schema.parse(shipped.parse({})).useCredits).toBe(false);
+  });
+
   it("can still be read by 1.2.2 after a downgrade", () => {
     const saved = preferences.schema.parse({ autoSwitch: false, moveAgentsOnDefaultChange: false });
     expect(shipped.safeParse(saved)).toMatchObject({ success: true, data: { autoSwitch: false } });

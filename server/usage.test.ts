@@ -13,6 +13,7 @@ const reading = (patch: Partial<Usage> = {}): Usage => ({
   error: null,
   cached: false,
   resets: null,
+  credits: null,
   ...patch,
 });
 

@@ -26,6 +26,11 @@ export const StoredAccountSchema = z.object({
   limitKind: z.enum(["window", "budget"]).nullable().default(null),
   /** When the current limit was recorded. */
   limitedAt: z.string().nullable().default(null),
+  /**
+   * What reported the current limit: a turn's limit notice, or a usage reading. Missing for limits
+   * saved by earlier versions, which count as a turn's.
+   */
+  limitSource: z.enum(["turn", "reading"]).optional(),
   createdAt: z.string(),
 });
 export type StoredAccount = z.infer<typeof StoredAccountSchema>;

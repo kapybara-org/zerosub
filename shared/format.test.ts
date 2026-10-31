@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { accountSubtitle, formatAge, formatPlan, formatResetIn, peakUsage, shortLabel, usageSummary } from "./format";
+import { accountSubtitle, formatAge, formatCredits, formatPlan, formatResetIn, peakUsage, shortLabel, usageSummary } from "./format";
 import type { AccountView } from "./model";
 
 const NOW = Date.parse("2026-09-23T12:00:00Z");
@@ -62,6 +62,7 @@ describe("account presentation", () => {
       error: null,
       cached: false,
       resets: null,
+      credits: null,
     },
     agentCount: 2,
     home: "/homes/claude-a",
@@ -76,6 +77,14 @@ describe("account presentation", () => {
     expect(usageSummary({ ...account, status: "limited", limitedUntil: "2026-09-23T13:30:00Z" }, NOW)).toBe(
       "Limit reached · resets in 1h 30m",
     );
+  });
+
+  it("names the credits a full window falls back on", () => {
+    expect(formatCredits({ balance: 57714.93, unlimited: false })).toBe("57,714 ChatGPT credits left");
+    expect(formatCredits({ balance: 1, unlimited: false })).toBe("1 ChatGPT credit left");
+    expect(formatCredits({ balance: 0.4, unlimited: false })).toBe("Less than 1 ChatGPT credit left");
+    expect(formatCredits({ balance: null, unlimited: false })).toBe("ChatGPT credits available");
+    expect(formatCredits({ balance: null, unlimited: true })).toBe("Unlimited ChatGPT credits");
   });
 
   it("names plans and trims long labels", () => {

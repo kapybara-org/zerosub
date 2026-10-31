@@ -97,6 +97,8 @@ interface SetUpOptions {
   detectLimit?: FamilyAdapter["detectLimit"];
   /** The tail of the agent's timeline as Paseo returns it when asked. */
   recent?: Parameters<typeof fakePaseo>[0];
+  /** What every usage reading returns. */
+  usage?: () => UsageRead;
 }
 
 async function setUp(state: Partial<StoredState>, hit: () => LimitHit, options: SetUpOptions = {}) {
@@ -122,7 +124,11 @@ async function setUp(state: Partial<StoredState>, hit: () => LimitHit, options: 
     },
   };
   const families = { resolve: async () => ({ claude: "claude" as const }) };
-  const claude = { ...claudeAdapter(hit), ...(options.detectLimit ? { detectLimit: options.detectLimit } : {}) };
+  const claude = {
+    ...claudeAdapter(hit),
+    ...(options.detectLimit ? { detectLimit: options.detectLimit } : {}),
+    ...(options.usage ? { usage: async () => options.usage!() } : {}),
+  };
   const service = new Service(
     { claude, codex: claudeAdapter(hit) },
     store,
@@ -560,6 +566,105 @@ describe("disabling an account", () => {
     state = await store.read();
     expect(state.sessions[AGENT]?.accountId).toBe(HELLO);
     expect(reopened).toHaveLength(2);
+  });
+});
+
+describe("usage readings", () => {
+  const CREDITS = { balance: 57714.93, unlimited: false };
+  const USE_CREDITS = preferences.schema.parse({ useCredits: true });
+  const NEW_AGENT = "agent-new";
+  const full = (credits: UsageRead["credits"]) => (): UsageRead => ({
+    fetchedAt: new Date().toISOString(),
+    windows: [{ id: "primary", label: "Weekly", usedPercent: 100, resetsAt: inFuture() }],
+    error: null,
+    cached: false,
+    resets: null,
+    credits,
+  });
+  const state = (limit: Partial<StoredAccount> = {}) => ({
+    accounts: [{ ...account(MAIN, "marketing", "main"), ...limit }, account(HELLO, "hello", "managed")] as never,
+    defaults: { claude: MAIN, codex: null },
+  });
+  const limitedUntil = async (store: StateStore) => (await store.read()).accounts.find((a) => a.id === MAIN)?.limitedUntil ?? null;
+  const unused = () => ({ kind: "window" as const, resetsAt: inFuture(), message: "" });
+  /** Dates the account's limit an hour back, so usage readings may second-guess it. */
+  const settle = (store: StateStore) =>
+    store.update((draft) => {
+      const main = draft.accounts.find((a) => a.id === MAIN);
+      if (main) main.limitedAt = new Date(Date.now() - 60 * 60_000).toISOString();
+    });
+  /** The account a brand-new agent's session opens on. */
+  const newAgentOpensOn = async (service: Service, store: StateStore, paseo: unknown) => {
+    await service.onSessionOpen(
+      { agentId: NEW_AGENT, provider: "claude", reason: "create", purpose: "interactive", env: {} } as never,
+      { paseo } as never,
+    );
+    return (await store.read()).sessions[NEW_AGENT]?.accountId;
+  };
+
+  it("takes a full window without credits for a limit, whatever the setting", async () => {
+    for (const prefs of [preferences.schema.parse({}), USE_CREDITS]) {
+      const { service, store } = await setUp(state(), unused, { usage: full(null) });
+      service.setPreferences(prefs);
+      await service.refreshUsage(MAIN, true);
+      expect(await limitedUntil(store)).not.toBeNull();
+    }
+  });
+
+  it("still takes a full window for a limit while credits are left, so new agents start elsewhere", async () => {
+    const { service, store, paseo } = await setUp(state(), unused, { usage: full(CREDITS) });
+    await service.refreshUsage(MAIN, true);
+    expect(await limitedUntil(store)).not.toBeNull();
+    expect(await newAgentOpensOn(service, store, paseo)).toBe(HELLO);
+  });
+
+  it("keeps an account going on its credits when told to use them", async () => {
+    const { service, store, paseo } = await setUp(state(), unused, { usage: full(CREDITS) });
+    service.setPreferences(USE_CREDITS);
+    await service.refreshUsage(MAIN, true);
+    expect(await limitedUntil(store)).toBeNull();
+    expect(await newAgentOpensOn(service, store, paseo)).toBe(MAIN);
+  });
+
+  it("clears a limit a reading found once told to use the credits", async () => {
+    const { service, store } = await setUp(state(), unused, { usage: full({ balance: null, unlimited: true }) });
+    await service.refreshUsage(MAIN, true);
+    await settle(store);
+    await service.refreshUsage(MAIN, true);
+    expect(await limitedUntil(store)).not.toBeNull(); // not while the setting is off
+
+    service.setPreferences(USE_CREDITS);
+    await service.refreshUsage(MAIN, true);
+    expect(await limitedUntil(store)).toBeNull();
+  });
+
+  it("leaves a limit a turn ran into until it resets, credits or not", async () => {
+    // The provider stopped the turn, so the credits didn't cover it: clearing the limit would only send new agents back.
+    const { service, store, limitTurn } = await setUp(
+      state(),
+      () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your usage limit" }),
+      { usage: full(CREDITS) },
+    );
+    service.setPreferences(USE_CREDITS);
+    await limitTurn();
+    await settle(store);
+    await service.refreshUsage(MAIN, true);
+    expect(await limitedUntil(store)).not.toBeNull();
+  });
+
+  it("takes a limit saved without its source for a turn's", async () => {
+    const { service, store } = await setUp(state({ limitedUntil: inFuture(), limitKind: "window" }), unused, { usage: full(CREDITS) });
+    service.setPreferences(USE_CREDITS);
+    await settle(store);
+    await service.refreshUsage(MAIN, true);
+    expect(await limitedUntil(store)).not.toBeNull();
+  });
+
+  it("stores a reading that leaves credits out as having none", async () => {
+    const { service, paseo } = await setUp(state(), unused);
+    await service.refreshUsage(MAIN, true);
+    const shown = (await service.view(paseo as never)).accounts.find((a) => a.id === MAIN);
+    expect(shown?.usage?.credits).toBeNull();
   });
 });
 

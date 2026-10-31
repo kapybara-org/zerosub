@@ -98,6 +98,7 @@ const DEFAULT_PREFERENCES: Preferences = {
   balanceNewAgents: false,
   showComposerPill: true,
   autoRedeem: false,
+  useCredits: false,
   forkOtherProvider: false,
 };
 
@@ -544,7 +545,7 @@ export class Service {
         const accountId = this.runningOn(await this.store.read(), agentId, family);
         if (accountId && !this.recentlyRedeemed(accountId)) {
           const hit = problem.hit;
-          await this.markLimited(accountId, hit.resetsAt ?? new Date(Date.now() + (hit.kind === "budget" ? BUDGET_LIMIT_MS : WINDOW_LIMIT_MS)).toISOString(), hit.kind);
+          await this.markLimited(accountId, hit.resetsAt ?? new Date(Date.now() + (hit.kind === "budget" ? BUDGET_LIMIT_MS : WINDOW_LIMIT_MS)).toISOString(), hit.kind, "turn");
         }
       }
       return;
@@ -606,7 +607,7 @@ export class Service {
     if (problem.kind === "limit") {
       const { hit } = problem;
       resetsAt = hit.resetsAt ?? new Date(now + (hit.kind === "budget" ? BUDGET_LIMIT_MS : WINDOW_LIMIT_MS)).toISOString();
-      await this.markLimited(account.id, resetsAt, hit.kind);
+      await this.markLimited(account.id, resetsAt, hit.kind, "turn");
       if (hit.kind === "window") {
         // The notice is the freshest word on usage: show that window full until a new reading lands.
         const shown = this.usage.get(account.id);
@@ -616,7 +617,7 @@ export class Service {
         const exact = this.resetFromUsage(account.id);
         if (exact && Date.parse(exact) > now) {
           resetsAt = exact;
-          await this.markLimited(account.id, exact, "window");
+          await this.markLimited(account.id, exact, "window", "turn");
         }
       }
       console.log(`[ZeroSub] ${account.label} hit a ${hit.kind} limit (agent ${agentId}): ${hit.message}`);
@@ -819,13 +820,14 @@ export class Service {
     });
   }
 
-  private async markLimited(accountId: string, until: string, kind: LimitKind): Promise<void> {
+  private async markLimited(accountId: string, until: string, kind: LimitKind, source: "turn" | "reading"): Promise<void> {
     await this.store.update((draft) => {
       const account = findAccount(draft, accountId);
       if (!account) return;
       account.limitedUntil = until;
       account.limitKind = kind;
       account.limitedAt = new Date().toISOString();
+      account.limitSource = source;
     });
   }
 
@@ -1305,13 +1307,14 @@ export class Service {
       this.usageAttemptAt.set(accountId, Date.now());
       const renew = renewLogin || this.renewsInBackground(account, Date.now());
       if (renew) this.renewAttemptAt.set(accountId, Date.now());
-      const { retryAt, ...usage } = await this.adapters[account.family]
+      const { retryAt, ...read } = await this.adapters[account.family]
         .usage(account.home, { renewLogin: renew })
         .catch(
           (error: unknown): UsageRead => ({ fetchedAt: new Date().toISOString(), windows: [], error: describe(error), cached: false, resets: null }),
         );
       if (retryAt) this.usageRetryAt.set(accountId, retryAt);
       else this.usageRetryAt.delete(accountId);
+      const usage: Usage = { ...read, credits: read.credits ?? null };
       this.setUsage(accountId, mergeUsage(this.usage.get(accountId), usage));
       // Only a live reading may change an account's limit state.
       if (usage.windows.length === 0 || usage.error || usage.cached) {
@@ -1320,15 +1323,19 @@ export class Service {
       }
       this.usageLive.add(accountId);
       const now = Date.now();
-      const full = usage.windows.find((window) => window.usedPercent >= 100 && window.resetsAt);
+      // With "Use ChatGPT credits when a limit is reached" on, credits keep an account going past a
+      // full window, so a full window alone isn't a limit then.
+      const creditsCover = this.prefs.useCredits && usage.credits != null;
+      const full = creditsCover ? undefined : usage.windows.find((window) => window.usedPercent >= 100 && window.resetsAt);
       if (full && !isLimited(account, now)) {
-        await this.markLimited(accountId, full.resetsAt ?? new Date(now + WINDOW_LIMIT_MS).toISOString(), "window");
+        await this.markLimited(accountId, full.resetsAt ?? new Date(now + WINDOW_LIMIT_MS).toISOString(), "window", "reading");
         return;
       }
-      // A window limit clears once usage shows room again. Budget limits never appear in usage
+      // A window limit clears once usage shows room again, or once credits cover it if a reading set
+      // it: a limit a turn ran into stands, credits or not. Budget limits never appear in usage
       // windows, and a fresh limit is trusted for a while (it may be on a window we can't see).
       const settled = account.limitedAt ? now - Date.parse(account.limitedAt) > LIMIT_TRUST_MS : true;
-      const roomy = Math.max(...usage.windows.map((window) => window.usedPercent)) < 90;
+      const roomy = (creditsCover && account.limitSource === "reading") || Math.max(...usage.windows.map((window) => window.usedPercent)) < 90;
       if (!full && account.limitedUntil && account.limitKind === "window" && settled && roomy) {
         await this.store.update((draft) => {
           const target = findAccount(draft, accountId);

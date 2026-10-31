@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { AgentTimelineItem } from "./adapter";
 import { parseUsage } from "./claude";
-import { parseRateLimits } from "./codex";
+import { parseCredits, parseRateLimits } from "./codex";
 import { buildTranscript, continuationPrompt } from "./handoff";
 
 describe("Claude usage", () => {
@@ -39,6 +39,26 @@ describe("Codex rate limits", () => {
     expect(parseRateLimits({ primary: null, secondary: { usedPercent: 5, windowDurationMins: null, resetsAt: null } })).toEqual([
       { id: "secondary", label: "Usage", usedPercent: 5, resetsAt: null, minutes: null },
     ]);
+  });
+});
+
+describe("Codex credits", () => {
+  it("reads the balance the plan falls back on", () => {
+    expect(parseCredits({ credits: { hasCredits: true, unlimited: false, balance: "57714.9310050000" } })).toEqual({
+      balance: 57714.931005,
+      unlimited: false,
+    });
+    expect(parseCredits({ credits: { hasCredits: true, unlimited: true, balance: null } })).toEqual({ balance: null, unlimited: true });
+    expect(parseCredits({ credits: { hasCredits: true, unlimited: false, balance: "0.25" } })).toEqual({ balance: 0.25, unlimited: false });
+  });
+
+  it("has none to offer when there are none, they're used up, or the spend cap is reached", () => {
+    expect(parseCredits({ credits: { hasCredits: false, unlimited: false, balance: "0" } })).toBeNull();
+    expect(parseCredits({ credits: { hasCredits: true, unlimited: false, balance: "0.0000000000" } })).toBeNull();
+    expect(parseCredits({ credits: { hasCredits: true, unlimited: false, balance: "-12.5" } })).toBeNull();
+    expect(parseCredits({ credits: null })).toBeNull();
+    expect(parseCredits({ spendControlReached: true, credits: { hasCredits: true, unlimited: false, balance: "10" } })).toBeNull();
+    expect(parseCredits(null)).toBeNull();
   });
 });
 

@@ -39,6 +39,7 @@ function usage(percent: number): Usage {
     error: null,
     cached: false,
     resets: null,
+    credits: null,
   };
 }
 

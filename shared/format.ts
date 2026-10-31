@@ -1,4 +1,4 @@
-import type { AccountView, UsageWindow } from "./model";
+import type { AccountView, Credits, UsageWindow } from "./model";
 
 /** "in 2h 14m", "in 3d 4h", "now". */
 export function formatResetIn(resetsAt: string | null, now: number = Date.now()): string | null {
@@ -20,6 +20,16 @@ export function formatResetIn(resetsAt: string | null, now: number = Date.now())
 
 export function formatPercent(value: number): string {
   return `${Math.round(Math.min(100, Math.max(0, value)))}%`;
+}
+
+/** "57,714 ChatGPT credits left", "Unlimited ChatGPT credits", or "ChatGPT credits available" when the balance isn't given. */
+export function formatCredits(credits: Credits): string {
+  if (credits.unlimited) return "Unlimited ChatGPT credits";
+  if (credits.balance === null) return "ChatGPT credits available";
+  // Rounding a last fraction of a credit down would read as none left.
+  if (credits.balance < 1) return "Less than 1 ChatGPT credit left";
+  const whole = String(Math.floor(credits.balance)).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return `${whole} ChatGPT credit${whole === "1" ? "" : "s"} left`;
 }
 
 /** The busiest window decides how close an account is to being cut off. */
