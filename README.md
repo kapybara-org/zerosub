@@ -43,7 +43,7 @@ Then open **Accounts (ZeroSub)** in the sidebar.
    - **The account button in an agent's message box**: moves that one agent.
    - **`/account work`** in the message box, or `/account default` to follow the default again.
    - **⌘K → "Make … the default"**.
-   - **Disable for now** (in a card's ⋯ menu): the account stays signed in but ZeroSub stops using it. Its agents move to your other accounts right away (busy ones after their turn) and come back when you choose **Enable account**. ChatGPT conversations already on it stay, since they can't change accounts. You can't disable the last usable account of a provider.
+   - **Disable for now** (in a card's ⋯ menu): the account stays signed in but ZeroSub stops using it. Its agents move to your other accounts right away (busy ones after their turn) and come back when you press **Enable** on its card. ChatGPT conversations already on it stay, since they can't change accounts. You can't disable the last usable account of a provider.
 4. Leave **Automatic switching** on (in Accounts, or **Settings → Plugins → zerosub → ZeroSub preferences**) and limits take care of themselves:
    - Only the CLIs' own limit notices trigger a switch. That covers Claude Code's "You've hit your session limit · resets 3pm" and Codex's "You’ve hit your usage limit…".
    - Paseo 0.13 and later no longer send the finished turn to plugins, so ZeroSub reads that turn from the agent's timeline instead.

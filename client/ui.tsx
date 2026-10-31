@@ -283,9 +283,11 @@ export function ActionsMenu({
   return (
     <View ref={button} collapsable={false}>
       <IconButton theme={theme} icon="Ellipsis" label={label} busy={busy} onPress={anchor ? close : openMenu} />
+      {/* An iPhone shows a modal in portrait only unless it allows landscape too, turning the app round to do it. */}
       <Modal
         transparent
         animationType="none"
+        supportedOrientations={["portrait", "landscape"]}
         visible={anchor !== null}
         onRequestClose={close}
         onDismiss={runPicked}
