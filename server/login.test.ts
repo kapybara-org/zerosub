@@ -87,6 +87,7 @@ describe("Codex login with legacy account identities", () => {
   it("does not replace a known member when sign-in cannot identify the member", async () => {
     const { view, state } = await login(null, "codex-existing");
     expect(view.step).toBe("failed");
+    expect(view.message).toContain("Couldn't tell which workspace member signed in");
     expect(state.accounts.find((a) => a.id === "codex-existing")?.email).toBe("first@example.com");
   });
 });

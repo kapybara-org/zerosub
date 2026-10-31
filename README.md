@@ -30,18 +30,13 @@ paseo plugin install github:kapybara-org/zerosub
 
 Then open **Accounts (ZeroSub)** in the sidebar.
 
-ChatGPT accounts are distinguished by workspace and member email. Different members of the same
-Team or Business workspace can be added separately; signing in as the same member in the same
-workspace twice is still rejected. Existing workspace-only account records remain compatible and
-are updated when their identity is refreshed or they sign back in. If Codex does not return a member
-email, duplicate detection conservatively treats the workspace as one account.
-
 ## Use it
 
 1. Open **Accounts (ZeroSub)** in the sidebar. Your current Claude Code and Codex logins are already listed.
 2. Click **Add account** under Claude or ChatGPT (Codex), then **Open sign-in page**, and sign in with the other account.
    - In a browser on the host's own computer, the page finishes by itself.
    - Anywhere else, choose **Use a code instead**. For Claude, paste the code shown after sign-in. For ChatGPT, type the code shown in Paseo on the page. Phones, and hosts without a desktop (servers, containers, daemons started over SSH), start with the code.
+   - Members of the same ChatGPT Team or Business workspace can each be added; ZeroSub tells them apart by email. If Codex doesn't return one, ZeroSub won't add a second account from that workspace or sign one of its members back in.
 3. Choose which account agents use:
    - **Make default**: new agents, and agents that follow the default, use it. Open Claude agents switch right away, busy ones after their turn.
      - To leave open agents where they are, turn off **Move open agents when the default changes** (in Accounts, or **Settings → Plugins → zerosub → ZeroSub preferences**). Each open agent that follows the default then stays pinned to the account it's using, even after it reopens, unless that account is signed out, disabled or at its limit. New agents, and agents that aren't open at the time, use the new default.

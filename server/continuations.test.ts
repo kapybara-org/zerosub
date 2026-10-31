@@ -200,7 +200,7 @@ describe("Codex account continuations", () => {
     expect(t.created).toHaveLength(1);
   });
 
-  it.each(["archived", "deleted", "workspace", "provider", "identity", "binding"])("creates a replacement for a %s target without moving its old thread", async (reason) => {
+  it.each(["archived", "deleted", "workspace", "provider", "identity", "member", "binding"])("creates a replacement for a %s target without moving its old thread", async (reason) => {
     const t = await setup();
     const b = await t.switchTo("root", "b");
     const original = t.agents.get("root")!;
@@ -209,6 +209,8 @@ describe("Codex account continuations", () => {
     if (reason === "workspace") original.workspaceId = "another-workspace";
     if (reason === "provider") original.provider = "another-codex-provider";
     if (reason === "identity") await t.store.update((draft) => { draft.accounts[0]!.identity = "chatgpt|replacement"; });
+    // Another member of the same ChatGPT workspace.
+    if (reason === "member") await t.store.update((draft) => { draft.accounts[0]!.identity = "chatgpt|a|someone-else@example.invalid"; });
     if (reason === "binding") await t.store.update((draft) => { draft.bindings.root!.accountId = "c"; });
     if (reason === "deleted") {
       // History can still be read from the persisted timeline after the tab disappears.
@@ -218,6 +220,20 @@ describe("Codex account continuations", () => {
     expect(result.agentId).not.toBe("root");
     expect(t.created).toHaveLength(2);
     expect(t.agents.get("root")?.archivedAt).toBe(reason === "deleted" ? undefined : original.archivedAt);
+  });
+
+  it.each(["before", "during"])("reuses a tab recorded under the workspace-only key when the account's key gains its email %s the switch", async (when) => {
+    const t = await setup();
+    // As on 1.4.0, the task's record keeps the workspace-only key chatgpt|a.
+    const b = await t.switchTo("root", "b");
+    const upgrade = () => t.store.update((draft) => { draft.accounts[0]!.identity = "chatgpt|a|a@example.invalid"; });
+    if (when === "before") await upgrade();
+    else {
+      const read = t.refetch.getMockImplementation()!;
+      t.refetch.mockImplementationOnce(async (...args) => { await upgrade(); return read(...args); });
+    }
+    expect((await t.switchTo(b.agentId, "a")).agentId).toBe("root");
+    expect(t.created).toHaveLength(1);
   });
 
   it.each(["running", "initializing", "permission"])("does not start another copy while the destination is %s", async (status) => {
