@@ -6,7 +6,9 @@ import type { AgentTimelineItem, LimitHit, LimitKind, TurnEvent } from "./adapte
  * separator (" · …", ".") or end the line, so prose like "You've hit your GitHub API rate limit"
  * never matches. Warnings ("You've used 80%…") and capacity 429s ("…not your usage limit") are
  * deliberately absent: switching accounts doesn't help with those. Claude Code 2.1.312 renamed the
- * session limit the "5-hour limit"; older builds still print "session limit".
+ * session limit the "5-hour limit"; older builds still print "session limit". A plain "usage limit"
+ * is a budget: Claude Code prints it for an org on usage-based billing, and as its fallback when the
+ * API names no window it knows. Usage readings show neither.
  */
 const END = String.raw`(?=\s*(?:·|\.|$))`;
 const APOSTROPHE = "['’]";
@@ -16,7 +18,7 @@ const CLAUDE_LIMITS: ReadonlyArray<{ pattern: RegExp; kind: LimitKind }> = [
   { pattern: /Claude AI usage limit reached\|\d{9,}/, kind: "window" },
   {
     pattern: new RegExp(
-      `^You${APOSTROPHE}ve hit your (?:usage credit limit|team${APOSTROPHE}s shared budget|(?:monthly|individual) spend limit|(?:org|channel)${APOSTROPHE}s monthly (?:usage|spend) limit)${END}`,
+      `^You${APOSTROPHE}ve hit your (?:usage limit|usage credit limit|team${APOSTROPHE}s shared budget|(?:monthly|individual) spend limit|individual usage limit|(?:org|channel)${APOSTROPHE}s monthly (?:usage|spend) limit)${END}`,
       "i",
     ),
     kind: "budget",
