@@ -32,6 +32,20 @@ describe("detectClaudeLimit", () => {
     expect(hit?.resetsAt).toBe("2026-09-23T09:30:00.000Z");
   });
 
+  it("recognises the 5-hour limit, as Claude Code 2.1.312 and later call the session limit", () => {
+    for (const apostrophe of ["'", "’"]) {
+      const notice = `You${apostrophe}ve hit your 5-hour limit · resets 7pm (America/Sao_Paulo)`;
+      const hit = detectClaudeLimit({ outcome: completed, timeline: turn("Working on it.", notice) }, NOW);
+      // 7pm in São Paulo (UTC-3), whatever the daemon's own zone.
+      expect(hit).toEqual({ message: notice, kind: "window", resetsAt: "2026-09-23T22:00:00.000Z" });
+    }
+    const saved = detectClaudeLimit(
+      { outcome: completed, timeline: turn("You've hit your 5-hour limit · resets 3pm (Asia/Kolkata) · progress saved") },
+      NOW,
+    );
+    expect(saved).toMatchObject({ kind: "window", resetsAt: "2026-09-23T09:30:00.000Z" });
+  });
+
   it("recognises weekly and model limits with a date", () => {
     const hit = detectClaudeLimit(
       { outcome: completed, timeline: turn("You've hit your weekly limit · resets Sep 25, 3pm (America/New_York)") },
@@ -57,8 +71,11 @@ describe("detectClaudeLimit", () => {
   it("ignores warnings, capacity errors and prose about limits", () => {
     const cases = [
       "You've used 85% of your session limit · resets 3pm (Asia/Kolkata)",
+      "You've used 92% of your 5-hour limit · resets 7pm (America/Sao_Paulo)",
       "You're close to your usage credit limit",
       "API Error: Server is temporarily limiting requests (not your usage limit) · Retrying",
+      // Fast mode's cooldown: Claude Code carries on at standard speed.
+      "You've hit your fast limit · resets in 12m",
       `I added a rate limiter. ${"x".repeat(700)}\nYou've hit your session limit is what users will see.`,
     ];
     for (const text of cases) {
@@ -98,11 +115,43 @@ describe("detectClaudeLimit", () => {
     }
   });
 
+  it("recognises every limit Claude Code 2.1.316 names", () => {
+    const windows = [
+      "You've hit your 5-hour limit · resets 7pm (America/Sao_Paulo) · progress saved",
+      "You've hit your weekly limit · resets Sep 25 at 3pm (UTC)",
+      "You've hit your Opus limit · resets Sep 25 at 3pm (UTC)",
+      "You've hit your Sonnet limit · resets Sep 25 at 3pm (UTC)",
+      "You've hit your Fable limit · resets Sep 25 at 3pm (UTC)",
+      "You've hit your limit · resets 7pm (America/Sao_Paulo)",
+    ];
+    for (const text of windows) {
+      expect(detectClaudeLimit({ outcome: completed, timeline: turn(text) }, NOW)?.kind).toBe("window");
+    }
+    const budgets = [
+      // An org on usage-based billing, and the fallback when the API names no window Claude Code knows.
+      "You've hit your usage limit · contact your admin to increase it",
+      "You've hit your usage limit · resets 7pm (America/Sao_Paulo)",
+      "You've hit your individual usage limit · resets Oct 1, 12am (UTC)",
+      "You've hit your individual spend limit · ask your admin for a higher limit",
+      "You've hit your monthly spend limit · raise it at https://claude.ai/settings/usage?from=cc_cli_limit_message",
+      "You've hit your org's monthly usage limit · resets Oct 1, 12am (UTC)",
+      "You've hit your org's monthly spend limit · ask your admin to raise it at https://claude.ai/admin-settings/usage",
+      "You've hit your channel's monthly usage limit",
+      "You've hit your channel's monthly spend limit",
+      "You've hit your team's shared budget · ask your admin to raise it at https://claude.ai/admin-settings/usage",
+    ];
+    for (const text of budgets) {
+      expect(detectClaudeLimit({ outcome: completed, timeline: turn(text) }, NOW)?.kind).toBe("budget");
+    }
+  });
+
   it("does not mistake ordinary replies for limits", () => {
     const replies = [
       "You've hit your GitHub API rate limit. Wait an hour and try again.",
       "You've reached your free tier limit on Vercel. Upgrade to deploy more.",
       "You've hit your session limit is what users will see after this change.",
+      "You've hit your 5-hour limit is what users will see after this change.",
+      "You've hit your usage limit on the OpenAI API, so the integration tests were skipped.",
     ];
     for (const text of replies) {
       expect(detectClaudeLimit({ outcome: completed, timeline: turn(text) }, NOW)).toBeNull();
