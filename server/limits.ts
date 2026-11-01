@@ -5,12 +5,13 @@ import type { AgentTimelineItem, LimitHit, LimitKind, TurnEvent } from "./adapte
  * plus the legacy `Claude AI usage limit reached|<epoch>`. Each must be followed by the CLI's own
  * separator (" · …", ".") or end the line, so prose like "You've hit your GitHub API rate limit"
  * never matches. Warnings ("You've used 80%…") and capacity 429s ("…not your usage limit") are
- * deliberately absent: switching accounts doesn't help with those.
+ * deliberately absent: switching accounts doesn't help with those. Claude Code 2.1.312 renamed the
+ * session limit the "5-hour limit"; older builds still print "session limit".
  */
 const END = String.raw`(?=\s*(?:·|\.|$))`;
 const APOSTROPHE = "['’]";
 const CLAUDE_LIMITS: ReadonlyArray<{ pattern: RegExp; kind: LimitKind }> = [
-  { pattern: new RegExp(`^You${APOSTROPHE}ve hit your (?:session |weekly |Opus |Sonnet |Fable )?limit${END}`, "i"), kind: "window" },
+  { pattern: new RegExp(`^You${APOSTROPHE}ve hit your (?:5-hour |session |weekly |Opus |Sonnet |Fable )?limit${END}`, "i"), kind: "window" },
   { pattern: new RegExp(`^You${APOSTROPHE}ve reached your (?:Fable|Opus|Sonnet|Haiku)(?: [\\w.]{1,10})? limit${END}`), kind: "window" },
   { pattern: /Claude AI usage limit reached\|\d{9,}/, kind: "window" },
   {

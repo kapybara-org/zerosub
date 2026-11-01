@@ -240,6 +240,47 @@ describe("failover", () => {
     expect(notes).toHaveLength(1);
   });
 
+  it("switches and continues on Claude Code's 5-hour limit notice", async () => {
+    // Claude Code 2.1.312 calls the session limit the "5-hour limit" (#28). Paseo 0.12 sends the turn
+    // with the hook; 0.13 and later send none, so it's read from the agent's timeline.
+    const saoPaulo = new Intl.DateTimeFormat("en-GB", { timeZone: "America/Sao_Paulo", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+    for (const apostrophe of ["'", "’"]) {
+      for (const hookSendsTurn of [true, false]) {
+        const turn: AgentTimelineItem[] = [
+          { type: "user_message", text: "fix the bug" },
+          { type: "assistant_message", text: `You${apostrophe}ve hit your 5-hour limit · resets 7pm (America/Sao_Paulo)` },
+        ];
+        const { service, store, reopened, sent, notes, paseo } = await setUp(
+          {
+            accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+            defaults: { claude: MAIN, codex: null },
+            bindings: {},
+            sessions: {},
+          },
+          () => {
+            throw new Error("unused: the real detector reads the turns");
+          },
+          { detectLimit: detectClaudeLimit, recent: inTurn("t1", ...turn) },
+        );
+        const before = Date.now();
+        const event = { agent: { id: AGENT, provider: "claude" }, turnId: "t1", outcome: { kind: "completed" }, timeline: hookSendsTurn ? turn : [] };
+        await service.onTurnEnded(event as never, { paseo } as never);
+        const state = await store.read();
+        expect(state.sessions[AGENT]?.accountId).toBe(HELLO);
+        expect(reopened).toEqual([AGENT]);
+        expect(notes.at(-1)).toMatchObject({ from: "marketing", to: "hello", outcome: "switched", continued: true });
+        expect(sent).toEqual([preferences.schema.parse({}).continuePrompt]);
+        // marketing is out until the next 7pm in São Paulo, whatever the daemon's own zone.
+        const marketing = state.accounts.find((a) => a.id === MAIN);
+        expect(marketing?.limitKind).toBe("window");
+        const until = Date.parse(marketing?.limitedUntil ?? "");
+        expect(saoPaulo.format(until)).toBe("19:00");
+        expect(until).toBeGreaterThan(before);
+        expect(until).toBeLessThanOrEqual(Date.now() + 24 * 3_600_000);
+      }
+    }
+  });
+
   // Paseo 0.13 (getpaseo/paseo#7477) stopped copying the conversation into turn-ended hooks: `timeline`
   // is always `[]`. Claude reports its limits as an ordinary reply, so the plugin has to page the
   // tail of the timeline itself or it never sees them again.
