@@ -845,6 +845,88 @@ describe("Codex account continuations", () => {
   });
 });
 
+describe("Codex continuations of a sub-agent", () => {
+  const PARENT = "paseo.parent-agent-id";
+  const FROM = "zerosub.continued-from";
+
+  /** Makes root a sub-agent of a lead agent with a task and a ChatGPT tab of its own. */
+  async function withLead(t: Awaited<ReturnType<typeof setup>>) {
+    t.agents.get("root")!.labels = { [PARENT]: "lead" };
+    t.addAgent("lead", { title: "Lead the release" });
+    t.add("lead", { type: "user_message", text: "Split the release work between sub-agents." });
+    await t.store.update((draft) => {
+      draft.bindings.lead = { accountId: "a", source: "thread", at: "now" };
+      draft.sessions.lead = { accountId: "a", family: "codex", openedAt: "now" };
+    });
+  }
+
+  it("creates its new tab under the same parent, and keeps the two tasks apart", async () => {
+    const t = await setup();
+    await withLead(t);
+    const b = await t.switchTo("root", "b");
+    expect(t.created[0]!.labels).toEqual({ [FROM]: "root", [PARENT]: "lead" });
+    // The lead has no parent, so its own continuation gets none.
+    const lead = await t.switchTo("lead", "c");
+    expect(t.created[1]!.labels).toEqual({ [FROM]: "lead" });
+    expect((await t.switchTo(b.agentId, "a")).agentId).toBe("root");
+    expect(t.created).toHaveLength(2);
+    const { continuations } = await t.store.read();
+    expect(Object.keys(continuations.root!.members).sort()).toEqual(["root", b.agentId].sort());
+    expect(Object.keys(continuations.lead!.members).sort()).toEqual(["lead", lead.agentId].sort());
+  });
+
+  it.each(["archived", "deleted"])("creates it without a parent when the parent is %s", async (reason) => {
+    const t = await setup();
+    await withLead(t);
+    if (reason === "archived") t.agents.get("lead")!.archivedAt = "2026-10-02T00:00:00Z";
+    else t.agents.delete("lead");
+    await t.switchTo("root", "b");
+    expect(t.created[0]!.labels).toEqual({ [FROM]: "root" });
+  });
+
+  it("goes ahead without a parent when the parent can't be looked up", async () => {
+    const t = await setup();
+    await withLead(t);
+    const ref = t.paseo.agents.ref;
+    t.paseo.agents.ref = ((id: string) => id === "lead" ? { ...ref(id), refresh: async () => { throw new Error("daemon unreachable"); } } : ref(id)) as typeof ref;
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const b = await t.switchTo("root", "b");
+      expect(t.created[0]!.labels).toEqual({ [FROM]: "root" });
+      expect(t.sent.at(-1)!.id).toBe(b.agentId);
+      expect(error.mock.calls.some(([line]) => String(line).includes("couldn't look up the parent of root"))).toBe(true);
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it("keeps the parent a failed creation reserved when it retries, so Paseo sees the same request", async () => {
+    const t = await setup();
+    await withLead(t);
+    // As in Paseo, a creation is recorded under its key before it runs, and a retry must repeat it exactly.
+    const create = t.create.getMockImplementation()!;
+    const recorded = new Map<string, string>();
+    let failNext = true;
+    t.create.mockImplementation(async (request) => {
+      const fingerprint = JSON.stringify(request);
+      if (recorded.has(request.idempotencyKey!) && recorded.get(request.idempotencyKey!) !== fingerprint) throw new Error("agent_request_key_conflict");
+      recorded.set(request.idempotencyKey!, fingerprint);
+      if (failNext && request.labels?.[FROM] === "root") {
+        failNext = false;
+        throw new Error("creation failed");
+      }
+      await create(request);
+    });
+    await expect(t.switchTo("root", "b")).rejects.toThrow(/creation failed/);
+    expect((await t.store.read()).continuations.root!.pending).toMatchObject({ stage: "creating", parent: "lead" });
+    // Meanwhile the lead is archived. A new creation wouldn't use it, but this one already has.
+    t.agents.get("lead")!.archivedAt = "2026-10-02T00:00:00Z";
+    const b = await t.switchTo("root", "b");
+    expect(t.created.find((request) => request.agentId === b.agentId)!.labels).toEqual({ [FROM]: "root", [PARENT]: "lead" });
+    expect((await t.store.read()).continuations.root!.pending).toBeUndefined();
+  });
+});
+
 describe("fitting pending instructions", () => {
   it("keeps them all when they fit", () => {
     expect(fitInstructions(["one", "two"])).toBe("one\n\ntwo");

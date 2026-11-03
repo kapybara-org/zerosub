@@ -466,6 +466,26 @@ describe("Codex continuations through the Paseo SDK", () => {
     t.expectCleanWire(p);
   });
 
+  it("creates a sub-agent's tab under its parent with Paseo's parent label rather than `parent`", async () => {
+    const t = await setup();
+    const lead = "0d8f6a1e-3b7c-4f2a-9e55-7c1b2a9d4e10";
+    t.daemon.addAgent(lead, { title: "Lead the release" });
+    t.daemon.agents.get(ROOT)!.snapshot.labels = { "paseo.parent-agent-id": lead };
+    const p = await t.plugin();
+    const b = await p.manager.continue(p.paseo, ROOT, t.account("b"), why, "user");
+    await t.daemon.idle();
+
+    const creates = t.daemon.requests("agent.create.request");
+    expect(creates).toHaveLength(1);
+    expect(creates[0]).toMatchObject({ agentId: b.agentId, workspaceId: WORKSPACE_ID, labels: { "zerosub.continued-from": ROOT, "paseo.parent-agent-id": lead } });
+    // `parent` would go out as callerAgentId, which Paseo also uses to place the agent and attribute its prompts.
+    expect(creates[0]!.callerAgentId).toBeUndefined();
+    expect(creates[0]!.initialPrompt).toBeUndefined();
+    expect(t.daemon.agents.get(b.agentId)!.snapshot.labels).toEqual({ "zerosub.continued-from": ROOT, "paseo.parent-agent-id": lead });
+    expect(t.daemon.requests("send_agent_message_request").map((send) => send.agentId)).toEqual([b.agentId]);
+    t.expectCleanWire(p);
+  });
+
   it("recovers a delivered handoff whose acknowledgement was lost with the connection, without a second send", async () => {
     const t = await setup();
     const p = await t.plugin();
