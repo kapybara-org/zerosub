@@ -63,6 +63,7 @@ Turn on **Spread new agents across accounts** to select an account from its usag
   - A tab you return to gets the instructions and progress since it was last used, and checks the current files and Git diff before going on. Very long instructions are shortened, keeping the first one since the tab was last used (the original request, for a new tab), the latest ones and a note of how many were left out.
   - You can type in any of a task's tabs and switch from any of them. The tab you used last is where the task continues: automatic switches and resets only move that tab, and another tab that hits a limit says in its timeline where the task went.
   - A tab is reused while it is in the same workspace with the same account and permission mode; otherwise ZeroSub starts a new one. While one of the task's tabs is working or asking for permission, a switch you pick is refused until it stops, and an automatic switch leaves the task where it is and says so in its timeline.
+  - A sub-agent (one another agent started) keeps its parent: its new tab goes under the same agent, or under the tab where that agent's own task now continues. Like the first tab, it's archived with the parent and sends no notifications of its own. Paseo doesn't tell the parent when the new tab finishes, though: it only reports to an agent on agents it started or prompted itself.
   - ZeroSub never sends a hand-off twice. If a lost connection leaves one unconfirmed, the switch stops and names the tab to check. Continuation agents from earlier versions are picked up on the first switch. New Codex agents simply start on the chosen account.
 
 ### Banked resets
@@ -88,7 +89,7 @@ ZeroSub tries these in order, and a timeline note says which one happened:
 
 1. **Use a banked reset**, if you turned on **Use banked resets when every account is out**.
 2. **Fork the chat to the other provider**, if you turned on **When every account is out, fork the chat to the other provider** (off by default). A stopped Claude chat continues in a new ChatGPT agent, or the other way round:
-   - The new agent opens in the same workspace with the conversation so far and goes straight back to work. If that conversation began as a hand-off itself, only the start and end of the earlier one are quoted. It uses the other provider's default model and its account with the most room left.
+   - The new agent opens in the same workspace (under the same parent, for a sub-agent) with the conversation so far and goes straight back to work. If that conversation began as a hand-off itself, only the start and end of the earlier one are quoted. It uses the other provider's default model and its account with the most room left.
    - Its permission mode matches the original's level. Bypass becomes Full Access, and Accept File Edits becomes Default Permissions. Codex has no read-only or ask-first mode, so a Claude agent in Plan Mode or Always Ask isn't forked. ZeroSub never gives a fork more freedom than you gave the original.
    - The original agent stays as it was, and prompting it again while its provider is still out points to the same fork rather than starting another.
    - With the option off, a stopped agent's account button offers **Continue on ChatGPT (new agent)…** (or Claude) instead, with a confirmation.
