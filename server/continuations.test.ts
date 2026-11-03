@@ -875,6 +875,27 @@ describe("Codex continuations of a sub-agent", () => {
     expect(Object.keys(continuations.lead!.members).sort()).toEqual(["lead", lead.agentId].sort());
   });
 
+  it("creates it under the tab where the parent's own task carries on", async () => {
+    const t = await setup();
+    await withLead(t);
+    const lead = await t.switchTo("lead", "c");
+    const b = await t.switchTo("root", "b");
+    expect(t.created.at(-1)!.labels).toEqual({ [FROM]: "root", [PARENT]: lead.agentId });
+    // Typing in the lead's first tab takes its task back there, so the next tab goes under it.
+    t.add("lead", { type: "user_message", text: "Back here: hold the release." });
+    const c = await t.switchTo(b.agentId, "c");
+    expect(t.created.at(-1)).toMatchObject({ agentId: c.agentId, labels: { [FROM]: b.agentId, [PARENT]: "lead" } });
+  });
+
+  it("goes back to the parent itself once the tab its task moved to is archived", async () => {
+    const t = await setup();
+    await withLead(t);
+    const lead = await t.switchTo("lead", "c");
+    t.agents.get(lead.agentId)!.archivedAt = "2026-10-02T00:00:00Z";
+    await t.switchTo("root", "b");
+    expect(t.created.at(-1)!.labels).toEqual({ [FROM]: "root", [PARENT]: "lead" });
+  });
+
   it.each(["archived", "deleted"])("creates it without a parent when the parent is %s", async (reason) => {
     const t = await setup();
     await withLead(t);
@@ -882,6 +903,27 @@ describe("Codex continuations of a sub-agent", () => {
     else t.agents.delete("lead");
     await t.switchTo("root", "b");
     expect(t.created[0]!.labels).toEqual({ [FROM]: "root" });
+  });
+
+  it("follows a parent that ZeroSub continued on the other provider", async () => {
+    const t = await setup();
+    await withLead(t);
+    t.addAgent("old-fork", { provider: "claude", labels: { [FROM]: "lead" }, archivedAt: "2026-10-02T00:00:00Z" });
+    t.addAgent("lead-on-claude", { provider: "claude", labels: { [FROM]: "lead" } });
+    await t.switchTo("root", "b");
+    expect(t.created[0]!.labels).toEqual({ [FROM]: "root", [PARENT]: "lead-on-claude" });
+  });
+
+  it("stops at a loop in the continuation records", async () => {
+    const t = await setup();
+    await withLead(t);
+    t.agents.get("lead")!.labels = { [FROM]: "lead-on-claude" };
+    t.addAgent("lead-on-claude", { provider: "claude", labels: { [FROM]: "lead" } });
+    // Lookups wait on the daemon, as real ones do, so an endless walk times out instead of starving the test's timer.
+    const ref = t.paseo.agents.ref;
+    t.paseo.agents.ref = ((id: string) => ({ ...ref(id), refresh: () => new Promise((resolve) => setTimeout(resolve, 1)).then(() => ref(id).refresh()) })) as typeof ref;
+    await t.switchTo("root", "b");
+    expect(t.created[0]!.labels).toEqual({ [FROM]: "root", [PARENT]: "lead" });
   });
 
   it("goes ahead without a parent when the parent can't be looked up", async () => {
@@ -900,7 +942,7 @@ describe("Codex continuations of a sub-agent", () => {
     }
   });
 
-  it("keeps the parent a failed creation reserved when it retries, so Paseo sees the same request", async () => {
+  it.each(["archived", "continued in another tab"])("keeps the parent a failed creation reserved when the parent is %s before the retry", async (change) => {
     const t = await setup();
     await withLead(t);
     // As in Paseo, a creation is recorded under its key before it runs, and a retry must repeat it exactly.
@@ -919,8 +961,9 @@ describe("Codex continuations of a sub-agent", () => {
     });
     await expect(t.switchTo("root", "b")).rejects.toThrow(/creation failed/);
     expect((await t.store.read()).continuations.root!.pending).toMatchObject({ stage: "creating", parent: "lead" });
-    // Meanwhile the lead is archived. A new creation wouldn't use it, but this one already has.
-    t.agents.get("lead")!.archivedAt = "2026-10-02T00:00:00Z";
+    // A new creation wouldn't use the lead now, but this one already has.
+    if (change === "archived") t.agents.get("lead")!.archivedAt = "2026-10-02T00:00:00Z";
+    else await t.switchTo("lead", "c");
     const b = await t.switchTo("root", "b");
     expect(t.created.find((request) => request.agentId === b.agentId)!.labels).toEqual({ [FROM]: "root", [PARENT]: "lead" });
     expect((await t.store.read()).continuations.root!.pending).toBeUndefined();

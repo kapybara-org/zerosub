@@ -548,12 +548,16 @@ describe("forking to the other provider", () => {
     expect(notes.at(-1)).toMatchObject({ outcome: "continued", toFamily: "codex", to: "hello", continuedIn: { agentId: fork?.agentId } });
   });
 
-  it("carries a sub-agent's work on as a sub-agent of its parent", async () => {
+  it.each([
+    ["its parent", [], "lead"],
+    ["where its parent's own work went on ChatGPT", [{ id: "lead-on-chatgpt", provider: "codex", labels: { "zerosub.continued-from": "lead" } }], "lead-on-chatgpt"],
+  ])("carries a sub-agent's work on as a sub-agent of %s", async (_, moved, parent) => {
     const lead = { id: "lead", provider: "claude", status: "idle", title: "Lead the release", workspaceId: "ws-1", archivedAt: null, labels: {} };
-    const { created, limitTurn } = await setUpFork("bypassPermissions", [], { "paseo.parent-agent-id": "lead" }, [lead]);
+    const others = [lead, ...moved.map((agent) => ({ status: "idle", title: "Lead the release (continued on ChatGPT)", workspaceId: "ws-1", archivedAt: null, ...agent }))];
+    const { created, limitTurn } = await setUpFork("bypassPermissions", [], { "paseo.parent-agent-id": "lead" }, others);
     await limitTurn();
     expect(created).toHaveLength(1);
-    expect(created[0]?.labels).toEqual({ "zerosub.continued-from": AGENT, "paseo.parent-agent-id": "lead" });
+    expect(created[0]?.labels).toEqual({ "zerosub.continued-from": AGENT, "paseo.parent-agent-id": parent });
     expect(created[0]?.prompt).toMatch(/earlier Claude Code session that stopped because every Claude account reached its usage limit/);
   });
 
