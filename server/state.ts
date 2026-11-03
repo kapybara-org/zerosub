@@ -77,6 +77,8 @@ export const ContinuationChainSchema = z.object({
     seen: z.record(z.string(), TimelineMarkSchema),
     stage: z.enum(["creating", "sending"]).default("sending"),
     replaceHistory: z.array(z.string()).optional(),
+    /** The agent a new tab is created under. A retried creation must repeat its first request. */
+    parent: z.string().optional(),
   }).optional(),
 });
 export type ContinuationChain = z.infer<typeof ContinuationChainSchema>;

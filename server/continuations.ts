@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { PluginHookContext } from "@getpaseo/plugin/server";
 import { sameAccountIdentity } from "./account-identity";
 import type { AgentTimelineItem } from "./adapter";
-import { buildTranscript, CONTINUED_FROM_LABEL, continueInNewAgent, keepEnds, type Continuation } from "./handoff";
+import { buildTranscript, CONTINUED_FROM_LABEL, continueInNewAgent, keepEnds, PARENT_LABEL, type Continuation } from "./handoff";
 import { Mutex } from "./json-file";
 import { isUsable } from "./routing";
 import { findAccount, MAIN_ACCOUNT_ID, StateStore, type ContinuationChain, type StoredAccount, type StoredState } from "./state";
@@ -89,6 +89,8 @@ interface Destination {
   /** The existing tab, when there is one. */
   agent?: Agent;
   entry?: Member;
+  /** A new tab's parent agent, if it's created as a sub-agent. */
+  parent?: string;
 }
 
 /** What the destination hasn't seen yet, and the timeline marks to record once it has. */
@@ -126,6 +128,40 @@ export class CodexContinuations {
     return current.id === agentId ? null : { agentId: current.id, title: current.agent?.title ?? "Codex task" };
   }
 
+  /**
+   * The agent to create a continuation of `agentId` under, so a sub-agent's continuation is still
+   * a sub-agent of the agent that started it: that parent, or where the parent's own task carries
+   * on if ZeroSub has continued it too (in another ChatGPT tab, or on the other provider). None for
+   * an agent without a parent, or when the parent is archived or gone. A failed lookup means none
+   * too: the hand-off goes ahead without a parent rather than not at all.
+   */
+  async parentFor(paseo: PaseoApi, agentId: string): Promise<string | undefined> {
+    try {
+      let parentId = (await snapshot(paseo, agentId))?.labels?.[PARENT_LABEL]?.trim();
+      let live: Agent[] | undefined;
+      // A continuation on the other provider has only its label to go by, as when an earlier fork is reused.
+      const forkOf = async (id: string) => {
+        const agent = await snapshot(paseo, id);
+        if (!agent) return undefined;
+        live ??= await liveAgents(paseo);
+        return live.find((other) => other.labels?.[CONTINUED_FROM_LABEL] === id && other.provider !== agent.provider && !other.archivedAt)?.id;
+      };
+      // Each step goes to where that agent's task went next. A loop in the records ends the walk.
+      const seen = new Set([agentId]);
+      while (parentId && !seen.has(parentId)) {
+        seen.add(parentId);
+        const next = (await this.continuesElsewhere(paseo, parentId))?.agentId ?? (await forkOf(parentId));
+        if (!next) break;
+        parentId = next;
+      }
+      const parent = parentId && parentId !== agentId ? await snapshot(paseo, parentId) : undefined;
+      return parent && !parent.archivedAt ? parent.id : undefined;
+    } catch (error) {
+      console.error(`[ZeroSub] couldn't look up the parent of ${agentId}; continuing it without one`, error instanceof Error ? error.message : error);
+      return undefined;
+    }
+  }
+
   continue(paseo: PaseoApi, sourceAgentId: string, target: StoredAccount, why: string, source: Source): Promise<Continuation> {
     const key = `${sourceAgentId}:${target.id}`;
     const existing = this.inFlight.get(key);
@@ -157,6 +193,8 @@ export class CodexContinuations {
       const gathered = await gatherUpdates(paseo, state, chain, snapshots, sourceAgent, destination);
       const prompt = composePrompt(chain, destination, gathered, why, Boolean(reserved));
       const messageId = reserved?.messageId ?? `${MESSAGE_PREFIX}${randomUUID()}`;
+      // A retried creation has to repeat its first request exactly, parent included.
+      if (!destination.agent) destination.parent = reserved ? reserved.parent : await this.parentFor(paseo, sourceAgent.id);
       await this.confirmUnchanged(paseo, sourceAgent, destination, account);
       await this.reserve(root, sourceAgent.id, destination, gathered, account, messageId, source);
       return this.deliver(paseo, root, sourceAgent, destination, account, prompt, messageId, why);
@@ -265,6 +303,7 @@ export class CodexContinuations {
         seen: gathered.seen,
         stage: destination.agent ? "sending" : "creating",
         ...(gathered.fallback ? { replaceHistory: gathered.obsolete } : {}),
+        ...(destination.parent ? { parent: destination.parent } : {}),
       };
       if (!destination.agent) draft.bindings[targetId] = { accountId: account.id, source: source === "user" ? "user" : "thread", at: new Date().toISOString() };
     });
@@ -286,7 +325,15 @@ export class CodexContinuations {
     if (destination.agent) {
       result = { agentId: targetId, title: destination.agent.title ?? "Codex task" };
     } else {
-      result = await continueInNewAgent({ paseo, sourceAgentId: sourceAgent.id, why, agentId: targetId, deferPrompt: true, bind: async () => {} });
+      result = await continueInNewAgent({
+        paseo,
+        sourceAgentId: sourceAgent.id,
+        why,
+        agentId: targetId,
+        deferPrompt: true,
+        parentId: destination.parent,
+        bind: async () => {},
+      });
       // Creation can take time. A user may have started another turn or disabled the account.
       const created = await waitForCreated(paseo, targetId);
       const sourceNow = await snapshot(paseo, sourceAgent.id);
@@ -352,6 +399,19 @@ async function adoptDescendants(paseo: PaseoApi, original: Agent, ancestors: Age
       }
     }
   }
+}
+
+/** Every agent that isn't archived, as far as MAX_PAGES pages go. */
+async function liveAgents(paseo: PaseoApi): Promise<Agent[]> {
+  const agents: Agent[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < MAX_PAGES; page += 1) {
+    const result = await paseo.agents.list({ page: { limit: 200, ...(cursor ? { cursor } : {}) } });
+    agents.push(...result.entries.map(({ agent }) => agent));
+    if (!result.pageInfo.hasMore || !result.pageInfo.nextCursor) break;
+    cursor = result.pageInfo.nextCursor;
+  }
+  return agents;
 }
 
 function newer(left: string | null | undefined, right: string | null | undefined): boolean {

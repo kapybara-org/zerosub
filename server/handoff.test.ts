@@ -1,7 +1,8 @@
 // The nesting, tag-pairing and cut-off cases are adapted from liloli's tests in #14.
+import type { PluginHookContext } from "@getpaseo/plugin/server";
 import { describe, expect, it } from "vitest";
 import type { AgentTimelineItem } from "./adapter";
-import { buildTranscript, continuationPrompt, keepEnds, shortenEarlierHandOff } from "./handoff";
+import { buildTranscript, continuationPrompt, continueInNewAgent, keepEnds, shortenEarlierHandOff } from "./handoff";
 
 const OPEN = "<previous-session>";
 const CLOSE = "</previous-session>";
@@ -84,5 +85,56 @@ describe("quoting an earlier hand-off", () => {
     const quoted = continuationPrompt(buildTranscript([user("ORIGINAL"), user("z".repeat(50_000))]), "limit");
     const transcript = buildTranscript([user(quoted), user("y".repeat(50_000))], 10_000);
     expect(transcript).not.toMatch(/<\/?previous-session>/);
+  });
+});
+
+describe("starting the new agent", () => {
+  /** A source agent, a sub-agent of `lead`, and the creates Paseo receives for its continuation. */
+  function fake(workspaceId?: string) {
+    const source = {
+      id: "sub", provider: "codex", model: "gpt-test", title: "Write the parser", cwd: "/repo/packages/parser",
+      ...(workspaceId ? { workspaceId } : {}), currentModeId: "auto", labels: { "paseo.parent-agent-id": "lead" },
+    };
+    const created: Array<{ via: "workspace" | "folder"; request: Record<string, unknown> }> = [];
+    const paseo = {
+      providers: { listModels: async () => ({ models: [{ id: "gpt-test", isDefault: true }] }) },
+      workspaces: { ref: () => ({ agents: { create: async (request: Record<string, unknown>) => void created.push({ via: "workspace", request }) } }) },
+      agents: {
+        create: async (request: Record<string, unknown>) => void created.push({ via: "folder", request }),
+        ref: () => ({
+          refresh: async () => ({ agent: source }),
+          timeline: { refetch: async () => ({ entries: [{ item: user("Write the parser for the new format.") }] }) },
+        }),
+      },
+    } as unknown as PluginHookContext["paseo"];
+    return { paseo, created };
+  }
+
+  it("makes it a sub-agent of the given parent by label, and still hands over in its own prompt", async () => {
+    const { paseo, created } = fake("ws-1");
+    await continueInNewAgent({ paseo, sourceAgentId: "sub", why: "its account reached its limit", parentId: "lead", bind: async () => {} });
+    expect(created).toHaveLength(1);
+    expect(created[0]!.via).toBe("workspace");
+    expect(created[0]!.request.labels).toEqual({ "zerosub.continued-from": "sub", "paseo.parent-agent-id": "lead" });
+    // `parent` would send the prompt as a message from the lead agent instead.
+    expect(created[0]!.request).not.toHaveProperty("parent");
+    expect(created[0]!.request.prompt).toContain("Write the parser for the new format.");
+  });
+
+  it("does the same for an agent outside a workspace, in its own folder", async () => {
+    const { paseo, created } = fake();
+    await continueInNewAgent({ paseo, sourceAgentId: "sub", why: "a limit", deferPrompt: true, parentId: "lead", bind: async () => {} });
+    expect(created).toHaveLength(1);
+    expect(created[0]!.via).toBe("folder");
+    expect(created[0]!.request.cwd).toBe("/repo/packages/parser");
+    expect(created[0]!.request.labels).toEqual({ "zerosub.continued-from": "sub", "paseo.parent-agent-id": "lead" });
+    expect(created[0]!.request).not.toHaveProperty("parent");
+    expect(created[0]!.request).not.toHaveProperty("prompt");
+  });
+
+  it("labels it only as a continuation when there's no parent to give it", async () => {
+    const { paseo, created } = fake("ws-1");
+    await continueInNewAgent({ paseo, sourceAgentId: "sub", why: "a limit", deferPrompt: true, bind: async () => {} });
+    expect(created[0]!.request.labels).toEqual({ "zerosub.continued-from": "sub" });
   });
 });

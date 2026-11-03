@@ -6,6 +6,8 @@ type PaseoApi = PluginHookContext["paseo"];
 
 /** Label on a continuation agent naming the agent it carries on from. */
 export const CONTINUED_FROM_LABEL = "zerosub.continued-from";
+/** Paseo's label naming the agent a sub-agent was created by (`PARENT_AGENT_ID_LABEL`). */
+export const PARENT_LABEL = "paseo.parent-agent-id";
 
 const MAX_TRANSCRIPT = 40_000;
 const MAX_FIRST_MESSAGE = 6_000;
@@ -170,6 +172,13 @@ export async function continueInNewAgent(options: {
   agentId?: string;
   /** Create the pre-bound tab first; the caller delivers its handoff separately. */
   deferPrompt?: boolean;
+  /**
+   * Make the new agent a sub-agent of this one, as the source was of its parent. This sets Paseo's
+   * parent label rather than `parent`: on a create, `parent` would also turn the first prompt into
+   * a message from the parent agent, move an agent made outside a workspace into the parent's, and
+   * fail outright once the parent has been closed.
+   */
+  parentId?: string;
 }): Promise<Continuation> {
   const { paseo, sourceAgentId } = options;
   const refreshed = await paseo.agents.ref(sourceAgentId).refresh();
@@ -211,7 +220,7 @@ export async function continueInNewAgent(options: {
     config,
     title,
     ...(!options.deferPrompt ? { prompt: continuationPrompt(buildTranscript(timeline ?? []), options.why, options.previous) } : {}),
-    labels: { [CONTINUED_FROM_LABEL]: sourceAgentId },
+    labels: { [CONTINUED_FROM_LABEL]: sourceAgentId, ...(options.parentId ? { [PARENT_LABEL]: options.parentId } : {}) },
   };
   if (source.workspaceId) await paseo.workspaces.ref(source.workspaceId).agents.create(request);
   else await paseo.agents.create({ ...request, cwd: source.cwd });

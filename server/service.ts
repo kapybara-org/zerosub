@@ -1069,6 +1069,7 @@ export class Service {
       why: source === "auto" ? `every ${FAMILY_LABEL[family]} account reached its usage limit` : `the work was moved to ${name}`,
       previous: PROVIDER_NAME[family],
       target: { provider, label: name, modeId },
+      parentId: await this.continuations.parentFor(paseo, agentId),
       bind: async (newAgentId) => {
         await this.store.update((draft) => {
           draft.bindings[newAgentId] = {
@@ -1141,6 +1142,7 @@ export class Service {
       sourceAgentId: agentId,
       timeline,
       why,
+      parentId: await this.continuations.parentFor(paseo, agentId),
       bind: async (newAgentId) => {
         await this.store.update((draft) => {
           draft.bindings[newAgentId] = {
