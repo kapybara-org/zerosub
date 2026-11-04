@@ -52,6 +52,7 @@ import {
   defaultAccount,
   findAccount,
   mainAccount,
+  type Cleanup,
   type ContinuationChain,
   type StoredAccount,
   type StoredState,
@@ -83,6 +84,8 @@ const LIMIT_TRUST_MS = 15 * 60_000;
 const LOGIN_TTL_MS = 15 * 60_000;
 const LOGIN_GRACE_MS = 3_000;
 const PRUNE_MS = 10 * 60_000;
+/** Cleanup passes a home's sign-out (or sign-in check) may fail in before it's given up on. */
+const CLEANUP_TRIES = 3;
 /** After a reset, limit notices from turns that were already running are stale. */
 const RESET_GRACE_MS = 5 * 60_000;
 const AGENT_LIST_MS = 3_000;
@@ -113,6 +116,8 @@ interface LoginSession {
   handle: LoginHandle | null;
   view: LoginView;
   finishedAt: number | null;
+  /** The account is being written to the registry: its home is in use for as long as that takes. */
+  saving: boolean;
 }
 
 interface AgentInfo {
@@ -184,7 +189,9 @@ export class Service {
   private readonly browserSignIn = canSignInWithBrowser();
   private agentCache: { at: number; agents: Promise<AgentInfo[]> } | null = null;
   private lastPrune = 0;
-  private collecting = false;
+  private cleaning: Promise<void> | null = null;
+  /** Failed cleanup attempts this run, by home. */
+  private readonly cleanupFailures = new Map<string, number>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private stopped = false;
   /** Startup's steps have all worked; until they have, each upkeep tries them again. See `startUp`. */
@@ -226,6 +233,7 @@ export class Service {
       for (const [accountId, reading] of await loadReadings()) if (!this.usage.has(accountId)) this.usage.set(accountId, reading);
       await Promise.all(FAMILIES.map((family) => this.ensureFamily(family)));
       this.started = true;
+      await this.reportStrayHomes().catch(() => undefined);
     })().finally(() => {
       this.starting = null;
     });
@@ -291,7 +299,7 @@ export class Service {
       if (login.finishedAt && now - login.finishedAt > LOGIN_TTL_MS) this.logins.delete(id);
       else if (!login.finishedAt && now - Date.parse(login.view.startedAt) > LOGIN_TTL_MS) void this.cancelLogin(id);
     }
-    if (this.paseo) await this.collectOrphanHomes(this.paseo);
+    if (this.paseo) await this.cleanUpHomes(this.paseo);
   }
 
   private async refreshIdentity(accountId: string): Promise<void> {
@@ -338,58 +346,114 @@ export class Service {
   }
 
   /**
-   * Signs out and deletes managed homes no account owns any more — removed accounts, and abandoned
-   * or failed sign-ins — once no live agent session still runs on them.
+   * Signs out and deletes the homes listed for cleanup (see `StoredState.cleanup`): a removed
+   * account's, and a new account's whose sign-in never finished, once no live agent session runs on
+   * it any more. A home that isn't listed is never touched, whatever the registry says about it: a
+   * damaged or hand-edited registry may simply be missing its account. One pass at a time.
    */
-  private async collectOrphanHomes(paseo: PaseoApi): Promise<void> {
-    if (this.collecting) return;
-    this.collecting = true;
-    try {
-      const root = homesDir();
-      const names = await readdir(root).catch(() => [] as string[]);
-      if (names.length === 0) return;
-      const state = await this.store.read();
-      const owned = new Set(state.accounts.map((account) => account.home).filter((home): home is string => Boolean(home)));
-      for (const login of this.logins.values()) {
-        const active = !login.finishedAt || Date.now() - login.finishedAt < LOGIN_GRACE_MS;
-        if (active && login.home) owned.add(login.home);
-      }
-      for (const name of names) {
-        const home = join(root, name);
-        const family: Family | null = name.startsWith("claude-") ? "claude" : name.startsWith("codex-") ? "codex" : null;
-        if (!family || owned.has(home)) continue;
-        // A managed account's ID is its home's folder name, so sessions still name it after removal.
-        const users = Object.entries(state.sessions)
-          .filter(([, session]) => session.accountId === name)
-          .map(([agentId]) => agentId);
-        let live = false;
-        for (const agentId of users) {
-          const info = await agentInfo(paseo, agentId);
-          if (info && !info.archived && info.status !== "closed") {
-            live = true;
-            break;
-          }
-        }
-        if (live) continue;
-        await this.adapters[family].logout(home).catch((error: unknown) => log(`signing out ${name} failed`, error));
-        await removeHome(home);
-        if (users.length > 0) {
-          await this.store.update((draft) => {
-            for (const agentId of users) if (draft.sessions[agentId]?.accountId === name) delete draft.sessions[agentId];
-          });
-        }
-        console.log(`[ZeroSub] removed the unused account home ${name}`);
-      }
-    } finally {
-      this.collecting = false;
+  cleanUpHomes(paseo: PaseoApi): Promise<void> {
+    this.cleaning ??= this.cleanUpPass(paseo).finally(() => {
+      this.cleaning = null;
+    });
+    return this.cleaning;
+  }
+
+  private async cleanUpPass(paseo: PaseoApi): Promise<void> {
+    const state = await this.store.read();
+    const owned = new Set(state.accounts.map((account) => account.home));
+    const busy = new Set<string>();
+    for (const login of this.logins.values()) {
+      const active = !login.finishedAt || login.saving || Date.now() - login.finishedAt < LOGIN_GRACE_MS;
+      if (active && login.home) busy.add(login.home);
     }
+    for (const [home, entry] of Object.entries(state.cleanup)) {
+      if (busy.has(home)) continue;
+      if (owned.has(home)) {
+        // An account uses it again (put back by hand, say), so it's never signed out from under it.
+        await this.store.update((draft) => {
+          if (draft.accounts.some((account) => account.home === home)) delete draft.cleanup[home];
+        });
+        continue;
+      }
+      await this.cleanUpHome(paseo, home, entry, state).catch((error: unknown) => log(`cleaning up ${home} failed`, error));
+    }
+  }
+
+  private async cleanUpHome(paseo: PaseoApi, home: string, entry: Cleanup, state: StoredState): Promise<void> {
+    const users = Object.entries(state.sessions)
+      .filter(([, session]) => session.accountId === entry.accountId)
+      .map(([agentId]) => agentId);
+    for (const agentId of users) {
+      const info = await agentInfo(paseo, agentId);
+      if (info && !info.archived && info.status !== "closed") return; // Still in use: a later pass.
+    }
+    // A sign-in this run saw end without an account is its own to undo. One left by an earlier run
+    // only goes if it isn't signed in: a registry restored from an older copy can still list a
+    // sign-in that has since become an account the registry no longer knows.
+    const earlier = entry.why === "unfinished" && !this.endedHere(home);
+    let deleteFolder = true;
+    let outcome: string;
+    try {
+      if (earlier) {
+        const signedIn = (await this.adapters[entry.family].identity(home)).signedIn;
+        if (signedIn) deleteFolder = false;
+        outcome = signedIn
+          ? `left ${home} alone: no account uses it, but it's signed in, so it may be an account missing from the registry`
+          : `deleted ${home}, left by a sign-in that never finished`;
+      } else {
+        await this.adapters[entry.family].logout(home);
+        outcome = `signed out and deleted ${home}`;
+      }
+    } catch (error) {
+      const failures = (this.cleanupFailures.get(home) ?? 0) + 1;
+      this.cleanupFailures.set(home, failures);
+      log(`cleaning up ${home} failed`, error);
+      if (failures < CLEANUP_TRIES) return;
+      // A removed account's home goes anyway, as before; one that may be a lost account stays.
+      if (earlier) deleteFolder = false;
+      outcome = earlier
+        ? `gave up checking whether ${home} is signed in, and left it alone`
+        : `gave up signing out ${home}, so its sign-in may still be valid; deleted it anyway`;
+    }
+    this.cleanupFailures.delete(home);
+    if (deleteFolder) await removeHome(home);
+    await this.store.update((draft) => {
+      delete draft.cleanup[home];
+      for (const agentId of users) if (draft.sessions[agentId]?.accountId === entry.accountId) delete draft.sessions[agentId];
+    });
+    console.log(`[ZeroSub] ${outcome}`);
+  }
+
+  /** Whether a sign-in into `home` ran in this process and has ended. */
+  private endedHere(home: string): boolean {
+    return [...this.logins.values()].some((login) => login.home === home && login.finishedAt !== null);
+  }
+
+  /**
+   * Folders in `homesDir()` that no account uses and nothing will clean up: leftovers of an earlier
+   * version, or homes of accounts a damaged registry lost. They are only ever reported.
+   */
+  async strayHomes(): Promise<string[]> {
+    const state = await this.store.read();
+    const known = new Set<string | null>([...state.accounts.map((account) => account.home), ...Object.keys(state.cleanup)]);
+    const names = await readdir(homesDir()).catch(() => [] as string[]);
+    return names.filter((name) => !name.startsWith(".") && !known.has(join(homesDir(), name)));
+  }
+
+  private async reportStrayHomes(): Promise<void> {
+    const stray = await this.strayHomes();
+    if (stray.length === 0) return;
+    console.error(
+      `[ZeroSub] no account uses ${stray.join(", ")} in ${homesDir()}, so ${stray.length === 1 ? "it is" : "they are"} left alone. ` +
+        "If accounts are missing, restore state.json; otherwise sign them out and delete them yourself.",
+    );
   }
 
   private scheduleCleanup(): void {
     const paseo = this.paseo;
     if (!paseo) return;
     setTimeout(
-      () => void this.collectOrphanHomes(paseo).catch((error: unknown) => log("cleanup failed", error)),
+      () => void this.cleanUpHomes(paseo).catch((error: unknown) => log("cleanup failed", error)),
       LOGIN_GRACE_MS + 500,
     ).unref?.();
   }
@@ -1756,6 +1820,7 @@ export class Service {
       .map(([agentId]) => agentId);
     await this.store.update((draft) => {
       draft.accounts = draft.accounts.filter((entry) => entry.id !== accountId);
+      if (account.home) draft.cleanup[account.home] = { family: account.family, accountId, why: "removed", at: new Date().toISOString() };
       for (const [agentId, binding] of Object.entries(draft.bindings)) {
         if (binding.accountId === accountId) delete draft.bindings[agentId];
       }
@@ -1765,7 +1830,7 @@ export class Service {
     // Idle agents move now and busy ones after their turn. The home is signed out and deleted by the
     // cleanup pass only once nothing runs on it any more.
     await this.reconcile(paseo, "removed", affected, new Map([[account.id, account.label]]));
-    void this.collectOrphanHomes(paseo).catch((error: unknown) => log("cleanup failed", error));
+    void this.cleanUpHomes(paseo).catch((error: unknown) => log("cleanup failed", error));
     return affected.length;
   }
 
@@ -1799,6 +1864,7 @@ export class Service {
       home,
       handle: null,
       finishedAt: null,
+      saving: false,
       view: {
         id,
         family,
@@ -1814,6 +1880,13 @@ export class Service {
     };
     this.logins.set(id, session);
     try {
+      if (!existing && home) {
+        // On the cleanup list until the account is saved, so an abandoned sign-in is cleaned up even
+        // after a restart. While this run tracks the sign-in, cleanup leaves it alone.
+        await this.store.update((draft) => {
+          draft.cleanup[home] = { family, accountId: `${family}-${id}`, why: "unfinished", at: new Date().toISOString() };
+        });
+      }
       if (home) await this.adapters[family].prepareHome(home);
       const handle = await this.adapters[family].login(home, method);
       if (session.finishedAt) {
@@ -1895,18 +1968,30 @@ export class Service {
     session.finishedAt = Date.now(); // Claim completion before writing, so a late cancel can't race it.
 
     let accountId = session.accountId;
-    await this.store.update((draft) => {
-      let account = findAccount(draft, accountId);
-      if (!account) {
-        // A managed account's ID matches its home's folder name (collectOrphanHomes relies on it).
-        accountId = `${session.family}-${session.id}`;
-        account = newAccount({ id: accountId, family: session.family, kind: "managed", home: session.home });
-        draft.accounts.push(account);
-      }
-      applyIdentity(account, identity, draft);
-      account.limitedUntil = null;
-      account.limitKind = null;
-    });
+    session.saving = true;
+    try {
+      await this.store.update((draft) => {
+        let account = findAccount(draft, accountId);
+        if (!account) {
+          // A managed account's ID matches its home's folder name, as its cleanup entry does.
+          accountId = `${session.family}-${session.id}`;
+          account = newAccount({ id: accountId, family: session.family, kind: "managed", home: session.home });
+          draft.accounts.push(account);
+          if (session.home) delete draft.cleanup[session.home];
+        }
+        applyIdentity(account, identity, draft);
+        account.limitedUntil = null;
+        account.limitKind = null;
+      });
+    } catch (error) {
+      // A new account's home is then cleaned up as an unfinished sign-in, like any that failed.
+      log("could not save the account just signed in", error);
+      session.view = { ...session.view, step: "failed", message: `Signed in, but ZeroSub couldn't save the account: ${describe(error)}` };
+      this.scheduleCleanup();
+      return;
+    } finally {
+      session.saving = false;
+    }
     if (accountId) this.identityCheckedAt.set(accountId, Date.now());
     session.accountId = accountId;
     session.view = { ...session.view, step: "done", accountId, message: null };
