@@ -32,7 +32,24 @@ export function formatCredits(credits: Credits): string {
   return `${whole} ChatGPT credit${whole === "1" ? "" : "s"} left`;
 }
 
-/** The busiest window decides how close an account is to being cut off. */
+/** Claude's 5-hour and weekly windows, and Codex's two (see `parseUsage`, `parseRateLimits`). */
+const ACCOUNT_WINDOWS = new Set(["five_hour", "seven_day", "primary", "secondary"]);
+
+/**
+ * Whether a full window stops the whole account. The others only cap one model or surface, such as
+ * Claude's "Weekly · Opus": the account still works with the rest, and a turn that does hit one
+ * says so itself. Windows ZeroSub doesn't know count as the narrower kind.
+ */
+export function capsAccount(window: UsageWindow): boolean {
+  return ACCOUNT_WINDOWS.has(window.id);
+}
+
+/** The busiest window that caps the whole account: how much room it has left for any model. */
+export function accountPeak(windows: readonly UsageWindow[]): UsageWindow | null {
+  return peakUsage(windows.filter(capsAccount));
+}
+
+/** The busiest of `windows`, whatever it caps. */
 export function peakUsage(windows: readonly UsageWindow[]): UsageWindow | null {
   let peak: UsageWindow | null = null;
   for (const limit of windows) {

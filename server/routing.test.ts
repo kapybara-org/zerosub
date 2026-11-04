@@ -318,3 +318,17 @@ describe("disabled accounts", () => {
     expect(mostAvailable(state, "claude", usageOf, NOW)?.id).toBe("claude-main");
   });
 });
+
+describe("headroom", () => {
+  it("ranks by the windows that cap the whole account, not one model's", async () => {
+    const { headroomScore } = await import("./routing");
+    const reading = (windows: Usage["windows"]): Usage => ({ fetchedAt: "", windows, error: null, cached: false, resets: null, credits: null });
+    const opusFull = reading([
+      { id: "five_hour", label: "5-hour", usedPercent: 10, resetsAt: null },
+      { id: "seven_day_opus", label: "Weekly · Opus", usedPercent: 100, resetsAt: null },
+    ]);
+    expect(headroomScore(opusFull)).toBe(10);
+    expect(headroomScore(reading([{ id: "primary", label: "5h", usedPercent: 70, resetsAt: null }]))).toBe(70);
+    expect(headroomScore(null)).toBe(50);
+  });
+});
