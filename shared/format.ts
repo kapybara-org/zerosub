@@ -1,4 +1,4 @@
-import type { AccountView, Credits, UsageWindow } from "./model";
+import type { AccountView, Credits, Egress, UsageWindow } from "./model";
 
 /** "in 2h 14m", "in 3d 4h", "now". */
 export function formatResetIn(resetsAt: string | null, now: number = Date.now()): string | null {
@@ -94,6 +94,18 @@ export function formatAge(at: string, now: number = Date.now()): string {
   if (minutes < 60) return `${minutes}m ago`;
   const hours = Math.round(minutes / 60);
   return hours < 48 ? `${hours}h ago` : `${Math.round(hours / 24)}d ago`;
+}
+
+/** How old an address may get before it says so: checks run every half hour. */
+const EGRESS_FRESH_MS = 60 * 60_000;
+
+/** "IP: 203.0.113.7 (US)", with its age once that's an hour; null before the first check. */
+export function egressText(egress: Egress | null, now: number = Date.now()): string | null {
+  if (!egress) return null;
+  if (!egress.ip) return egress.error ? "IP: couldn't check" : null;
+  const old = egress.checkedAt && now - Date.parse(egress.checkedAt) >= EGRESS_FRESH_MS ? formatAge(egress.checkedAt, now) : null;
+  const notes = [egress.country, old].filter(Boolean).join(", ");
+  return `IP: ${egress.ip}${notes ? ` (${notes})` : ""}`;
 }
 
 export function usageSummary(account: AccountView, now: number = Date.now()): string | null {

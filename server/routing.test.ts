@@ -13,6 +13,7 @@ function account(partial: Partial<StoredAccount> & Pick<StoredAccount, "id">): S
     label: partial.id,
     autoLabel: false,
     kind: "managed",
+    auth: "subscription",
     home: `/homes/${partial.id}`,
     email: null,
     plan: null,
@@ -71,13 +72,13 @@ describe("chooseAccount", () => {
   });
 
   it("follows the chosen default", () => {
-    const state = stateWith([main, work], { defaults: { claude: "claude-work", codex: null } });
+    const state = stateWith([main, work], { defaults: { claude: "claude-work", codex: null, pi: null } });
     expect(chooseAccount(state, { ...base, reason: "resume", usageOf: () => null })?.account.id).toBe("claude-work");
   });
 
   it("prefers the agent's own binding over the default", () => {
     const state = stateWith([main, work, personal], {
-      defaults: { claude: "claude-work", codex: null },
+      defaults: { claude: "claude-work", codex: null, pi: null },
       bindings: { "agent-1": { accountId: "claude-personal", source: "user", at: "x" } },
     });
     expect(chooseAccount(state, { ...base, reason: "resume", usageOf: () => null })?.account.id).toBe("claude-personal");
@@ -92,7 +93,7 @@ describe("chooseAccount", () => {
 
   it("skips an exhausted account for the roomiest usable one", () => {
     const limited = account({ id: "claude-work", limitedUntil: "2026-09-23T14:00:00Z" });
-    const state = stateWith([main, limited, personal], { defaults: { claude: "claude-work", codex: null } });
+    const state = stateWith([main, limited, personal], { defaults: { claude: "claude-work", codex: null, pi: null } });
     const decision = chooseAccount(state, {
       ...base,
       reason: "resume",
@@ -105,14 +106,14 @@ describe("chooseAccount", () => {
 
   it("keeps an exhausted account when automatic switching is off", () => {
     const limited = account({ id: "claude-work", limitedUntil: "2026-09-23T14:00:00Z" });
-    const state = stateWith([main, limited], { defaults: { claude: "claude-work", codex: null } });
+    const state = stateWith([main, limited], { defaults: { claude: "claude-work", codex: null, pi: null } });
     const decision = chooseAccount(state, { ...base, autoSwitch: false, reason: "resume", usageOf: () => null });
     expect(decision?.account.id).toBe("claude-work");
   });
 
   it("treats an expired limit as usable again", () => {
     const recovered = account({ id: "claude-work", limitedUntil: "2026-09-23T11:00:00Z" });
-    const state = stateWith([main, recovered], { defaults: { claude: "claude-work", codex: null } });
+    const state = stateWith([main, recovered], { defaults: { claude: "claude-work", codex: null, pi: null } });
     expect(chooseAccount(state, { ...base, reason: "resume", usageOf: () => null })?.account.id).toBe("claude-work");
   });
 
@@ -219,7 +220,7 @@ describe("mostAvailable", () => {
   it("breaks ties toward the default account", () => {
     const main = account({ id: "claude-main", kind: "main", home: null });
     const work = account({ id: "claude-work" });
-    const state = stateWith([main, work], { defaults: { claude: "claude-work", codex: null } });
+    const state = stateWith([main, work], { defaults: { claude: "claude-work", codex: null, pi: null } });
     expect(mostAvailable(state, "claude", () => usage(20), NOW)?.id).toBe("claude-work");
   });
 

@@ -45,6 +45,13 @@ const CLAUDE_SIGNED_OUT =
 const CODEX_SIGNED_OUT =
   /refresh token was already used|please log out and sign in again|access token could not be refreshed|refresh_token_reused|refresh_token_expired/i;
 
+/**
+ * Anthropic refusing the key a Pi account sends (`401 {"type":"error","error":{"type":"authentication_error",
+ * "message":"invalid x-api-key"}}`). Other providers' refusals word it otherwise, so a model of
+ * another provider failing on the account doesn't mark its Anthropic key as refused.
+ */
+const PI_SIGNED_OUT = /"type"\s*:\s*"authentication_error"|invalid x-api-key/i;
+
 const SYSTEM_ERROR = /^\[System Error\]\s*/;
 const MAX_NOTICE = 400;
 
@@ -120,6 +127,12 @@ export function detectCodexLimit(event: TurnEvent, now: Date = new Date()): Limi
 /** A turn that failed because the account's login is no longer valid. */
 export function detectClaudeSignOut(event: TurnEvent): string | null {
   for (const text of notices(event, true)) if (CLAUDE_SIGNED_OUT.test(firstLine(text))) return firstLine(text);
+  return null;
+}
+
+/** A Pi turn that failed because Anthropic refused the account's key. */
+export function detectPiSignOut(event: TurnEvent): string | null {
+  for (const text of notices(event, false)) if (PI_SIGNED_OUT.test(text)) return firstLine(text);
   return null;
 }
 

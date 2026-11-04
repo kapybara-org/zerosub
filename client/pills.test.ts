@@ -23,6 +23,18 @@ function account(id: string, isDefault: boolean): AccountView {
     usage: null,
     agentCount: 1,
     home: null,
+    auth: "subscription",
+    api: null,
+    apiEditable: false,
+    proxy: null,
+    proxyEditable: false,
+    inheritedProxy: null,
+    proxyFile: null,
+    proxyFollowers: [],
+    launcher: null,
+    egress: null,
+    externalHome: false,
+    moving: null,
   };
 }
 
@@ -35,6 +47,8 @@ async function menu(route: Partial<AgentRoute>): Promise<readonly PluginButtonMe
     providers: { codex: "codex" },
     canReopen: true,
     browserSignIn: true,
+    piLaunchers: null,
+    piHomes: null,
     showComposerPill: true,
     warnings: [],
   };

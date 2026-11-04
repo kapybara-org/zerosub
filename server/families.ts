@@ -1,5 +1,6 @@
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
-import type { Family } from "../shared/model";
+import { FAMILIES, type Family } from "../shared/model";
+import { rememberProviderEnvs } from "./provider-env";
 
 type PaseoApi = PluginHandlerContext["paseo"];
 
@@ -19,7 +20,12 @@ const OWN_AUTH_KEYS: Record<Family, readonly string[]> = {
     "CLAUDE_CODE_USE_FOUNDRY",
   ],
   codex: ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_HOME", "OPENAI_BASE_URL"],
+  // Pi keeps every sign-in in its agent directory, and a key stored there outranks one in the
+  // environment, so only a directory of the entry's own means it isn't Pi's usual login.
+  pi: ["PI_CODING_AGENT_DIR"],
 };
+
+const isFamily = (id: unknown): id is Family => typeof id === "string" && (FAMILIES as readonly string[]).includes(id);
 
 export function bringsOwnAuth(family: Family, env: Record<string, unknown> | undefined): boolean {
   if (!env) return false;
@@ -31,21 +37,21 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 }
 
 /**
- * Maps Paseo provider IDs to the subscription family they run on: the built-in `claude` and `codex`
+ * Maps Paseo provider IDs to the family they run on: the built-in `claude`, `codex` and `pi`
  * providers, plus custom profiles that extend them without their own credentials.
  */
 export function familiesFromConfig(providers: Record<string, unknown> | undefined): Record<string, Family> {
   const result: Record<string, Family> = {};
   const entries = providers ?? {};
-  for (const family of ["claude", "codex"] as const) {
+  for (const family of FAMILIES) {
     const entry = asRecord(entries[family]);
     if (!entry || !bringsOwnAuth(family, asRecord(entry.env))) result[family] = family;
   }
   for (const [id, value] of Object.entries(entries)) {
-    if (id === "claude" || id === "codex") continue;
+    if (isFamily(id)) continue;
     const entry = asRecord(value);
     const base = entry?.extends;
-    if (base !== "claude" && base !== "codex") continue;
+    if (!isFamily(base)) continue;
     if (bringsOwnAuth(base, asRecord(entry?.env))) continue;
     result[id] = base;
   }
@@ -63,10 +69,13 @@ export class FamilyResolver {
     let value: Record<string, Family>;
     try {
       const { config } = await paseo.config.get();
-      value = familiesFromConfig(asRecord(config.providers));
+      const providers = asRecord(config.providers);
+      value = familiesFromConfig(providers);
+      // Pi's provider `env` (a proxy there, say) is what its agents inherit; see server/pi.ts.
+      rememberProviderEnvs(value, providers);
     } catch (error) {
       console.warn("[ZeroSub] could not read provider config; using built-in providers only", describe(error));
-      value = { claude: "claude", codex: "codex" };
+      value = Object.fromEntries(FAMILIES.map((family) => [family, family]));
     }
     this.cache = { at: Date.now(), value };
     return value;
