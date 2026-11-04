@@ -270,7 +270,11 @@ export class Service {
     this.identityCheckedAt.set(accountId, Date.now());
     const account = findAccount(await this.store.read(), accountId);
     if (!account) return;
-    const identity = await this.adapters[account.family].identity(account.home).catch(() => null);
+    // A check that can't tell (Claude's keychain unreadable just now, say) changes nothing; the next one may.
+    const identity = await this.adapters[account.family].identity(account.home).catch((error: unknown) => {
+      log(`could not check whether ${account.label} is signed in`, error);
+      return null;
+    });
     if (!identity) return;
     await this.store.update((draft) => {
       const target = findAccount(draft, accountId);
