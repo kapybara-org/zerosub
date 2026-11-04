@@ -16,6 +16,7 @@ import {
   type StateView,
   type Usage,
 } from "../shared/model";
+import { capsAccount } from "../shared/format";
 import { DEFAULT_CONTINUE_PROMPT, type Preferences } from "../shared/preferences";
 import type { RedeemResult, ReopenSummary } from "../shared/rpc";
 import { SWITCH_ROW_KIND, SWITCH_ROW_VERSION, type SwitchRow } from "../shared/timeline";
@@ -942,8 +943,11 @@ export class Service {
     const usage = this.usage.get(accountId);
     if (!usage || usage.cached) return null;
     const full = usage.windows.filter((window) => window.usedPercent >= 99 && window.resetsAt);
-    full.sort((a, b) => Date.parse(b.resetsAt ?? "") - Date.parse(a.resetsAt ?? ""));
-    return full[0]?.resetsAt ?? null;
+    // A full window of one model's only is what the turn hit when none of the account's own is full,
+    // so a later-resetting model window doesn't stretch a 5-hour limit to days.
+    const hit = full.some(capsAccount) ? full.filter(capsAccount) : full;
+    hit.sort((a, b) => Date.parse(b.resetsAt ?? "") - Date.parse(a.resetsAt ?? ""));
+    return hit[0]?.resetsAt ?? null;
   }
 
   /** Did this agent's own last turn end on a limit? Then its own failover (with a follow-up) handles it. */
@@ -1329,8 +1333,12 @@ export class Service {
       // full window, so a full window alone isn't a limit then.
       const creditsCover = this.prefs.useCredits && usage.credits != null;
       const full = creditsCover ? undefined : usage.windows.find((window) => window.usedPercent >= 100 && window.resetsAt);
-      if (full && !isLimited(account, now)) {
-        await this.markLimited(accountId, full.resetsAt ?? new Date(now + WINDOW_LIMIT_MS).toISOString(), "window", "reading");
+      // One model's own full window (Claude's "Weekly · Opus") leaves the account usable for the rest.
+      // A turn that hits it still marks the account (see `failover`), and while it's full that limit
+      // doesn't clear here.
+      const cutOff = full && usage.windows.find((window) => window.usedPercent >= 100 && window.resetsAt && capsAccount(window));
+      if (cutOff && !isLimited(account, now)) {
+        await this.markLimited(accountId, cutOff.resetsAt ?? new Date(now + WINDOW_LIMIT_MS).toISOString(), "window", "reading");
         return;
       }
       // A window limit clears once usage shows room again, or once credits cover it if a reading set

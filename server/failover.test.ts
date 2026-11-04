@@ -656,6 +656,24 @@ describe("usage readings", () => {
     return (await store.read()).sessions[NEW_AGENT]?.accountId;
   };
 
+  it("doesn't take one model's full window for the whole account's limit", async () => {
+    const opusFull = (): UsageRead => ({
+      fetchedAt: new Date().toISOString(),
+      windows: [
+        { id: "five_hour", label: "5-hour", usedPercent: 12, resetsAt: inFuture() },
+        { id: "seven_day", label: "Weekly", usedPercent: 40, resetsAt: inFuture() },
+        { id: "seven_day_opus", label: "Weekly · Opus", usedPercent: 100, resetsAt: inFuture() },
+      ],
+      error: null,
+      cached: false,
+      resets: null,
+    });
+    const { service, store, paseo } = await setUp(state(), unused, { usage: opusFull });
+    await service.refreshUsage(MAIN, true);
+    expect(await limitedUntil(store)).toBeNull();
+    expect(await newAgentOpensOn(service, store, paseo)).toBe(MAIN);
+  });
+
   it("takes a full window without credits for a limit, whatever the setting", async () => {
     for (const prefs of [preferences.schema.parse({}), USE_CREDITS]) {
       const { service, store } = await setUp(state(), unused, { usage: full(null) });

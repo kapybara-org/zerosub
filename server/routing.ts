@@ -1,4 +1,4 @@
-import { peakUsage } from "../shared/format";
+import { accountPeak } from "../shared/format";
 import type { Family, Usage } from "../shared/model";
 import { FIVE_HOUR_MINUTES, WEEK_MINUTES } from "./codex";
 import {
@@ -28,9 +28,12 @@ export function isUsable(account: StoredAccount, now: number): boolean {
   return account.signedIn && !account.disabled && !isLimited(account, now);
 }
 
-/** Lower is better. Unknown usage ranks in the middle so a known-quiet account wins over a mystery. */
+/**
+ * Lower is better. Unknown usage ranks in the middle so a known-quiet account wins over a mystery.
+ * A full window of one model only, such as "Weekly · Opus", leaves the account its room for the rest.
+ */
 export function headroomScore(usage: Usage | null | undefined): number {
-  const peak = usage ? peakUsage(usage.windows) : null;
+  const peak = usage ? accountPeak(usage.windows) : null;
   return peak ? peak.usedPercent : 50;
 }
 
