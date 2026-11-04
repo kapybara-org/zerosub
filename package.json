@@ -31,12 +31,13 @@
     "server/",
     "shared/",
     "!**/*.test.ts",
+    "!**/*.test-support.ts",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.server.json",
-    "test": "vitest run",
+    "test": "ZEROSUB_PI_DIR=\"${TMPDIR:-/tmp}/zerosub-tests/pi-config\" vitest run",
     "audit:mobile": "! grep -rnE \"\\\\b(document|window|localStorage|navigator)\\\\.|<(div|span|p|a|button|input|img|ul|ol|li|section|header|footer|main|nav|form|label|h[1-6]|table|tr|td|svg|path|br|hr)[ >/]|className=|onClick=\" client/"
   },
   "devDependencies": {

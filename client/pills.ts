@@ -5,7 +5,7 @@ import type {
   PluginClientContext,
 } from "@getpaseo/plugin/client";
 import { formatCredits, formatPercent, peakUsage, shortLabel } from "../shared/format";
-import { FAMILY_LABEL, type AccountView, type Family, type StateView } from "../shared/model";
+import { FAMILY_LABEL, OTHER_FAMILY, type AccountView, type StateView } from "../shared/model";
 import { setAgentAccount } from "../shared/rpc";
 import { forkPopover } from "./fork-confirm";
 import { resetPopover } from "./reset-confirm";
@@ -157,9 +157,10 @@ function buttonFor(
   // A banked reset is worth offering right where the agent stopped, even with a single account.
   const resets = current.usage?.resets ?? null;
   const offerReset = resets !== null && (current.status === "limited" || resets.usableNow);
-  // With every account of this provider out, the work can carry on with the other provider.
-  const other: Family = family === "claude" ? "codex" : "claude";
+  // With every account of this provider out, the work can carry on with the other provider (Pi has none).
+  const other = OTHER_FAMILY[family];
   const offerFork =
+    other !== null &&
     current.status === "limited" &&
     accounts.every((account) => account.status === "limited" || account.status === "signed_out" || account.status === "disabled") &&
     state.accounts.some((account) => account.family === other && account.status === "ready");
@@ -192,7 +193,7 @@ function buttonFor(
     if (current.status === "limited") wayOut.push(entry);
     else items.push(entry);
   }
-  if (offerFork) {
+  if (offerFork && other) {
     wayOut.push({
       kind: "item",
       id: "fork-other",

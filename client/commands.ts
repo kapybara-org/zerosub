@@ -12,7 +12,7 @@ export function contributeCommands(client: PluginClientContext, store: ZeroSubSt
       id: "open-accounts",
       title: "Manage subscription accounts (ZeroSub)",
       icon: "Users",
-      keywords: ["zerosub", "claude", "chatgpt", "codex", "account", "subscription", "login", "switch"],
+      keywords: ["zerosub", "claude", "chatgpt", "codex", "pi", "account", "subscription", "login", "switch"],
       context: "global",
       onSelect({ openSurface }) {
         openSurface("accounts");

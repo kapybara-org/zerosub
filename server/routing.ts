@@ -28,6 +28,11 @@ export function isUsable(account: StoredAccount, now: number): boolean {
   return account.signedIn && !account.disabled && !isLimited(account, now);
 }
 
+/** Routing may put agents on this account by itself: it's usable and not billed per use (an added Pi account is). */
+export function canStandIn(account: StoredAccount, now: number): boolean {
+  return account.auth !== "api" && isUsable(account, now);
+}
+
 /** Lower is better. Unknown usage ranks in the middle so a known-quiet account wins over a mystery. */
 export function headroomScore(usage: Usage | null | undefined): number {
   const peak = usage ? peakUsage(usage.windows) : null;
@@ -44,7 +49,7 @@ export function mostAvailable(
 ): StoredAccount | undefined {
   const preferred = defaultAccount(state, family)?.id;
   const candidates = accountsOf(state, family).filter(
-    (account) => !exclude.has(account.id) && isUsable(account, now),
+    (account) => !exclude.has(account.id) && canStandIn(account, now),
   );
   const rank = (account: StoredAccount) => [
     headroomScore(usageOf(account.id)),

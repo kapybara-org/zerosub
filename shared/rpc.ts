@@ -37,6 +37,54 @@ export const renameAccount = defineRpc({
   output: z.object({ ok: z.literal(true) }),
 });
 
+/** Adds a Pi account: an Anthropic API key, with an optional base URL and proxy. */
+export const addApiAccount = defineRpc({
+  name: "zerosub.accounts.api.add",
+  input: z.object({
+    label: z.string().trim().min(1).max(40),
+    key: z.string().trim().min(1).max(4096),
+    /** Empty for Anthropic's own API. */
+    baseUrl: z.string().trim().max(2048).optional(),
+    proxy: z.string().trim().max(2048).optional(),
+  }),
+  output: z.object({ accountId: z.string() }),
+});
+
+/** Changes a Pi account's key (empty or omitted keeps it) or base URL; Pi's own login's too. */
+export const updateApiAccount = defineRpc({
+  name: "zerosub.accounts.api.update",
+  input: z.object({
+    accountId: z.string(),
+    key: z.string().trim().max(4096).optional(),
+    baseUrl: z.string().trim().max(2048).optional(),
+  }),
+  output: z.object({ ok: z.literal(true) }),
+});
+
+/** Sets a Pi account's proxy (Pi's own login's included); an empty value clears it. */
+export const setAccountProxy = defineRpc({
+  name: "zerosub.accounts.proxy",
+  input: z.object({ accountId: z.string(), proxy: z.string().trim().max(2048) }),
+  output: z.object({ ok: z.literal(true), proxy: z.string().nullable() }),
+});
+
+/**
+ * Changes the folder added Pi accounts' homes are kept in (empty: the default, `~/.pi-config`); the
+ * accounts kept before move there. `moving`: how many are due to move.
+ */
+export const setPiHomesDir = defineRpc({
+  name: "zerosub.accounts.pi.homes",
+  input: z.object({ dir: z.string().trim().max(1024) }),
+  output: z.object({ ok: z.literal(true), dir: z.string(), moving: z.number() }),
+});
+
+/** Adds back a Pi account from the folder ZeroSub kept when it was removed. */
+export const importPiAccount = defineRpc({
+  name: "zerosub.accounts.pi.import",
+  input: z.object({ path: z.string().trim().min(1).max(1024) }),
+  output: z.object({ accountId: z.string() }),
+});
+
 export const removeAccount = defineRpc({
   name: "zerosub.accounts.remove",
   input: z.object({ accountId: z.string() }),
