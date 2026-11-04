@@ -2,7 +2,7 @@ import type { PluginClientContext } from "@getpaseo/plugin/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { LoginView, StateView } from "../shared/model";
 import { getState, setAgentAccount } from "../shared/rpc";
-import { VISIBLE_POLL_MS, createZeroSubStore, type StoreSnapshot } from "./store";
+import { VISIBLE_POLL_MS, createZeroSubStore, describe as describeError, type StoreSnapshot } from "./store";
 
 function view(overrides: Partial<StateView> = {}): StateView {
   return {
@@ -219,5 +219,93 @@ describe("createZeroSubStore", () => {
     await vi.advanceTimersByTimeAsync(20_000);
     expect(client.rpc).toHaveBeenCalledTimes(3);
     expect(store.current.error).toBeNull();
+  });
+});
+
+describe("createZeroSubStore with a usage refresh under way", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("answers other refreshes, and the one after an action, without waiting for it", async () => {
+    const { client, store } = createStore();
+    const usage = deferred<StateView>();
+    const latest = view({ warnings: ["after the action"] });
+    client.rpc.mockReturnValueOnce(usage.promise).mockResolvedValue(latest);
+    const refreshing = store.refresh({ refreshUsage: true });
+    // A poll, and an action with the refresh it asks for and the one its caller awaits.
+    await store.refresh();
+    await store.rpc(setAgentAccount, { agentId: "agent-1", accountId: null });
+    await store.refresh();
+    expect(store.current.state).toBe(latest);
+    expect(client.rpc).toHaveBeenCalledWith(getState, { refreshUsage: true });
+    expect(client.rpc).toHaveBeenLastCalledWith(getState, { refreshUsage: undefined });
+    const calls = client.rpc.mock.calls.length;
+    usage.resolve(view({ warnings: ["usage"] }));
+    await refreshing;
+    // Its answer is older than the ones shown since, so the store asks again for the newest.
+    expect(client.rpc).toHaveBeenCalledTimes(calls + 1);
+    expect(store.current.state).toBe(latest);
+  });
+
+  it("shows the usage answer when nothing newer came in meanwhile", async () => {
+    const { client, store } = createStore();
+    const fresh = view({ warnings: ["fresh usage"] });
+    client.rpc.mockResolvedValueOnce(fresh);
+    await store.refresh({ refreshUsage: true });
+    expect(client.rpc).toHaveBeenCalledTimes(1);
+    expect(store.current.state).toBe(fresh);
+  });
+
+  it("shares a second usage refresh with the one under way", async () => {
+    const { client, store } = createStore();
+    const usage = deferred<StateView>();
+    client.rpc.mockReturnValueOnce(usage.promise);
+    const first = store.refresh({ refreshUsage: true });
+    const second = store.refresh({ refreshUsage: true });
+    expect(second).toBe(first);
+    expect(client.rpc).toHaveBeenCalledTimes(1);
+    usage.resolve(view());
+    await first;
+  });
+
+  it("remembers when the state shown arrived, and keeps that time while refreshes fail", async () => {
+    const { client, store } = createStore();
+    vi.setSystemTime(new Date("2026-10-28T10:00:00Z"));
+    client.rpc.mockResolvedValueOnce(view()).mockRejectedValueOnce(new Error("Plugin is not available"));
+    expect(store.current.updatedAt).toBeNull();
+    await store.refresh();
+    const arrived = Date.parse("2026-10-28T10:00:00Z");
+    expect(store.current.updatedAt).toBe(arrived);
+    vi.setSystemTime(new Date("2026-10-28T10:03:00Z"));
+    await store.refresh();
+    expect(store.current.error).toBe("Plugin is not available");
+    expect(store.current.updatedAt).toBe(arrived);
+  });
+});
+
+describe("describe", () => {
+  it("words Zod's input errors for the user", async () => {
+    const { z } = await import("zod");
+    const schema = z.object({ label: z.string().trim().min(1).max(40), key: z.string().trim().min(1) });
+    const failure = schema.safeParse({ label: "x".repeat(41), key: " " }).error;
+    expect(describeError(failure)).toBe("Name can be at most 40 characters. Key can't be empty.");
+    // The same error once only its message is left, as after crossing an RPC.
+    expect(describeError(new Error(failure?.message))).toBe("Name can be at most 40 characters. Key can't be empty.");
+  });
+
+  it("drops what Paseo wraps a plugin handler's error in", () => {
+    const wrapped = (inner: string) => new Error(`Request failed: ${inner} requestType=plugin.rpc.invoke.request code=handler_error`);
+    expect(describeError(wrapped("Pick a folder of their own for the accounts, not ~ itself."))).toBe(
+      "Pick a folder of their own for the accounts, not ~ itself.",
+    );
+    expect(describeError(new Error("Plugin is not available requestType=plugin.rpc.invoke.request"))).toBe("Plugin is not available");
+    const issues = '[{"code":"too_big","maximum":40,"type":"string","inclusive":true,"path":["label"],"message":"x"}]';
+    expect(describeError(wrapped(issues))).toBe("Name can be at most 40 characters.");
+  });
+
+  it("leaves other errors as they are", () => {
+    expect(describeError(new Error("Plugin RPC timed out"))).toBe("Plugin RPC timed out");
+    expect(describeError(new Error("[ZeroSub] not JSON"))).toBe("[ZeroSub] not JSON");
+    expect(describeError("plain")).toBe("plain");
   });
 });
