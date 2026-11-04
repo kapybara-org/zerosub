@@ -35,6 +35,17 @@ describe("run", () => {
     expect(Date.now() - started).toBeGreaterThanOrEqual(1_900);
   }, 15_000);
 
+  it.skipIf(process.platform === "win32")("finishes once the child exits, though a process it started keeps the output open", async () => {
+    const started = Date.now();
+    const result = await run(
+      NODE,
+      ["-e", 'require("node:child_process").spawn("sleep", ["10"], { stdio: "inherit", detached: true }).unref(); process.stdout.write("done\\n");'],
+      { timeoutMs: 20_000 },
+    );
+    expect(result).toEqual({ code: 0, stdout: "done\n", stderr: "", timedOut: false });
+    expect(Date.now() - started).toBeLessThan(5_000);
+  }, 15_000);
+
   it("caps output past 1 MiB and reports the limit first", async () => {
     const result = await run(
       NODE,
