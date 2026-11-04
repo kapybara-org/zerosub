@@ -9,6 +9,8 @@ export interface RunResult {
 }
 
 const MAX_OUTPUT_BYTES = 1024 * 1024;
+/** How long output may still arrive after the child exits, before pipes held open by its own children are let go. */
+const EXIT_DRAIN_MS = 1_000;
 
 /** Runs a command to completion with a timeout. Never throws for a non-zero exit. */
 export function run(
@@ -24,6 +26,8 @@ export function run(
     let outputExceeded = false;
     const decoders = { stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8") };
     let killTimer: ReturnType<typeof setTimeout> | undefined;
+    let drainTimer: ReturnType<typeof setTimeout> | undefined;
+    let finished = false;
     let child: ChildProcess;
     try {
       child = spawn(command, [...args], {
@@ -65,14 +69,27 @@ export function run(
     child.on("error", (error) => {
       stderr += error.message;
     });
-    child.on("close", (code) => {
+    const finish = (code: number | null) => {
+      if (finished) return;
+      finished = true;
       clearTimeout(timer);
       clearTimeout(killTimer);
+      clearTimeout(drainTimer);
       stdout += decoders.stdout.end();
       stderr += decoders.stderr.end();
       if (outputExceeded) stderr = `Command output exceeded the 1 MiB limit.${stderr ? `\n${stderr}` : ""}`;
       resolve({ code: outputExceeded ? null : code, stdout, stderr, timedOut });
+    };
+    // "close" waits for every process holding the pipes, so a helper the command left running would
+    // keep the caller waiting until it ends too.
+    child.on("exit", (code) => {
+      drainTimer = setTimeout(() => {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        finish(code);
+      }, EXIT_DRAIN_MS);
     });
+    child.on("close", finish);
     if (options.input !== undefined) child.stdin?.end(options.input);
     else child.stdin?.end();
   });

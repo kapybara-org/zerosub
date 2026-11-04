@@ -4,7 +4,7 @@ import { useCallback, useState, type ComponentType } from "react";
 import { Text, View } from "react-native";
 import type { AccountView, ResetOffer } from "../shared/model";
 import { redeemReset, type RedeemResult } from "../shared/rpc";
-import { describe, type ZeroSubStore } from "./store";
+import { describe, stoppedWaiting, type ZeroSubStore } from "./store";
 import { Button, useText } from "./ui";
 
 type Theme = PluginHostProps["theme"];
@@ -63,7 +63,15 @@ export function ResetConfirm({
     try {
       onFinished(await store.rpc(redeemReset, { accountId: account.id, agentId }));
     } catch (failure) {
-      setError(describe(failure));
+      // The daemon carries on with the reset; using another now could spend a second one.
+      if (stoppedWaiting(failure)) {
+        onFinished({
+          outcome: "pending",
+          message: `Still using the reset on ${account.label}. Its limits show on its card once it's done; don't use another.`,
+          left: null,
+          continued: false,
+        });
+      } else setError(describe(failure));
     } finally {
       setBusy(false);
     }
@@ -131,10 +139,11 @@ export function resetPopover(store: ZeroSubStore, account: AccountView, agentId:
 }
 
 /** Toast wording and tone for a redeem result. */
-export function redeemToast(label: string, result: RedeemResult): { message: string; variant: "success" | "warning" | "error" } {
+export function redeemToast(label: string, result: RedeemResult): { message: string; variant: "success" | "info" | "warning" | "error" } {
   if (result.outcome === "reset") {
     return { message: `${label}: ${result.message}${result.continued ? " The agent is carrying on." : ""}`, variant: "success" };
   }
   if (result.outcome === "error") return { message: result.message, variant: "error" };
+  if (result.outcome === "pending") return { message: result.message, variant: "info" };
   return { message: result.message, variant: "warning" };
 }

@@ -4,12 +4,12 @@ import type {
   PluginButtonRegistration,
   PluginClientContext,
 } from "@getpaseo/plugin/client";
-import { formatCredits, formatPercent, peakUsage, shortLabel } from "../shared/format";
+import { accountPeak, formatCredits, formatPercent, moveProblem, peakUsage, pillText, shortLabel } from "../shared/format";
 import { FAMILY_LABEL, type AccountView, type Family, type StateView } from "../shared/model";
 import { setAgentAccount } from "../shared/rpc";
 import { forkPopover } from "./fork-confirm";
 import { resetPopover } from "./reset-confirm";
-import type { ZeroSubStore } from "./store";
+import { stoppedWaiting, type ZeroSubStore } from "./store";
 
 /** The most agents Paseo returns per page. */
 const PAGE_SIZE = 200;
@@ -165,8 +165,15 @@ function buttonFor(
     state.accounts.some((account) => account.family === other && account.status === "ready");
   if (accounts.length < 2 && !(current.status === "limited" && (offerReset || offerFork))) return null;
 
-  const choose = (accountId: string | null) => async () => {
-    await store.rpc(setAgentAccount, { agentId: agent.id, accountId });
+  const choose = (accountId: string | null, to: string) => async () => {
+    const summary = await store.rpc(setAgentAccount, { agentId: agent.id, accountId }).catch((error: unknown) => {
+      // The move goes on without Paseo waiting for it, and the pill shows it under way.
+      if (stoppedWaiting(error)) return null;
+      throw error;
+    });
+    // Paseo shows what an action throws: here, that the agent couldn't be reloaded.
+    const problem = summary && moveProblem(summary, to);
+    if (problem) throw new Error(problem);
   };
 
   // Codex threads can't change accounts in place; continue in this task's tab for that account.
@@ -176,8 +183,13 @@ function buttonFor(
     id: `account-${index}`,
     title: account.id === current.id || movable ? menuTitle(account) : `Continue on ${account.label}`,
     icon: account.id === current.id ? "CircleCheck" : movable ? "Circle" : "ArrowRightLeft",
-    disabled: account.status === "signed_out" || account.status === "disabled" || account.id === current.id,
-    behavior: { kind: "action", onPress: choose(account.id) },
+    // With automatic switching on, an account at its limit would only pass the agent on (the server refuses it too).
+    disabled:
+      account.status === "signed_out" ||
+      account.status === "disabled" ||
+      (state.autoSwitch && account.status === "limited") ||
+      account.id === current.id,
+    behavior: { kind: "action", onPress: choose(account.id, account.label) },
   }));
   // When the agent is stuck on a limit, a way out is the most useful thing in the menu.
   const wayOut: PluginButtonMenuEntry[] = [];
@@ -217,7 +229,7 @@ function buttonFor(
       id: "follow-default",
       title: fallback ? `Follow default (${fallback.label})` : "Follow default",
       icon: "Undo2",
-      behavior: { kind: "action", onPress: choose(null) },
+      behavior: { kind: "action", onPress: choose(null, fallback?.label ?? "the default account") },
     });
   }
   items.push({
@@ -233,11 +245,10 @@ function buttonFor(
     },
   });
 
-  const pending = route?.pendingAccountId ? " (after this turn)" : "";
+  const running = route?.pendingAccountId ? state.accounts.find((account) => account.id === route.pendingAccountId) : undefined;
   return {
-    title: `Account: ${current.label}${current.email && current.email !== current.label ? ` (${current.email})` : ""}`,
+    ...pillText(current, running ?? null, route?.waiting ?? (state.canReopen ? "idle" : "restart")),
     icon: current.status === "limited" ? "CircleAlert" : "CircleUserRound",
-    label: `${shortLabel(current)}${pending}`,
     behavior: { kind: "menu", items },
   };
 }
@@ -246,7 +257,8 @@ function menuTitle(account: AccountView): string {
   if (account.status === "signed_out") return `${account.label} — signed out`;
   if (account.status === "disabled") return `${account.label} — disabled`;
   if (account.status === "limited") return `${account.label} — limit reached`;
-  const peak = account.usage ? peakUsage(account.usage.windows) : null;
+  // A full window of one model only (Claude's "Weekly · Opus") isn't the account's room.
+  const peak = account.usage ? accountPeak(account.usage.windows) : null;
   if (!peak) return account.label;
   const credits = account.usage?.credits;
   return `${account.label} — ${formatPercent(peak.usedPercent)} used${credits ? ` · ${formatCredits(credits)}` : ""}`;

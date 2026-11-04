@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { UsageSchema, type Usage } from "../shared/model";
+import { UsageSchema, type Usage, type UsageWindow } from "../shared/model";
 import { readJson, writeJsonAtomic } from "./json-file";
 import { dataDir } from "./paths";
 

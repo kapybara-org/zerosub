@@ -89,6 +89,11 @@ export class ClaudeAdapter implements FamilyAdapter {
     const status = parseJsonObject(result.stdout);
     if (!status) throw new Error(result.stderr.trim() || "Could not read Claude sign-in status");
     const signedIn = status.loggedIn === true;
+    // Claude Code takes a Keychain entry it couldn't read (keychain locked, `security` slower than its
+    // 2 s limit) for no sign-in, so "signed out" only stands once the entry says so too.
+    if (!signedIn && (await keychainSignIn(home)) !== false) {
+      throw new Error("Claude reported no sign-in, but its keychain entry couldn't be read or still holds one");
+    }
     const email = str(status.email);
     const orgId = str(status.orgId);
     return {
@@ -390,6 +395,24 @@ export function keychainService(home: string | null): string {
   const { path, hashed } = storageDir(home);
   if (!hashed) return "Claude Code-credentials";
   return `Claude Code-credentials-${createHash("sha256").update(path.normalize("NFC")).digest("hex").slice(0, 8)}`;
+}
+
+/** `security`'s exit code when there's no such keychain item (errSecItemNotFound). */
+const KEYCHAIN_ITEM_NOT_FOUND = 44;
+
+/**
+ * Whether the home's Keychain entry holds a Claude sign-in: false once it's gone or holds none, null
+ * when it can't be read. Off macOS Claude Code keeps the sign-in in a file, and its answer stands.
+ * The token read here is only looked at, never logged or stored.
+ */
+async function keychainSignIn(home: string | null): Promise<boolean | null> {
+  if (process.platform !== "darwin") return false;
+  const result = await run("/usr/bin/security", ["find-generic-password", "-a", keychainAccount(), "-w", "-s", keychainService(home)], {
+    timeoutMs: 10_000,
+  });
+  if (result.code === KEYCHAIN_ITEM_NOT_FOUND) return false;
+  if (result.code !== 0) return null;
+  return Boolean(parseCredentials(result.stdout)?.accessToken);
 }
 
 function parseCredentials(raw: string): Credentials | null {
