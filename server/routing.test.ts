@@ -249,6 +249,22 @@ describe("non-portable conversations (Codex)", () => {
     expect(chooseAccount(state, { ...codex, reason: "resume", usageOf: () => null })?.account.id).toBe("codex-main");
   });
 
+  it("gives an existing thread ZeroSub never routed to the CLI login, whatever the default", () => {
+    const state = stateWith([main, work], { defaults: { claude: null, codex: "codex-work" } });
+    for (const reason of ["resume", "refresh", "import"] as const) {
+      const decision = chooseAccount(state, { ...codex, reason, usageOf: () => null });
+      expect(decision?.account.id).toBe("codex-main");
+      expect(decision?.bind).toMatchObject({ accountId: "codex-main", source: "thread" });
+    }
+    // A brand-new agent, and a thread ZeroSub opened before (it has a session record), follow the default.
+    expect(chooseAccount(state, { ...codex, reason: "create", usageOf: () => null })?.account.id).toBe("codex-work");
+    const routed = stateWith([main, work], {
+      defaults: { claude: null, codex: "codex-work" },
+      sessions: { "agent-1": { accountId: "codex-work", family: "codex", openedAt: "x" } },
+    });
+    expect(chooseAccount(routed, { ...codex, reason: "resume", usageOf: () => null })?.account.id).toBe("codex-work");
+  });
+
   it("starts new agents on a usable account", () => {
     const limited = account({ id: "codex-main", family: "codex", kind: "main", home: null, limitedUntil: "2026-09-23T14:00:00Z" });
     const decision = chooseAccount(stateWith([limited, work]), { ...codex, reason: "create", usageOf: () => null });
