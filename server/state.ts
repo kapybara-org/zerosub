@@ -83,6 +83,17 @@ export const ContinuationChainSchema = z.object({
 });
 export type ContinuationChain = z.infer<typeof ContinuationChainSchema>;
 
+/** A home to sign out and delete once nothing runs on it any more. */
+export const CleanupSchema = z.object({
+  family: FamilySchema,
+  /** The account it was (or was going to be) the home of; its agents' sessions name this ID. */
+  accountId: z.string(),
+  /** `removed`: the user removed the account. `unfinished`: a new account whose sign-in hasn't been saved yet. */
+  why: z.enum(["removed", "unfinished"]),
+  at: z.string(),
+});
+export type Cleanup = z.infer<typeof CleanupSchema>;
+
 export const StoredStateSchema = z.object({
   version: z.literal(1).default(1),
   accounts: z.array(StoredAccountSchema).default([]),
@@ -94,6 +105,11 @@ export const StoredStateSchema = z.object({
   /** Which account each agent's live provider session was opened with. */
   sessions: z.record(z.string(), LiveSessionSchema).default({}),
   continuations: z.record(z.string(), ContinuationChainSchema).default({}),
+  /**
+   * Homes to clean up, by path. Only these are ever signed out or deleted: a home missing from
+   * `accounts` may just be missing from a damaged or hand-edited registry.
+   */
+  cleanup: z.record(z.string(), CleanupSchema).default({}),
 });
 export type StoredState = z.infer<typeof StoredStateSchema>;
 
@@ -138,6 +154,7 @@ export function salvageState(raw: unknown): { state: StoredState; dropped: boole
       bindings: records(BindingSchema, source.bindings),
       sessions: records(LiveSessionSchema, source.sessions),
       continuations: records(ContinuationChainSchema, source.continuations),
+      cleanup: records(CleanupSchema, source.cleanup),
     },
     dropped: true,
   };
