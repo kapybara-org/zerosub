@@ -177,6 +177,9 @@ export class Service {
   private collecting = false;
   private timer: ReturnType<typeof setInterval> | null = null;
   private stopped = false;
+  /** Startup's steps have all worked; until they have, each upkeep tries them again. See `startUp`. */
+  private started = false;
+  private starting: Promise<void> | null = null;
 
   constructor(
     private readonly adapters: Record<Family, FamilyAdapter>,
@@ -197,12 +200,26 @@ export class Service {
   }
 
   async start(): Promise<void> {
-    // The last readings show right away; fresh ones replace them as they arrive.
-    for (const [accountId, reading] of await loadReadings()) if (!this.usage.has(accountId)) this.usage.set(accountId, reading);
-    await Promise.all(FAMILIES.map((family) => this.ensureFamily(family)));
+    // Upkeep runs even when a startup step fails (the registry can't be read or written for a
+    // moment, say): it tries the step again until it works.
     this.timer = setInterval(() => void this.tick().catch((error: unknown) => log("upkeep failed", error)), UPKEEP_MS);
     this.timer.unref?.();
+    await this.startUp();
     void this.tick().catch(() => undefined);
+  }
+
+  /** Shows the last readings and registers the CLIs' own logins, once it all works. */
+  private startUp(): Promise<void> {
+    if (this.started) return Promise.resolve();
+    this.starting ??= (async () => {
+      // The last readings show right away; fresh ones replace them as they arrive.
+      for (const [accountId, reading] of await loadReadings()) if (!this.usage.has(accountId)) this.usage.set(accountId, reading);
+      await Promise.all(FAMILIES.map((family) => this.ensureFamily(family)));
+      this.started = true;
+    })().finally(() => {
+      this.starting = null;
+    });
+    return this.starting;
   }
 
   async stop(): Promise<void> {
@@ -239,6 +256,7 @@ export class Service {
 
   private async tick(): Promise<void> {
     if (this.stopped) return;
+    if (!this.started) await this.startUp().catch((error: unknown) => log("startup still didn't finish; trying again in 30 s", error));
     const now = Date.now();
     for (const family of FAMILIES) {
       const availability = this.availability.get(family);

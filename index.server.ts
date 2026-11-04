@@ -28,7 +28,7 @@ export default function contribute(server: PluginServerContext) {
   void settings.read().then(applySettings, (error: unknown) => console.error("[ZeroSub] could not read preferences", describe(error)));
   const stopSettings = settings.subscribe(applySettings);
 
-  void service.start().catch((error: unknown) => console.error("[ZeroSub] startup failed", describe(error)));
+  void service.start().catch((error: unknown) => console.error("[ZeroSub] startup failed; trying again in 30 s", describe(error)));
 
   // Never let routing break or stall an agent: on any error, or if it takes too long (Paseo fails
   // a hook after 30s), the session simply opens on its usual login.
