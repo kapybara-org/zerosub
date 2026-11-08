@@ -4,7 +4,7 @@ import type {
   PluginButtonRegistration,
   PluginClientContext,
 } from "@getpaseo/plugin/client";
-import { accountPeak, formatCredits, formatPercent, moveProblem, peakUsage, pillText, shortLabel } from "../shared/format";
+import { accountPeak, formatCredits, formatPercent, moveProblem, pillText } from "../shared/format";
 import { FAMILY_LABEL, type AccountView, type Family, type StateView } from "../shared/model";
 import { setAgentAccount } from "../shared/rpc";
 import { forkPopover } from "./fork-confirm";
