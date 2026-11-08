@@ -957,6 +957,22 @@ describe("changing the default account", () => {
     return { service, store, paseo: paseo as never, context, reopened };
   }
 
+  it("aligns an agent whose last turn failed with the account it's shown on", async () => {
+    const { service, store, paseo, reopened } = await setUpAgents(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
+        defaults: { claude: MAIN, codex: null },
+        sessions: { drifted: session(MAIN) },
+        bindings: { drifted: { accountId: WORK, source: "user", at: openedAt } },
+      },
+      [{ id: "drifted", status: "error" }],
+    );
+    expect((await service.view(paseo)).agents.find((route) => route.agentId === "drifted")).toMatchObject({ accountId: WORK, pendingAccountId: MAIN });
+    await service.alignSessions(paseo);
+    expect(reopened).toEqual(["drifted"]);
+    expect((await store.read()).sessions.drifted?.accountId).toBe(WORK);
+  });
+
   it("moves an agent whose last turn failed when it's switched", async () => {
     // A failed turn leaves the agent in "error" with its session still open: its next message goes to
     // that session as it is, so only a reload moves it.
