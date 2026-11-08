@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FamilyAdapter, LoginHandle } from "./adapter";
 import type { FamilyResolver } from "./families";
@@ -100,6 +100,27 @@ describe("cleaning up homes", () => {
     expect(loggedOut).toEqual([home("claude-aaaaaaaaaaaa")]);
     expect(await exists(home("claude-aaaaaaaaaaaa"))).toBe(false);
     expect((await store.read()).cleanup).toEqual({});
+  });
+
+  it("never signs out or deletes a listed path that isn't one of its own homes", async () => {
+    const elsewhere = join(root, "elsewhere", "claude-aaaaaaaaaaaa");
+    const victim = join(root, "zerosub", "victim");
+    await mkdir(elsewhere, { recursive: true });
+    await mkdir(victim, { recursive: true });
+    await mkdir(home("claude-bbbbbbbbbbbb"), { recursive: true });
+    // Starts with the homes folder, but resolves to `zerosub/victim`.
+    const traversal = [home("claude-bbbbbbbbbbbb"), "..", "..", "victim"].join(sep);
+    const removed = (accountId: string) => ({ family: "claude" as const, accountId, why: "removed" as const, at: "x" });
+    const { service, store, loggedOut, paseo } = await setUp({
+      cleanup: { [elsewhere]: removed("claude-aaaaaaaaaaaa"), [traversal]: removed("claude-bbbbbbbbbbbb") },
+    });
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await service.cleanUpHomes(paseo);
+    expect(loggedOut).toEqual([]);
+    expect(await exists(elsewhere)).toBe(true);
+    expect(await exists(victim)).toBe(true);
+    expect((await store.read()).cleanup).toEqual({});
+    errors.mockRestore();
   });
 
   it("drops the entry, signing nothing out, once an account uses the home again", async () => {

@@ -35,7 +35,7 @@ import { FamilyResolver } from "./families";
 import { sameAccountIdentity } from "./account-identity";
 import { CodexContinuations } from "./continuations";
 import { CONTINUED_FROM_LABEL, continueInNewAgent, type Continuation } from "./handoff";
-import { removeHome } from "./homes";
+import { isAccountHome, removeHome } from "./homes";
 import { Mutex } from "./json-file";
 import { turnRows } from "./limits";
 import { canSignInWithBrowser } from "./machine";
@@ -368,6 +368,15 @@ export class Service {
     }
     for (const [home, entry] of Object.entries(state.cleanup)) {
       if (busy.has(home)) continue;
+      if (!isAccountHome(home, entry.family)) {
+        // Only a folder ZeroSub made in homes/ is ever signed out or deleted. An entry naming anything
+        // else (a hand edit, say) could otherwise sign out the CLI's own login, keychain entry and all.
+        await this.store.update((draft) => {
+          delete draft.cleanup[home];
+        });
+        console.error(`[ZeroSub] left ${home} alone: it isn't an account home in ${homesDir()}`);
+        continue;
+      }
       if (owned.has(home)) {
         // An account uses it again (put back by hand, say), so it's never signed out from under it.
         await this.store.update((draft) => {
