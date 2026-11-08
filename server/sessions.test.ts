@@ -74,6 +74,8 @@ interface Options {
   unlisted?: Array<Agent & { internal?: boolean }>;
   /** Agents Paseo can't look up just now. */
   lookupFails?: string[];
+  /** Answer an unknown ID, or a helper's, with an error, as Paseo 0.9 and 0.10 do. */
+  notFoundError?: boolean;
 }
 
 async function setUp(state: Partial<StoredState>, agents: Agent[], options: Options = {}) {
@@ -87,7 +89,9 @@ async function setUp(state: Partial<StoredState>, agents: Agent[], options: Opti
       ref: (id: string) => ({
         refresh: async () => {
           if (options.lookupFails?.includes(id)) throw new Error("Timeout waiting for message");
-          return { agent: [...agents, ...(options.unlisted ?? [])].find((agent) => agent.id === id) };
+          const agent = [...agents, ...(options.unlisted ?? [])].find((entry) => entry.id === id);
+          if (options.notFoundError && (!agent || (agent as { internal?: boolean }).internal)) throw new Error(`Agent not found: ${id}`);
+          return { agent };
         },
         send: async () => undefined,
         timeline: {
@@ -350,6 +354,21 @@ describe("agents Paseo doesn't list", () => {
     // Gone, or one of Paseo's hidden helpers: forgotten. Still there, or no answer yet: kept.
     expect(Object.keys(sessions).sort()).toEqual(["background", "unsure"]);
     expect(Object.keys(bindings).sort()).toEqual(["background", "unsure"]);
+  });
+
+  it("are forgotten when an older Paseo says it can't find them", async () => {
+    const recorded = (...ids: string[]) => Object.fromEntries(ids.map((id) => [id, { accountId: HELLO, family: "claude" as const, openedAt: EARLIER }]));
+    const { service, store, paseo } = await setUp(
+      {
+        accounts: claudeAccounts(),
+        defaults: { claude: MAIN, codex: null },
+        sessions: recorded("background", "gone", "helper", "unsure"),
+      },
+      [live("open")],
+      { unlisted: [live("background"), { ...live("helper"), internal: true }], lookupFails: ["unsure"], notFoundError: true },
+    );
+    await (service as unknown as { prune(paseo: unknown): Promise<void> }).prune(paseo);
+    expect(Object.keys((await store.read()).sessions).sort()).toEqual(["background", "unsure"]);
   });
 });
 

@@ -445,7 +445,9 @@ export class Service {
         .ref(id)
         .refresh()
         .then((result) => result?.agent ?? null)
-        .catch(() => undefined);
+        // Paseo 0.9 and 0.10 answer an ID they don't know (their own helpers' included) with an error
+        // rather than no agent. Any other error means no answer yet.
+        .catch((error: unknown) => (/Agent not found/.test(describe(error)) ? null : undefined));
       if (agent === null || (agent && (agent as { internal?: boolean }).internal)) gone.add(id);
     }
     const staleSessions = Object.entries(state.sessions).filter(([id, session]) => gone.has(id) && old(session.openedAt));
