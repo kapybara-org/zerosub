@@ -129,7 +129,6 @@ interface AgentInfo {
 type ReopenOutcome = "reopened" | "deferred" | "closed" | "failed";
 type Problem = { kind: "limit"; hit: LimitHit } | { kind: "signed_out" };
 
-/** The agent has a running CLI session (idle between turns counts). */
 /**
  * Whether the agent has a session open. One whose last turn failed ("error": an API key out of
  * credit, say) still does, and its next message goes to that session as it is, so it's moved like an
