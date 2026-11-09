@@ -838,6 +838,23 @@ describe("changing the default account", () => {
     return { service, store, paseo: paseo as never, context, reopened };
   }
 
+  it("moves an agent whose last turn failed when it's switched", async () => {
+    // A failed turn leaves the agent in "error" with its session still open: its next message goes to
+    // that session as it is, so only a reload moves it.
+    const { service, store, paseo, reopened } = await setUpAgents(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
+        defaults: { claude: MAIN, codex: null },
+        sessions: { failed: session(MAIN) },
+      },
+      [{ id: "failed", status: "error" }],
+    );
+    const summary = await service.setAgentAccount(paseo, "failed", WORK);
+    expect(summary.reopened).toEqual(["failed"]);
+    expect(reopened).toEqual(["failed"]);
+    expect((await store.read()).sessions.failed?.accountId).toBe(WORK);
+  });
+
   it("keeps each open agent that follows the default on the account it runs on, and nothing else", async () => {
     const { service, store, paseo, reopened } = await setUpAgents(
       {

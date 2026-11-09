@@ -130,9 +130,18 @@ interface AgentInfo {
 type ReopenOutcome = "reopened" | "deferred" | "closed" | "failed";
 type Problem = { kind: "limit"; hit: LimitHit } | { kind: "signed_out" };
 
-/** The agent has a running CLI session (idle between turns counts). */
+/**
+ * Whether the agent has a session open. One whose last turn failed ("error": an API key out of
+ * credit, say) still does, and its next message goes to that session as it is, so it's moved like an
+ * idle one: by a reload.
+ */
 function isLive(status: string): boolean {
-  return status === "idle" || status === "running" || status === "initializing";
+  return status === "idle" || status === "error" || status === "running" || status === "initializing";
+}
+
+/** Open and between turns: idle, or stopped by a failed turn. */
+function settled(status: string): boolean {
+  return status === "idle" || status === "error";
 }
 
 function emptySummary(): ReopenSummary {
@@ -924,7 +933,7 @@ export class Service {
   private async continueAfterReset(paseo: PaseoApi, agentId: string, account: StoredAccount, detail: string): Promise<boolean> {
     if (!this.prefs.autoContinue) return false;
     const info = await agentInfo(paseo, agentId);
-    if (!info || info.archived || info.status !== "idle") return false;
+    if (!info || info.archived || !settled(info.status)) return false;
     if (this.runningOn(await this.store.read(), agentId, account.family) !== account.id) return false;
     // Only resume an agent that this limit actually stopped.
     if (!(await this.lastTurnHitLimit(paseo, agentId, account.family))) return false;
@@ -1006,7 +1015,7 @@ export class Service {
     for (const agentId of candidates) {
       if (this.switching.has(agentId) || !this.switchGuard.allows(agentId, Date.now())) continue;
       const info = await agentInfo(paseo, agentId);
-      if (!info || info.archived || info.status !== "idle") continue;
+      if (!info || info.archived || !settled(info.status)) continue;
       if (await this.lastTurnHitLimit(paseo, agentId, family)) continue;
       this.switching.add(agentId);
       try {
