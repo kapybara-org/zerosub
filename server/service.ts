@@ -148,6 +148,14 @@ function emptySummary(): ReopenSummary {
   return { reopened: [], deferred: [], failed: [], continuedIn: null };
 }
 
+/** How long a "next new agent" pick waits to be used. */
+const NEXT_PICK_MS = 10 * 60_000;
+
+function nextPickUntil(state: StoredState, accountId: string, family: Family, now: number): string | null {
+  const pick = state.nextAgent?.[family];
+  return pick && pick.accountId === accountId && Date.parse(pick.until) > now ? pick.until : null;
+}
+
 export class Service {
   private readonly continuations: CodexContinuations;
   private paseo: PaseoApi | null = null;
@@ -430,9 +438,16 @@ export class Service {
       balanceNewAgents: this.prefs.balanceNewAgents,
       portable: adapter.portable,
       usageOf: (id) => this.usage.get(id),
+      allowNextPick: request.purpose === "interactive",
     });
     if (!decision) return undefined;
     const { account } = decision;
+    if (decision.usedNextPick) {
+      await this.store.update((draft) => {
+        if (draft.nextAgent?.[family]?.accountId === account.id) draft.nextAgent[family] = null;
+      });
+      console.log(`[ZeroSub] next-agent pick used: ${request.agentId} starts on ${account.label}`);
+    }
 
     if (account.kind === "managed" && account.home) {
       await adapter.prepareHome(account.home).catch((error: unknown) => log(`could not refresh the home of ${account.label}`, error));
@@ -1465,6 +1480,7 @@ export class Service {
         organization: account.organization,
         status: !account.signedIn ? "signed_out" : account.disabled ? "disabled" : limited ? "limited" : "ready",
         isDefault: defaultAccount(state, account.family)?.id === account.id,
+        nextAgentUntil: nextPickUntil(state, account.id, account.family, now),
         limitedUntil: limited ? account.limitedUntil : null,
         usage: this.usage.get(account.id) ?? null,
         agentCount: counts.get(account.id) ?? 0,
@@ -1529,6 +1545,22 @@ export class Service {
   }
 
   // ------------------------------------------------------------------ RPC: accounts
+
+  /** Picks (or clears) the account the next new agent of its family starts on, for NEXT_PICK_MS. */
+  async setNextAgent(accountId: string, enabled: boolean): Promise<{ until: string | null }> {
+    const account = findAccount(await this.store.read(), accountId);
+    if (!account) throw new Error("That account no longer exists.");
+    if (enabled && !account.signedIn) throw new Error(`${account.label} is signed out. Sign it in first.`);
+    if (enabled && account.disabled) throw new Error(`${account.label} is disabled. Enable it first.`);
+    const until = enabled ? new Date(Date.now() + NEXT_PICK_MS).toISOString() : null;
+    await this.store.update((draft) => {
+      draft.nextAgent ??= { claude: null, codex: null };
+      if (enabled) draft.nextAgent[account.family] = { accountId: account.id, until: until! };
+      else if (draft.nextAgent[account.family]?.accountId === account.id) draft.nextAgent[account.family] = null;
+    });
+    console.log(`[ZeroSub] next new ${account.family} agent: ${enabled ? account.label : "back to the default"}`);
+    return { until };
+  }
 
   async setDefault(paseo: PaseoApi, accountId: string): Promise<ReopenSummary> {
     this.attach(paseo);

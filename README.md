@@ -56,6 +56,10 @@ Then open **Accounts (ZeroSub)** in the sidebar.
 
 Turn on **Spread new agents across accounts** to select an account from its usage. For ChatGPT agents, ZeroSub prefers an account when its weekly limit resets within one day and both limits have at least 20% left. Usage for every available account must be complete and less than 30 minutes old. Otherwise, ZeroSub selects the account with the most room. Claude agents use the account with the most room. When a near weekly reset was the reason, the agent's account menu says **Started here: weekly reset was near**. Existing agents stay on their accounts.
 
+### Pick the account for the next new agent
+
+A new workspace has no agent yet, so its message box has no account button. To choose the account of the agent you're about to start, use **⌘K → "Next new … agent: use …"** or the **plus-square** button on an account card. The next agent of that provider you start (in a new workspace or a new tab) opens on that account, then new agents follow the default again. The pick is used once, expires after 10 minutes, and doesn't affect agents that already have an account, resumed conversations or background sessions. Choose it again to cancel.
+
 ### Claude vs. ChatGPT when switching mid-conversation
 
 - **Claude:** a conversation moves to another account in place. The agent reopens on the new account with its full history and continues.

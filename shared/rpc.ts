@@ -96,6 +96,12 @@ export const redeemReset = defineRpc({
   output: RedeemResultSchema,
 });
 
+export const setNextAgentAccount = defineRpc({
+  name: "zerosub.accounts.next_agent",
+  input: z.object({ accountId: z.string(), enabled: z.boolean() }),
+  output: z.object({ until: z.string().nullable() }),
+});
+
 export const setDefaultAccount = defineRpc({
   name: "zerosub.accounts.default",
   input: z.object({ accountId: z.string() }),

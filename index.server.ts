@@ -12,6 +12,7 @@ import {
   renameAccount,
   setAgentAccount,
   setDefaultAccount,
+  setNextAgentAccount,
   setAccountEnabled,
   forkAgent,
   startLogin,
@@ -76,6 +77,7 @@ export default function contribute(server: PluginServerContext) {
     ok: true as const,
     movedAgents: await service.remove(paseo, accountId),
   }));
+  server.handle(setNextAgentAccount, ({ accountId, enabled }) => service.setNextAgent(accountId, enabled));
   server.handle(setDefaultAccount, ({ accountId }, { paseo }) => service.setDefault(paseo, accountId));
   server.handle(clearAccountLimit, async ({ accountId }) => {
     await service.clearLimit(accountId);

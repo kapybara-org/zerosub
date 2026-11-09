@@ -82,6 +82,8 @@ export const AccountViewSchema = z.object({
   organization: z.string().nullable(),
   status: AccountStatusSchema,
   isDefault: z.boolean(),
+  /** Set while the next new agent of this family will start on this account (one-time pick). */
+  nextAgentUntil: z.string().nullable().optional(),
   limitedUntil: z.string().nullable(),
   usage: UsageSchema.nullable(),
   agentCount: z.number(),

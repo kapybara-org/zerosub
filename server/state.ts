@@ -83,6 +83,10 @@ export const ContinuationChainSchema = z.object({
 });
 export type ContinuationChain = z.infer<typeof ContinuationChainSchema>;
 
+/** A one-time choice: the next new agent of this family starts on this account (until it expires). */
+export const NextAgentPickSchema = z.object({ accountId: z.string(), until: z.string() });
+export type NextAgentPick = z.infer<typeof NextAgentPickSchema>;
+
 export const StoredStateSchema = z.object({
   version: z.literal(1).default(1),
   accounts: z.array(StoredAccountSchema).default([]),
@@ -94,6 +98,9 @@ export const StoredStateSchema = z.object({
   /** Which account each agent's live provider session was opened with. */
   sessions: z.record(z.string(), LiveSessionSchema).default({}),
   continuations: z.record(z.string(), ContinuationChainSchema).default({}),
+  nextAgent: z
+    .object({ claude: NextAgentPickSchema.nullable().default(null), codex: NextAgentPickSchema.nullable().default(null) })
+    .default({ claude: null, codex: null }),
 });
 export type StoredState = z.infer<typeof StoredStateSchema>;
 
@@ -138,6 +145,7 @@ export function salvageState(raw: unknown): { state: StoredState; dropped: boole
       bindings: records(BindingSchema, source.bindings),
       sessions: records(LiveSessionSchema, source.sessions),
       continuations: records(ContinuationChainSchema, source.continuations),
+      nextAgent: { claude: null, codex: null },
     },
     dropped: true,
   };

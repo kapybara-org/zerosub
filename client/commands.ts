@@ -1,6 +1,6 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
 import { FAMILY_LABEL, type AccountView, type StateView } from "../shared/model";
-import { setAgentAccount, setDefaultAccount } from "../shared/rpc";
+import { setAgentAccount, setDefaultAccount, setNextAgentAccount } from "../shared/rpc";
 import type { ZeroSubStore } from "./store";
 
 /** Command Center entries and the `/account` slash command. */
@@ -57,13 +57,31 @@ export function contributeCommands(client: PluginClientContext, store: ZeroSubSt
   let signature = "";
   const syncDynamic = () => {
     const state = store.current.state;
-    const next = state ? JSON.stringify(state.accounts.map((a) => [a.id, a.label, a.isDefault, a.status])) : "";
+    const next = state ? JSON.stringify(state.accounts.map((a) => [a.id, a.label, a.isDefault, a.status, a.nextAgentUntil])) : "";
     if (next === signature) return;
     signature = next;
     for (const remove of dynamic) remove();
     dynamic = [];
     if (!state) return;
     state.accounts.forEach((account, index) => {
+      if (account.status !== "signed_out" && account.status !== "disabled") {
+        const pending = Boolean(account.nextAgentUntil);
+        dynamic.push(
+          client.addCommandCenterItem({
+            id: `next-agent-${index}`,
+            title: pending
+              ? `Cancel: next new ${FAMILY_LABEL[account.family]} agent on ${account.label}`
+              : `Next new ${FAMILY_LABEL[account.family]} agent: use ${account.label}`,
+            icon: pending ? "CircleX" : "SquarePlus",
+            keywords: ["account", "next", "new agent", "workspace", account.email ?? "", account.family],
+            context: "global",
+            async onSelect() {
+              await store.rpc(setNextAgentAccount, { accountId: account.id, enabled: !pending });
+              await store.refresh();
+            },
+          }),
+        );
+      }
       if (account.isDefault || account.status === "signed_out" || account.status === "disabled") return;
       dynamic.push(
         client.addCommandCenterItem({

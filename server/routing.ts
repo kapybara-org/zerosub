@@ -102,6 +102,8 @@ export interface RouteInput {
    */
   portable: boolean;
   usageOf(accountId: string): Usage | null | undefined;
+  /** Whether this session may use the one-time "next new agent" pick (interactive sessions only). */
+  allowNextPick?: boolean;
 }
 
 export interface RouteDecision {
@@ -110,6 +112,8 @@ export interface RouteDecision {
   bind: Binding | null;
   /** Why the preferred account was skipped, if it was. */
   skipped: { account: StoredAccount; why: "limited" | "signed_out" | "disabled" } | null;
+  /** The one-time "next new agent" pick was used and should be cleared. */
+  usedNextPick?: boolean;
 }
 
 /**
@@ -130,6 +134,16 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   let account = bound && bound.family === input.family ? bound : undefined;
   let bind: Binding | null = null;
 
+  let usedNextPick = false;
+  if (!account && fresh && input.allowNextPick) {
+    const pick = state.nextAgent?.[input.family];
+    const picked = pick && Date.parse(pick.until) > input.now ? findAccount(state, pick.accountId) : undefined;
+    if (picked && picked.family === input.family) {
+      account = picked;
+      bind = { accountId: picked.id, source: "user", at };
+      usedNextPick = true;
+    }
+  }
   if (!account && fresh && input.balanceNewAgents && accounts.length > 1) {
     const nearReset = input.family === "codex" ? soonestWeeklyReset(state, input.family, input.usageOf, input.now) : undefined;
     account = nearReset ?? mostAvailable(state, input.family, input.usageOf, input.now);
@@ -164,7 +178,7 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
             : { accountId: alternative.id, source: "auto", at };
     }
   }
-  return { account, bind, skipped };
+  return { account, bind, skipped, usedNextPick };
 }
 
 /** The account an agent is routed to right now, without side effects (for display). */
