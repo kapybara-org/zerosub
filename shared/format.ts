@@ -125,3 +125,10 @@ export function usageSummary(account: AccountView, now: number = Date.now()): st
   const base = `${formatPercent(peak.usedPercent)} of ${peak.label.toLowerCase()} used`;
   return reset ? `${base} · resets ${reset}` : base;
 }
+
+/** The note over state the daemon stopped answering for: "Showing data from 3m ago · couldn't refresh: …". */
+export function staleNotice(updatedAt: number | null, error: string, now: number = Date.now()): string {
+  if (updatedAt === null) return `Couldn't refresh: ${error}`;
+  const age = formatAge(new Date(updatedAt).toISOString(), now);
+  return `Showing data from ${age === "just now" ? "a moment ago" : age} · couldn't refresh: ${error}`;
+}

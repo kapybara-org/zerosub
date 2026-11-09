@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { accountSubtitle, formatAge, formatCredits, formatPlan, formatResetIn, peakUsage, shortLabel, usageSummary } from "./format";
+import { accountSubtitle, formatAge, formatCredits, formatPlan, formatResetIn, peakUsage, shortLabel, staleNotice, usageSummary } from "./format";
 import type { AccountView } from "./model";
 
 const NOW = Date.parse("2026-09-23T12:00:00Z");
@@ -92,5 +92,15 @@ describe("account presentation", () => {
     expect(formatPlan("max")).toBe("Max");
     expect(formatPlan("something_new")).toBe("Something_new");
     expect(shortLabel({ label: "lovelace@analytical.example" })).toBe("lovelace@analytic…");
+  });
+});
+
+describe("staleNotice", () => {
+  it("says how old the data shown is and why it isn't newer", () => {
+    expect(staleNotice(NOW - 3 * 60_000, "Plugin is not available", NOW)).toBe(
+      "Showing data from 3m ago · couldn't refresh: Plugin is not available",
+    );
+    expect(staleNotice(NOW - 5_000, "Plugin RPC timed out", NOW)).toBe("Showing data from a moment ago · couldn't refresh: Plugin RPC timed out");
+    expect(staleNotice(null, "Plugin is not available", NOW)).toBe("Couldn't refresh: Plugin is not available");
   });
 });

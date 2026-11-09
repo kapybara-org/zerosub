@@ -3,7 +3,7 @@ import { Icon, Modal, TextInput, useToast } from "@getpaseo/plugin/client/react-
 import { SettingsCard, SettingsSwitch } from "@getpaseo/plugin/client/ui";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ScrollView, Text, View } from "react-native";
-import { accountSubtitle, formatAge, formatCredits, formatPlan, usageSummary } from "../shared/format";
+import { accountSubtitle, formatAge, formatCredits, formatPlan, staleNotice, usageSummary } from "../shared/format";
 import { FAMILY_LABEL, type AccountView, type Family } from "../shared/model";
 import { preferences } from "../shared/preferences";
 import {
@@ -23,7 +23,7 @@ type Theme = PluginSurfaceProps["theme"];
 
 export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStore }) {
   const { theme, layout, host, store } = props;
-  const { state, error } = useStore(store);
+  const { state, error, updatedAt } = useStore(store);
   const text = useText(theme);
   const [adding, setAdding] = useState<{ family: Family; accountId?: string } | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -101,6 +101,11 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
           </Card>
         ) : null}
 
+        {/* The daemon stopped answering, or answered with an error: say how old what's shown is. */}
+        {error && state && !offline ? (
+          <StaleNotice theme={theme} message={staleNotice(updatedAt, error)} onRetry={() => void store.refresh()} />
+        ) : null}
+
         {state?.warnings.map((warning) => (
           <Card theme={theme} key={warning}>
             <Text style={text.warning}>{warning}</Text>
@@ -139,6 +144,41 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
           onClose={() => setAdding(null)}
         />
       ) : null}
+    </View>
+  );
+}
+
+/** Over the last state shown while the daemon doesn't answer; it goes once a refresh works again. */
+function StaleNotice({ theme, message, onRetry }: { theme: Theme; message: string; onRetry(): void }) {
+  const text = useText(theme);
+  return (
+    <View
+      accessibilityRole="alert"
+      accessibilityLiveRegion="polite"
+      style={{
+        flexDirection: "row",
+        flexWrap: "wrap",
+        alignItems: "center",
+        gap: 10,
+        paddingVertical: 8,
+        paddingHorizontal: 12,
+        borderRadius: 10,
+        borderWidth: 1,
+        borderColor: theme.colors.border,
+        backgroundColor: theme.colors.surface1,
+      }}
+    >
+      <Icon name="CircleAlert" size={16} color={theme.colors.statusWarning} />
+      <Text style={[text.small, { flex: 1, minWidth: 160 }]}>{message}</Text>
+      <Button
+        theme={theme}
+        size="small"
+        icon="RefreshCw"
+        label="Try again"
+        tooltip="Ask this host for its accounts again"
+        tooltipAlign="end"
+        onPress={onRetry}
+      />
     </View>
   );
 }

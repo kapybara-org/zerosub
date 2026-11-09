@@ -14,7 +14,13 @@ import { DEFAULT_CONTINUE_PROMPT, preferences, type Preferences } from "../share
 export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurfaceProps & { onOpenAccounts(): void }) {
   const settings = useSettings(preferences);
   const multiHost = useHosts().length > 1;
-  const [prompt, setPrompt] = useState<string | null>(null);
+  // What's typed into the follow-up box, over which saved message. The box only takes its text when
+  // it's made, so it's made again once the saved one changes (restored, say, or on another device).
+  const [draft, setDraft] = useState<{ over: string; text: string } | null>(null);
+  // Whether the last save was the follow-up's: its box says why that failed, the top any other.
+  const [savedPrompt, setSavedPrompt] = useState(false);
+  // The box goes while the settings can't be shown (a refresh failed, say), and what's typed with it.
+  if (settings.status !== "ready" && draft) setDraft(null);
   const muted = { color: theme.colors.foregroundMuted };
   if (settings.status === "loading") return <Text style={muted}>Loading…</Text>;
   if (settings.status !== "ready") {
@@ -23,15 +29,26 @@ export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurface
         <Text style={{ color: theme.colors.statusDanger }}>{settings.error}</Text>
         <SettingsAction label="Try again" actionLabel="Reload" onPress={() => void settings.reload()} />
         {settings.status === "invalid" ? (
-          <SettingsAction label="Restore defaults" actionLabel="Reset" onPress={() => void settings.reset()} />
+          <>
+            <SettingsAction label="Restore defaults" actionLabel="Reset" onPress={() => void settings.reset()} />
+            {settings.saveError ? <Text style={{ color: theme.colors.statusDanger }}>{settings.saveError}</Text> : null}
+          </>
         ) : null}
       </SettingsSection>
     );
   }
-  const save = (patch: Partial<Preferences>) =>
+  const save = (patch: Partial<Preferences>) => {
+    setSavedPrompt("continuePrompt" in patch);
     void settings.save({ ...settings.values, ...patch }, settings.revision);
+  };
+  const saved = settings.values.continuePrompt;
+  // Typed into a box made for an earlier saved message: it went with that box, even should the saved
+  // message come back to what it was (restored after a save, say).
+  if (draft && draft.over !== saved) setDraft(null);
+  const typed = draft?.over === saved ? draft.text.trim() : "";
   return (
     <>
+      {settings.saveError && !savedPrompt ? <Text style={{ color: theme.colors.statusDanger }}>{settings.saveError}</Text> : null}
       {multiHost ? (
         <Text style={muted}>These apply to agents on {host.label}. Each host keeps its own accounts and preferences.</Text>
       ) : null}
@@ -68,18 +85,19 @@ export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurface
             onValueChange={(autoContinue) => save({ autoContinue })}
           />
           <SettingsInput
+            key={saved}
             label="Follow-up message"
-            initialValue={settings.values.continuePrompt}
-            onChangeText={setPrompt}
+            initialValue={saved}
+            onChangeText={(text) => setDraft({ over: saved, text })}
             disabled={settings.saving || !settings.values.autoContinue}
-            error={settings.saveError}
+            error={savedPrompt ? settings.saveError : null}
           />
           <SettingsAction
             label="Save the follow-up message"
             actionLabel="Save"
-            disabled={settings.saving || prompt === null || !prompt.trim()}
+            disabled={settings.saving || !typed || typed === saved}
             onPress={() => {
-              if (prompt?.trim()) save({ continuePrompt: prompt.trim() });
+              if (typed && typed !== saved) save({ continuePrompt: typed });
             }}
           />
           <SettingsAction
