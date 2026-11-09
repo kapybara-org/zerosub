@@ -136,9 +136,11 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
     if (account) bind = { accountId: account.id, source: "balance", at, selectionReason: nearReset ? "weekly_reset" : "headroom" };
   }
   if (!account) {
-    // An imported Codex thread most likely came from the user's own CLI, so it belongs to that login.
-    const imported = !input.portable && input.reason === "import" ? mainAccount(state, input.family) : undefined;
-    account = imported ?? defaultAccount(state, input.family);
+    // An existing Codex thread ZeroSub never routed (imported from the user's own CLI, or started
+    // while ZeroSub was off) ran on the CLI login, so it belongs to that login: on any other account
+    // its encrypted reasoning can't be read. Only a brand-new agent follows the default.
+    const unrouted = !input.portable && !fresh && !state.sessions[input.agentId] ? mainAccount(state, input.family) : undefined;
+    account = unrouted ?? defaultAccount(state, input.family);
     // A thread that can't move is pinned to the account it first opened on.
     if (account && !input.portable) bind = { accountId: account.id, source: "thread", at };
   }
