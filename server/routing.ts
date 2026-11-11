@@ -102,6 +102,12 @@ export interface RouteInput {
    */
   portable: boolean;
   usageOf(accountId: string): Usage | null | undefined;
+  /**
+   * The account the agent's session runs on now. When the account it's routed to has to be skipped
+   * and this one can stand in, the agent stays on it rather than following whichever account ranks
+   * first at the moment, which would move it again each time two accounts swap places.
+   */
+  current?: string;
 }
 
 export interface RouteDecision {
@@ -114,10 +120,12 @@ export interface RouteDecision {
 
 /**
  * Which account a session opens on: the agent's own binding, else (for balanced new agents) the
- * roomiest account, else the default. An exhausted or signed-out choice is swapped for the roomiest
- * usable account when automatic switching is on — for new agents always, and for existing ones
- * only when their conversation can move between accounts. A disabled choice is always swapped,
- * and the agent keeps its own binding so it returns once the account is enabled again.
+ * roomiest account, else the default (the CLI login for an existing Codex thread ZeroSub never
+ * routed). An exhausted or signed-out choice is swapped for the roomiest usable account when
+ * automatic switching is on — for new agents always, and for existing ones only when their
+ * conversation can move between accounts. A disabled choice is always swapped,
+ * and the agent keeps its own binding so it returns once the account is enabled again. An agent
+ * already running on a usable stand-in keeps it (see `RouteInput.current`).
  */
 export function chooseAccount(state: StoredState, input: RouteInput): RouteDecision | null {
   const accounts = accountsOf(state, input.family);
@@ -150,7 +158,11 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   const why = !account.signedIn ? "signed_out" : account.disabled ? "disabled" : isLimited(account, input.now) ? "limited" : null;
   const mayMove = fresh || input.portable;
   if (why && mayMove && (input.autoSwitch || why !== "limited")) {
-    const alternative = mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]));
+    const staying = findAccount(state, input.current);
+    const alternative =
+      staying && staying.family === input.family && staying.id !== account.id && isUsable(staying, input.now)
+        ? staying
+        : mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]));
     if (alternative) {
       skipped = { account, why };
       account = alternative;

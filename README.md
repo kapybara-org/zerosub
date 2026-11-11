@@ -41,7 +41,8 @@ Then open **Accounts (ZeroSub)** in the sidebar.
    - **Make default**: new agents, and agents that follow the default, use it. Open Claude agents switch right away, busy ones after their turn.
      - To leave open agents where they are, turn off **Move open agents when the default changes** (in Accounts, or **Settings → Plugins → zerosub → ZeroSub preferences**). Each open agent that follows the default then stays pinned to the account it's using, even after it reopens, unless that account is signed out, disabled or at its limit. New agents, and agents that aren't open at the time, use the new default.
      - A kept agent still switches when its account hits a limit. To move it to the new default, choose **Follow default** from its account button, or type `/account default`.
-   - **The account button in an agent's message box**: moves that one agent.
+   - **The account button in an agent's message box**: moves that one agent. While a move is under way it names both accounts, for example `personal → work`: the agent still runs on the first until its session reopens, and the button's tooltip says when that happens (once it's idle, when its turn ends, or when its session next starts). If the reload doesn't work, the button says why and the agent's timeline notes it.
+   - With automatic switching on, an account at its limit can't be picked for an agent: the agent would only move straight off it again. Pick another one, or press **Mark as available again** on the account's card if it has room.
    - **`/account work`** in the message box, or `/account default` to follow the default again.
    - **⌘K → "Make … the default"**.
    - **Disable for now** (the pause button on a card): the account stays signed in but ZeroSub stops using it. Its agents move to your other accounts right away (busy ones after their turn) and come back when you press **Enable**. ChatGPT conversations already on it stay, since they can't change accounts. You can't disable the last usable account of a provider.
@@ -49,6 +50,8 @@ Then open **Accounts (ZeroSub)** in the sidebar.
    - Only the CLIs' own limit notices trigger a switch. That covers Claude Code's "You've hit your 5-hour limit · resets 3pm" ("session limit" before Claude Code 2.1.312) and Codex's "You’ve hit your usage limit…".
    - Paseo 0.13 and later no longer send the finished turn to plugins, so ZeroSub reads that turn from the agent's timeline instead.
    - A short note in the agent's timeline says what happened.
+   - With **Keep going after a switch** on, ZeroSub then sends the agent its follow-up message, unless you've written to it or archived it since the limit stopped it: the follow-up would cut your new turn short.
+   - An agent that hits a limit while it's waiting to move to an account you picked moves there, rather than to whichever account has the most room.
    - As a safety stop, one agent changes accounts at most 4 times in 10 minutes. If it hits that, its timeline says so; pick an account from its account button to carry on.
    - An exhausted account is skipped until it resets. If you know it has room again sooner, for example after upgrading or buying credits, press **Mark as available again** (the check mark) on its card. For ChatGPT credits, see [ChatGPT credits](#chatgpt-credits).
 
@@ -70,7 +73,7 @@ Turn on **Spread new agents across accounts** to select an account from its usag
 
 Some plans come with banked limit resets: ChatGPT's reset credits, and Claude Code's limit resets. When an account has any, its card shows how many are banked and when they expire, with a **Use reset** button. When an agent is stopped by a limit, its account button offers the reset too, and the agent carries on afterwards.
 
-- A reset can't be undone, so ZeroSub always asks first and says what it refills.
+- A reset can't be undone, so ZeroSub always asks first and says what it refills. Asking again while one is still being used, or within five minutes of one, doesn't spend another.
 - **ChatGPT** uses Codex's own reset-credit API, the same one as `/usage` → reset in the Codex CLI. It never spends a credit while nothing is used up.
 - **Claude** uses Claude Code's limit-reset endpoint. Anthropic decides which accounts get resets; so far it reports the tested accounts as not eligible, so the button may not appear for Claude. It shows up by itself once an account has a reset.
 - **Use banked resets when every account is out** (off by default) spends one automatically, but only when every account of that provider is at its limit and the provider confirms the limit at that moment.
@@ -114,7 +117,11 @@ Each added account gets its own credential home under `$PASEO_HOME/zerosub/homes
 - Everything that isn't account-specific is a symlink back to `~/.claude` or `~/.codex`. For Claude that includes `settings.json`, `skills/`, `plugins/` and `projects/`; for Codex, `config.toml`, `sessions/` and more. Codex also shares its thread database through `CODEX_SQLITE_HOME`.
 - Claude's `.claude.json` holds the account identity, so each account keeps its own copy. It's seeded from yours, and your MCP servers stay in sync.
 
-A `before("agent.session_open")` hook sets those variables for every session Paseo opens: create, resume, refresh and import. To move a live agent, ZeroSub reopens its session with `paseo agent reload`. It never interrupts a running turn; a busy agent moves when its turn ends.
+A `before("agent.session_open")` hook sets those variables for every session Paseo opens: create, resume, refresh and import. To move a live agent, ZeroSub reopens its session with `paseo agent reload`. It never interrupts a running turn; a busy agent moves when its turn ends, even when that turn ends at a limit. It looks at the agent again just before reloading it, and the moves it starts by itself also wait until nobody has used the agent for a minute, so a message you've just sent isn't cancelled. Only one move of an agent runs at a time. Every 30 seconds it also checks that each open agent runs on the account it's routed to, and moves the ones that don't. That catches the changes no button press moved them for: a limit read from usage or cleared, automatic switching turned on or off, a move that was waiting for a turn when the plugin restarted or for one that never came. A move that doesn't land isn't tried again for 30 minutes; the agent's timeline says so once, and it moves when its session next starts.
+
+Sessions ZeroSub didn't route run on your CLI login, and it counts them that way: one whose routing failed or took longer than 15 seconds, and one opened while ZeroSub was off. The account button then shows the move still to come, and the 30-second check makes it; a ChatGPT thread goes back to the account it's pinned to, which holds its history. A move ZeroSub started whose reload opened this way counts as not landed. To tell these sessions apart, ZeroSub forgets where an agent ran when the agent closes (Paseo 0.11 and later), and on startup for agents that closed while it was off. An agent that closed and opened again while ZeroSub was off still shows its earlier account until its session next opens.
+
+Paseo stops waiting for a plugin after 30 seconds. Buttons that move agents, use a reset or refresh usage answer within about 20 seconds and leave the rest running: each agent's timeline says when it has switched, and the account's card shows the refilled limits once a reset is done.
 
 Sign-in runs the official CLIs:
 
@@ -139,8 +146,9 @@ ZeroSub never implements OAuth itself and never copies credentials between accou
 - **MCP servers that use OAuth** (Linear, Notion, …) store their tokens per Claude account, so sign in to them once on each account.
 - **Shared settings apply to every account.** If `~/.claude/settings.json` sets an `apiKeyHelper` or API-key `env`, every account uses that key instead of its subscription.
 - **Usage for an idle Claude account** shows the last reading until the account is used again or you refresh usage. If a window in it has passed its reset time, or the account is at its limit, ZeroSub also renews the sign-in in the background to read it again, at most every 30 minutes, so an early reset or one used on another machine shows up too. Anthropic rate-limits its usage endpoint (Claude Code and Paseo read it too), so a reading can be a few minutes old; the card then says when it was taken. Readings are saved in `$PASEO_HOME/zerosub/usage.json`, so they survive restarts.
-- **Password-protected daemons:** `paseo agent reload` can't authenticate. Agents then switch the next time their session starts, not immediately, and their timeline note says so.
+- **Password-protected daemons:** `paseo agent reload` can't authenticate. Agents then switch the next time their session starts, not immediately, and their account button and timeline note say so.
 - **Imported Codex threads** (`paseo agent import`) are assigned to your CLI login, since that's where standalone Codex sessions come from.
+- **Agents in background workspaces** (`paseo workspace create --background`) are left out of the list of agents Paseo gives plugins, so they have no account button: switch one with `/account` in its message box. Each still opens on the account it's routed to, switches when a turn hits a limit and moves off an account you remove, but changing the default, disabling an account and the 30-second check don't move it.
 - **ChatGPT device-code sign-in** has to be enabled in ChatGPT → Settings → Security. The browser option works from a browser on the host's own computer.
 - Tested on macOS with Claude Code 2.1.280, Codex 0.156.1 and Paseo 0.9.1. Linux should work. Windows is untested.
 

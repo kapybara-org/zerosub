@@ -321,6 +321,40 @@ describe("Codex account continuations", () => {
     expect((await t.store.read()).accounts.find((account) => account.id === "b")!.limitedUntil).toBeNull();
   });
 
+  it.each([
+    ["finishes it", null, { outcome: "continued", to: "B", continued: true }],
+    ["says so when it can't finish it", new Error("The workspace is gone"), { outcome: "stayed", to: "B", detail: "Couldn't continue on B: The workspace is gone" }],
+  ])("answers a switch before Paseo gives up, and %s in the background", async (_, failure, row) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const t = await setup();
+      const service = t.service();
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      let release!: () => void;
+      let started!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const entered = new Promise<void>((resolve) => { started = resolve; });
+      const create = t.create.getMockImplementation()!;
+      t.create.mockImplementationOnce(async (request) => {
+        started();
+        await gate;
+        if (failure) throw failure;
+        await create(request);
+      });
+      const switching = service.setAgentAccount(t.paseo, "root", "b");
+      await entered;
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(await switching).toMatchObject({ pending: ["root"], continuedIn: null });
+      expect(t.notes).toEqual([]);
+
+      release();
+      await vi.waitFor(() => expect(t.notes.at(-1)).toMatchObject({ agentId: "root", row }));
+    } finally {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    }
+  });
+
   it("does not send a snapshot made before a newer source instruction", async () => {
     const t = await setup();
     const read = t.refetch.getMockImplementation()!;

@@ -16,7 +16,7 @@ import {
   type StateView,
   type Usage,
 } from "../shared/model";
-import { capsAccount } from "../shared/format";
+import { capsAccount, limitedPick } from "../shared/format";
 import { DEFAULT_CONTINUE_PROMPT, type Preferences } from "../shared/preferences";
 import type { RedeemResult, ReopenSummary } from "../shared/rpc";
 import { SWITCH_ROW_KIND, SWITCH_ROW_VERSION, type SwitchRow } from "../shared/timeline";
@@ -44,7 +44,7 @@ import { homesDir } from "./paths";
 import { Reopener } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
-import { chooseAccount, isLimited, isUsable, mostAvailable } from "./routing";
+import { chooseAccount, isLimited, isUsable, mostAvailable, type RouteDecision } from "./routing";
 import {
   MAIN_ACCOUNT_ID,
   StateStore,
@@ -52,8 +52,10 @@ import {
   defaultAccount,
   findAccount,
   mainAccount,
+  type Binding,
   type Cleanup,
   type ContinuationChain,
+  type LiveSession,
   type StoredAccount,
   type StoredState,
 } from "./state";
@@ -93,6 +95,20 @@ const AGENT_LIST_MS = 3_000;
 const ROUTING_WAIT_MS = 5_000;
 /** How long the end of a turn waits for Paseo to page the agent's timeline. The SDK itself waits 60 s. */
 const TURN_READ_MS = 10_000;
+/** An agent whose move to an account didn't land isn't moved there again for this long. */
+const ALIGN_RETRY_MS = 30 * 60_000;
+/**
+ * Just after a turn starts or ends, or the user sends a message, alignment leaves the agent alone:
+ * failover and waiting switches own it, and a reload would cancel a turn that is about to start.
+ */
+const TURN_SETTLE_MS = 60_000;
+/**
+ * How long an RPC that moves agents or spends a reset waits for that before answering, since Paseo
+ * gives up on an RPC after 30 s. The work carries on, and timeline notes and the state say how it went.
+ */
+const REPLY_WAIT_MS = 20_000;
+/** How long a usage refresh asked for by hand waits for readings; renewing a sign-in can take a minute. */
+const USAGE_REPLY_MS = 15_000;
 
 const DEFAULT_PREFERENCES: Preferences = {
   autoSwitch: true,
@@ -130,9 +146,26 @@ interface AgentInfo {
   title: string | null;
   /** The agent this one carries on from, when ZeroSub started it as a continuation. */
   continuedFrom: string | null;
+  /** When the user last sent it a message (ms), or 0. */
+  lastMessageAt: number;
 }
 
-type ReopenOutcome = "reopened" | "deferred" | "closed" | "failed";
+/** `unchecked`: Paseo couldn't say how the agent was doing, so it wasn't reloaded at all. */
+type ReopenResult =
+  | { outcome: "reopened" | "deferred" | "closed" }
+  | { outcome: "failed"; error: string; timedOut: boolean; unchecked?: boolean };
+/** A reload under way: sessions opened since it started, and what the first one recorded in place of what. */
+interface Reload {
+  opens: number;
+  opened?: { replaced: LiveSession | undefined; wrote: LiveSession };
+}
+/** What routing an interactive session recorded, taken back if the session opens without it (see `onSessionOpen`). */
+interface Opening {
+  startedAt: number;
+  session?: LiveSession;
+  /** A Codex thread's pin it wrote, and the one that pin replaced. */
+  pin?: { wrote: Binding; replaced: Binding | undefined };
+}
 type Problem = { kind: "limit"; hit: LimitHit } | { kind: "signed_out" };
 
 /**
@@ -150,7 +183,15 @@ function settled(status: string): boolean {
 }
 
 function emptySummary(): ReopenSummary {
-  return { reopened: [], deferred: [], failed: [], continuedIn: null };
+  return { reopened: [], deferred: [], failed: [], pending: [], continuedIn: null };
+}
+
+function busy(agent: AgentInfo): boolean {
+  return agent.status === "running" || agent.status === "initializing";
+}
+
+function sameBinding(a: Binding | undefined, b: Binding | undefined): boolean {
+  return a?.accountId === b?.accountId && a?.at === b?.at;
 }
 
 export class Service {
@@ -164,10 +205,35 @@ export class Service {
   private readonly availability = new Map<Family, { ok: boolean; detail: string | null; at: number }>();
   private readonly logins = new Map<string, LoginSession>();
   private readonly loginLocks: Record<Family, Mutex> = { claude: new Mutex(), codex: new Mutex() };
-  /** Agents whose account changed mid-turn; reopened when the turn ends. */
+  /**
+   * Agents whose account changed mid-turn (or while starting); reopened when the turn ends, or by
+   * alignment once they're idle without one.
+   */
   private readonly deferred = new Map<string, SwitchRow | null>();
-  /** Agents in the middle of a failover, so nothing else moves them at the same time. */
-  private readonly switching = new Set<string>();
+  /**
+   * Agents being moved right now (failover, a switch, alignment), so nothing else moves them at the
+   * same time. Each resolves when its move is done. See `claim` and `tryClaim`.
+   */
+  private readonly switching = new Map<string, Promise<void>>();
+  /** When alignment last tried a reload of each agent that didn't land, to which account, and whether it said so. */
+  private readonly alignedAt = new Map<string, { accountId: string; at: number; noted?: boolean }>();
+  /** Agents whose last reload didn't work, and the account it was for; cleared when their session next opens. */
+  private readonly failedMoves = new Map<string, string>();
+  /** Reloads under way, by agent: sessions opened since, and what the first one recorded and replaced. */
+  private readonly reloads = new Map<string, Reload>();
+  /**
+   * Agents whose live session opened without routing's answer (routing failed, or Paseo stopped
+   * waiting for it), so on the CLI login. Cleared when routing next opens one. See `onSessionOpen`.
+   */
+  private readonly unrouted = new Set<string>();
+  /** When each agent's last turn started or ended; see `noteTurn`. */
+  private readonly turnAt = new Map<string, number>();
+  private aligning = false;
+  /**
+   * Default changes pinning open agents right now. Until they're pinned, an agent that follows the
+   * default looks due to move, so moves nobody asked for (alignment, waiting switches) hold off.
+   */
+  private pinning = 0;
   /** Interactive sessions being routed right now, and their agents. Where each opens isn't recorded yet. */
   private readonly routing = new Map<Promise<unknown>, string>();
   /** One failover at a time per exhausted account. */
@@ -186,6 +252,8 @@ export class Service {
   private usageSave: ReturnType<typeof setTimeout> | null = null;
   private readonly lastRedeemAt = new Map<string, number>();
   private readonly redeemLocks = new Map<string, Mutex>();
+  /** Accounts a banked reset is being spent on right now. */
+  private readonly redeeming = new Set<string>();
   private readonly browserSignIn = canSignInWithBrowser();
   private agentCache: { at: number; agents: Promise<AgentInfo[]> } | null = null;
   private lastPrune = 0;
@@ -197,6 +265,10 @@ export class Service {
   /** Startup's steps have all worked; until they have, each upkeep tries them again. See `startUp`. */
   private started = false;
   private starting: Promise<void> | null = null;
+  /** When this run began: a session recorded before it may have ended while ZeroSub was off. */
+  private readonly startedAt = Date.now();
+  /** Whether records of sessions that ended while ZeroSub was off are forgotten yet (once a run). */
+  private endedForgotten = false;
 
   constructor(
     private readonly adapters: Record<Family, FamilyAdapter>,
@@ -208,7 +280,10 @@ export class Service {
   }
 
   setPreferences(prefs: Preferences): void {
+    const routingChanged = prefs.autoSwitch !== this.prefs.autoSwitch;
     this.prefs = prefs;
+    // Whether limited accounts are skipped decides where agents belong: move them now, not at the next upkeep.
+    if (routingChanged && this.paseo) void this.alignSessions(this.paseo).catch((error: unknown) => log("aligning agents failed", error));
   }
 
   /** Remember the plugin's SDK connection for background work (cleanup, failover). */
@@ -299,7 +374,11 @@ export class Service {
       if (login.finishedAt && now - login.finishedAt > LOGIN_TTL_MS) this.logins.delete(id);
       else if (!login.finishedAt && now - Date.parse(login.view.startedAt) > LOGIN_TTL_MS) void this.cancelLogin(id);
     }
-    if (this.paseo) await this.cleanUpHomes(this.paseo);
+    if (this.paseo) {
+      await this.forgetEndedSessions(this.paseo).catch((error: unknown) => log("could not check which agents closed while ZeroSub was off", error));
+      void this.alignSessions(this.paseo).catch((error: unknown) => log("aligning agents failed", error));
+      await this.cleanUpHomes(this.paseo);
+    }
   }
 
   private async refreshIdentity(accountId: string): Promise<void> {
@@ -318,6 +397,27 @@ export class Service {
     });
   }
 
+  /**
+   * Forgets records from before this run of sessions that have ended since: an agent that closed
+   * while ZeroSub was off sent no `agent.closed`, and opened again while ZeroSub is off it runs on
+   * the CLI login. Once a run, when Paseo lists every agent. One that closed and opened again while
+   * ZeroSub was off looks like one that stayed open, so its record stays until its session next opens.
+   */
+  private async forgetEndedSessions(paseo: PaseoApi): Promise<void> {
+    if (this.endedForgotten) return;
+    const { agents, complete } = await listAgents(paseo, true);
+    if (!complete) return;
+    const ended = new Set(agents.filter((agent) => agent.archived || agent.status === "closed").map((agent) => agent.id));
+    // Every session routing opens this run is recorded afresh, so only older records can be stale.
+    const stale = ([agentId, session]: [string, LiveSession]) => ended.has(agentId) && Date.parse(session.openedAt) < this.startedAt;
+    if (Object.entries((await this.store.read()).sessions).some(stale)) {
+      await this.store.update((draft) => {
+        for (const entry of Object.entries(draft.sessions)) if (stale(entry)) delete draft.sessions[entry[0]];
+      });
+    }
+    this.endedForgotten = true;
+  }
+
   /** Forget bindings and sessions of agents that no longer exist (including Paseo's internal helpers). */
   private async prune(paseo: PaseoApi): Promise<void> {
     const now = Date.now();
@@ -328,8 +428,28 @@ export class Service {
     const known = new Set(agents.map((agent) => agent.id));
     const state = await this.store.read();
     const old = (at: string) => now - (Date.parse(at) || 0) > PRUNE_MS;
-    const staleSessions = Object.entries(state.sessions).filter(([id, session]) => !known.has(id) && old(session.openedAt));
-    const staleBindings = Object.entries(state.bindings).filter(([id, binding]) => !known.has(id) && old(binding.at));
+    // Paseo's list leaves out agents in background workspaces, which still run and open sessions, so
+    // one missing from it is looked up: only one Paseo doesn't know, or one of its hidden helpers, is
+    // gone. One it can't say about now stays for a later pass.
+    const unlisted = new Set(
+      [
+        ...Object.entries(state.sessions).map(([id, session]) => [id, session.openedAt] as const),
+        ...Object.entries(state.bindings).map(([id, binding]) => [id, binding.at] as const),
+      ]
+        .filter(([id, at]) => !known.has(id) && old(at))
+        .map(([id]) => id),
+    );
+    const gone = new Set<string>();
+    for (const id of unlisted) {
+      const agent = await paseo.agents
+        .ref(id)
+        .refresh()
+        .then((result) => result?.agent ?? null)
+        .catch(() => undefined);
+      if (agent === null || (agent && (agent as { internal?: boolean }).internal)) gone.add(id);
+    }
+    const staleSessions = Object.entries(state.sessions).filter(([id, session]) => gone.has(id) && old(session.openedAt));
+    const staleBindings = Object.entries(state.bindings).filter(([id, binding]) => gone.has(id) && old(binding.at));
     const active = new Set(agents.filter((agent) => !agent.archived).map((agent) => agent.id));
     // A hand-off that may have sent its prompt stays on record while its tab could come back. A
     // failed creation sent nothing, so it doesn't keep the task's record alive.
@@ -469,30 +589,82 @@ export class Service {
 
   // ------------------------------------------------------------------ hooks
 
-  /** Routes every provider session (create, resume, refresh, import) to the agent's account. */
+  /**
+   * Routes every provider session (create, resume, refresh, import) to the agent's account. When
+   * routing fails, or `abandoned` says Paseo stopped waiting for it, Paseo opens an interactive
+   * session as it asked: on the CLI login. Then nothing routing recorded for it stands.
+   */
   async onSessionOpen(
     request: PluginSessionOpenRequest,
     context: PluginHookContext,
+    abandoned?: AbortSignal,
   ): Promise<PluginSessionOpenRequest | undefined> {
-    const routed = this.route(request, context);
-    if (request.purpose !== "interactive") return routed;
-    this.routing.set(routed, request.agentId);
+    if (request.purpose !== "interactive") return this.route(request, context);
+    const { agentId } = request;
+    const opening: Opening = { startedAt: Date.now() };
+    const routed = this.route(request, context, opening, abandoned);
+    this.routing.set(routed, agentId);
+    // Noted before Paseo goes on to open the session, so a reload waiting for it knows (see `reopenAgent`).
+    const giveUp = () => this.unrouted.add(agentId);
+    abandoned?.addEventListener("abort", giveUp, { once: true });
     try {
-      return await routed;
+      const result = await routed;
+      if (!abandoned?.aborted) {
+        if (result) {
+          // A fresh session already runs on the routed account, so any pending switch is done.
+          this.deferred.delete(agentId);
+          this.failedMoves.delete(agentId);
+          this.unrouted.delete(agentId);
+        }
+        return result;
+      }
+    } catch (error) {
+      this.unrouted.add(agentId);
+      await this.openedUnrouted(agentId, opening).catch((undo: unknown) => log(`could not undo routing ${agentId}`, undo));
+      throw error;
     } finally {
+      abandoned?.removeEventListener("abort", giveUp);
       this.routing.delete(routed);
     }
+    await this.openedUnrouted(agentId, opening).catch((undo: unknown) => log(`could not undo routing ${agentId}`, undo));
+    return undefined;
+  }
+
+  /**
+   * A session routing didn't answer for runs on the CLI login. Forgets the account recorded for it
+   * (by this routing, or for the session before when routing never got that far), so `runningOn`
+   * reads the CLI login, unless a session opened since replaced the record. A Codex thread's new pin
+   * goes too: the thread starts out where it runs.
+   */
+  private async openedUnrouted(agentId: string, opening: Opening): Promise<void> {
+    const ours = (session: LiveSession) => session.accountId === opening.session?.accountId && session.openedAt === opening.session.openedAt;
+    await this.store.update((draft) => {
+      const recorded = draft.sessions[agentId];
+      if (recorded && (ours(recorded) || Date.parse(recorded.openedAt) < opening.startedAt)) delete draft.sessions[agentId];
+      const { pin } = opening;
+      if (pin && sameBinding(draft.bindings[agentId], pin.wrote)) {
+        if (pin.replaced) draft.bindings[agentId] = pin.replaced;
+        else delete draft.bindings[agentId];
+      }
+    });
   }
 
   private async route(
     request: PluginSessionOpenRequest,
     context: PluginHookContext,
+    opening?: Opening,
+    abandoned?: AbortSignal,
   ): Promise<PluginSessionOpenRequest | undefined> {
     this.attach(context.paseo);
     const family = (await this.families.resolve(context.paseo))[request.provider];
     if (!family) return undefined;
     const adapter = this.adapters[family];
     const now = Date.now();
+    const interactive = request.purpose === "interactive";
+    // The first session a reload of ours opens is the one it rolls back if the reload fails.
+    const reload = interactive ? this.reloads.get(request.agentId) : undefined;
+    if (reload) reload.opens += 1;
+    const ownReload = reload?.opens === 1;
     const state = await this.store.read();
     const decision = chooseAccount(state, {
       agentId: request.agentId,
@@ -503,6 +675,8 @@ export class Service {
       balanceNewAgents: this.prefs.balanceNewAgents,
       portable: adapter.portable,
       usageOf: (id) => this.usage.get(id),
+      // Alignment and the account button decide with the same stand-in rule, so a reopen lands where they expect.
+      current: request.reason === "create" ? undefined : this.standingIn(state, request.agentId, family, request.reason === "refresh"),
     });
     if (!decision) return undefined;
     const { account } = decision;
@@ -510,21 +684,25 @@ export class Service {
     if (account.kind === "managed" && account.home) {
       await adapter.prepareHome(account.home).catch((error: unknown) => log(`could not refresh the home of ${account.label}`, error));
     }
-    const interactive = request.purpose === "interactive";
     const seenBinding = state.bindings[request.agentId]?.accountId;
     const bindingChanged = decision.bind !== null && seenBinding !== decision.bind.accountId;
-    const sessionChanged = interactive && state.sessions[request.agentId]?.accountId !== account.id;
-    if (bindingChanged || sessionChanged) {
+    // An interactive session is recorded even when it opens on the account the last one did: when it
+    // opened tells it from a session that has ended since (see `onAgentClosed`, `forgetEndedSessions`).
+    if (bindingChanged || interactive) {
       await this.store.update((draft) => {
         // Don't overwrite a choice the user made while this decision was being taken.
         if (decision.bind && bindingChanged && draft.bindings[request.agentId]?.accountId === seenBinding) {
+          if (opening && !adapter.portable) opening.pin = { wrote: decision.bind, replaced: draft.bindings[request.agentId] };
           draft.bindings[request.agentId] = decision.bind;
         }
-        if (interactive) draft.sessions[request.agentId] = { accountId: account.id, family, openedAt: new Date(now).toISOString() };
+        // Paseo has opened the session without waiting: `onSessionOpen` sorts out its record.
+        if (!interactive || abandoned?.aborted) return;
+        const session = { accountId: account.id, family, openedAt: new Date(now).toISOString() };
+        if (reload && ownReload) reload.opened = { replaced: draft.sessions[request.agentId], wrote: session };
+        draft.sessions[request.agentId] = session;
+        if (opening) opening.session = session;
       });
     }
-    // A fresh session already runs on the routed account, so any pending switch is done.
-    if (interactive) this.deferred.delete(request.agentId);
     this.activeAt.set(account.id, now);
     console.log(
       `[ZeroSub] ${request.provider} agent ${request.agentId} → ${account.label} (${request.reason}${
@@ -534,8 +712,19 @@ export class Service {
     return { ...request, env: applyEnv(await adapter.env(account.home), request.env) };
   }
 
+  /**
+   * Notes a turn starting or ending on the agent, at a time no earlier event of the agent's shares, so
+   * the time an event was noted at also tells whether another came after it (see `untouchedSince`).
+   */
+  private noteTurn(agentId: string): number {
+    const at = Math.max(Date.now(), (this.turnAt.get(agentId) ?? 0) + 1);
+    this.turnAt.set(agentId, at);
+    return at;
+  }
+
   /** A turn uses the account from its first token, so a long one keeps its usage fresh too. */
   async onTurnStarted(agent: { id: string; provider: string }, context: PluginHookContext): Promise<void> {
+    this.noteTurn(agent.id);
     this.attach(context.paseo);
     const family = (await this.families.resolve(context.paseo))[agent.provider];
     if (!family) return;
@@ -544,21 +733,32 @@ export class Service {
   }
 
   async onTurnEnded(event: TurnEnded, context: PluginHookContext): Promise<void> {
+    const endedAt = this.noteTurn(event.agent.id);
     this.attach(context.paseo);
     const family = (await this.families.resolve(context.paseo))[event.agent.provider];
     if (!family) return;
     const adapter = this.adapters[family];
     const agentId = event.agent.id;
-    const accountId = this.runningOn(await this.store.read(), agentId, family);
+    // The account the turn ran on, read before anything that takes a while: the agent may be moved
+    // meanwhile, and the limit is still this account's.
+    const accountId = this.runningOn(await this.store.read(), agentId, family) ?? null;
     if (accountId) this.activeAt.set(accountId, Date.now());
     if (event.outcome.kind !== "canceled") {
       const turn = await this.turnWithTimeline(context.paseo, event);
       // A hand-off quotes the whole conversation, not just this turn. Paseo 0.13 sends none, so the hand-off pages it.
       const conversation = event.timeline.length > 0 ? event.timeline : undefined;
       const hit = adapter.detectLimit(turn);
-      if (hit) return this.handleUnavailable(context.paseo, agentId, family, conversation, { kind: "limit", hit });
-      if (adapter.detectSignOut(turn) && (await this.confirmSignedOut(agentId, family))) {
-        return this.handleUnavailable(context.paseo, agentId, family, conversation, { kind: "signed_out" });
+      const problem: Problem | null = hit
+        ? { kind: "limit", hit }
+        : adapter.detectSignOut(turn) && (await this.confirmSignedOut(accountId))
+          ? { kind: "signed_out" }
+          : null;
+      if (problem) {
+        await this.handleUnavailable(context.paseo, agentId, family, conversation, problem, endedAt, accountId);
+        // A move asked for during the turn still happens when failover didn't move the agent
+        // itself (automatic switching off, say), and goes where it was asked to.
+        if (this.deferred.has(agentId)) await this.finishDeferred(context.paseo, agentId, family);
+        return;
       }
     }
     if (this.deferred.has(agentId)) await this.finishDeferred(context.paseo, agentId, family);
@@ -597,8 +797,30 @@ export class Service {
     }
   }
 
+  /**
+   * A closed agent runs nowhere until a session opens again: through routing, which records it, or
+   * while ZeroSub is off, on the CLI login, which no record stands for. So its record goes, unless a
+   * session opened since the close.
+   */
+  async onAgentClosed(agentId: string): Promise<void> {
+    const closedAt = Date.now();
+    this.deferred.delete(agentId);
+    this.alignedAt.delete(agentId);
+    this.failedMoves.delete(agentId);
+    this.unrouted.delete(agentId);
+    const ended = (session: LiveSession | undefined) => session !== undefined && Date.parse(session.openedAt) < closedAt;
+    if (!ended((await this.store.read()).sessions[agentId])) return;
+    await this.store.update((draft) => {
+      if (ended(draft.sessions[agentId])) delete draft.sessions[agentId];
+    });
+  }
+
   async onAgentArchived(agentId: string): Promise<void> {
     this.deferred.delete(agentId);
+    this.alignedAt.delete(agentId);
+    this.failedMoves.delete(agentId);
+    this.unrouted.delete(agentId);
+    this.turnAt.delete(agentId);
     this.switchGuard.forget(agentId);
     this.guardNoticeAt.delete(agentId);
     this.guardNoticeAt.delete(`${agentId}:elsewhere`);
@@ -609,23 +831,32 @@ export class Service {
   }
 
   /** Re-checks the account an agent was using; true when it really is signed out now. */
-  private async confirmSignedOut(agentId: string, family: Family): Promise<boolean> {
-    const state = await this.store.read();
-    const accountId = this.runningOn(state, agentId, family);
+  private async confirmSignedOut(accountId: string | null): Promise<boolean> {
     if (!accountId) return false;
     await this.refreshIdentity(accountId);
     return findAccount(await this.store.read(), accountId)?.signedIn === false;
   }
 
-  /** Carries out a switch that waited for the agent's turn to end, unless it's no longer wanted. */
-  private async finishDeferred(paseo: PaseoApi, agentId: string, family: Family): Promise<void> {
-    const row = this.deferred.get(agentId) ?? null;
-    this.deferred.delete(agentId);
-    const state = await this.store.read();
-    const current = this.runningOn(state, agentId, family);
-    if (!current || this.targetFor(state, agentId, family) === current) return; // Switched back meanwhile.
-    const outcome = await this.reopenAgent(paseo, agentId, row, true);
-    if (outcome === "reopened" && row) await this.appendRow(paseo, agentId, await this.landed(row, agentId));
+  /**
+   * Carries out a switch that waited for the agent's turn to end, unless it's no longer wanted. While
+   * another move has the agent, or a default change is pinning open agents, it keeps waiting, and
+   * alignment picks it up once the agent is idle. `background`: alignment found it idle, rather than
+   * its turn just ending (see `reopenAgent`).
+   */
+  private async finishDeferred(paseo: PaseoApi, agentId: string, family: Family, background = false): Promise<void> {
+    const release = this.pinning > 0 ? null : this.tryClaim(agentId);
+    if (!release) return;
+    try {
+      const row = this.deferred.get(agentId) ?? null;
+      this.deferred.delete(agentId);
+      const state = await this.store.read();
+      const current = this.runningOn(state, agentId, family);
+      if (!current || this.targetFor(state, agentId, family, current) === current) return; // Switched back meanwhile.
+      const result = await this.reopenAgent(paseo, agentId, { row, settle: !background, background });
+      if (row) await this.noteOutcome(paseo, agentId, row, result);
+    } finally {
+      release();
+    }
   }
 
   // ------------------------------------------------------------------ limits and failover
@@ -636,41 +867,56 @@ export class Service {
     return lock;
   }
 
+  /**
+   * Deals with a turn that `ranOn` an account at its limit or signed out. When another move has the
+   * agent, or it has moved since the turn ended, the limit is still recorded against `ranOn`, but
+   * where the agent goes is left to that move.
+   */
   private async handleUnavailable(
     paseo: PaseoApi,
     agentId: string,
     family: Family,
     timeline: readonly AgentTimelineItem[] | undefined,
     problem: Problem,
+    endedAt: number,
+    ranOn: string | null,
   ): Promise<void> {
-    if (this.switching.has(agentId)) {
-      // A manual Codex handoff can race the old thread's limit event. Its account is immutable:
-      // remember the limit even though the ongoing handoff owns continuation dispatch.
-      if (!this.adapters[family].portable && problem.kind === "limit") {
-        const accountId = this.runningOn(await this.store.read(), agentId, family);
-        if (accountId && !this.recentlyRedeemed(accountId)) {
-          const hit = problem.hit;
-          await this.markLimited(accountId, hit.resetsAt ?? new Date(Date.now() + (hit.kind === "budget" ? BUDGET_LIMIT_MS : WINDOW_LIMIT_MS)).toISOString(), hit.kind, "turn");
-        }
-      }
+    if (!ranOn) return;
+    const release = this.tryClaim(agentId);
+    if (!release) {
+      // A manual Codex handoff racing the old thread's limit event, say, or a switch asked for as the
+      // turn ended: that move owns the agent.
+      await this.noteLimit(ranOn, problem);
       return;
     }
-    this.switching.add(agentId);
     let exhausted: string | null = null;
     try {
       const state = await this.store.read();
-      const account = findAccount(state, this.runningOn(state, agentId, family));
+      const account = findAccount(state, ranOn);
       if (!account) return;
+      if (this.runningOn(state, agentId, family) !== account.id) {
+        // Moved while the turn was being read (the user picked another account, say).
+        await this.noteLimit(account.id, problem);
+        return;
+      }
       exhausted = account.id;
-      await this.lockFor(account.id).run(() => this.failover(paseo, agentId, family, account, timeline, problem));
+      await this.lockFor(account.id).run(() => this.failover(paseo, agentId, family, account, timeline, problem, endedAt));
     } finally {
-      this.switching.delete(agentId);
+      release();
     }
     if (exhausted && this.prefs.autoSwitch && this.adapters[family].portable) {
       void this.moveIdleAgentsOff(paseo, exhausted, family, agentId, problem.kind).catch((error: unknown) =>
         log("moving idle agents failed", error),
       );
     }
+  }
+
+  /** Records the limit a turn hit on `accountId`, unless a reset refilled the account just now. */
+  private async noteLimit(accountId: string, problem: Problem): Promise<void> {
+    if (problem.kind !== "limit") return;
+    const { hit } = problem;
+    if (hit.kind === "window" && this.recentlyRedeemed(accountId)) return;
+    await this.markLimited(accountId, hit.resetsAt ?? new Date(Date.now() + (hit.kind === "budget" ? BUDGET_LIMIT_MS : WINDOW_LIMIT_MS)).toISOString(), hit.kind, "turn");
   }
 
   private async failover(
@@ -680,6 +926,7 @@ export class Service {
     account: StoredAccount,
     timeline: readonly AgentTimelineItem[] | undefined,
     problem: Problem,
+    endedAt: number,
   ): Promise<void> {
     const adapter = this.adapters[family];
     const now = Date.now();
@@ -701,10 +948,7 @@ export class Service {
       console.log(`[ZeroSub] ${account.label} was just reset; ${agentId} carries on where it is`);
       if (this.prefs.autoContinue && this.switchGuard.allows(agentId, now)) {
         this.switchGuard.note(agentId, now);
-        await paseo.agents
-          .ref(agentId)
-          .send(this.prefs.continuePrompt)
-          .catch((error: unknown) => log(`could not continue ${agentId}`, error));
+        await this.carryOn(paseo, agentId, endedAt);
       }
       return;
     }
@@ -762,14 +1006,15 @@ export class Service {
       }
       return;
     }
-    const next = mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]));
+    const move = adapter.portable ? this.nextAccount(latest, agentId, family, account.id) : null;
+    const next = adapter.portable ? move?.account : mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]));
     if (!next) {
       if (problem.kind === "limit" && problem.hit.kind === "window" && this.prefs.autoRedeem && !account.disabled) {
         // Opt-in: every account is out, so spend a banked reset rather than stop.
         const reply = await this.redeemOn(account, true);
         if (reply.outcome === "reset") {
           this.switchGuard.note(agentId, now);
-          const continued = this.prefs.autoContinue;
+          const continued = this.prefs.autoContinue && (await this.untouchedSince(paseo, agentId, endedAt));
           await this.appendRow(paseo, agentId, {
             ...base,
             to: account.label,
@@ -778,12 +1023,7 @@ export class Service {
             outcome: "reset",
             detail: reply.message,
           });
-          if (continued) {
-            await paseo.agents
-              .ref(agentId)
-              .send(this.prefs.continuePrompt)
-              .catch((error: unknown) => log(`could not continue ${agentId}`, error));
-          }
+          if (continued) await this.carryOn(paseo, agentId, endedAt);
           return;
         }
         if (reply.outcome === "not_limited") {
@@ -792,12 +1032,7 @@ export class Service {
           console.log(`[ZeroSub] ${account.label} has room again; ${agentId} carries on where it is`);
           this.switchGuard.note(agentId, now);
           await this.afterReset(account.id, reply.left);
-          if (this.prefs.autoContinue) {
-            await paseo.agents
-              .ref(agentId)
-              .send(this.prefs.continuePrompt)
-              .catch((error: unknown) => log(`could not continue ${agentId}`, error));
-          }
+          if (this.prefs.autoContinue) await this.carryOn(paseo, agentId, endedAt);
           return;
         }
         console.log(`[ZeroSub] no automatic reset for ${account.label}: ${reply.message}`);
@@ -832,23 +1067,23 @@ export class Service {
     }
 
     if (adapter.portable) {
-      await this.store.update((draft) => {
-        draft.bindings[agentId] = { accountId: next.id, source: "auto", at: new Date(now).toISOString() };
-      });
+      if (move?.pin) await this.pin(agentId, next.id, latest.bindings[agentId]);
       this.switchGuard.note(agentId, now);
-      const outcome = await this.reopenAgent(paseo, agentId, null, true);
-      const continued = outcome === "reopened" && this.prefs.autoContinue;
+      const result = await this.reopenAgent(paseo, agentId, { settle: true });
+      const continued = result.outcome === "reopened" && this.prefs.autoContinue && (await this.untouchedSince(paseo, agentId, endedAt));
       const row = await this.landed(
-        { ...base, to: next.label, reason, continued, outcome: outcome === "reopened" ? "switched" : "pending" },
+        {
+          ...base,
+          to: next.label,
+          reason,
+          continued,
+          outcome: result.outcome === "reopened" ? "switched" : "pending",
+          detail: result.outcome === "failed" ? failureDetail(result) : null,
+        },
         agentId,
       );
       await this.appendRow(paseo, agentId, row);
-      if (continued) {
-        await paseo.agents
-          .ref(agentId)
-          .send(this.prefs.continuePrompt)
-          .catch((error: unknown) => log(`could not continue ${agentId}`, error));
-      }
+      if (continued) await this.carryOn(paseo, agentId, endedAt);
       return;
     }
 
@@ -943,28 +1178,40 @@ export class Service {
   }
 
   /**
-   * Spends one banked reset on `account`, one attempt at a time per account. `automatic` use shares
-   * a reset this host just spent across concurrent failovers, and spends one only while the provider
-   * still sees the limit, so hosts sharing the account can't spend two on the same limit.
+   * Spends one banked reset on `account`, one attempt at a time per account. A reset this host just
+   * spent is shared: concurrent failovers carry on with it, and asking again by hand (a retry after
+   * Paseo stopped waiting, say) doesn't spend a second one. `automatic` use spends one only while
+   * the provider still sees the limit, so hosts sharing the account can't spend two on the same limit.
    */
   private redeemOn(account: StoredAccount, automatic: boolean): Promise<RedeemReply> {
     let lock = this.redeemLocks.get(account.id);
     if (!lock) this.redeemLocks.set(account.id, (lock = new Mutex()));
     return lock.run(async () => {
-      if (automatic && this.recentlyRedeemed(account.id)) {
-        return { outcome: "reset", message: "A reset was just used on this account.", left: null };
+      if (this.recentlyRedeemed(account.id)) {
+        if (automatic) return { outcome: "reset", message: "A reset was just used on this account.", left: null };
+        const minutes = Math.floor((Date.now() - (this.lastRedeemAt.get(account.id) ?? 0)) / 60_000);
+        return {
+          outcome: "already_used",
+          message: `A reset was used on ${account.label} ${minutes < 1 ? "moments" : `${minutes} min`} ago, so another one wasn't spent. Refresh usage to see its limits.`,
+          left: null,
+        };
       }
-      const reply = await this.adapters[account.family]
-        .redeemReset(account.home, { onlyAtLimit: automatic })
-        .catch((error: unknown): RedeemReply => ({ outcome: "error", message: describe(error), left: null }));
-      console.log(`[ZeroSub] banked reset on ${account.label}: ${reply.outcome}`);
-      if (reply.outcome === "reset") {
-        this.lastRedeemAt.set(account.id, Date.now());
-        await this.afterReset(account.id, reply.left);
-      } else if (reply.left !== null) {
-        this.updateResetCount(account.id, reply.left);
+      this.redeeming.add(account.id);
+      try {
+        const reply = await this.adapters[account.family]
+          .redeemReset(account.home, { onlyAtLimit: automatic })
+          .catch((error: unknown): RedeemReply => ({ outcome: "error", message: describe(error), left: null }));
+        console.log(`[ZeroSub] banked reset on ${account.label}: ${reply.outcome}`);
+        if (reply.outcome === "reset") {
+          this.lastRedeemAt.set(account.id, Date.now());
+          await this.afterReset(account.id, reply.left);
+        } else if (reply.left !== null) {
+          this.updateResetCount(account.id, reply.left);
+        }
+        return reply;
+      } finally {
+        this.redeeming.delete(account.id);
       }
-      return reply;
     });
   }
 
@@ -989,18 +1236,36 @@ export class Service {
     this.setUsage(accountId, { ...usage, resets: left > 0 ? { ...usage.resets, available: left } : null });
   }
 
-  /** A user-requested reset, optionally resuming the agent that was stopped by the limit. */
+  /**
+   * A user-requested reset, optionally resuming the agent that was stopped by the limit. Renewing the
+   * sign-in and the provider's answer can take longer than Paseo waits for an RPC, so after a while
+   * this answers `pending` and the reset goes on: the account's usage, and the agent's timeline if it
+   * carries on, show the result. A second request meanwhile is answered `pending` too, and one just
+   * after a reset `already_used`; neither spends another.
+   */
   async redeem(paseo: PaseoApi, accountId: string, agentId?: string): Promise<RedeemResult> {
+    const replyBy = Date.now() + REPLY_WAIT_MS;
     this.attach(paseo);
     const account = findAccount(await this.store.read(), accountId);
     if (!account) throw new Error("That account no longer exists.");
     if (!account.signedIn) throw new Error(`${account.label} is signed out. Sign it in first.`);
-    const reply = await this.redeemOn(account, false);
-    let continued = false;
-    if (reply.outcome === "reset" && agentId) {
-      continued = await this.continueAfterReset(paseo, agentId, account, reply.message).catch(() => false);
+    const pending = (message: string): RedeemResult => ({ outcome: "pending", message, left: null, continued: false });
+    if (this.redeeming.has(account.id)) {
+      return pending(`A reset is already being used on ${account.label}. Its limits show here once it's done; don't use another.`);
     }
-    return { ...reply, continued };
+    const task = (async (): Promise<RedeemResult> => {
+      const reply = await this.redeemOn(account, false);
+      let continued = false;
+      if (reply.outcome === "reset" && agentId) {
+        continued = await this.continueAfterReset(paseo, agentId, account, reply.message).catch(() => false);
+      }
+      return { ...reply, continued };
+    })();
+    task.catch((error: unknown) => log(`using a reset on ${account.label} failed`, error));
+    if (await settles(task, replyBy - Date.now())) return task;
+    return pending(
+      `Still using the reset on ${account.label}. Its limits show here once it's done${agentId ? ", and the agent carries on" : ""}; don't use another.`,
+    );
   }
 
   private async continueAfterReset(paseo: PaseoApi, agentId: string, account: StoredAccount, detail: string): Promise<boolean> {
@@ -1008,8 +1273,8 @@ export class Service {
     const info = await agentInfo(paseo, agentId);
     if (!info || info.archived || !settled(info.status)) return false;
     if (this.runningOn(await this.store.read(), agentId, account.family) !== account.id) return false;
-    // Only resume an agent that this limit actually stopped.
-    if (!(await this.lastTurnHitLimit(paseo, agentId, account.family))) return false;
+    // Only resume an agent that this limit is known to have stopped.
+    if ((await this.lastTurnHitLimit(paseo, agentId, account.family)) !== true) return false;
     const elsewhere = this.adapters[account.family].portable ? null : await this.continuations.continuesElsewhere(paseo, agentId);
     if (elsewhere) {
       await this.noteElsewhere(paseo, agentId, account, "limit", null, elsewhere, "resume");
@@ -1042,6 +1307,15 @@ export class Service {
     return state.sessions[agentId]?.accountId ?? mainAccount(state, family)?.id;
   }
 
+  /**
+   * The account a session opening now may stay on as a stand-in (see `RouteInput.current`): where a
+   * live agent runs. A closed one runs on none, so only an account its last session is still recorded
+   * on counts, never the CLI login it would fall back to.
+   */
+  private standingIn(state: StoredState, agentId: string, family: Family, live: boolean): string | undefined {
+    return live ? this.runningOn(state, agentId, family) : state.sessions[agentId]?.accountId;
+  }
+
   /** The reset time of the window that is full, from the freshest live usage reading. */
   private resetFromUsage(accountId: string): string | null {
     const usage = this.usage.get(accountId);
@@ -1054,15 +1328,60 @@ export class Service {
     return hit[0]?.resetsAt ?? null;
   }
 
-  /** Did this agent's own last turn end on a limit? Then its own failover (with a follow-up) handles it. */
-  private async lastTurnHitLimit(paseo: PaseoApi, agentId: string, family: Family): Promise<boolean> {
+  /**
+   * Did this agent's own last turn end on a limit? Then its own failover (with a follow-up) handles
+   * it. Null when its timeline can't be read.
+   */
+  private async lastTurnHitLimit(paseo: PaseoApi, agentId: string, family: Family): Promise<boolean | null> {
     try {
       const page = await paseo.agents.ref(agentId).timeline.refetch({ direction: "tail", limit: 40 });
       const timeline = page.entries.map((entry) => entry.item);
       return this.adapters[family].detectLimit({ outcome: { kind: "completed" }, timeline }) !== null;
     } catch {
-      return true; // When unsure, leave it alone.
+      return null;
     }
+  }
+
+  /**
+   * Sends the continue prompt to an agent whose turn ended at `endedAt` on a limit. Paseo's send
+   * cancels a turn that's running and unarchives an archived agent, so an agent someone has written
+   * to since, or put away, is left as it is.
+   */
+  private async carryOn(paseo: PaseoApi, agentId: string, endedAt: number): Promise<void> {
+    if (!(await this.untouchedSince(paseo, agentId, endedAt))) {
+      console.log(`[ZeroSub] not continuing ${agentId}: it was used or put away since its limit`);
+      return;
+    }
+    await paseo.agents
+      .ref(agentId)
+      .send(this.prefs.continuePrompt)
+      .catch((error: unknown) => log(`could not continue ${agentId}`, error));
+  }
+
+  /** No turn has started or ended on the agent since `endedAt`, and it's still open. */
+  private async untouchedSince(paseo: PaseoApi, agentId: string, endedAt: number): Promise<boolean> {
+    if (this.turnAt.get(agentId) !== endedAt) return false;
+    const info = await agentInfo(paseo, agentId);
+    return info !== null && !info.archived && info.status !== "closed";
+  }
+
+  /**
+   * Where an agent moves off an `exhausted` account: where it's routed now when that's another
+   * account as chosen (one picked for it, perhaps while its turn ran, or the default it follows),
+   * else the roomiest other one, which it's then pinned to. Undefined when there's none.
+   */
+  private nextAccount(state: StoredState, agentId: string, family: Family, exhausted: string): { account: StoredAccount; pin: boolean } | undefined {
+    const routed = this.routeFor(state, agentId, family, exhausted);
+    if (routed && routed.account.id !== exhausted && !routed.skipped) return { account: routed.account, pin: false };
+    const roomiest = mostAvailable(state, family, (id) => this.usage.get(id), Date.now(), new Set([exhausted]));
+    return roomiest && { account: roomiest, pin: true };
+  }
+
+  /** Pins an agent to the account an automatic switch moved it to, unless the user picked one since `seen`. */
+  private async pin(agentId: string, accountId: string, seen: Binding | undefined): Promise<void> {
+    await this.store.update((draft) => {
+      if (sameBinding(draft.bindings[agentId], seen)) draft.bindings[agentId] = { accountId, source: "auto", at: new Date().toISOString() };
+    });
   }
 
   /** Idle agents still on an exhausted account would fail on their next turn; move them now. */
@@ -1075,6 +1394,8 @@ export class Service {
   ): Promise<void> {
     const state = await this.store.read();
     const from = findAccount(state, accountId);
+    // One a reset refilled just before this turn's limit came in still has room (see `failover`).
+    if (!from || isUsable(from, Date.now())) return;
     const families = await this.families.resolve(paseo);
     const candidates = (await this.cachedAgents(paseo))
       .filter(
@@ -1086,22 +1407,23 @@ export class Service {
       )
       .map((agent) => agent.id);
     for (const agentId of candidates) {
-      if (this.switching.has(agentId) || !this.switchGuard.allows(agentId, Date.now())) continue;
+      if (!this.switchGuard.allows(agentId, Date.now())) continue;
       const info = await agentInfo(paseo, agentId);
-      if (!info || info.archived || !settled(info.status)) continue;
-      if (await this.lastTurnHitLimit(paseo, agentId, family)) continue;
-      this.switching.add(agentId);
+      // One the user is using right now is left for alignment to move once it's quiet.
+      if (!info || info.archived || !settled(info.status) || this.recentlyActive(info, Date.now())) continue;
+      // Left for its own failover, or alone when that can't be told.
+      if ((await this.lastTurnHitLimit(paseo, agentId, family)) !== false) continue;
+      const release = this.tryClaim(agentId);
+      if (!release) continue;
       try {
         const now = Date.now();
         const latest = await this.store.read();
         if (this.runningOn(latest, agentId, family) !== accountId) continue;
-        const next = mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([accountId]));
-        if (!next) return;
-        await this.store.update((draft) => {
-          draft.bindings[agentId] = { accountId: next.id, source: "auto", at: new Date(now).toISOString() };
-        });
+        const move = this.nextAccount(latest, agentId, family, accountId);
+        if (!move) return;
+        const next = move.account;
+        if (move.pin) await this.pin(agentId, next.id, latest.bindings[agentId]);
         this.switchGuard.note(agentId, now);
-        if ((await this.reopenAgent(paseo, agentId)) !== "reopened") continue;
         const row: SwitchRow = {
           family,
           from: from?.label ?? null,
@@ -1115,9 +1437,9 @@ export class Service {
           detail: null,
           at: new Date(now).toISOString(),
         };
-        await this.appendRow(paseo, agentId, await this.landed(row, agentId));
+        await this.noteOutcome(paseo, agentId, row, await this.reopenAgent(paseo, agentId, { row, background: true }));
       } finally {
-        this.switching.delete(agentId);
+        release();
       }
     }
   }
@@ -1199,18 +1521,38 @@ export class Service {
 
   /** Manual continuations share the automatic failover guard, including cross-provider forks. */
   private async withSwitch<T>(agentId: string, action: () => Promise<T>): Promise<T> {
-    if (this.switching.has(agentId)) throw new Error("This agent is already switching accounts. Wait for its handoff to finish.");
-    this.switching.add(agentId);
+    const release = this.tryClaim(agentId);
+    if (!release) throw new Error("This agent is already switching accounts. Wait for its handoff to finish.");
     try {
       return await action();
     } finally {
+      release();
+    }
+  }
+
+  /** Claims an agent for a move, or returns null while another move has it. */
+  private tryClaim(agentId: string): (() => void) | null {
+    if (this.switching.has(agentId)) return null;
+    let done = () => {};
+    this.switching.set(agentId, new Promise<void>((resolve) => (done = resolve)));
+    return () => {
       this.switching.delete(agentId);
+      done();
+    };
+  }
+
+  /** Claims an agent for a move once any move it's in has finished. */
+  private async claim(agentId: string): Promise<() => void> {
+    for (;;) {
+      const release = this.tryClaim(agentId);
+      if (release) return release;
+      await this.switching.get(agentId);
     }
   }
 
   private async forkAgentNow(paseo: PaseoApi, agentId: string): Promise<Continuation> {
     this.attach(paseo);
-    const info = await agentInfo(paseo, agentId);
+    const info = await lookUpAgent(paseo, agentId);
     if (!info || info.archived) throw new Error("That agent is no longer available.");
     const family = (await this.families.resolve(paseo))[info.provider];
     if (!family) throw new Error(`${info.provider} agents don't use Claude or ChatGPT subscription accounts.`);
@@ -1265,8 +1607,11 @@ export class Service {
 
   // ------------------------------------------------------------------ reopening sessions
 
-  /** Where routing would put this agent's next session, including skipping exhausted accounts. */
-  private targetFor(state: StoredState, agentId: string, family: Family): string | undefined {
+  /**
+   * How routing would open this agent's next session now, including skipping exhausted accounts.
+   * `current` is the account its session runs on, which it keeps while that can stand in.
+   */
+  private routeFor(state: StoredState, agentId: string, family: Family, current?: string): RouteDecision | null {
     return chooseAccount(state, {
       agentId,
       family,
@@ -1276,7 +1621,16 @@ export class Service {
       balanceNewAgents: false,
       portable: this.adapters[family].portable,
       usageOf: (id) => this.usage.get(id),
-    })?.account.id;
+      current,
+    });
+  }
+
+  /**
+   * Where this agent's session belongs now. One on a usable stand-in, `current` (see `standingIn`),
+   * belongs where it is.
+   */
+  private targetFor(state: StoredState, agentId: string, family: Family, current: string | undefined): string | undefined {
+    return this.routeFor(state, agentId, family, current)?.account.id;
   }
 
   /** Names the account the agent actually reopened on in its timeline note. */
@@ -1286,100 +1640,264 @@ export class Service {
     return label && row.outcome === "switched" ? { ...row, to: label } : row;
   }
 
+  /** The user was using the agent a moment ago: a turn started or ended, or they sent a message. */
+  private recentlyActive(agent: AgentInfo, now: number): boolean {
+    return now - Math.max(this.turnAt.get(agent.id) ?? 0, agent.lastMessageAt) < TURN_SETTLE_MS;
+  }
+
   /**
    * Reopens an idle agent now, or defers a busy one until its turn ends. `settle` waits a moment for
-   * an agent whose turn just ended to report idle, since nothing else would reopen it later.
+   * an agent whose turn just ended to report idle, since nothing else would reopen it later. A reload
+   * cancels a running turn, so the agent is looked at again right before it; a `background` move,
+   * which nobody asked for just now, then also waits for the turn of an agent that was in use a
+   * moment ago (alignment carries it out if no turn comes).
    */
   private async reopenAgent(
     paseo: PaseoApi,
     agentId: string,
-    row: SwitchRow | null = null,
-    settle = false,
-  ): Promise<ReopenOutcome> {
-    let info = await agentInfo(paseo, agentId);
-    for (let attempt = 0; settle && info && attempt < 20 && (info.status === "running" || info.status === "initializing"); attempt += 1) {
-      await delay(300);
-      info = await agentInfo(paseo, agentId);
+    options: { row?: SwitchRow | null; settle?: boolean; background?: boolean } = {},
+  ): Promise<ReopenResult> {
+    const { row = null, settle = false, background = false } = options;
+    let info: AgentInfo | null;
+    try {
+      info = await lookUpAgent(paseo, agentId);
+      for (let attempt = 0; settle && info && attempt < 20 && busy(info); attempt += 1) {
+        await delay(300);
+        info = await lookUpAgent(paseo, agentId);
+      }
+    } catch (error) {
+      return unchecked(error);
     }
-    if (!info) return "closed";
-    if (info.status === "running" || info.status === "initializing") {
-      this.deferred.set(agentId, row);
-      return "deferred";
-    }
+    if (!info) return { outcome: "closed" };
+    if (busy(info)) return this.defer(agentId, row);
     // Reloading an archived agent would unarchive it; a closed one routes itself when it next opens.
-    if (info.archived || info.status === "closed") return "closed";
+    if (info.archived || info.status === "closed") return { outcome: "closed" };
     const family = (await this.families.resolve(paseo))[info.provider];
-    if (family && !this.adapters[family].portable && info.hasHistory) {
+    const state = await this.store.read();
+    // A thread whose session opened without ZeroSub (on the CLI login) belongs to the account it's
+    // pinned to, which holds its history, so it reopens there.
+    if (family && !this.adapters[family].portable && info.hasHistory && (state.sessions[agentId] || !state.bindings[agentId])) {
       // The thread gained history while waiting, so it can no longer change accounts: keep it put.
-      const state = await this.store.read();
       const current = this.runningOn(state, agentId, family);
       if (current && findAccount(state, current)) {
         await this.store.update((draft) => {
           draft.bindings[agentId] = { accountId: current, source: "thread", at: new Date().toISOString() };
         });
       }
-      return "closed";
+      return { outcome: "closed" };
     }
-    const before = (await this.store.read()).sessions[agentId];
-    const result = await this.reopener.reopen(agentId);
+    // Look once more right before reloading: a turn that started meanwhile would be cancelled.
+    let latest: AgentInfo | null;
+    try {
+      latest = await lookUpAgent(paseo, agentId);
+    } catch (error) {
+      return unchecked(error);
+    }
+    if (!latest || latest.archived || latest.status === "closed") return { outcome: "closed" };
+    if (busy(latest) || (background && this.recentlyActive(latest, Date.now()))) return this.defer(agentId, row);
+    const reload: Reload = { opens: 0 };
+    this.reloads.set(agentId, reload);
+    let result: Awaited<ReturnType<Reopener["reopen"]>>;
+    try {
+      result = await this.reopener.reopen(agentId);
+    } finally {
+      this.reloads.delete(agentId);
+    }
+    if (result.ok && this.unrouted.has(agentId)) {
+      // Paseo stopped waiting for routing and reopened the session as it was (see `onSessionOpen`).
+      result = { ok: false, error: "ZeroSub couldn't pick its account in time, so it reopened on your CLI login", timedOut: false };
+    }
     if (!result.ok) {
       console.warn(`[ZeroSub] could not reopen ${agentId}: ${result.error}`);
       // Paseo asks for the new session's environment before it closes the old one, so a failed reload
-      // has still recorded a session that never opened. One that ran out of time may yet open.
-      if (!result.timedOut) {
+      // has still recorded a session that never opened. One that ran out of time may yet open. Only
+      // this reload's own record is undone: a session opened since (another reload) stands.
+      const { opened } = reload;
+      if (!result.timedOut && opened && reload.opens === 1) {
         await this.store.update((draft) => {
           const recorded = draft.sessions[agentId];
-          if (!recorded || recorded.openedAt === before?.openedAt) return;
-          if (before) draft.sessions[agentId] = before;
+          if (recorded?.openedAt !== opened.wrote.openedAt || recorded.accountId !== opened.wrote.accountId) return;
+          if (opened.replaced) draft.sessions[agentId] = opened.replaced;
           else delete draft.sessions[agentId];
         });
       }
-      return "failed";
+      if (!result.timedOut && family) {
+        const latest = await this.store.read();
+        const target = this.targetFor(latest, agentId, family, this.runningOn(latest, agentId, family));
+        if (target) this.failedMoves.set(agentId, target);
+      }
+      return { outcome: "failed", error: result.error, timedOut: result.timedOut };
     }
-    return "reopened";
+    // A move alignment asked for has landed, so a later one to the same account isn't held back.
+    if (this.alignedAt.get(agentId)?.accountId === (await this.store.read()).sessions[agentId]?.accountId) this.alignedAt.delete(agentId);
+    return { outcome: "reopened" };
+  }
+
+  /** Leaves the move for the end of the agent's turn, keeping the note of a move already waiting. */
+  private defer(agentId: string, row: SwitchRow | null): ReopenResult {
+    this.deferred.set(agentId, row ?? this.deferred.get(agentId) ?? null);
+    return { outcome: "deferred" };
+  }
+
+  /** Notes how a move came out: where the agent landed, or that it moves when its session next starts. */
+  private async noteOutcome(paseo: PaseoApi, agentId: string, row: SwitchRow, result: ReopenResult): Promise<void> {
+    if (result.outcome === "reopened") await this.appendRow(paseo, agentId, await this.landed(row, agentId));
+    else if (result.outcome === "failed") {
+      await this.appendRow(paseo, agentId, { ...row, outcome: "pending", detail: failureDetail(result), at: new Date().toISOString() });
+    }
   }
 
   /**
    * Reopens every live agent whose session runs on a different account than it is routed to now,
-   * and notes the switch in its timeline. Busy agents switch (and get their note) after their turn.
+   * and notes in its timeline how that went. Busy agents switch (and get their note) after their
+   * turn. With no `reason`, each agent's note says why its account no longer fits.
+   *
+   * Each agent is claimed while it moves, so two moves never reload it twice. A move the user asked
+   * for waits for one already under way, then looks again. A `background` pass (alignment) skips
+   * agents another move has and leaves ones in use a moment ago for later; with `expected`, it only
+   * makes the moves it decided on, since whatever changed under it is for its next pass. `summary`
+   * fills in as agents move, with the ones still to go in `pending`, for an answer that can't wait.
    */
   private async reconcile(
     paseo: PaseoApi,
-    reason: SwitchRow["reason"],
+    reason: SwitchRow["reason"] | null,
     agentIds?: readonly string[],
     fromLabels: ReadonlyMap<string, string> = new Map(),
+    options: { summary?: ReopenSummary; background?: boolean; expected?: ReadonlyMap<string, string> } = {},
   ): Promise<ReopenSummary> {
-    const summary = emptySummary();
-    const state = await this.store.read();
+    const summary = options.summary ?? emptySummary();
     const families = await this.families.resolve(paseo);
+    const initial = await this.store.read();
+    const due: Array<{ agentId: string; family: Family }> = [];
     for (const agent of await this.liveAgents(paseo, agentIds)) {
-      const agentId = agent.id;
       const family = families[agent.provider];
-      if (!family || this.switching.has(agentId)) continue;
-      const current = this.runningOn(state, agentId, family);
-      const target = this.targetFor(state, agentId, family);
-      if (!current || !target || target === current) continue;
-      const row: SwitchRow = {
-        family,
-        from: findAccount(state, current)?.label ?? fromLabels.get(current) ?? null,
-        to: findAccount(state, target)?.label ?? target,
-        reason,
-        resetsAt: null,
-        continued: false,
-        continuedIn: null,
-        toFamily: null,
-        outcome: "switched",
-        detail: null,
-        at: new Date().toISOString(),
-      };
-      const outcome = await this.reopenAgent(paseo, agentId, row);
-      if (outcome === "reopened") {
-        summary.reopened.push(agentId);
-        await this.appendRow(paseo, agentId, await this.landed(row, agentId));
-      } else if (outcome === "deferred") summary.deferred.push(agentId);
-      else if (outcome === "failed") summary.failed.push({ agentId, error: "Reload failed" });
+      if (!family) continue;
+      const current = this.runningOn(initial, agent.id, family);
+      const target = this.targetFor(initial, agent.id, family, current);
+      if (current && target && target !== current) due.push({ agentId: agent.id, family });
+    }
+    summary.pending.push(...due.map(({ agentId }) => agentId));
+    for (const { agentId, family } of due) {
+      const release = options.background ? this.tryClaim(agentId) : await this.claim(agentId);
+      try {
+        if (!release) continue;
+        const state = await this.store.read();
+        const current = this.runningOn(state, agentId, family);
+        const target = this.targetFor(state, agentId, family, current);
+        if (!current || !target || target === current) continue; // Moved, or no longer wanted, meanwhile.
+        if (options.expected && options.expected.get(agentId) !== target) continue;
+        const why = reason ?? this.driftReason(state, agentId, current, target, Date.now());
+        const row: SwitchRow = {
+          family,
+          from: findAccount(state, current)?.label ?? fromLabels.get(current) ?? null,
+          to: findAccount(state, target)?.label ?? target,
+          reason: why,
+          resetsAt: why === "limit" ? (findAccount(state, current)?.limitedUntil ?? null) : null,
+          continued: false,
+          continuedIn: null,
+          toFamily: null,
+          outcome: "switched",
+          detail: null,
+          at: new Date().toISOString(),
+        };
+        const result = await this.reopenAgent(paseo, agentId, { row, background: options.background });
+        if (result.outcome === "reopened") summary.reopened.push(agentId);
+        else if (result.outcome === "deferred") summary.deferred.push(agentId);
+        else if (result.outcome === "failed") summary.failed.push({ agentId, error: result.error });
+        if (options.background && result.outcome === "failed") {
+          // A reload alignment tried that didn't land is tried again after a while, and noted once. One
+          // that never got as far as a reload is tried again next pass, without a note.
+          if (result.unchecked) continue;
+          const tried = this.alignedAt.get(agentId);
+          const noted = tried?.accountId === target && tried.noted === true;
+          this.alignedAt.set(agentId, { accountId: target, at: Date.now(), noted: true });
+          if (noted) continue;
+        }
+        await this.noteOutcome(paseo, agentId, row, result);
+      } finally {
+        release?.();
+        const index = summary.pending.indexOf(agentId);
+        if (index >= 0) summary.pending.splice(index, 1);
+      }
     }
     return summary;
+  }
+
+  /**
+   * Answers an RPC that moves agents by `replyBy` with what's known: agents still moving are in
+   * `pending`, and the move carries on, its outcome in each agent's timeline and the next state.
+   */
+  private async answerBy(replyBy: number, moves: Promise<ReopenSummary>, summary: ReopenSummary): Promise<ReopenSummary> {
+    // What the moves follow from (a new default, a disabled account) is saved already, so a move that
+    // throws doesn't fail the answer: the agents it didn't get to stay in `pending`, for alignment.
+    const answer = moves.catch((error: unknown) => {
+      log("moving agents failed", error);
+      return structuredClone(summary);
+    });
+    if (await settles(answer, replyBy - Date.now())) return answer;
+    return structuredClone(summary);
+  }
+
+  /**
+   * Moves live agents whose session runs on another account than they're routed to, when nothing
+   * else did: a limit read from usage or cleared, automatic switching turned on or off, a switch
+   * that was waiting for a turn when the plugin restarted or for one that never came. Otherwise the
+   * account button names an account the agent isn't on, and nothing ever moves it there. Idle
+   * agents move now, busy ones after their turn, and ones the user was just using once they've
+   * been quiet a while. A move that doesn't land isn't tried again for a while.
+   */
+  async alignSessions(paseo: PaseoApi): Promise<ReopenSummary> {
+    if (this.aligning || this.stopped || this.pinning > 0) return emptySummary();
+    this.aligning = true;
+    try {
+      // Without the CLI nothing can be reopened; agents move when their sessions next start.
+      if ((await this.reopener.locate()) === null) return emptySummary();
+      const state = await this.store.read();
+      const families = await this.families.resolve(paseo);
+      const routing = new Set(this.routing.values());
+      const now = Date.now();
+      const due = new Map<string, string>();
+      const waiting: Array<{ agentId: string; family: Family }> = [];
+      for (const agent of await this.liveAgents(paseo)) {
+        const agentId = agent.id;
+        const family = families[agent.provider];
+        if (!family || routing.has(agentId) || this.switching.has(agentId) || this.recentlyActive(agent, now)) continue;
+        if (this.deferred.has(agentId)) {
+          // Its switch waited for a turn that never came (it was only starting), or ended without it.
+          if (settled(agent.status)) waiting.push({ agentId, family });
+          continue;
+        }
+        const current = this.runningOn(state, agentId, family);
+        const target = this.targetFor(state, agentId, family, current);
+        if (!current || !target || target === current) continue;
+        const tried = this.alignedAt.get(agentId);
+        if (tried?.accountId === target && now - tried.at < ALIGN_RETRY_MS) continue;
+        if (!this.switchGuard.allows(agentId, now)) continue;
+        due.set(agentId, target);
+      }
+      for (const { agentId, family } of waiting) await this.finishDeferred(paseo, agentId, family, true);
+      if (due.size === 0) return emptySummary();
+      const summary = await this.reconcile(paseo, null, [...due.keys()], undefined, { background: true, expected: due });
+      for (const agentId of summary.reopened) this.switchGuard.note(agentId, Date.now());
+      if (summary.reopened.length + summary.deferred.length + summary.failed.length > 0) {
+        console.log(
+          `[ZeroSub] aligned agents with their accounts: ${summary.reopened.length} moved, ${summary.deferred.length} after their turn, ${summary.failed.length} failed`,
+        );
+      }
+      return summary;
+    } finally {
+      this.aligning = false;
+    }
+  }
+
+  /** Why an agent's session no longer runs on the account it's routed to, for its timeline note. */
+  private driftReason(state: StoredState, agentId: string, current: string, target: string, now: number): SwitchRow["reason"] {
+    const from = findAccount(state, current);
+    if (!from) return "removed";
+    if (!from.signedIn) return "signed_out";
+    if (from.disabled) return "disabled";
+    if (isLimited(from, now)) return "limit";
+    return state.bindings[agentId]?.accountId === target ? "manual" : "default";
   }
 
   private async appendRow(paseo: PaseoApi, agentId: string, row: SwitchRow): Promise<void> {
@@ -1493,12 +2011,14 @@ export class Service {
     this.attach(paseo);
     if (refreshUsage) {
       const state = await this.store.read();
-      await Promise.allSettled(state.accounts.map((account) => this.refreshUsage(account.id, true, true)));
+      // Renewing a sign-in can take longer than Paseo waits for an answer; later readings show at the next poll.
+      await settles(Promise.allSettled(state.accounts.map((account) => this.refreshUsage(account.id, true, true))), USAGE_REPLY_MS);
     }
     void this.prune(paseo).catch(() => undefined);
     const state = await this.store.read();
     const families = await this.families.resolve(paseo);
     const agents = await this.cachedAgents(paseo);
+    const canReopen = (await this.reopener.locate()) !== null;
     const now = Date.now();
 
     const routes: AgentRoute[] = [];
@@ -1506,11 +2026,13 @@ export class Service {
     for (const agent of agents) {
       const family = families[agent.provider];
       if (!family || agent.archived) continue;
-      const accountId = this.targetFor(state, agent.id, family);
+      const live = isLive(agent.status);
+      const accountId = this.targetFor(state, agent.id, family, this.standingIn(state, agent.id, family, live));
       if (!accountId) continue;
       counts.set(accountId, (counts.get(accountId) ?? 0) + 1);
-      const current = isLive(agent.status) ? this.runningOn(state, agent.id, family) : undefined;
+      const current = live ? this.runningOn(state, agent.id, family) : undefined;
       const binding = state.bindings[agent.id];
+      const pending = current && current !== accountId ? current : null;
       routes.push({
         agentId: agent.id,
         family,
@@ -1521,7 +2043,14 @@ export class Service {
           binding?.source === "balance" && binding.selectionReason === "weekly_reset" && binding.accountId === accountId
             ? "weekly_reset"
             : undefined,
-        pendingAccountId: current && current !== accountId ? current : null,
+        pendingAccountId: pending,
+        waiting: !pending
+          ? null
+          : !canReopen || this.failedMoves.get(agent.id) === accountId
+            ? "restart"
+            : this.deferred.has(agent.id) || busy(agent)
+              ? "turn"
+              : "idle",
         movable: this.adapters[family].portable || !agent.hasHistory,
       });
     }
@@ -1550,9 +2079,10 @@ export class Service {
       agents: routes,
       logins: [...this.logins.values()].map((login) => login.view),
       providers: families,
-      canReopen: (await this.reopener.locate()) !== null,
+      canReopen,
       browserSignIn: this.browserSignIn,
       showComposerPill: this.prefs.showComposerPill,
+      autoSwitch: this.prefs.autoSwitch,
       warnings: await this.warnings(),
     };
   }
@@ -1603,7 +2133,9 @@ export class Service {
 
   // ------------------------------------------------------------------ RPC: accounts
 
+  /** Makes an account the default. Moving agents can outlast the RPC: see `answerBy`. */
   async setDefault(paseo: PaseoApi, accountId: string): Promise<ReopenSummary> {
+    const replyBy = Date.now() + REPLY_WAIT_MS;
     this.attach(paseo);
     const account = findAccount(await this.store.read(), accountId);
     if (!account) throw new Error("That account no longer exists.");
@@ -1611,18 +2143,34 @@ export class Service {
     if (account.disabled) throw new Error(`${account.label} is disabled. Enable it before making it the default.`);
     const portable = this.adapters[account.family].portable;
     if (!portable) await this.pinThreads(paseo, account.family);
-    await this.store.update((draft) => {
-      draft.defaults[account.family] = account.id;
-    });
-    if (portable && !this.prefs.moveAgentsOnDefaultChange) {
-      // The new default is for what comes next: open agents stay on the account they run on.
-      const { kept, moving } = await this.keepOpenAgents(paseo, account.family, account.id);
-      console.log(`[ZeroSub] ${account.label} is the default now; ${kept} open agent(s) stay on their account`);
-      // Agents that can't stay where they are move as they would with the switch on; nothing else does.
-      return moving.length > 0 ? this.reconcile(paseo, "default", moving) : emptySummary();
-    }
     // Conversations that can't move (Codex threads) are pinned, so this only moves portable ones.
-    return this.reconcile(paseo, "default");
+    let agentIds: string[] | undefined;
+    let previous: string | null = null;
+    this.pinning += 1;
+    try {
+      await this.store.update((draft) => {
+        previous = draft.defaults[account.family];
+        draft.defaults[account.family] = account.id;
+      });
+      if (portable && !this.prefs.moveAgentsOnDefaultChange) {
+        // The new default is for what comes next: open agents stay on the account they run on. If they
+        // can't be kept, the old default comes back, or alignment would move them all to the new one.
+        const { kept, moving } = await this.keepOpenAgents(paseo, account.family, account.id).catch(async (error: unknown) => {
+          await this.store.update((draft) => {
+            if (draft.defaults[account.family] === account.id) draft.defaults[account.family] = previous;
+          });
+          throw error;
+        });
+        console.log(`[ZeroSub] ${account.label} is the default now; ${kept} open agent(s) stay on their account`);
+        // Agents that can't stay where they are move as they would with the switch on; nothing else does.
+        agentIds = moving;
+      }
+    } finally {
+      this.pinning -= 1;
+    }
+    if (agentIds?.length === 0) return emptySummary();
+    const summary = emptySummary();
+    return this.answerBy(replyBy, this.reconcile(paseo, "default", agentIds, undefined, { summary }), summary);
   }
 
   /**
@@ -1632,31 +2180,49 @@ export class Service {
    * already on it stay there; `stayed` counts them.
    */
   async setAccountEnabled(paseo: PaseoApi, accountId: string, enabled: boolean): Promise<ReopenSummary & { stayed: number }> {
+    const replyBy = Date.now() + REPLY_WAIT_MS;
     this.attach(paseo);
     const state = await this.store.read();
     const account = findAccount(state, accountId);
     if (!account) throw new Error("That account no longer exists.");
     if (account.disabled === !enabled) return { ...emptySummary(), stayed: 0 };
-    if (!enabled && !accountsOf(state, account.family).some((other) => other.id !== account.id && other.signedIn && !other.disabled)) {
-      // With nothing else to route to, sessions would quietly fall back to the CLI login.
-      throw new Error(`${account.label} is the only ${FAMILY_LABEL[account.family]} account in use. Add or enable another one first.`);
+    if (!enabled && !mostAvailable(state, account.family, (id) => this.usage.get(id), Date.now(), new Set([account.id]))) {
+      // Routing only stands in a usable account for a disabled one. Without one, its
+      // agents and new ones would stay on it, or quietly fall back to the CLI login.
+      const others = accountsOf(state, account.family).some((other) => other.id !== account.id && other.signedIn && !other.disabled);
+      throw new Error(
+        others
+          ? `${account.label}'s agents would have nowhere to go: your other ${FAMILY_LABEL[account.family]} accounts are at their limit. Wait for one to reset, or add or enable another account first.`
+          : `${account.label} is the only ${FAMILY_LABEL[account.family]} account in use. Add or enable another one first.`,
+      );
     }
     await this.store.update((draft) => {
       const target = findAccount(draft, accountId);
       if (target) target.disabled = !enabled;
     });
     console.log(`[ZeroSub] ${account.label} is ${enabled ? "enabled" : "disabled"}`);
-    const summary = await this.reconcile(paseo, enabled ? "enabled" : "disabled");
     let stayed = 0;
     if (!enabled && !this.adapters[account.family].portable) {
+      // Threads with history can't move, so they stay whatever reconciling does.
       const families = await this.families.resolve(paseo);
       const latest = await this.store.read();
-      stayed = (await listAgents(paseo, false)).agents.filter(
+      const agents = await listAgents(paseo, false).then(
+        (result) => result.agents,
+        (error: unknown) => {
+          log(`could not count the ChatGPT conversations that stay on ${account.label}`, error);
+          return [];
+        },
+      );
+      stayed = agents.filter(
         (agent) =>
-          families[agent.provider] === account.family && agent.hasHistory && this.targetFor(latest, agent.id, account.family) === accountId,
+          families[agent.provider] === account.family &&
+          agent.hasHistory &&
+          this.targetFor(latest, agent.id, account.family, this.runningOn(latest, agent.id, account.family)) === accountId,
       ).length;
     }
-    return { ...summary, stayed };
+    const summary = emptySummary();
+    const moved = await this.answerBy(replyBy, this.reconcile(paseo, enabled ? "enabled" : "disabled", undefined, undefined, { summary }), summary);
+    return { ...moved, stayed };
   }
 
   /**
@@ -1735,9 +2301,15 @@ export class Service {
     void this.refreshUsage(accountId, true).catch(() => undefined);
   }
 
+  /**
+   * Moves one agent to an account, or back to following the default. With automatic switching on,
+   * an account at its limit is refused, since the agent would be moved straight off it. A failover
+   * under way finishes first; the agent then moves to the account picked here.
+   */
   async setAgentAccount(paseo: PaseoApi, agentId: string, accountId: string | null): Promise<ReopenSummary> {
+    const replyBy = Date.now() + REPLY_WAIT_MS;
     this.attach(paseo);
-    const info = await agentInfo(paseo, agentId);
+    const info = await lookUpAgent(paseo, agentId);
     if (!info) throw new Error("That agent is no longer available.");
     const family = (await this.families.resolve(paseo))[info.provider];
     if (!family) throw new Error(`${info.provider} agents don't use Claude or ChatGPT subscription accounts.`);
@@ -1747,6 +2319,7 @@ export class Service {
     if (!target || target.family !== family) throw new Error("That account can't be used with this agent.");
     if (!target.signedIn) throw new Error(`${target.label} is signed out. Sign it in first.`);
     if (accountId && target.disabled) throw new Error(`${target.label} is disabled. Enable it in Accounts first.`);
+    if (accountId && this.prefs.autoSwitch && isLimited(target, Date.now())) throw new Error(limitedPick(target.label));
 
     if (!adapter.portable) {
       if (info.status === "running" || info.status === "initializing") {
@@ -1756,28 +2329,50 @@ export class Service {
         const binding = state.bindings[agentId];
         const current = binding?.source === "thread" ? binding.accountId : this.runningOn(state, agentId, family);
         if (current === target.id) return emptySummary();
-        const continuation = await this.withSwitch(agentId, () => this.continueElsewhere(
-          paseo,
-          agentId,
-          target,
-          `you moved the work to your ChatGPT account "${target.label}"`,
-          undefined,
-          "user",
-        ));
-        await this.appendRow(paseo, agentId, {
-          family,
-          from: findAccount(state, current)?.label ?? null,
-          to: target.label,
-          reason: "manual",
-          resetsAt: null,
-          continued: true,
-          continuedIn: continuation,
-          toFamily: null,
-          outcome: "continued",
-          detail: null,
-          at: new Date().toISOString(),
+        const from = findAccount(state, current)?.label ?? null;
+        const handoff = (async (): Promise<ReopenSummary> => {
+          const continuation = await this.withSwitch(agentId, () => this.continueElsewhere(
+            paseo,
+            agentId,
+            target,
+            `you moved the work to your ChatGPT account "${target.label}"`,
+            undefined,
+            "user",
+          ));
+          await this.appendRow(paseo, agentId, {
+            family,
+            from,
+            to: target.label,
+            reason: "manual",
+            resetsAt: null,
+            continued: true,
+            continuedIn: continuation,
+            toFamily: null,
+            outcome: "continued",
+            detail: null,
+            at: new Date().toISOString(),
+          });
+          return { ...emptySummary(), continuedIn: continuation };
+        })();
+        if (await settles(handoff, replyBy - Date.now())) return handoff;
+        // Creating the other tab outlasts the RPC: it finishes in the background, and says if it can't.
+        handoff.catch(async (error: unknown) => {
+          log(`could not continue ${agentId} on ${target.label}`, error);
+          await this.appendRow(paseo, agentId, {
+            family,
+            from,
+            to: target.label,
+            reason: "manual",
+            resetsAt: null,
+            continued: false,
+            continuedIn: null,
+            toFamily: null,
+            outcome: "stayed",
+            detail: `Couldn't continue on ${target.label}: ${describe(error)}`,
+            at: new Date().toISOString(),
+          });
         });
-        return { ...emptySummary(), continuedIn: continuation };
+        return { ...emptySummary(), pending: [agentId] };
       }
     }
 
@@ -1785,7 +2380,8 @@ export class Service {
       if (accountId) draft.bindings[agentId] = { accountId, source: adapter.portable ? "user" : "thread", at: new Date().toISOString() };
       else delete draft.bindings[agentId];
     });
-    return this.reconcile(paseo, "manual", [agentId]);
+    const summary = emptySummary();
+    return this.answerBy(replyBy, this.reconcile(paseo, "manual", [agentId], undefined, { summary }), summary);
   }
 
   async rename(accountId: string, label: string): Promise<void> {
@@ -1798,7 +2394,9 @@ export class Service {
     if (!findAccount(state, accountId)) throw new Error("That account no longer exists.");
   }
 
-  async remove(paseo: PaseoApi, accountId: string): Promise<number> {
+  /** Removes an account. Moving its agents can outlast the RPC: see `answerBy`. */
+  async remove(paseo: PaseoApi, accountId: string): Promise<{ affected: number; moves: ReopenSummary }> {
+    const replyBy = Date.now() + REPLY_WAIT_MS;
     this.attach(paseo);
     const state = await this.store.read();
     const account = findAccount(state, accountId);
@@ -1838,9 +2436,10 @@ export class Service {
     this.setUsage(accountId, null);
     // Idle agents move now and busy ones after their turn. The home is signed out and deleted by the
     // cleanup pass only once nothing runs on it any more.
-    await this.reconcile(paseo, "removed", affected, new Map([[account.id, account.label]]));
+    const summary = emptySummary();
+    const moves = await this.answerBy(replyBy, this.reconcile(paseo, "removed", affected, new Map([[account.id, account.label]]), { summary }), summary);
     void this.cleanUpHomes(paseo).catch((error: unknown) => log("cleanup failed", error));
-    return affected.length;
+    return { affected: affected.length, moves };
   }
 
   // ------------------------------------------------------------------ RPC: sign-in
@@ -2076,16 +2675,23 @@ function toAgentInfo(agent: AgentSnapshot): AgentInfo {
     hasHistory: Boolean(agent.lastUserMessageAt),
     title: agent.title ?? null,
     continuedFrom: agent.labels?.[CONTINUED_FROM_LABEL] ?? null,
+    lastMessageAt: Date.parse(agent.lastUserMessageAt ?? "") || 0,
   };
 }
 
+/** The agent, or null once Paseo says it doesn't know it. A lookup that fails throws. */
+async function lookUpAgent(paseo: PaseoApi, agentId: string): Promise<AgentInfo | null> {
+  const agent = (await paseo.agents.ref(agentId).refresh())?.agent;
+  return agent ? toAgentInfo(agent) : null;
+}
+
+/** The agent, or null when it's gone or can't be looked up: for callers that then leave it alone. */
 async function agentInfo(paseo: PaseoApi, agentId: string): Promise<AgentInfo | null> {
-  try {
-    const agent = (await paseo.agents.ref(agentId).refresh())?.agent;
-    return agent ? toAgentInfo(agent) : null;
-  } catch {
-    return null;
-  }
+  return lookUpAgent(paseo, agentId).catch(() => null);
+}
+
+function unchecked(error: unknown): ReopenResult {
+  return { outcome: "failed", error: `Paseo couldn't say what the agent is doing (${describe(error)})`, timedOut: false, unchecked: true };
 }
 
 const MAX_PAGES = 100;
@@ -2111,6 +2717,27 @@ function delay(ms: number): Promise<void> {
 
 async function withTimeout(task: Promise<unknown>, ms: number): Promise<void> {
   await Promise.race([task.catch(() => undefined), delay(ms)]);
+}
+
+/** Whether `task` settles within `ms`. A rejection then is the caller's to read from `task`. */
+async function settles(task: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<false>((resolve) => {
+    timer = setTimeout(() => resolve(false), Math.max(0, ms));
+  });
+  try {
+    return await Promise.race([task.then(() => true, () => true), late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** What a reload that didn't work means for the agent, for its timeline note. */
+function failureDetail(result: { error: string; timedOut: boolean; unchecked?: boolean }): string {
+  if (result.unchecked) return `It wasn't reloaded, since ${result.error.replace(/\.$/, "")}. It moves on a later try.`;
+  return result.timedOut
+    ? "Paseo didn't confirm the reload in time, so it may have moved already."
+    : `Reloading it didn't work: ${result.error.replace(/\.$/, "")}.`;
 }
 
 /** `task`, or a rejection with `message` once `ms` pass without it settling. */

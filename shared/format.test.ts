@@ -1,5 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { accountSubtitle, formatAge, formatCredits, formatPlan, formatResetIn, peakUsage, shortLabel, staleNotice, usageSummary } from "./format";
+import {
+  accountSubtitle,
+  describeReopen,
+  formatAge,
+  formatCredits,
+  formatPlan,
+  formatResetIn,
+  moveProblem,
+  peakUsage,
+  pillText,
+  shortLabel,
+  staleNotice,
+  usageSummary,
+} from "./format";
 import type { AccountView } from "./model";
 
 const NOW = Date.parse("2026-09-23T12:00:00Z");
@@ -102,5 +115,49 @@ describe("staleNotice", () => {
     );
     expect(staleNotice(NOW - 5_000, "Plugin RPC timed out", NOW)).toBe("Showing data from a moment ago · couldn't refresh: Plugin RPC timed out");
     expect(staleNotice(null, "Plugin is not available", NOW)).toBe("Couldn't refresh: Plugin is not available");
+  });
+});
+
+describe("pillText", () => {
+  const work = { label: "work", email: "ada@example.com" };
+
+  it("names the account an agent runs on", () => {
+    expect(pillText(work, null, null)).toEqual({ label: "work", title: "Account: work (ada@example.com)" });
+  });
+
+  it("names both accounts while the session hasn't moved yet, and says when it will", () => {
+    expect(pillText(work, { label: "lovelace@analytical.example" }, "idle")).toEqual({
+      label: "lovelace@an… → work",
+      title: "Account: lovelace@analytical.example, moving to work (ada@example.com) once it's idle",
+    });
+    expect(pillText(work, { label: "personal" }, "turn").title).toBe(
+      "Account: personal, moving to work (ada@example.com) when its current turn ends",
+    );
+    // A reload that didn't work, or no CLI to reload with: not "once it's idle", which won't happen.
+    expect(pillText(work, { label: "personal" }, "restart").title).toBe(
+      "Account: personal, moving to work (ada@example.com) when its session next starts",
+    );
+  });
+});
+
+describe("move outcomes", () => {
+  const nothing = { reopened: [], deferred: [], failed: [], pending: [], continuedIn: null };
+
+  it("sums up what moving agents came to, including moves still going on", () => {
+    expect(describeReopen("work is now the default", nothing)).toBe("work is now the default");
+    expect(
+      describeReopen("work is disabled", { ...nothing, reopened: ["a"], pending: ["b", "c"], deferred: ["d"], failed: [{ agentId: "e", error: "x" }] }),
+    ).toBe(
+      "work is disabled · 1 agent(s) switched · 2 still switching (their timelines will say when) · 1 will switch after their current turn · 1 couldn't be reloaded and will switch when their session next starts",
+    );
+  });
+
+  it("says why one agent didn't move now, and only then", () => {
+    expect(moveProblem(nothing, "work")).toBeNull();
+    expect(moveProblem({ ...nothing, deferred: ["a"] }, "work")).toBeNull();
+    expect(moveProblem({ ...nothing, pending: ["a"] }, "work")).toBeNull();
+    expect(moveProblem({ ...nothing, failed: [{ agentId: "a", error: "Timed out closing previous session during refresh" }] }, "work")).toBe(
+      "Couldn't reload this agent onto work (Timed out closing previous session during refresh), so it moves when its session next starts.",
+    );
   });
 });
