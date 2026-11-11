@@ -1,7 +1,8 @@
 import type { PluginServerContext, PluginSettingsState } from "@getpaseo/plugin/server";
 import { ClaudeAdapter } from "./server/claude";
 import { CodexAdapter } from "./server/codex";
-import { Service, describe } from "./server/service";
+import { MODEL_ENV, Service, describe } from "./server/service";
+import { modelTier } from "./shared/model";
 import { preferences } from "./shared/preferences";
 import {
   cancelLogin,
@@ -12,6 +13,7 @@ import {
   renameAccount,
   setAgentAccount,
   setDefaultAccount,
+  setModelDefault,
   setAccountEnabled,
   forkAgent,
   startLogin,
@@ -50,6 +52,13 @@ export default function contribute(server: PluginServerContext) {
     }
   });
 
+  // A new agent isn't listed yet when its session opens, so hand its model to the open hook.
+  server.before("agent.create", ({ request }) => {
+    const model = request.config.model;
+    if (typeof model !== "string" || !modelTier(model)) return undefined;
+    return { ...request, env: { ...request.env, [MODEL_ENV]: model } };
+  });
+
   server.on("agent.turn_started", (event, context) => {
     void service.onTurnStarted(event.agent, context).catch(() => undefined);
   });
@@ -77,6 +86,7 @@ export default function contribute(server: PluginServerContext) {
     movedAgents: await service.remove(paseo, accountId),
   }));
   server.handle(setDefaultAccount, ({ accountId }, { paseo }) => service.setDefault(paseo, accountId));
+  server.handle(setModelDefault, ({ tier, accountId }, { paseo }) => service.setModelDefault(paseo, tier, accountId));
   server.handle(clearAccountLimit, async ({ accountId }) => {
     await service.clearLimit(accountId);
     return { ok: true as const };

@@ -1,5 +1,5 @@
-import { accountPeak } from "../shared/format";
-import type { Family, Usage } from "../shared/model";
+import { capsAccount, peakUsage } from "../shared/format";
+import { modelTier, type Family, type ModelTier, type Usage } from "../shared/model";
 import { FIVE_HOUR_MINUTES, WEEK_MINUTES } from "./codex";
 import {
   accountsOf,
@@ -18,22 +18,29 @@ const NEAR_RESET_MS = 24 * 60 * 60_000;
 /** The most a near-reset account may have used of any window, so it still has room to spare. */
 const NEAR_RESET_MAX_USED_PERCENT = 80;
 
-export function isLimited(account: StoredAccount, now: number): boolean {
-  if (!account.limitedUntil) return false;
-  const until = Date.parse(account.limitedUntil);
-  return Number.isFinite(until) && until > now;
+function active(until: string | null | undefined, now: number): boolean {
+  if (!until) return false;
+  const at = Date.parse(until);
+  return Number.isFinite(at) && at > now;
 }
 
-export function isUsable(account: StoredAccount, now: number): boolean {
-  return account.signedIn && !account.disabled && !isLimited(account, now);
+/** Limited account-wide, or (given a model line) on that line's own limit. */
+export function isLimited(account: StoredAccount, now: number, tier?: ModelTier | null): boolean {
+  return active(account.limitedUntil, now) || (!!tier && active(account.modelLimits?.[tier], now));
+}
+
+export function isUsable(account: StoredAccount, now: number, tier?: ModelTier | null): boolean {
+  return account.signedIn && !account.disabled && !isLimited(account, now, tier);
 }
 
 /**
  * Lower is better. Unknown usage ranks in the middle so a known-quiet account wins over a mystery.
- * A full window of one model only, such as "Weekly · Opus", leaves the account its room for the rest.
+ * A full window of one model only, such as "Weekly · Opus", leaves the account its room for the rest;
+ * for an agent on a model line with its own window (Fable), that window counts too.
  */
-export function headroomScore(usage: Usage | null | undefined): number {
-  const peak = usage ? accountPeak(usage.windows) : null;
+export function headroomScore(usage: Usage | null | undefined, tier?: ModelTier | null): number {
+  const counted = usage?.windows.filter((window) => capsAccount(window) || (!!tier && (modelTier(window.id) ?? modelTier(window.label)) === tier));
+  const peak = counted ? peakUsage(counted) : null;
   return peak ? peak.usedPercent : 50;
 }
 
@@ -44,13 +51,14 @@ export function mostAvailable(
   usageOf: (accountId: string) => Usage | null | undefined,
   now: number,
   exclude: ReadonlySet<string> = new Set(),
+  tier: ModelTier | null = null,
 ): StoredAccount | undefined {
-  const preferred = defaultAccount(state, family)?.id;
+  const preferred = defaultAccount(state, family, tier)?.id;
   const candidates = accountsOf(state, family).filter(
-    (account) => !exclude.has(account.id) && isUsable(account, now),
+    (account) => !exclude.has(account.id) && isUsable(account, now, tier),
   );
   const rank = (account: StoredAccount) => [
-    headroomScore(usageOf(account.id)),
+    headroomScore(usageOf(account.id), tier),
     account.id === preferred ? 0 : 1,
     account.kind === "main" ? 0 : 1,
     Date.parse(account.createdAt) || 0,
@@ -101,6 +109,8 @@ export interface RouteInput {
    * thread stays on the account it started on, and only brand-new agents are balanced or rerouted.
    */
   portable: boolean;
+  /** The agent's Claude model line, when known: limits and defaults of that line apply. */
+  tier?: ModelTier | null;
   usageOf(accountId: string): Usage | null | undefined;
 }
 
@@ -132,7 +142,7 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
 
   if (!account && fresh && input.balanceNewAgents && accounts.length > 1) {
     const nearReset = input.family === "codex" ? soonestWeeklyReset(state, input.family, input.usageOf, input.now) : undefined;
-    account = nearReset ?? mostAvailable(state, input.family, input.usageOf, input.now);
+    account = nearReset ?? mostAvailable(state, input.family, input.usageOf, input.now, new Set(), input.tier ?? null);
     if (account) bind = { accountId: account.id, source: "balance", at, selectionReason: nearReset ? "weekly_reset" : "headroom" };
   }
   if (!account) {
@@ -140,17 +150,17 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
     // while ZeroSub was off) ran on the CLI login, so it belongs to that login: on any other account
     // its encrypted reasoning can't be read. Only a brand-new agent follows the default.
     const unrouted = !input.portable && !fresh && !state.sessions[input.agentId] ? mainAccount(state, input.family) : undefined;
-    account = unrouted ?? defaultAccount(state, input.family);
+    account = unrouted ?? defaultAccount(state, input.family, input.tier);
     // A thread that can't move is pinned to the account it first opened on.
     if (account && !input.portable) bind = { accountId: account.id, source: "thread", at };
   }
   if (!account) return null;
 
   let skipped: RouteDecision["skipped"] = null;
-  const why = !account.signedIn ? "signed_out" : account.disabled ? "disabled" : isLimited(account, input.now) ? "limited" : null;
+  const why = !account.signedIn ? "signed_out" : account.disabled ? "disabled" : isLimited(account, input.now, input.tier) ? "limited" : null;
   const mayMove = fresh || input.portable;
   if (why && mayMove && (input.autoSwitch || why !== "limited")) {
-    const alternative = mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]));
+    const alternative = mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]), input.tier ?? null);
     if (alternative) {
       skipped = { account, why };
       account = alternative;
@@ -168,8 +178,8 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
 }
 
 /** The account an agent is routed to right now, without side effects (for display). */
-export function effectiveAccountId(state: StoredState, agentId: string, family: Family): string | undefined {
+export function effectiveAccountId(state: StoredState, agentId: string, family: Family, tier?: ModelTier | null): string | undefined {
   const bound = findAccount(state, state.bindings[agentId]?.accountId);
   if (bound && bound.family === family) return bound.id;
-  return defaultAccount(state, family)?.id;
+  return defaultAccount(state, family, tier)?.id;
 }

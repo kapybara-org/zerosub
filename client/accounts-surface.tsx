@@ -4,7 +4,7 @@ import { SettingsCard, SettingsSwitch } from "@getpaseo/plugin/client/ui";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ScrollView, Text, View } from "react-native";
 import { accountSubtitle, formatAge, formatCredits, formatPlan, staleNotice, usageSummary } from "../shared/format";
-import { FAMILY_LABEL, type AccountView, type Family } from "../shared/model";
+import { FAMILY_LABEL, MODEL_TIERS, TIER_LABEL, type AccountView, type Family, type ModelTier } from "../shared/model";
 import { preferences } from "../shared/preferences";
 import {
   clearAccountLimit,
@@ -12,6 +12,7 @@ import {
   renameAccount,
   setAccountEnabled,
   setDefaultAccount,
+  setModelDefault,
   type ReopenSummary,
 } from "../shared/rpc";
 import { AddAccountModal } from "./add-account";
@@ -280,7 +281,7 @@ function AccountCard({
 }) {
   const text = useText(theme);
   const toast = useToast();
-  const [busy, setBusy] = useState<"default" | "remove" | "clear" | "toggle" | null>(null);
+  const [busy, setBusy] = useState<"default" | "remove" | "clear" | "toggle" | ModelTier | null>(null);
   const [renaming, setRenaming] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
@@ -320,6 +321,22 @@ function AccountCard({
     try {
       const summary = await store.rpc(setDefaultAccount, { accountId: account.id });
       toast.show(describeReopen(`${account.label} is now the default`, summary), { variant: "success" });
+      await store.refresh();
+    } catch (error) {
+      toast.error(describe(error));
+    } finally {
+      setBusy(null);
+    }
+  }, [account, store, toast]);
+
+  // Claude only: this account as the default for one model line, or back to the Claude default.
+  const toggleModelDefault = useCallback(async (tier: ModelTier) => {
+    const owning = !!account.defaultFor?.includes(tier);
+    setBusy(tier);
+    try {
+      const summary = await store.rpc(setModelDefault, { tier, accountId: owning ? null : account.id });
+      const what = owning ? `${TIER_LABEL[tier]} follows the Claude default again` : `${account.label} is now the default for ${TIER_LABEL[tier]}`;
+      toast.show(describeReopen(what, summary), { variant: "success" });
       await store.refresh();
     } catch (error) {
       toast.error(describe(error));
@@ -430,6 +447,11 @@ function AccountCard({
         {plan ? <Badge theme={theme} label={plan} /> : null}
         {account.kind === "main" ? <Badge theme={theme} label="CLI login" /> : null}
         {account.status === "limited" ? <Badge theme={theme} label="Limit reached" tone="danger" /> : null}
+        {account.status !== "limited"
+          ? Object.keys(account.modelLimits ?? {}).map((tier) => (
+              <Badge key={tier} theme={theme} label={`${TIER_LABEL[tier as ModelTier] ?? tier} limit reached`} tone="danger" />
+            ))
+          : null}
         {account.status === "signed_out" ? <Badge theme={theme} label="Signed out" tone="warning" /> : null}
         {resets && !signedOut ? <Badge theme={theme} label={resetBadge(resets)} tone="accent" /> : null}
       </View>
@@ -446,6 +468,31 @@ function AccountCard({
         {!signedOut && windows.length > 0 && account.usage?.error ? <Text style={text.small}>{account.usage.error}</Text> : null}
         {!signedOut && resets?.blockedReason ? <Text style={text.small}>{resets.blockedReason}</Text> : null}
       </View>
+
+      {account.family === "claude" && !signedOut && !disabled ? (
+        <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 }}>
+          {MODEL_TIERS.map((tier) => {
+            const owning = !!account.defaultFor?.includes(tier);
+            return (
+              <Button
+                key={tier}
+                theme={theme}
+                size="small"
+                tone={owning ? "primary" : "secondary"}
+                icon="Star"
+                label={owning ? `${TIER_LABEL[tier]} default` : `Make ${TIER_LABEL[tier]} default`}
+                tooltip={
+                  owning
+                    ? `${TIER_LABEL[tier]} agents start here. Press to send them to the Claude default again`
+                    : `Start ${TIER_LABEL[tier]} agents on this account; other models keep using the Claude default`
+                }
+                busy={busy === tier}
+                onPress={() => void toggleModelDefault(tier)}
+              />
+            );
+          })}
+        </View>
+      ) : null}
 
       {/* Pinned to the bottom, so cards side by side line up however much each one shows. */}
       <View

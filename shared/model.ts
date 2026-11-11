@@ -9,6 +9,20 @@ export const FAMILY_LABEL: Record<Family, string> = {
   codex: "ChatGPT",
 };
 
+/**
+ * Claude model lines with a quota of their own. Only Fable has one ("Weekly · Fable", "You've hit
+ * your Fable limit"); every other model shares the account's 5-hour and weekly windows, so a
+ * Fable limit leaves the account usable for them.
+ */
+export const MODEL_TIERS = ["fable"] as const;
+export type ModelTier = (typeof MODEL_TIERS)[number];
+export const TIER_LABEL: Record<ModelTier, string> = { fable: "Fable" };
+
+/** The model line a model id, window id/label or limit notice names (`claude-fable-5-2`, `Weekly · Fable`), else `null`. */
+export function modelTier(text: string | null | undefined): ModelTier | null {
+  return text && /(?:^|[^a-z])fable(?![a-z])/i.test(text) ? "fable" : null;
+}
+
 export const UsageWindowSchema = z.object({
   /** Stable key, e.g. `five_hour`, `seven_day`, `seven_day_opus`, `primary`, `secondary`. */
   id: z.string(),
@@ -82,7 +96,11 @@ export const AccountViewSchema = z.object({
   organization: z.string().nullable(),
   status: AccountStatusSchema,
   isDefault: z.boolean(),
+  /** Model lines this account is the default for, overriding the family default. */
+  defaultFor: z.array(z.enum(MODEL_TIERS)).optional(),
   limitedUntil: z.string().nullable(),
+  /** Model lines at their own limit (tier → until). The account stays usable for other models. */
+  modelLimits: z.record(z.string(), z.string()).optional(),
   usage: UsageSchema.nullable(),
   agentCount: z.number(),
   home: z.string().nullable(),

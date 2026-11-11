@@ -168,6 +168,31 @@ describe("failover", () => {
     expect(sent).toHaveLength(1);
   });
 
+  it("takes a Fable limit for Fable's alone: the Fable agent moves, other models keep the account", async () => {
+    const { service, store, reopened, paseo, limitTurn } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: MAIN, codex: null },
+        sessions: {},
+      },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your Fable limit", model: "fable" }),
+    );
+    await limitTurn();
+    const state = await store.read();
+    const main = state.accounts.find((a) => a.id === MAIN);
+    expect(main?.limitedUntil).toBeNull();
+    expect(main?.modelLimits?.fable).toBeTruthy();
+    expect(state.sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(reopened).toEqual([AGENT]);
+    // A new Opus agent still starts on the default account.
+    const opus = "agent-opus";
+    await service.onSessionOpen(
+      { agentId: opus, provider: "claude", reason: "create", purpose: "interactive", env: { ZEROSUB_MODEL: "claude-opus-5-5" } } as never,
+      { paseo } as never,
+    );
+    expect((await store.read()).sessions[opus]?.accountId).toBe(MAIN);
+  });
+
   it("moves on again when the next account runs out too", async () => {
     let resetsAt = inPast(); // marketing's window has already reset when hello runs out
     const { store, reopened, notes, limitTurn } = await setUp(

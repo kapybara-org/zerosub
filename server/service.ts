@@ -8,13 +8,17 @@ import type {
 } from "@getpaseo/plugin/server";
 import {
   FAMILY_LABEL,
+  MODEL_TIERS,
+  modelTier,
   type AccountView,
+  type ModelTier,
   type AgentRoute,
   type Family,
   type LoginMethod,
   type LoginView,
   type StateView,
   type Usage,
+  type UsageWindow,
 } from "../shared/model";
 import { capsAccount } from "../shared/format";
 import { DEFAULT_CONTINUE_PROMPT, type Preferences } from "../shared/preferences";
@@ -125,6 +129,8 @@ interface AgentInfo {
   title: string | null;
   /** The agent this one carries on from, when ZeroSub started it as a continuation. */
   continuedFrom: string | null;
+  /** The Claude model line it runs on, when its model names one. */
+  tier: ModelTier | null;
 }
 
 type ReopenOutcome = "reopened" | "deferred" | "closed" | "failed";
@@ -183,6 +189,10 @@ export class Service {
   private readonly redeemLocks = new Map<string, Mutex>();
   private readonly browserSignIn = canSignInWithBrowser();
   private agentCache: { at: number; agents: Promise<AgentInfo[]> } | null = null;
+  /** Each agent's Claude model line, as last seen (agent list, session open, or a limit it hit). */
+  private readonly tiers = new Map<string, ModelTier>();
+  /** When a turn last ran into each model line's limit, by `${accountId}:${tier}`. */
+  private readonly modelLimitedAt = new Map<string, number>();
   private lastPrune = 0;
   private collecting = false;
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -419,6 +429,7 @@ export class Service {
     const family = (await this.families.resolve(context.paseo))[request.provider];
     if (!family) return undefined;
     const adapter = this.adapters[family];
+    const tier = family === "claude" ? await this.tierAtOpen(context.paseo, request) : null;
     const now = Date.now();
     const state = await this.store.read();
     const decision = chooseAccount(state, {
@@ -429,6 +440,7 @@ export class Service {
       autoSwitch: this.prefs.autoSwitch,
       balanceNewAgents: this.prefs.balanceNewAgents,
       portable: adapter.portable,
+      tier,
       usageOf: (id) => this.usage.get(id),
     });
     if (!decision) return undefined;
@@ -456,9 +468,26 @@ export class Service {
     console.log(
       `[ZeroSub] ${request.provider} agent ${request.agentId} → ${account.label} (${request.reason}${
         decision.skipped ? `; skipped ${decision.skipped.account.label}: ${decision.skipped.why}` : ""
-      })`,
+      }${tier ? `; model ${tier}` : ""})`,
     );
     return { ...request, env: applyEnv(await adapter.env(account.home), request.env) };
+  }
+
+  /**
+   * The model line a session opens with. A new agent isn't listed yet, so `agent.create` passed its
+   * model along in the env; an existing one is read from the (briefly cached) agent list.
+   */
+  private async tierAtOpen(paseo: PaseoApi, request: PluginSessionOpenRequest): Promise<ModelTier | null> {
+    let tier = modelTier(request.env[MODEL_ENV]);
+    if (request.reason !== "create") {
+      const listed = await Promise.race([
+        this.cachedAgents(paseo).then((agents) => agents.find((agent) => agent.id === request.agentId)?.tier ?? null, () => null),
+        delay(2_000).then(() => undefined),
+      ]);
+      tier = listed ?? this.tiers.get(request.agentId) ?? tier;
+    }
+    if (tier) this.tiers.set(request.agentId, tier);
+    return tier;
   }
 
   /** A turn uses the account from its first token, so a long one keeps its usage fresh too. */
@@ -577,13 +606,15 @@ export class Service {
         const accountId = this.runningOn(await this.store.read(), agentId, family);
         if (accountId && !this.recentlyRedeemed(accountId)) {
           const hit = problem.hit;
-          await this.markLimited(accountId, hit.resetsAt ?? new Date(Date.now() + (hit.kind === "budget" ? BUDGET_LIMIT_MS : WINDOW_LIMIT_MS)).toISOString(), hit.kind, "turn");
+          await this.markLimited(accountId, hit.resetsAt ?? new Date(Date.now() + (hit.kind === "budget" ? BUDGET_LIMIT_MS : WINDOW_LIMIT_MS)).toISOString(), hit.kind, "turn", hit.model ?? null);
         }
       }
       return;
     }
     this.switching.add(agentId);
     let exhausted: string | null = null;
+    const limitTier = problem.kind === "limit" ? problem.hit.model ?? null : null;
+    if (limitTier) this.tiers.set(agentId, limitTier);
     try {
       const state = await this.store.read();
       const account = findAccount(state, this.runningOn(state, agentId, family));
@@ -594,7 +625,7 @@ export class Service {
       this.switching.delete(agentId);
     }
     if (exhausted && this.prefs.autoSwitch && this.adapters[family].portable) {
-      void this.moveIdleAgentsOff(paseo, exhausted, family, agentId, problem.kind).catch((error: unknown) =>
+      void this.moveIdleAgentsOff(paseo, exhausted, family, agentId, problem.kind, limitTier).catch((error: unknown) =>
         log("moving idle agents failed", error),
       );
     }
@@ -639,17 +670,19 @@ export class Service {
     if (problem.kind === "limit") {
       const { hit } = problem;
       resetsAt = hit.resetsAt ?? new Date(now + (hit.kind === "budget" ? BUDGET_LIMIT_MS : WINDOW_LIMIT_MS)).toISOString();
-      await this.markLimited(account.id, resetsAt, hit.kind, "turn");
+      const tier = hit.model ?? null;
+      await this.markLimited(account.id, resetsAt, hit.kind, "turn", tier);
       if (hit.kind === "window") {
         // The notice is the freshest word on usage: show that window full until a new reading lands.
+        // A model line's notice says nothing about the account's other windows.
         const shown = this.usage.get(account.id);
-        if (shown) this.setUsage(account.id, showLimit(shown, hit.resetsAt));
+        if (shown && !tier) this.setUsage(account.id, showLimit(shown, hit.resetsAt));
         // The account was just used, so its token is fresh: ask for the exact reset time.
         await withTimeout(this.refreshUsage(account.id, true), 12_000);
-        const exact = this.resetFromUsage(account.id);
+        const exact = this.resetFromUsage(account.id, tier);
         if (exact && Date.parse(exact) > now) {
           resetsAt = exact;
-          await this.markLimited(account.id, exact, "window", "turn");
+          await this.markLimited(account.id, exact, "window", "turn", tier);
         }
       }
       console.log(`[ZeroSub] ${account.label} hit a ${hit.kind} limit (agent ${agentId}): ${hit.message}`);
@@ -689,7 +722,7 @@ export class Service {
       }
       return;
     }
-    const next = mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]));
+    const next = mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]), this.tiers.get(agentId) ?? null);
     if (!next) {
       if (problem.kind === "limit" && problem.hit.kind === "window" && this.prefs.autoRedeem && !account.disabled) {
         // Opt-in: every account is out, so spend a banked reset rather than stop.
@@ -852,10 +885,22 @@ export class Service {
     });
   }
 
-  private async markLimited(accountId: string, until: string, kind: LimitKind, source: "turn" | "reading"): Promise<void> {
+  private async markLimited(
+    accountId: string,
+    until: string,
+    kind: LimitKind,
+    source: "turn" | "reading",
+    tier: ModelTier | null = null,
+  ): Promise<void> {
     await this.store.update((draft) => {
       const account = findAccount(draft, accountId);
       if (!account) return;
+      // A model line's own limit leaves the account usable for every other model.
+      if (tier) {
+        account.modelLimits = { ...account.modelLimits, [tier]: until };
+        if (source === "turn") this.modelLimitedAt.set(`${accountId}:${tier}`, Date.now());
+        return;
+      }
       account.limitedUntil = until;
       account.limitKind = kind;
       account.limitedAt = new Date().toISOString();
@@ -901,6 +946,7 @@ export class Service {
       if (!account) return;
       account.limitedUntil = null;
       account.limitKind = null;
+      account.modelLimits = {};
     });
     if (left !== null) this.updateResetCount(accountId, left);
     // Give the provider a moment to settle before reading the refilled usage.
@@ -970,10 +1016,16 @@ export class Service {
   }
 
   /** The reset time of the window that is full, from the freshest live usage reading. */
-  private resetFromUsage(accountId: string): string | null {
+  private resetFromUsage(accountId: string, tier: ModelTier | null = null): string | null {
     const usage = this.usage.get(accountId);
     if (!usage || usage.cached) return null;
     const full = usage.windows.filter((window) => window.usedPercent >= 99 && window.resetsAt);
+    // A Fable limit resets with Fable's own window.
+    if (tier) {
+      const own = full.filter((window) => windowTier(window) === tier);
+      own.sort((a, b) => Date.parse(b.resetsAt ?? "") - Date.parse(a.resetsAt ?? ""));
+      return own[0]?.resetsAt ?? null;
+    }
     // A full window of one model's only is what the turn hit when none of the account's own is full,
     // so a later-resetting model window doesn't stretch a 5-hour limit to days.
     const hit = full.some(capsAccount) ? full.filter(capsAccount) : full;
@@ -999,6 +1051,7 @@ export class Service {
     family: Family,
     except: string,
     reason: "limit" | "signed_out",
+    tier: ModelTier | null = null,
   ): Promise<void> {
     const state = await this.store.read();
     const from = findAccount(state, accountId);
@@ -1009,6 +1062,8 @@ export class Service {
           agent.id !== except &&
           !agent.archived &&
           families[agent.provider] === family &&
+          // A model line's limit only moves the agents on that line.
+          (!tier || agent.tier === tier) &&
           this.runningOn(state, agent.id, family) === accountId,
       )
       .map((agent) => agent.id);
@@ -1022,7 +1077,7 @@ export class Service {
         const now = Date.now();
         const latest = await this.store.read();
         if (this.runningOn(latest, agentId, family) !== accountId) continue;
-        const next = mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([accountId]));
+        const next = mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([accountId]), this.tiers.get(agentId) ?? null);
         if (!next) return;
         await this.store.update((draft) => {
           draft.bindings[agentId] = { accountId: next.id, source: "auto", at: new Date(now).toISOString() };
@@ -1202,6 +1257,7 @@ export class Service {
       autoSwitch: this.prefs.autoSwitch,
       balanceNewAgents: false,
       portable: this.adapters[family].portable,
+      tier: this.tiers.get(agentId) ?? null,
       usageOf: (id) => this.usage.get(id),
     })?.account.id;
   }
@@ -1364,6 +1420,8 @@ export class Service {
       // full window, so a full window alone isn't a limit then.
       const creditsCover = this.prefs.useCredits && usage.credits != null;
       const full = creditsCover ? undefined : usage.windows.find((window) => window.usedPercent >= 100 && window.resetsAt);
+      // A model line with a quota of its own (Fable) is limited by its own window, on its own.
+      await this.syncModelLimits(account, usage.windows, now);
       // One model's own full window (Claude's "Weekly · Opus") leaves the account usable for the rest.
       // A turn that hits it still marks the account (see `failover`), and while it's full that limit
       // doesn't clear here.
@@ -1375,9 +1433,12 @@ export class Service {
       // A window limit clears once usage shows room again, or once credits cover it if a reading set
       // it: a limit a turn ran into stands, credits or not. Budget limits never appear in usage
       // windows, and a fresh limit is trusted for a while (it may be on a window we can't see).
+      // Fable's own window is tracked apart (`syncModelLimits`), so it neither holds nor lifts this limit.
+      const others = usage.windows.filter((window) => windowTier(window) === null);
+      const othersFull = !creditsCover && others.some((window) => window.usedPercent >= 100 && window.resetsAt);
       const settled = account.limitedAt ? now - Date.parse(account.limitedAt) > LIMIT_TRUST_MS : true;
-      const roomy = (creditsCover && account.limitSource === "reading") || Math.max(...usage.windows.map((window) => window.usedPercent)) < 90;
-      if (!full && account.limitedUntil && account.limitKind === "window" && settled && roomy) {
+      const roomy = (creditsCover && account.limitSource === "reading") || Math.max(0, ...others.map((window) => window.usedPercent)) < 90;
+      if (!othersFull && account.limitedUntil && account.limitKind === "window" && settled && roomy) {
         await this.store.update((draft) => {
           const target = findAccount(draft, accountId);
           if (!target) return;
@@ -1388,6 +1449,33 @@ export class Service {
     })().finally(() => this.usageInFlight.delete(accountId));
     this.usageInFlight.set(accountId, task);
     return task;
+  }
+
+  /**
+   * Brings each model line's limit in line with a live reading of its own window, e.g. "Weekly ·
+   * Fable" at 100% limits Fable on this account until that window resets, while Opus and Sonnet
+   * keep routing here.
+   */
+  private async syncModelLimits(account: StoredAccount, windows: readonly UsageWindow[], now: number): Promise<void> {
+    const next: Record<string, string> = {};
+    for (const window of windows) {
+      const tier = windowTier(window);
+      if (!tier) continue;
+      // Full at 100%; once limited, stays so until the window drops below 90% (same gap as account-wide).
+      const held = account.modelLimits?.[tier];
+      if (window.usedPercent >= 100) next[tier] = window.resetsAt ?? held ?? new Date(now + WINDOW_LIMIT_MS).toISOString();
+      else if (window.usedPercent >= 90 && held) next[tier] = held;
+    }
+    // A limit a turn just ran into is trusted for a while: the reading may lag behind it.
+    for (const [tier, until] of Object.entries(account.modelLimits ?? {})) {
+      const hitAt = this.modelLimitedAt.get(`${account.id}:${tier}`) ?? 0;
+      if (!next[tier] && Date.parse(until) > now && now - hitAt < LIMIT_TRUST_MS) next[tier] = until;
+    }
+    if (JSON.stringify(next) === JSON.stringify(account.modelLimits ?? {})) return;
+    await this.store.update((draft) => {
+      const target = findAccount(draft, account.id);
+      if (target) target.modelLimits = next;
+    });
   }
 
   /**
@@ -1465,7 +1553,11 @@ export class Service {
         organization: account.organization,
         status: !account.signedIn ? "signed_out" : account.disabled ? "disabled" : limited ? "limited" : "ready",
         isDefault: defaultAccount(state, account.family)?.id === account.id,
+        defaultFor: MODEL_TIERS.filter((tier) => state.defaults.models?.[tier] === account.id),
         limitedUntil: limited ? account.limitedUntil : null,
+        modelLimits: Object.fromEntries(
+          Object.entries(account.modelLimits ?? {}).filter(([tier]) => isLimited({ ...account, limitedUntil: null }, now, tier as ModelTier)),
+        ),
         usage: this.usage.get(account.id) ?? null,
         agentCount: counts.get(account.id) ?? 0,
         home: account.home,
@@ -1494,7 +1586,10 @@ export class Service {
 
   private cachedAgents(paseo: PaseoApi): Promise<AgentInfo[]> {
     if (this.agentCache && Date.now() - this.agentCache.at < AGENT_LIST_MS) return this.agentCache.agents;
-    const agents = listAgents(paseo, false).then((result) => result.agents);
+    const agents = listAgents(paseo, false).then((result) => {
+      for (const agent of result.agents) if (agent.tier) this.tiers.set(agent.id, agent.tier);
+      return result.agents;
+    });
     this.agentCache = { at: Date.now(), agents };
     agents.catch(() => {
       this.agentCache = null;
@@ -1550,6 +1645,25 @@ export class Service {
     }
     // Conversations that can't move (Codex threads) are pinned, so this only moves portable ones.
     return this.reconcile(paseo, "default");
+  }
+
+  /** Makes `accountId` the default for one Claude model line, or (`null`) clears that override. */
+  async setModelDefault(paseo: PaseoApi, tier: ModelTier, accountId: string | null): Promise<ReopenSummary> {
+    this.attach(paseo);
+    if (accountId) {
+      const account = findAccount(await this.store.read(), accountId);
+      if (!account || account.family !== "claude") throw new Error("Model defaults are for Claude accounts.");
+      if (!account.signedIn) throw new Error(`${account.label} is signed out. Sign it in first.`);
+      if (account.disabled) throw new Error(`${account.label} is disabled. Enable it before making it a default.`);
+    }
+    await this.store.update((draft) => {
+      const models = { ...draft.defaults.models };
+      if (accountId) models[tier] = accountId;
+      else delete models[tier];
+      draft.defaults.models = models;
+    });
+    // Open agents on that line that follow the default move like they do for the family default.
+    return this.prefs.moveAgentsOnDefaultChange ? this.reconcile(paseo, "default") : emptySummary();
   }
 
   /**
@@ -1657,6 +1771,7 @@ export class Service {
       if (!account) return;
       account.limitedUntil = null;
       account.limitKind = null;
+      account.modelLimits = {};
     });
     if (!findAccount(state, accountId)) throw new Error("That account no longer exists.");
     void this.refreshUsage(accountId, true).catch(() => undefined);
@@ -1982,6 +2097,7 @@ function toAgentInfo(agent: AgentSnapshot): AgentInfo {
     hasHistory: Boolean(agent.lastUserMessageAt),
     title: agent.title ?? null,
     continuedFrom: agent.labels?.[CONTINUED_FROM_LABEL] ?? null,
+    tier: modelTier(agent.model),
   };
 }
 
@@ -2009,6 +2125,14 @@ async function listAgents(paseo: PaseoApi, includeArchived: boolean): Promise<{ 
     cursor = result.pageInfo.nextCursor;
   }
   return { agents, complete: false };
+}
+
+/** Env var `agent.create` uses to tell the session-open hook a new agent's model. */
+export const MODEL_ENV = "ZEROSUB_MODEL";
+
+/** The model line a usage window belongs to (`Weekly · Fable`), or `null` for an account-wide window. */
+function windowTier(window: { id: string; label: string }): ModelTier | null {
+  return modelTier(window.id) ?? modelTier(window.label);
 }
 
 function delay(ms: number): Promise<void> {

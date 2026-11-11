@@ -103,6 +103,22 @@ describe("chooseAccount", () => {
     expect(decision?.skipped?.why).toBe("limited");
   });
 
+  it("a Fable limit moves only Fable agents; a Fable default wins for Fable only", () => {
+    // claude-main: Weekly 84%, Weekly · Fable 100% — out for Fable only.
+    const fableOut = account({ id: "claude-main", kind: "main", home: null, modelLimits: { fable: "2026-09-24T09:00:00Z" } });
+    const pinned = { "agent-1": { accountId: "claude-main", source: "user" as const, at: "x" } };
+    const state = stateWith([fableOut, work], { bindings: pinned });
+    const route = (tier: "fable" | null) => chooseAccount(state, { ...base, tier, reason: "resume", usageOf: () => null });
+    expect(route(null)?.account.id).toBe("claude-main");
+    expect(route(null)?.skipped).toBeNull();
+    expect(route("fable")?.account.id).toBe("claude-work");
+    expect(route("fable")?.skipped?.why).toBe("limited");
+    // Fable defaults to work; everything else follows the Claude default.
+    const split = stateWith([fableOut, work], { defaults: { claude: "claude-main", codex: null, models: { fable: "claude-work" } } });
+    const fresh = (tier: "fable" | null) => chooseAccount(split, { ...base, tier, reason: "create", usageOf: () => null })?.account.id;
+    expect([fresh("fable"), fresh(null)]).toEqual(["claude-work", "claude-main"]);
+  });
+
   it("keeps an exhausted account when automatic switching is off", () => {
     const limited = account({ id: "claude-work", limitedUntil: "2026-09-23T14:00:00Z" });
     const state = stateWith([main, limited], { defaults: { claude: "claude-work", codex: null } });
