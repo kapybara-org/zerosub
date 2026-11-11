@@ -56,6 +56,9 @@ describe("detectClaudeLimit", () => {
       "2026-09-24T04:30:00.000Z",
     );
     expect(detectClaudeLimit({ outcome: completed, timeline: turn("You've reached your Fable limit.") }, NOW)).not.toBeNull();
+    expect(detectClaudeLimit({ outcome: completed, timeline: turn("You've reached your Fable limit.") }, NOW)?.model).toBe("fable");
+    expect(detectClaudeLimit({ outcome: completed, timeline: turn("You've hit your Opus limit · resets 3pm (UTC)") }, NOW)?.model).toBeUndefined();
+    expect(detectClaudeLimit({ outcome: completed, timeline: turn("You've hit your weekly limit · resets 3pm (UTC)") }, NOW)?.model).toBeUndefined();
   });
 
   it("recognises the legacy epoch form and failed turns", () => {

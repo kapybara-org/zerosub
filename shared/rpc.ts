@@ -1,6 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import { FamilySchema, LoginMethodSchema, LoginViewSchema, StateViewSchema } from "./model";
+import { FamilySchema, LoginMethodSchema, LoginViewSchema, MODEL_TIERS, StateViewSchema } from "./model";
 
 export const getState = defineRpc({
   name: "zerosub.state",
@@ -99,6 +99,13 @@ export const redeemReset = defineRpc({
 export const setDefaultAccount = defineRpc({
   name: "zerosub.accounts.default",
   input: z.object({ accountId: z.string() }),
+  output: ReopenSummarySchema,
+});
+
+/** Makes a Claude account the default for one model line (Fable, Opus, …); `null` follows the Claude default again. */
+export const setModelDefault = defineRpc({
+  name: "zerosub.accounts.model-default",
+  input: z.object({ tier: z.enum(MODEL_TIERS), accountId: z.string().nullable() }),
   output: ReopenSummarySchema,
 });
 

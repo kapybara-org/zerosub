@@ -1,6 +1,6 @@
 import { copyFile } from "node:fs/promises";
 import { z } from "zod";
-import { AccountKindSchema, FamilySchema, type Family } from "../shared/model";
+import { AccountKindSchema, FamilySchema, type Family, type ModelTier } from "../shared/model";
 import { Mutex, readJson, writeJsonAtomic } from "./json-file";
 import { statePath } from "./paths";
 
@@ -31,6 +31,8 @@ export const StoredAccountSchema = z.object({
    * saved by earlier versions, which count as a turn's.
    */
   limitSource: z.enum(["turn", "reading"]).optional(),
+  /** Model lines at their own limit (tier → until ISO), e.g. Fable's weekly cap. Not account-wide. */
+  modelLimits: z.record(z.string(), z.string()).optional(),
   createdAt: z.string(),
 });
 export type StoredAccount = z.infer<typeof StoredAccountSchema>;
@@ -87,7 +89,12 @@ export const StoredStateSchema = z.object({
   version: z.literal(1).default(1),
   accounts: z.array(StoredAccountSchema).default([]),
   defaults: z
-    .object({ claude: z.string().nullable().default(null), codex: z.string().nullable().default(null) })
+    .object({
+      claude: z.string().nullable().default(null),
+      codex: z.string().nullable().default(null),
+      /** Per-model-line defaults (tier → account id), consulted before the family default. */
+      models: z.record(z.string(), z.string()).optional(),
+    })
     .default({ claude: null, codex: null }),
   /** Per-agent overrides of the default account. */
   bindings: z.record(z.string(), BindingSchema).default({}),
@@ -202,8 +209,10 @@ export function accountsOf(state: StoredState, family: Family): StoredAccount[] 
   return state.accounts.filter((account) => account.family === family);
 }
 
-/** The explicit default, else the CLI's own login, else the first account. */
-export function defaultAccount(state: StoredState, family: Family): StoredAccount | undefined {
+/** The model line's default, else the explicit default, else the CLI's own login, else the first account. */
+export function defaultAccount(state: StoredState, family: Family, tier?: ModelTier | null): StoredAccount | undefined {
+  const forModel = tier ? findAccount(state, state.defaults.models?.[tier]) : undefined;
+  if (forModel && forModel.family === family) return forModel;
   const chosen = findAccount(state, state.defaults[family]);
   if (chosen && chosen.family === family) return chosen;
   const accounts = accountsOf(state, family);

@@ -1,6 +1,6 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
-import { FAMILY_LABEL, type AccountView, type StateView } from "../shared/model";
-import { setAgentAccount, setDefaultAccount } from "../shared/rpc";
+import { FAMILY_LABEL, MODEL_TIERS, TIER_LABEL, type AccountView, type StateView } from "../shared/model";
+import { setAgentAccount, setDefaultAccount, setModelDefault } from "../shared/rpc";
 import type { ZeroSubStore } from "./store";
 
 /** Command Center entries and the `/account` slash command. */
@@ -57,7 +57,7 @@ export function contributeCommands(client: PluginClientContext, store: ZeroSubSt
   let signature = "";
   const syncDynamic = () => {
     const state = store.current.state;
-    const next = state ? JSON.stringify(state.accounts.map((a) => [a.id, a.label, a.isDefault, a.status])) : "";
+    const next = state ? JSON.stringify(state.accounts.map((a) => [a.id, a.label, a.isDefault, a.status, a.defaultFor])) : "";
     if (next === signature) return;
     signature = next;
     for (const remove of dynamic) remove();
@@ -78,6 +78,41 @@ export function contributeCommands(client: PluginClientContext, store: ZeroSubSt
         }),
       );
     });
+    // Claude only: a default per model line (e.g. Fable on one account, Opus on another).
+    const claude = state.accounts.filter((account) => account.family === "claude");
+    if (claude.length < 2) return;
+    for (const tier of MODEL_TIERS) {
+      const owner = claude.find((account) => account.defaultFor?.includes(tier));
+      claude.forEach((account, index) => {
+        if (account === owner || account.status === "signed_out" || account.status === "disabled") return;
+        dynamic.push(
+          client.addCommandCenterItem({
+            id: `default-${tier}-${index}`,
+            title: `Make ${account.label} the default for ${TIER_LABEL[tier]}`,
+            icon: "Star",
+            keywords: ["account", "default", "model", tier, account.email ?? "", "claude"],
+            context: "global",
+            async onSelect() {
+              await store.rpc(setModelDefault, { tier, accountId: account.id });
+            },
+          }),
+        );
+      });
+      if (owner) {
+        dynamic.push(
+          client.addCommandCenterItem({
+            id: `default-${tier}-clear`,
+            title: `${TIER_LABEL[tier]} follows the Claude default again (now ${owner.label})`,
+            icon: "Undo2",
+            keywords: ["account", "default", "model", tier, "claude"],
+            context: "global",
+            async onSelect() {
+              await store.rpc(setModelDefault, { tier, accountId: null });
+            },
+          }),
+        );
+      }
+    }
   };
   const unsubscribe = store.subscribe(syncDynamic);
   syncDynamic();

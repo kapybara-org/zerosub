@@ -1,5 +1,5 @@
 import type { PluginLifecycleEvents, PluginTurnOutcome } from "@getpaseo/plugin/server";
-import type { Family, LoginMethod, LoginStep, Usage } from "../shared/model";
+import type { Family, LoginMethod, LoginStep, ModelTier, Usage } from "../shared/model";
 import type { RedeemOutcome } from "../shared/rpc";
 
 /**
@@ -41,6 +41,8 @@ export interface LimitHit {
   /** When the limit lifts, if the provider said. */
   resetsAt: string | null;
   message: string;
+  /** The Claude model line the limit is on ("You've hit your Fable limit"); absent when account-wide. */
+  model?: ModelTier | null;
 }
 
 /** A finished turn, as Paseo reports it. */

@@ -1,3 +1,4 @@
+import { modelTier } from "../shared/model";
 import type { AgentTimelineItem, LimitHit, LimitKind, TurnEvent } from "./adapter";
 
 /**
@@ -104,7 +105,10 @@ export function detectClaudeLimit(event: TurnEvent, now: Date = new Date()): Lim
   for (const text of notices(event, true)) {
     const line = firstLine(text);
     const match = CLAUDE_LIMITS.find(({ pattern }) => pattern.test(line));
-    if (match) return { message: line, kind: match.kind, resetsAt: parseClaudeReset(line, now) };
+    // The notice's own wording (before " · resets …") names the model line, if the limit is on one.
+    if (!match) continue;
+    const model = modelTier(line.split("·")[0]);
+    return { message: line, kind: match.kind, resetsAt: parseClaudeReset(line, now), ...(model ? { model } : {}) };
   }
   return null;
 }

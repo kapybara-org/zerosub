@@ -5,7 +5,7 @@ import type {
   PluginClientContext,
 } from "@getpaseo/plugin/client";
 import { accountPeak, formatCredits, formatPercent, shortLabel } from "../shared/format";
-import { FAMILY_LABEL, type AccountView, type Family, type StateView } from "../shared/model";
+import { FAMILY_LABEL, TIER_LABEL, type AccountView, type Family, type ModelTier, type StateView } from "../shared/model";
 import { setAgentAccount } from "../shared/rpc";
 import { forkPopover } from "./fork-confirm";
 import { resetPopover } from "./reset-confirm";
@@ -246,6 +246,9 @@ function menuTitle(account: AccountView): string {
   if (account.status === "signed_out") return `${account.label} — signed out`;
   if (account.status === "disabled") return `${account.label} — disabled`;
   if (account.status === "limited") return `${account.label} — limit reached`;
+  // Usable, but a model line with its own quota is out: say which.
+  const lines = Object.keys(account.modelLimits ?? {}).map((tier) => TIER_LABEL[tier as ModelTier] ?? tier);
+  if (lines.length > 0) return `${account.label} — ${lines.join(", ")} limit reached`;
   // A full window of one model only (Claude's "Weekly · Opus") isn't the account's room.
   const peak = account.usage ? accountPeak(account.usage.windows) : null;
   if (!peak) return account.label;
