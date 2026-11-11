@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AgentTimelineItem, FamilyAdapter, LimitHit, UsageRead } from "./adapter";
+import type { AgentTimelineItem, FamilyAdapter, Identity, LimitHit, UsageRead } from "./adapter";
 import type { FamilyResolver } from "./families";
 import { detectClaudeLimit } from "./limits";
 import type { Reopener } from "./reopen";
@@ -99,6 +99,8 @@ interface SetUpOptions {
   recent?: Parameters<typeof fakePaseo>[0];
   /** What every usage reading returns. */
   usage?: () => UsageRead;
+  /** Who the adapter says is signed in. */
+  identity?: () => Identity;
 }
 
 async function setUp(state: Partial<StoredState>, hit: () => LimitHit, options: SetUpOptions = {}) {
@@ -128,6 +130,7 @@ async function setUp(state: Partial<StoredState>, hit: () => LimitHit, options: 
     ...claudeAdapter(hit),
     ...(options.detectLimit ? { detectLimit: options.detectLimit } : {}),
     ...(options.usage ? { usage: async () => options.usage!() } : {}),
+    ...(options.identity ? { identity: async () => options.identity!() } : {}),
   };
   const service = new Service(
     { claude, codex: claudeAdapter(hit) },
@@ -145,6 +148,94 @@ async function setUp(state: Partial<StoredState>, hit: () => LimitHit, options: 
 
 const inFuture = () => new Date(Date.now() + 30 * 60_000).toISOString();
 const inPast = () => new Date(Date.now() - 60_000).toISOString();
+
+const TWIN = "claude-twin";
+const signedInAs = (key: string) => ({ ...account(key, key, "managed"), identity: key, email: `${key}@example.com` });
+
+describe("one subscription, one limit", () => {
+  const window = () => ({ kind: "window" as const, resetsAt: inFuture(), message: "You've hit your session limit" });
+  const twinOfMain = (): StoredAccount => ({ ...account(MAIN, "main", "main"), identity: "org|x", email: "x@example.com" }) as never;
+  const twin = (): StoredAccount => ({ ...account(TWIN, "twin", "managed"), identity: "org|x", email: "x@example.com" }) as never;
+
+  it("limits the twin slot too and moves the agent to a different subscription", async () => {
+    const other = { ...account(HELLO, "hello", "managed"), identity: "org|y", email: "y@example.com" } as never;
+    const { store, reopened, limitTurn } = await setUp(
+      { accounts: [twinOfMain(), twin(), other], defaults: { claude: MAIN, codex: null }, sessions: {} },
+      window,
+    );
+    await limitTurn();
+    const state = await store.read();
+    const byId = (id: string) => state.accounts.find((a) => a.id === id);
+    expect(byId(TWIN)?.limitedUntil).toBe(byId(MAIN)?.limitedUntil);
+    expect(byId(TWIN)).toMatchObject({ limitKind: "window", limitSource: "turn" });
+    expect(byId(HELLO)?.limitedUntil).toBeNull();
+    expect(state.sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(reopened).toEqual([AGENT]);
+  });
+
+  it("doesn't move the agent onto a twin that shares the exhausted quota", async () => {
+    const { reopened, notes, limitTurn } = await setUp(
+      { accounts: [twinOfMain(), twin()], defaults: { claude: MAIN, codex: null }, sessions: {} },
+      window,
+    );
+    await limitTurn();
+    expect(reopened).toEqual([]);
+    expect(notes.at(-1)).toMatchObject({ outcome: "stayed" });
+  });
+
+  it("lifts the twin's limit along with the one the user marks available", async () => {
+    const { service, store, limitTurn } = await setUp(
+      { accounts: [twinOfMain(), twin()], defaults: { claude: MAIN, codex: null }, sessions: {} },
+      window,
+    );
+    await limitTurn();
+    await service.clearLimit(TWIN);
+    const state = await store.read();
+    expect(state.accounts.map((a) => a.limitedUntil)).toEqual([null, null]);
+  });
+});
+
+describe("when the CLI login changes hands", () => {
+  const reading = (percent: number) => (): UsageRead => ({
+    fetchedAt: new Date().toISOString(),
+    windows: [{ id: "five_hour", label: "5-hour", usedPercent: percent, resetsAt: inFuture() }],
+    error: null,
+    cached: false,
+    resets: null,
+  });
+  const as = (key: string): Identity => ({ signedIn: true, email: `${key}@example.com`, plan: null, organization: null, identity: key });
+  const stale = { ...signedInAs("old"), ...account(MAIN, "main", "main"), limitedUntil: inFuture(), limitKind: "window", limitedAt: inPast(), limitSource: "turn" };
+
+  async function handOver(others: StoredAccount[]) {
+    let percent = 0;
+    let who = "old";
+    const { service, store } = await setUp(
+      { accounts: [stale as never, ...others], defaults: { claude: MAIN, codex: null }, sessions: {} },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "" }),
+      { usage: () => reading(percent)(), identity: () => as(who) },
+    );
+    await service.refreshUsage(MAIN, true);
+    who = "new";
+    percent = 40;
+    await (service as unknown as { refreshIdentity(id: string): Promise<void> }).refreshIdentity(MAIN);
+    await service.refreshUsage(MAIN, true);
+    const main = (await store.read()).accounts.find((a) => a.id === MAIN)!;
+    const shown = (await service.view(fakePaseo().paseo as never)).accounts.find((a) => a.id === MAIN);
+    return { main, shown };
+  }
+
+  it("drops the previous person's limit and reading", async () => {
+    const { main, shown } = await handOver([]);
+    expect(main).toMatchObject({ identity: "new", limitedUntil: null, limitKind: null, limitedAt: null });
+    expect(shown?.usage?.windows.map((w) => w.usedPercent)).toEqual([40]);
+  });
+
+  it("takes over the limit of another slot already signed into the new account", async () => {
+    const until = new Date(Date.now() + 3 * 3_600_000).toISOString();
+    const { main } = await handOver([{ ...signedInAs("new"), limitedUntil: until, limitKind: "window", limitedAt: inPast(), limitSource: "reading" } as never]);
+    expect(main).toMatchObject({ identity: "new", limitedUntil: until, limitKind: "window", limitSource: "reading" });
+  });
+});
 
 describe("failover", () => {
   it("blames the CLI login for a session ZeroSub never routed, even when the agent is bound elsewhere", async () => {

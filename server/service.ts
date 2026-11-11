@@ -252,6 +252,7 @@ export class Service {
     if (!availability.ok) return;
     const identity = await adapter.identity(null).catch(() => null);
     this.identityCheckedAt.set(MAIN_ACCOUNT_ID[family], Date.now());
+    let handedOver = false;
     await this.store.update((draft) => {
       let main = findAccount(draft, MAIN_ACCOUNT_ID[family]);
       if (!main) {
@@ -259,9 +260,10 @@ export class Service {
         main.signedIn = false;
         draft.accounts.unshift(main);
       }
-      if (identity) applyIdentity(main, identity, draft);
+      if (identity) handedOver = applyIdentity(main, identity, draft);
       if (!main.label) main.label = `${FAMILY_LABEL[family]} (CLI login)`;
     });
+    if (handedOver) this.forgetReading(MAIN_ACCOUNT_ID[family]);
   }
 
   private async tick(): Promise<void> {
@@ -304,10 +306,22 @@ export class Service {
       return null;
     });
     if (!identity) return;
+    let handedOver = false;
     await this.store.update((draft) => {
       const target = findAccount(draft, accountId);
-      if (target) applyIdentity(target, identity, draft);
+      if (target) handedOver = applyIdentity(target, identity, draft);
     });
+    if (handedOver) this.forgetReading(accountId);
+  }
+
+  /** The CLI login now belongs to someone else, so the last reading and its refresh timing were the previous person's. */
+  private forgetReading(accountId: string): void {
+    console.log(`[ZeroSub] the CLI login for ${accountId} changed hands; dropping its old usage and limit`);
+    this.setUsage(accountId, null);
+    this.usageLive.delete(accountId);
+    this.usageRetryAt.delete(accountId);
+    this.usageAttemptAt.delete(accountId);
+    void this.refreshUsage(accountId, true).catch(() => undefined);
   }
 
   /** Forget bindings and sessions of agents that no longer exist (including Paseo's internal helpers). */
@@ -856,10 +870,9 @@ export class Service {
     await this.store.update((draft) => {
       const account = findAccount(draft, accountId);
       if (!account) return;
-      account.limitedUntil = until;
-      account.limitKind = kind;
-      account.limitedAt = new Date().toISOString();
-      account.limitSource = source;
+      const limit: Limit = { limitedUntil: until, limitKind: kind, limitedAt: new Date().toISOString(), limitSource: source };
+      // A quota belongs to the subscription, so every slot signed into it is out of room.
+      for (const slot of [account, ...sameSubscription(draft, account)]) Object.assign(slot, limit);
     });
   }
 
@@ -899,8 +912,10 @@ export class Service {
     await this.store.update((draft) => {
       const account = findAccount(draft, accountId);
       if (!account) return;
-      account.limitedUntil = null;
-      account.limitKind = null;
+      for (const slot of [account, ...sameSubscription(draft, account)]) {
+        slot.limitedUntil = null;
+        slot.limitKind = null;
+      }
     });
     if (left !== null) this.updateResetCount(accountId, left);
     // Give the provider a moment to settle before reading the refilled usage.
@@ -1655,8 +1670,10 @@ export class Service {
     const state = await this.store.update((draft) => {
       const account = findAccount(draft, accountId);
       if (!account) return;
-      account.limitedUntil = null;
-      account.limitKind = null;
+      for (const slot of [account, ...sameSubscription(draft, account)]) {
+        slot.limitedUntil = null;
+        slot.limitKind = null;
+      }
     });
     if (!findAccount(state, accountId)) throw new Error("That account no longer exists.");
     void this.refreshUsage(accountId, true).catch(() => undefined);
@@ -1895,6 +1912,7 @@ export class Service {
     session.finishedAt = Date.now(); // Claim completion before writing, so a late cancel can't race it.
 
     let accountId = session.accountId;
+    let handedOver = false;
     await this.store.update((draft) => {
       let account = findAccount(draft, accountId);
       if (!account) {
@@ -1903,11 +1921,12 @@ export class Service {
         account = newAccount({ id: accountId, family: session.family, kind: "managed", home: session.home });
         draft.accounts.push(account);
       }
-      applyIdentity(account, identity, draft);
+      handedOver = applyIdentity(account, identity, draft);
       account.limitedUntil = null;
       account.limitKind = null;
     });
     if (accountId) this.identityCheckedAt.set(accountId, Date.now());
+    if (accountId && handedOver) this.forgetReading(accountId);
     session.accountId = accountId;
     session.view = { ...session.view, step: "done", accountId, message: null };
     if (accountId) void this.refreshUsage(accountId, true).catch(() => undefined);
@@ -1942,7 +1961,32 @@ function newAccount(fields: Pick<StoredAccount, "id" | "family" | "kind" | "home
   };
 }
 
-function applyIdentity(account: StoredAccount, identity: Identity, state: StoredState): void {
+type Limit = Pick<StoredAccount, "limitedUntil" | "limitKind" | "limitedAt" | "limitSource">;
+
+/** The other accounts signed into the same subscription (and so sharing its quota). */
+function sameSubscription(state: StoredState, account: StoredAccount): StoredAccount[] {
+  return accountsOf(state, account.family).filter((other) => other.id !== account.id && sameAccountIdentity(account.family, other, account));
+}
+
+/** Returns true when the CLI login's account was replaced by a different one, which drops what the slot knew of the old one's limit. */
+function applyIdentity(account: StoredAccount, identity: Identity, state: StoredState): boolean {
+  const handedOver = account.kind === "main" && identity.signedIn && !!account.identity && !!identity.identity && !sameAccountIdentity(account.family, account, identity);
+  applyIdentityFields(account, identity, state);
+  if (!handedOver) return false;
+  account.limitedUntil = null;
+  account.limitKind = null;
+  account.limitedAt = null;
+  account.limitSource = undefined;
+  const now = Date.now();
+  const limited = sameSubscription(state, account).find((other) => isLimited(other, now));
+  if (limited) {
+    const { limitedUntil, limitKind, limitedAt, limitSource } = limited;
+    Object.assign(account, { limitedUntil, limitKind, limitedAt, limitSource });
+  }
+  return true;
+}
+
+function applyIdentityFields(account: StoredAccount, identity: Identity, state: StoredState): void {
   account.signedIn = identity.signedIn;
   if (!identity.signedIn) return;
   account.email = identity.email ?? account.email;
