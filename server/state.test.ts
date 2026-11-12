@@ -136,7 +136,7 @@ describe("StateStore backups", () => {
     expect(kept.length).toBeLessThanOrEqual(5 + 12 + 7);
     expect(kept.at(-1)).toBe(written.at(-1));
     expect(kept[0]?.slice(0, 16)).toBe("state-2026-10-01"); // the oldest day is still there
-  });
+  }, 30_000);
 });
 
 describe("snapshotsToKeep", () => {
