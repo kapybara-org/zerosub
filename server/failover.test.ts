@@ -1036,6 +1036,62 @@ describe("changing the default account", () => {
     expect((await store.read()).sessions.failing?.accountId).toBe(WORK);
   });
 
+  it("leaves an agent with background work when moving idle agents off an account at its limit", async () => {
+    const { service, store, context, reopened } = await setUpAgents(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
+        defaults: { claude: MAIN, codex: null },
+        sessions: { failing: session(MAIN), quiet: session(MAIN), serving: session(MAIN) },
+      },
+      [
+        { id: "failing", status: "idle" },
+        // Looked at first, so it's been passed over by the time "quiet" moves.
+        { id: "serving", status: "idle", backgroundWork: 1 },
+        { id: "quiet", status: "idle" },
+      ],
+    );
+    service.setPreferences(preferences.schema.parse({ autoSwitch: true, autoContinue: false, moveAgentsOnDefaultChange: false }));
+    await service.onTurnEnded({ agent: { id: "failing", provider: "claude" }, turnId: null, outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never, context);
+    await vi.waitFor(() => expect(reopened).toContain("quiet"));
+    expect(reopened).not.toContain("serving");
+    expect((await store.read()).sessions.serving?.accountId).toBe(MAIN);
+  });
+
+  it("keeps a deferred move waiting for background work only when nobody asked for it", async () => {
+    const { service, store, paseo, context, reopened, agents } = await setUpAgents(
+      {
+        accounts: [{ ...account(MAIN, "marketing", "main"), limitedUntil: inFuture() }, account(WORK, "work", "managed"), account("claude-spare", "spare", "managed")] as never,
+        defaults: { claude: WORK, codex: null },
+        sessions: { drifted: session(MAIN), picked: session(WORK) },
+      },
+      [
+        { id: "drifted", status: "running" },
+        { id: "picked", status: "running" },
+      ],
+    );
+    // Alignment's move waits for the turn; the turn ends with a dev server still running.
+    expect((await service.alignSessions(paseo)).deferred).toEqual(["drifted"]);
+    agents[0]!.status = "idle";
+    agents[0]!.backgroundWork.count = 1;
+    await service.onTurnEnded({ agent: { id: "drifted", provider: "claude" }, turnId: null, outcome: { kind: "completed" }, timeline: [] } as never, context);
+    expect(reopened).toEqual([]);
+
+    // A switch the user asked for waits for the turn, and once alignment finds it idle, not for background work.
+    await service.setAgentAccount(paseo, "picked", "claude-spare");
+    expect(reopened).toEqual([]);
+    agents[1]!.status = "idle";
+    agents[1]!.backgroundWork.count = 1;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.now() + 5_000); // past the daemon's cached list of agents
+      await service.alignSessions(paseo);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(reopened).toEqual(["picked"]);
+    expect((await store.read()).sessions.picked?.accountId).toBe("claude-spare");
+  });
+
   it("says when each pending move happens", async () => {
     const limited = await setUpAgents(
       {
@@ -1058,12 +1114,20 @@ describe("changing the default account", () => {
       {
         accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
         defaults: { claude: MAIN, codex: null },
-        sessions: { picked: session(MAIN) },
-        bindings: { picked: { accountId: WORK, source: "user", at: openedAt } },
+        sessions: { picked: session(MAIN), busy: session(MAIN) },
+        bindings: { picked: { accountId: WORK, source: "user", at: openedAt }, busy: { accountId: WORK, source: "user", at: openedAt } },
       },
-      [{ id: "picked", status: "idle" }],
+      [
+        { id: "picked", status: "idle" },
+        { id: "busy", status: "running", backgroundWork: 1 },
+      ],
     );
-    expect((await working.service.view(working.paseo)).agents).toEqual([expect.objectContaining({ agentId: "picked", pendingAccountId: MAIN, waiting: "restart" })]);
+    // Nothing moves either when the turn ends, so not "when its current turn ends".
+    const later = (await working.service.view(working.paseo)).agents;
+    expect(later).toEqual([
+      expect.objectContaining({ agentId: "picked", pendingAccountId: MAIN, waiting: "restart" }),
+      expect.objectContaining({ agentId: "busy", pendingAccountId: MAIN, waiting: "restart" }),
+    ]);
   });
 
   it("moves an agent whose last turn failed when it's switched", async () => {

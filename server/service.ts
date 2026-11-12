@@ -156,6 +156,14 @@ interface AgentInfo {
 type ReopenResult =
   | { outcome: "reopened" | "deferred" | "closed" }
   | { outcome: "failed"; error: string; timedOut: boolean; unchecked?: boolean };
+/**
+ * A move left for the end of the agent's turn: its timeline note, and whether nobody asked for it
+ * (alignment), so it also waits for background work when it's finished (see `reopenAgent`).
+ */
+interface Deferred {
+  row: SwitchRow | null;
+  unattended: boolean;
+}
 /** A reload under way: sessions opened since it started, and what the first one recorded in place of what. */
 interface Reload {
   opens: number;
@@ -221,7 +229,7 @@ export class Service {
    * Agents whose account changed mid-turn (or while starting); reopened when the turn ends, or by
    * alignment once they're idle without one.
    */
-  private readonly deferred = new Map<string, SwitchRow | null>();
+  private readonly deferred = new Map<string, Deferred>();
   /**
    * Agents being moved right now (failover, a switch, alignment), so nothing else moves them at the
    * same time. Each resolves when its move is done. See `claim` and `tryClaim`.
@@ -865,19 +873,21 @@ export class Service {
   /**
    * Carries out a switch that waited for the agent's turn to end, unless it's no longer wanted. While
    * another move has the agent, or a default change is pinning open agents, it keeps waiting, and
-   * alignment picks it up once the agent is idle. `background`: alignment found it idle, rather than
-   * its turn just ending (see `reopenAgent`).
+   * alignment picks it up once the agent is idle. `polled`: alignment found it idle, rather than its
+   * turn just ending. Whoever finishes it, a move nobody asked for still waits for background work,
+   * and one the user asked for doesn't (see `reopenAgent`).
    */
-  private async finishDeferred(paseo: PaseoApi, agentId: string, family: Family, background = false): Promise<void> {
+  private async finishDeferred(paseo: PaseoApi, agentId: string, family: Family, polled = false): Promise<void> {
     const release = this.pinning > 0 ? null : this.tryClaim(agentId);
     if (!release) return;
     try {
-      const row = this.deferred.get(agentId) ?? null;
+      const entry = this.deferred.get(agentId);
+      const row = entry?.row ?? null;
       this.deferred.delete(agentId);
       const state = await this.store.read();
       const current = this.runningOn(state, agentId, family);
       if (!current || this.targetFor(state, agentId, family, current) === current) return; // Switched back meanwhile.
-      const result = await this.reopenAgent(paseo, agentId, { row, settle: !background, background });
+      const result = await this.reopenAgent(paseo, agentId, { row, settle: !polled, background: polled, unattended: entry?.unattended ?? false });
       if (row) await this.noteOutcome(paseo, agentId, row, result);
     } finally {
       release();
@@ -1673,16 +1683,17 @@ export class Service {
   /**
    * Reopens an idle agent now, or defers a busy one until its turn ends. `settle` waits a moment for
    * an agent whose turn just ended to report idle, since nothing else would reopen it later. A reload
-   * cancels a running turn, so the agent is looked at again right before it; a `background` move,
-   * which nobody asked for just now, then also waits for background work to stop and for the turn of
-   * an agent that was in use a moment ago (alignment carries it out once it's quiet).
+   * cancels a running turn, so the agent is looked at again right before it; a `background` move
+   * (alignment's pass) then also waits for the turn of an agent that was in use a moment ago, and an
+   * `unattended` one (nobody asked for it; alignment's by default) for background work to stop.
+   * Alignment carries either out once it's quiet.
    */
   private async reopenAgent(
     paseo: PaseoApi,
     agentId: string,
-    options: { row?: SwitchRow | null; settle?: boolean; background?: boolean } = {},
+    options: { row?: SwitchRow | null; settle?: boolean; background?: boolean; unattended?: boolean } = {},
   ): Promise<ReopenResult> {
-    const { row = null, settle = false, background = false } = options;
+    const { row = null, settle = false, background = false, unattended = background } = options;
     let info: AgentInfo | null;
     try {
       info = await lookUpAgent(paseo, agentId);
@@ -1694,7 +1705,7 @@ export class Service {
       return unchecked(error);
     }
     if (!info) return { outcome: "closed" };
-    if (busy(info)) return this.defer(agentId, row);
+    if (busy(info)) return this.defer(agentId, row, unattended);
     // Reloading an archived agent would unarchive it; a closed one routes itself when it next opens.
     if (info.archived || info.status === "closed") return { outcome: "closed" };
     const family = (await this.families.resolve(paseo))[info.provider];
@@ -1719,7 +1730,9 @@ export class Service {
       return unchecked(error);
     }
     if (!latest || latest.archived || latest.status === "closed") return { outcome: "closed" };
-    if (busy(latest) || (background && (hasBackgroundWork(latest) || this.recentlyActive(latest, Date.now())))) return this.defer(agentId, row);
+    if (busy(latest) || (unattended && hasBackgroundWork(latest)) || (background && this.recentlyActive(latest, Date.now()))) {
+      return this.defer(agentId, row, unattended);
+    }
     const reload: Reload = { opens: 0 };
     this.reloads.set(agentId, reload);
     let result: Awaited<ReturnType<Reopener["reopen"]>>;
@@ -1758,9 +1771,13 @@ export class Service {
     return { outcome: "reopened" };
   }
 
-  /** Leaves the move for the end of the agent's turn, keeping the note of a move already waiting. */
-  private defer(agentId: string, row: SwitchRow | null): ReopenResult {
-    this.deferred.set(agentId, row ?? this.deferred.get(agentId) ?? null);
+  /**
+   * Leaves the move for the end of the agent's turn, keeping the note of a move already waiting. One
+   * the user asked for stays theirs when alignment defers it again.
+   */
+  private defer(agentId: string, row: SwitchRow | null, unattended: boolean): ReopenResult {
+    const waiting = this.deferred.get(agentId);
+    this.deferred.set(agentId, { row: row ?? waiting?.row ?? null, unattended: unattended && (waiting?.unattended ?? true) });
     return { outcome: "deferred" };
   }
 
@@ -1935,11 +1952,12 @@ export class Service {
     now: number,
   ): NonNullable<AgentRoute["waiting"]> {
     if (!canReopen || this.failedMoves.get(agent.id) === target) return "restart";
-    if (busy(agent)) return "turn";
-    const deferred = this.deferred.has(agent.id);
+    const deferred = this.deferred.get(agent.id);
+    // Only a move left for its turn, or one alignment makes, happens before the session next starts.
     if (!deferred && !this.movesUnattended(state, agent, family, current, target, now)) return "restart";
-    if (hasBackgroundWork(agent)) return "background";
-    return deferred ? "turn" : "idle";
+    if (busy(agent)) return "turn";
+    if (hasBackgroundWork(agent) && (deferred?.unattended ?? true)) return "background";
+    return "idle";
   }
 
   /**
