@@ -8,6 +8,7 @@ import { ProgressEmitter } from "./adapter";
 import type { Reopener } from "./reopen";
 import { Service } from "./service";
 import { StateStore, type StoredState } from "./state";
+import { absentPi } from "./fakes.test-support";
 
 let root: string;
 let previousHome: string | undefined;
@@ -73,7 +74,7 @@ async function setUp(state: Partial<StoredState>, options: { signedIn?: (home: s
     },
   };
   const service = new Service(
-    { claude: adapter, codex: { ...adapter, family: "codex" } },
+    { claude: adapter, codex: { ...adapter, family: "codex" }, pi: absentPi() },
     store,
     { resolve: async () => ({ claude: "claude" as const }) } as unknown as FamilyResolver,
     { locate: async () => null } as unknown as Reopener,

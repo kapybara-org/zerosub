@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FamilyAdapter, Identity } from "./adapter";
 import { Service } from "./service";
 import { StateStore } from "./state";
+import { absentPi } from "./fakes.test-support";
 
 let root: string;
 let service: Service;
@@ -22,7 +23,7 @@ async function login(email: string | null, existingId?: string, storedEmail = "f
     // An account saved by 1.2.1, not yet refreshed by background upkeep.
     draft.accounts.push({
       id: "codex-existing", family: "codex", label: "first", autoLabel: false,
-      kind: "managed", home: root, email: storedEmail, plan: "team", organization: null,
+      kind: "managed", auth: "subscription", home: root, email: storedEmail, plan: "team", organization: null,
       identity: "chatgpt|team-workspace", signedIn: true, disabled: false,
       limitedUntil: null, limitKind: null, limitedAt: null, createdAt: new Date().toISOString(),
     });
@@ -46,7 +47,7 @@ async function login(email: string | null, existingId?: string, storedEmail = "f
     detectLimit: () => null, detectSignOut: () => null,
     redeemReset: async () => ({ outcome: "none", message: "none", left: 0 }),
   };
-  service = new Service({ codex: adapter, claude: adapter }, store);
+  service = new Service({ codex: adapter, claude: adapter, pi: absentPi() }, store);
   const started = await service.startLogin("codex", "browser", existingId);
   let view = started;
   await vi.waitFor(async () => {

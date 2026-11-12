@@ -1,5 +1,5 @@
 import type { PluginLifecycleEvents, PluginTurnOutcome } from "@getpaseo/plugin/server";
-import type { Family, LoginMethod, LoginStep, Usage } from "../shared/model";
+import type { ApiSummary, Family, LoginMethod, LoginStep, Usage } from "../shared/model";
 import type { RedeemOutcome } from "../shared/rpc";
 
 /**
@@ -70,6 +70,14 @@ export interface LoginHandle {
   readonly finished: Promise<{ ok: boolean; message: string | null }>;
 }
 
+/** Where an account's CLI gets its proxy (see `FamilyAdapter.proxyState`). */
+export interface ProxyState {
+  /** Its own proxy, or null when it uses whatever it inherits. */
+  own: string | null;
+  /** The proxy it goes through without one of its own, and where that's set; null when that's direct. */
+  inherited: { proxy: string; from: string } | null;
+}
+
 /**
  * Launch-environment changes for a session. `null` means "inherit the daemon's value": the key is
  * dropped from the per-session override map, and left untouched for processes ZeroSub spawns.
@@ -84,10 +92,16 @@ export interface FamilyAdapter {
   /** Shortest gap between usage checks for one account, even when a refresh is forced. */
   readonly usageSpacingMs: number;
   available(): Promise<{ ok: boolean; detail: string | null }>;
-  /** Creates or refreshes a managed home: isolated credentials, everything else shared with main. */
-  prepareHome(home: string): Promise<void>;
-  /** `home === null` is the CLI's own login. */
-  env(home: string | null): Promise<EnvPatch>;
+  /**
+   * Creates or refreshes a managed home: isolated credentials, everything else shared with main.
+   * `wanted`, if given, is asked once nothing else works on the home; false leaves it untouched.
+   */
+  prepareHome(home: string, wanted?: () => Promise<boolean>): Promise<void>;
+  /**
+   * `home === null` is the CLI's own login. `session`, when the patch is for a session Paseo opens:
+   * the folder it runs in.
+   */
+  env(home: string | null, session?: { cwd: string }): Promise<EnvPatch>;
   identity(home: string | null): Promise<Identity>;
   /**
    * Usage windows and banked resets. `renewLogin` lets the adapter have the CLI refresh an expired
@@ -103,6 +117,21 @@ export interface FamilyAdapter {
   redeemReset(home: string | null, options?: { onlyAtLimit?: boolean }): Promise<RedeemReply>;
   login(home: string | null, method: LoginMethod): Promise<LoginHandle>;
   logout(home: string): Promise<void>;
+  /**
+   * The rest is only there for providers whose added accounts are API keys with a proxy each (Pi's),
+   * and only for those added accounts: the CLI's own login is left as it is.
+   * An account's key (reduced to a hint) and base URL.
+   */
+  api?(home: string): Promise<ApiSummary | null>;
+  /**
+   * Stores an account's key (`null` keeps the current one) and base URL. `wanted`, if given, is asked
+   * once nothing else works on the home; false throws and writes nothing.
+   */
+  setApi?(home: string, config: { key: string | null; baseUrl: string | null }, wanted?: () => Promise<boolean>): Promise<void>;
+  /** Where an account's CLI gets its proxy. */
+  proxyState?(home: string): Promise<ProxyState>;
+  /** Sets (or clears, with `null`) an account's proxy, for sessions started afterwards. `wanted` as for `setApi`. */
+  setProxy?(home: string, proxy: string | null, wanted?: () => Promise<boolean>): Promise<void>;
   /** Looks for a subscription usage-limit failure in a finished turn. */
   detectLimit(event: TurnEvent): LimitHit | null;
   /** Looks for a turn that failed because the account's login is no longer valid. */

@@ -10,6 +10,7 @@ import type { SwitchGuard } from "./switch-guard";
 import { Service } from "./service";
 import { MAIN_ACCOUNT_ID, StateStore, type StoredAccount, type StoredState } from "./state";
 import { preferences } from "../shared/preferences";
+import { absentPi } from "./fakes.test-support";
 
 const MAIN = MAIN_ACCOUNT_ID.claude;
 const HELLO = "claude-hello";
@@ -156,7 +157,7 @@ async function setUp(state: Partial<StoredState>, hit: () => LimitHit, options: 
     ...options.claude,
   };
   const service = new Service(
-    { claude, codex: claudeAdapter(hit) },
+    { claude, codex: claudeAdapter(hit), pi: absentPi() },
     store,
     families as unknown as FamilyResolver,
     reopener as unknown as Reopener,
@@ -192,7 +193,7 @@ describe("failover", () => {
     const { store, reopened, sent, notes, limitTurn } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         bindings: { [AGENT]: { accountId: HELLO, source: "user", at: new Date().toISOString() } },
         sessions: {},
       },
@@ -215,7 +216,7 @@ describe("failover", () => {
       const { service, paseo, agent, reopened, sent, notes, limitTurn } = await setUp(
         {
           accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-          defaults: { claude: MAIN, codex: null },
+          defaults: { claude: MAIN, codex: null, pi: null },
           sessions: {},
         },
         () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your session limit" }),
@@ -237,7 +238,7 @@ describe("failover", () => {
     const { store, reopened, notes, limitTurn } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         sessions: {},
       },
       () => ({ kind: "window", resetsAt, message: "You've hit your session limit" }),
@@ -254,7 +255,7 @@ describe("failover", () => {
     const { reopened, notes, limitTurn } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         sessions: {},
       },
       () => ({ kind: "window", resetsAt: inPast(), message: "You've hit your session limit" }),
@@ -272,7 +273,7 @@ describe("failover", () => {
     const { service, store, reopened, notes, paseo } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         sessions: {},
       },
       () => {
@@ -317,7 +318,7 @@ describe("failover", () => {
         const { service, store, reopened, sent, notes, paseo } = await setUp(
           {
             accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-            defaults: { claude: MAIN, codex: null },
+            defaults: { claude: MAIN, codex: null, pi: null },
             bindings: {},
             sessions: {},
           },
@@ -352,7 +353,7 @@ describe("failover", () => {
     const notice = "You've hit your session limit · resets 3pm (UTC)";
     const twoAccounts = () => ({
       accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-      defaults: { claude: MAIN, codex: null },
+      defaults: { claude: MAIN, codex: null, pi: null },
       sessions: {},
     });
     const unused = () => {
@@ -482,7 +483,7 @@ describe("failover", () => {
     const { store, reopened, notes, limitTurn } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         sessions: { [AGENT]: { accountId: MAIN, family: "claude", openedAt } },
       },
       () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your weekly limit" }),
@@ -501,7 +502,7 @@ describe("failover", () => {
     const { store, limitTurn } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         sessions: { [AGENT]: { accountId: MAIN, family: "claude", openedAt: "2026-09-23T07:00:00.000Z" } },
       },
       () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your weekly limit" }),
@@ -533,7 +534,7 @@ describe("forking to the other provider", () => {
     await store.update((draft) =>
       Object.assign(draft, {
         accounts: [account(MAIN, "marketing", "main"), { ...account(CODEX_MAIN, "hello", "main"), family: "codex" }],
-        defaults: { claude: MAIN, codex: CODEX_MAIN },
+        defaults: { claude: MAIN, codex: CODEX_MAIN, pi: null },
       }),
     );
     const source = {
@@ -584,6 +585,7 @@ describe("forking to the other provider", () => {
       {
         claude: claudeAdapter(() => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your session limit" })),
         codex: { ...claudeAdapter(() => ({ kind: "window", resetsAt: null, message: "" })), family: "codex", portable: false } as FamilyAdapter,
+        pi: absentPi(),
       },
       store,
       { resolve: async () => ({ claude: "claude" as const, codex: "codex" as const }) } as unknown as FamilyResolver,
@@ -664,7 +666,7 @@ describe("disabling an account", () => {
     const { service, store, reopened } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         bindings: { [AGENT]: { accountId: HELLO, source: "user", at: new Date().toISOString() } },
         sessions: { [AGENT]: { accountId: HELLO, family: "claude", openedAt: new Date().toISOString() } },
       },
@@ -696,7 +698,7 @@ describe("disabling an account", () => {
       const { service, store, reopened, paseo } = await setUp(
         {
           accounts: [account(MAIN, "marketing", "main"), other] as never,
-          defaults: { claude: MAIN, codex: null },
+          defaults: { claude: MAIN, codex: null, pi: null },
           sessions: { [AGENT]: { accountId: MAIN, family: "claude", openedAt: new Date().toISOString() } },
         },
         () => ({ kind: "window", resetsAt: inFuture(), message: "" }),
@@ -722,7 +724,7 @@ describe("usage readings", () => {
   });
   const state = (limit: Partial<StoredAccount> = {}) => ({
     accounts: [{ ...account(MAIN, "marketing", "main"), ...limit }, account(HELLO, "hello", "managed")] as never,
-    defaults: { claude: MAIN, codex: null },
+    defaults: { claude: MAIN, codex: null, pi: null },
   });
   const limitedUntil = async (store: StateStore) => (await store.read()).accounts.find((a) => a.id === MAIN)?.limitedUntil ?? null;
   const unused = () => ({ kind: "window" as const, resetsAt: inFuture(), message: "" });
@@ -829,7 +831,7 @@ describe("changing the default account", () => {
   const openedAt = "2026-09-23T07:00:00.000Z";
   const stateWithLiveAgent = () => ({
     accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-    defaults: { claude: MAIN, codex: null },
+    defaults: { claude: MAIN, codex: null, pi: null },
     bindings: {},
     sessions: { [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt } },
   });
@@ -941,7 +943,7 @@ describe("changing the default account", () => {
     const reopened: string[] = [];
     const hit = (): LimitHit => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your session limit" });
     const service: Service = new Service(
-      { claude: { ...claudeAdapter(hit), ...options.claude }, codex: { ...claudeAdapter(hit), family: "codex", portable: false } as FamilyAdapter },
+      { claude: { ...claudeAdapter(hit), ...options.claude }, codex: { ...claudeAdapter(hit), family: "codex", portable: false } as FamilyAdapter, pi: absentPi() },
       store,
       { resolve: async () => ({ claude: "claude" as const, codex: "codex" as const }) } as unknown as FamilyResolver,
       {
@@ -963,7 +965,7 @@ describe("changing the default account", () => {
     const { service, store, paseo, reopened } = await setUpAgents(
       {
         accounts: [{ ...account(MAIN, "marketing", "main"), limitedUntil: inFuture() }, account(WORK, "work", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         sessions: { drifted: session(MAIN) },
         bindings: { drifted: { accountId: WORK, source: "user", at: openedAt } },
       },
@@ -980,7 +982,7 @@ describe("changing the default account", () => {
     const { service, store, paseo, reopened } = await setUpAgents(
       {
         accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
-        defaults: { claude: WORK, codex: null },
+        defaults: { claude: WORK, codex: null, pi: null },
         sessions: { picked: session(MAIN), followed: session(MAIN) },
         bindings: { picked: { accountId: WORK, source: "user", at: openedAt } },
       },
@@ -1000,7 +1002,7 @@ describe("changing the default account", () => {
     const { service, store, paseo, reopened, agents } = await setUpAgents(
       {
         accounts: [{ ...account(MAIN, "marketing", "main"), limitedUntil: inFuture() }, account(WORK, "work", "managed")] as never,
-        defaults: { claude: WORK, codex: null },
+        defaults: { claude: WORK, codex: null, pi: null },
         sessions: { working: session(MAIN) },
       },
       [{ id: "working", status: "idle", backgroundWork: 1 }],
@@ -1020,7 +1022,7 @@ describe("changing the default account", () => {
     const { service, store, paseo, context, reopened } = await setUpAgents(
       {
         accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         sessions: { picked: session(MAIN), failing: session(MAIN) },
       },
       [
@@ -1041,7 +1043,7 @@ describe("changing the default account", () => {
     const { service, store, context, reopened } = await setUpAgents(
       {
         accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         sessions: { failing: session(MAIN) },
       },
       [{ id: "failing", status: "idle", backgroundWork: 1 }],
@@ -1061,7 +1063,7 @@ describe("changing the default account", () => {
     const { service, store, paseo, reopened } = await setUpAgents(
       {
         accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         sessions: { serving: session(MAIN) },
         bindings: { serving: { accountId: WORK, source: "user", at: openedAt } },
       },
@@ -1077,7 +1079,7 @@ describe("changing the default account", () => {
     const { service, paseo } = await setUpAgents(
       {
         accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         sessions: { busy: session(MAIN) },
         bindings: { busy: { accountId: WORK, source: "user", at: openedAt } },
       },
@@ -1095,7 +1097,7 @@ describe("changing the default account", () => {
     const { service, store, paseo, context, reopened } = await setUpAgents(
       {
         accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         sessions: { failing: session(MAIN), quiet: session(MAIN), serving: session(MAIN) },
       },
       [
@@ -1120,7 +1122,7 @@ describe("changing the default account", () => {
     const { service, store, paseo, context, reopened, agents } = await setUpAgents(
       {
         accounts: [{ ...account(MAIN, "marketing", "main"), limitedUntil: inFuture() }, account(WORK, "work", "managed"), account("claude-spare", "spare", "managed")] as never,
-        defaults: { claude: WORK, codex: null },
+        defaults: { claude: WORK, codex: null, pi: null },
         sessions: { drifted: session(MAIN), picked: session(WORK) },
       },
       [
@@ -1155,7 +1157,7 @@ describe("changing the default account", () => {
     const limited = await setUpAgents(
       {
         accounts: [{ ...account(MAIN, "marketing", "main"), limitedUntil: inFuture() }, account(WORK, "work", "managed")] as never,
-        defaults: { claude: WORK, codex: null },
+        defaults: { claude: WORK, codex: null, pi: null },
         sessions: { idle: session(MAIN), working: session(MAIN), busy: session(MAIN) },
       },
       [
@@ -1172,7 +1174,7 @@ describe("changing the default account", () => {
     const working = await setUpAgents(
       {
         accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         sessions: { picked: session(MAIN), busy: session(MAIN) },
         bindings: { picked: { accountId: WORK, source: "user", at: openedAt }, busy: { accountId: WORK, source: "user", at: openedAt } },
       },
@@ -1195,7 +1197,7 @@ describe("changing the default account", () => {
     const { service, store, paseo, reopened } = await setUpAgents(
       {
         accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         sessions: { failed: session(MAIN) },
       },
       [{ id: "failed", status: "error" }],
@@ -1210,7 +1212,7 @@ describe("changing the default account", () => {
     const { service, store, paseo, reopened } = await setUpAgents(
       {
         accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: WORK, codex: null },
+        defaults: { claude: WORK, codex: null, pi: null },
         bindings: { chosen: { accountId: MAIN, source: "user", at: openedAt } },
         sessions: {
           idle: session(WORK),
@@ -1266,7 +1268,7 @@ describe("changing the default account", () => {
             ...(work ? [{ ...account(WORK, "work", "managed"), ...work }] : []),
             account(HELLO, "hello", "managed"),
           ] as never,
-          defaults: { claude: MAIN, codex: null },
+          defaults: { claude: MAIN, codex: null, pi: null },
           bindings: {},
           sessions: { stuck: session(WORK), fine: session(MAIN) },
         },
@@ -1294,7 +1296,7 @@ describe("changing the default account", () => {
     ];
     for (const prefs of [KEEP, preferences.schema.parse({})]) {
       const { service, store, paseo, reopened } = await setUpAgents(
-        { accounts, defaults: { claude: WORK, codex: null }, bindings: {}, sessions: { idle: session(WORK), busy: session(WORK) } },
+        { accounts, defaults: { claude: WORK, codex: null, pi: null }, bindings: {}, sessions: { idle: session(WORK), busy: session(WORK) } },
         agents,
       );
       service.setPreferences(prefs);
@@ -1305,7 +1307,7 @@ describe("changing the default account", () => {
 
     // Until another account is chosen, the CLI login is the default.
     const { service, store, paseo, reopened } = await setUpAgents(
-      { accounts, defaults: { claude: null, codex: null }, bindings: {}, sessions: { idle: session(MAIN), busy: session(MAIN) } },
+      { accounts, defaults: { claude: null, codex: null, pi: null }, bindings: {}, sessions: { idle: session(MAIN), busy: session(MAIN) } },
       agents,
     );
     expect(await service.setDefault(paseo, MAIN)).toEqual(NOTHING_MOVED);
@@ -1322,7 +1324,7 @@ describe("changing the default account", () => {
     const { service, store, paseo, context, reopened } = await setUpAgents(
       {
         accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: WORK, codex: null },
+        defaults: { claude: WORK, codex: null, pi: null },
       },
       [{ id: "starting", status: "initializing" }],
       {
@@ -1363,7 +1365,7 @@ describe("changing the default account", () => {
     const { service, store, paseo, reopened } = await setUpAgents(
       {
         accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: WORK, codex: null },
+        defaults: { claude: WORK, codex: null, pi: null },
         bindings: {},
         sessions: { reloading: session(WORK) },
       },
@@ -1396,7 +1398,7 @@ describe("changing the default account", () => {
     const { service, store, paseo, reopened } = await setUpAgents(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: null, codex: null },
+        defaults: { claude: null, codex: null, pi: null },
         sessions: { routed: session(MAIN) },
       },
       [
@@ -1449,7 +1451,7 @@ describe("changing the default account", () => {
     const { service, store, paseo, reopened } = await setUpAgents(
       {
         accounts: [codex(CODEX_MAIN, "chatgpt", "main"), codex("codex-work", "work", "managed")] as never,
-        defaults: { claude: null, codex: CODEX_MAIN },
+        defaults: { claude: null, codex: CODEX_MAIN, pi: null },
         sessions: { thread: { accountId: CODEX_MAIN, family: "codex", openedAt } },
       },
       [
@@ -1473,7 +1475,7 @@ describe("changing the default account", () => {
     const { service, store, paseo, context, reopened } = await setUpAgents(
       {
         accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: WORK, codex: null },
+        defaults: { claude: WORK, codex: null, pi: null },
         bindings: {},
         sessions: { idle: session(WORK) },
       },
@@ -1512,7 +1514,7 @@ describe("a limit hit while the agent is being moved", () => {
   const OTHER = "agent-2";
   const state = (bindings: StoredState["bindings"] = {}) => ({
     accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-    defaults: { claude: MAIN, codex: null },
+    defaults: { claude: MAIN, codex: null, pi: null },
     bindings,
     sessions: { [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt } },
   });
@@ -1591,7 +1593,7 @@ describe("using a reset for a stopped agent", () => {
   const openedAt = "2026-09-23T07:00:00.000Z";
   const state = () => ({
     accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-    defaults: { claude: MAIN, codex: null },
+    defaults: { claude: MAIN, codex: null, pi: null },
     sessions: { [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt } },
   });
   const hit = (): LimitHit => ({ kind: "window", resetsAt: inFuture(), message: "" });
@@ -1624,7 +1626,7 @@ describe("aligning agents with their accounts", () => {
   const openedAt = "2026-09-23T07:00:00.000Z";
   const onMarketing = (bindings: StoredState["bindings"] = {}) => ({
     accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-    defaults: { claude: MAIN, codex: null },
+    defaults: { claude: MAIN, codex: null, pi: null },
     bindings,
     sessions: { [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt } },
   });
@@ -1787,7 +1789,7 @@ describe("aligning agents with their accounts", () => {
     const { service, store, reopened, paseo } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), { ...account(HELLO, "hello", "managed"), disabled: true }, account(WORK, "work", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         bindings: { [AGENT]: { accountId: HELLO, source: "user", at: openedAt } },
         sessions: { [AGENT]: { accountId: WORK, family: "claude", openedAt } },
       },
@@ -1818,7 +1820,7 @@ describe("aligning agents with their accounts", () => {
     const { service, store, paseo, agent } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed"), account(WORK, "work", "managed")] as never,
-        defaults: { claude: HELLO, codex: null },
+        defaults: { claude: HELLO, codex: null, pi: null },
         sessions: {},
       },
       hit,
@@ -1915,7 +1917,7 @@ describe("a move asked for during a turn", () => {
   const WORK = "claude-work";
   const threeAccounts = () => ({
     accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed"), account(WORK, "work", "managed")] as never,
-    defaults: { claude: MAIN, codex: null },
+    defaults: { claude: MAIN, codex: null, pi: null },
     sessions: { [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt } },
   });
   const limit = (): LimitHit => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your session limit" });
@@ -1967,7 +1969,7 @@ describe("moves that overlap", () => {
   const openedAt = "2026-09-23T07:00:00.000Z";
   const onMarketing = () => ({
     accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-    defaults: { claude: MAIN, codex: null },
+    defaults: { claude: MAIN, codex: null, pi: null },
     sessions: { [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt } },
   });
   const hit = (): LimitHit => ({ kind: "window", resetsAt: inFuture(), message: "" });
@@ -2007,7 +2009,7 @@ describe("picking an account by hand", () => {
   const WORK = "claude-work";
   const threeAccounts = (hello: Partial<StoredAccount> = {}) => ({
     accounts: [account(MAIN, "marketing", "main"), { ...account(HELLO, "hello", "managed"), ...hello }, account(WORK, "work", "managed")] as never,
-    defaults: { claude: MAIN, codex: null },
+    defaults: { claude: MAIN, codex: null, pi: null },
     sessions: { [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt } },
   });
   const limit = (): LimitHit => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your session limit" });
@@ -2059,7 +2061,7 @@ describe("telling the user how a move went", () => {
   const openedAt = "2026-09-23T07:00:00.000Z";
   const onMarketing = () => ({
     accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-    defaults: { claude: MAIN, codex: null },
+    defaults: { claude: MAIN, codex: null, pi: null },
     sessions: { [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt } },
   });
   const hit = (): LimitHit => ({ kind: "window", resetsAt: inFuture(), message: "" });
@@ -2090,7 +2092,7 @@ describe("answering before Paseo gives up", () => {
   const openedAt = "2026-09-23T07:00:00.000Z";
   const onMarketing = () => ({
     accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-    defaults: { claude: MAIN, codex: null },
+    defaults: { claude: MAIN, codex: null, pi: null },
     sessions: { [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt } },
   });
   const hit = (): LimitHit => ({ kind: "window", resetsAt: inFuture(), message: "" });
@@ -2193,7 +2195,7 @@ describe("a reading past its reset", () => {
     try {
       vi.setSystemTime(NOW);
       const store = new StateStore(join(root, "state.json"));
-      await store.update((draft) => Object.assign(draft, { accounts: [account(MAIN, "main", "main")], defaults: { claude: MAIN, codex: null } }));
+      await store.update((draft) => Object.assign(draft, { accounts: [account(MAIN, "main", "main")], defaults: { claude: MAIN, codex: null, pi: null } }));
       const windows = (weekly: number) => [{ id: "seven_day", label: "Weekly", usedPercent: weekly, resetsAt: new Date(NOW + 72 * 3_600_000).toISOString() }];
       // Like Claude with an expired sign-in: nothing is read unless the CLI renews it first.
       const renewals: boolean[] = [];
@@ -2206,7 +2208,7 @@ describe("a reading past its reset", () => {
       };
       const claude = { ...claudeAdapter(() => ({ kind: "window", resetsAt: null, message: "" })), usage };
       const service = new Service(
-        { claude, codex: { ...claude, family: "codex", portable: false } as FamilyAdapter },
+        { claude, codex: { ...claude, family: "codex", portable: false } as FamilyAdapter, pi: absentPi() },
         store,
         { resolve: async () => ({ claude: "claude" as const }) } as unknown as FamilyResolver,
         { locate: async () => "/usr/local/bin/paseo" } as unknown as Reopener,
@@ -2248,11 +2250,11 @@ describe("renewing an expired sign-in in the background", () => {
   async function setUpAccount(usage: FamilyAdapter["usage"], patch: Partial<StoredAccount> = {}) {
     const store = new StateStore(join(root, "state.json"));
     await store.update((draft) =>
-      Object.assign(draft, { accounts: [{ ...account(MAIN, "main", "main"), ...patch }], defaults: { claude: MAIN, codex: null } }),
+      Object.assign(draft, { accounts: [{ ...account(MAIN, "main", "main"), ...patch }], defaults: { claude: MAIN, codex: null, pi: null } }),
     );
     const claude = { ...claudeAdapter(() => ({ kind: "window", resetsAt: null, message: "" })), usage };
     const service = new Service(
-      { claude, codex: { ...claude, family: "codex", portable: false } as FamilyAdapter },
+      { claude, codex: { ...claude, family: "codex", portable: false } as FamilyAdapter, pi: absentPi() },
       store,
       { resolve: async () => ({ claude: "claude" as const }) } as unknown as FamilyResolver,
       { locate: async () => "/usr/local/bin/paseo" } as unknown as Reopener,
@@ -2362,7 +2364,7 @@ describe("the account button's reason row", () => {
     const { service, store } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         bindings: { [AGENT]: { accountId: HELLO, source: "balance", at: new Date().toISOString(), selectionReason: "headroom" } },
         sessions: {},
       },

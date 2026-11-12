@@ -13,6 +13,7 @@ function account(partial: Partial<StoredAccount> & Pick<StoredAccount, "id">): S
     label: partial.id,
     autoLabel: false,
     kind: "managed",
+    auth: "subscription",
     home: `/homes/${partial.id}`,
     email: null,
     plan: null,
@@ -71,13 +72,13 @@ describe("chooseAccount", () => {
   });
 
   it("follows the chosen default", () => {
-    const state = stateWith([main, work], { defaults: { claude: "claude-work", codex: null } });
+    const state = stateWith([main, work], { defaults: { claude: "claude-work", codex: null, pi: null } });
     expect(chooseAccount(state, { ...base, reason: "resume", usageOf: () => null })?.account.id).toBe("claude-work");
   });
 
   it("prefers the agent's own binding over the default", () => {
     const state = stateWith([main, work, personal], {
-      defaults: { claude: "claude-work", codex: null },
+      defaults: { claude: "claude-work", codex: null, pi: null },
       bindings: { "agent-1": { accountId: "claude-personal", source: "user", at: "x" } },
     });
     expect(chooseAccount(state, { ...base, reason: "resume", usageOf: () => null })?.account.id).toBe("claude-personal");
@@ -92,7 +93,7 @@ describe("chooseAccount", () => {
 
   it("skips an exhausted account for the roomiest usable one", () => {
     const limited = account({ id: "claude-work", limitedUntil: "2026-09-23T14:00:00Z" });
-    const state = stateWith([main, limited, personal], { defaults: { claude: "claude-work", codex: null } });
+    const state = stateWith([main, limited, personal], { defaults: { claude: "claude-work", codex: null, pi: null } });
     const decision = chooseAccount(state, {
       ...base,
       reason: "resume",
@@ -105,14 +106,14 @@ describe("chooseAccount", () => {
 
   it("keeps an exhausted account when automatic switching is off", () => {
     const limited = account({ id: "claude-work", limitedUntil: "2026-09-23T14:00:00Z" });
-    const state = stateWith([main, limited], { defaults: { claude: "claude-work", codex: null } });
+    const state = stateWith([main, limited], { defaults: { claude: "claude-work", codex: null, pi: null } });
     const decision = chooseAccount(state, { ...base, autoSwitch: false, reason: "resume", usageOf: () => null });
     expect(decision?.account.id).toBe("claude-work");
   });
 
   it("treats an expired limit as usable again", () => {
     const recovered = account({ id: "claude-work", limitedUntil: "2026-09-23T11:00:00Z" });
-    const state = stateWith([main, recovered], { defaults: { claude: "claude-work", codex: null } });
+    const state = stateWith([main, recovered], { defaults: { claude: "claude-work", codex: null, pi: null } });
     expect(chooseAccount(state, { ...base, reason: "resume", usageOf: () => null })?.account.id).toBe("claude-work");
   });
 
@@ -126,6 +127,19 @@ describe("chooseAccount", () => {
     });
     expect(decision?.account.id).toBe("claude-work");
     expect(decision?.bind?.source).toBe("balance");
+  });
+
+  it("never stands a Pi account in for another, so new Pi agents follow the default even when balancing", () => {
+    const cli = account({ id: "pi", family: "pi", kind: "main", home: null });
+    const key = account({ id: "pi-key", family: "pi", auth: "api" });
+    const other = account({ id: "pi-other", family: "pi", auth: "api" });
+    const state = stateWith([cli, key, other], { defaults: { claude: null, codex: null, pi: "pi-key" } });
+    const pi = { ...base, family: "pi" as const, usageOf: () => null };
+    expect(chooseAccount(state, { ...pi, balanceNewAgents: true, reason: "create" })?.account.id).toBe("pi-key");
+    // Its key refused: nothing else is billed in its place, the CLI login included.
+    const refused = stateWith([cli, { ...key, signedIn: false }, other], { defaults: state.defaults });
+    expect(chooseAccount(refused, { ...pi, reason: "create" })).toMatchObject({ account: { id: "pi-key" }, skipped: null });
+    expect(mostAvailable(refused, "pi", () => null, NOW)).toBeUndefined();
   });
 
   it("prefers a near weekly reset for new Codex agents with sufficient headroom", () => {
@@ -219,14 +233,14 @@ describe("mostAvailable", () => {
   it("breaks ties toward the default account", () => {
     const main = account({ id: "claude-main", kind: "main", home: null });
     const work = account({ id: "claude-work" });
-    const state = stateWith([main, work], { defaults: { claude: "claude-work", codex: null } });
+    const state = stateWith([main, work], { defaults: { claude: "claude-work", codex: null, pi: null } });
     expect(mostAvailable(state, "claude", () => usage(20), NOW)?.id).toBe("claude-work");
   });
 
   it("ranks accounts by the room they have for any model, not by one model's full window", () => {
     const main = account({ id: "claude-main", kind: "main", home: null });
     const work = account({ id: "claude-work" });
-    const state = stateWith([main, work], { defaults: { claude: "claude-main", codex: null } });
+    const state = stateWith([main, work], { defaults: { claude: "claude-main", codex: null, pi: null } });
     const usageOf = (id: string): Usage =>
       id === "claude-work"
         ? {
@@ -267,7 +281,7 @@ describe("non-portable conversations (Codex)", () => {
   });
 
   it("gives an existing thread ZeroSub never routed to the CLI login, whatever the default", () => {
-    const state = stateWith([main, work], { defaults: { claude: null, codex: "codex-work" } });
+    const state = stateWith([main, work], { defaults: { claude: null, codex: "codex-work", pi: null } });
     for (const reason of ["resume", "refresh", "import"] as const) {
       const decision = chooseAccount(state, { ...codex, reason, usageOf: () => null });
       expect(decision?.account.id).toBe("codex-main");
@@ -276,7 +290,7 @@ describe("non-portable conversations (Codex)", () => {
     // A brand-new agent, and a thread ZeroSub opened before (it has a session record), follow the default.
     expect(chooseAccount(state, { ...codex, reason: "create", usageOf: () => null })?.account.id).toBe("codex-work");
     const routed = stateWith([main, work], {
-      defaults: { claude: null, codex: "codex-work" },
+      defaults: { claude: null, codex: "codex-work", pi: null },
       sessions: { "agent-1": { accountId: "codex-work", family: "codex", openedAt: "x" } },
     });
     expect(chooseAccount(routed, { ...codex, reason: "resume", usageOf: () => null })?.account.id).toBe("codex-work");
@@ -374,7 +388,7 @@ describe("threads ZeroSub never routed (Codex)", () => {
   const main = account({ id: "codex-main", family: "codex", kind: "main", home: null });
   const work = account({ id: "codex-work", family: "codex" });
   const codex = { ...base, family: "codex" as const, portable: false };
-  const byDefault = (patch: Partial<StoredState> = {}) => stateWith([main, work], { defaults: { claude: null, codex: "codex-work" }, ...patch });
+  const byDefault = (patch: Partial<StoredState> = {}) => stateWith([main, work], { defaults: { claude: null, codex: "codex-work", pi: null }, ...patch });
 
   it("belong to the CLI login they ran on, whether resumed, reloaded or imported", () => {
     // Started while ZeroSub was off, say: no pin and no session record.
@@ -398,7 +412,7 @@ describe("threads ZeroSub never routed (Codex)", () => {
   it("leave Claude conversations following the default", () => {
     const claudeMain = account({ id: "claude-main", kind: "main", home: null });
     const claudeWork = account({ id: "claude-work" });
-    const state = stateWith([claudeMain, claudeWork], { defaults: { claude: "claude-work", codex: null } });
+    const state = stateWith([claudeMain, claudeWork], { defaults: { claude: "claude-work", codex: null, pi: null } });
     expect(chooseAccount(state, { ...base, reason: "resume", usageOf: () => null })?.account.id).toBe("claude-work");
   });
 });

@@ -1,9 +1,11 @@
 import type { PluginServerContext, PluginSettingsState } from "@getpaseo/plugin/server";
 import { ClaudeAdapter } from "./server/claude";
 import { CodexAdapter } from "./server/codex";
+import { PiAdapter } from "./server/pi";
 import { Service, describe } from "./server/service";
 import { preferences } from "./shared/preferences";
 import {
+  addApiAccount,
   cancelLogin,
   clearAccountLimit,
   getState,
@@ -14,12 +16,14 @@ import {
   setDefaultAccount,
   setAccountEnabled,
   forkAgent,
+  setAccountProxy,
   startLogin,
   submitLoginCode,
+  updateApiAccount,
 } from "./shared/rpc";
 
 export default function contribute(server: PluginServerContext) {
-  const service = new Service({ claude: new ClaudeAdapter(), codex: new CodexAdapter() });
+  const service = new Service({ claude: new ClaudeAdapter(), codex: new CodexAdapter(), pi: new PiAdapter() });
 
   const settings = server.registerSettings(preferences);
   const applySettings = (state: PluginSettingsState<typeof preferences.schema>) => {
@@ -98,6 +102,12 @@ export default function contribute(server: PluginServerContext) {
   server.handle(setAgentAccount, ({ agentId, accountId }, { paseo }) => service.setAgentAccount(paseo, agentId, accountId));
   server.handle(forkAgent, ({ agentId }, { paseo }) => service.forkAgent(paseo, agentId));
   server.handle(setAccountEnabled, ({ accountId, enabled }, { paseo }) => service.setAccountEnabled(paseo, accountId, enabled));
+  server.handle(addApiAccount, async (input) => ({ accountId: await service.addApiAccount(input) }));
+  server.handle(updateApiAccount, async ({ accountId, ...input }) => {
+    await service.updateApiAccount(accountId, input);
+    return { ok: true as const };
+  });
+  server.handle(setAccountProxy, async ({ accountId, proxy }) => ({ ok: true as const, proxy: await service.setProxy(accountId, proxy) }));
 
   return async () => {
     stopSettings();
