@@ -1,7 +1,8 @@
-import { copyFile } from "node:fs/promises";
+import { chmod, copyFile, readdir, rm } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { z } from "zod";
 import { AccountKindSchema, FamilySchema, type Family } from "../shared/model";
-import { Mutex, readJson, writeJsonAtomic } from "./json-file";
+import { Mutex, readJson, readText, writeJsonAtomic } from "./json-file";
 import { statePath } from "./paths";
 
 export const StoredAccountSchema = z.object({
@@ -160,12 +161,51 @@ export function salvageState(raw: unknown): { state: StoredState; dropped: boole
   };
 }
 
-/** The registry: small, read on every session open, written atomically. */
+/**
+ * Which snapshots of the registry are kept: the last few writes, which a damaged registry is
+ * restored from, then the last one of each recent hour and day, to undo a mistake noticed later.
+ * Buckets are prefixes of the snapshot's name (`state-2026-10-28T09-15-02-123Z.json`).
+ */
+const SNAPSHOT_TIERS = [
+  { count: 5, bucket: (name: string) => name },
+  { count: 12, bucket: (name: string) => name.slice(0, "state-2026-10-28T09".length) },
+  { count: 7, bucket: (name: string) => name.slice(0, "state-2026-10-28".length) },
+];
+const SNAPSHOT_NAME = /^state-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z\.json$/;
+
+function snapshotName(at: Date): string {
+  return `state-${at.toISOString().replace(/[:.]/g, "-")}.json`;
+}
+
+/** The snapshots rotation keeps, out of `names`; at most the sum of the tiers' counts. */
+export function snapshotsToKeep(names: readonly string[]): Set<string> {
+  const newestFirst = [...names].sort().reverse();
+  const keep = new Set<string>();
+  for (const { count, bucket } of SNAPSHOT_TIERS) {
+    const buckets = new Set<string>();
+    for (const name of newestFirst) {
+      const key = bucket(name);
+      if (buckets.has(key)) continue;
+      if (buckets.size === count) break;
+      buckets.add(key);
+      keep.add(name);
+    }
+  }
+  return keep;
+}
+
+/**
+ * The registry: small, read on every session open, written atomically. Every write also leaves a
+ * snapshot in `backups/` beside it, which a damaged or missing registry is restored from.
+ */
 export class StateStore {
   private cached: StoredState | null = null;
   private readonly mutex = new Mutex();
+  private readonly backups: string;
 
-  constructor(private readonly path: string = statePath()) {}
+  constructor(private readonly path: string = statePath()) {
+    this.backups = join(dirname(path), "backups");
+  }
 
   async read(): Promise<StoredState> {
     if (this.cached) return this.cached;
@@ -182,33 +222,98 @@ export class StateStore {
       const draft = structuredClone(current);
       change(draft);
       const next = StoredStateSchema.parse(draft);
-      await writeJsonAtomic(this.path, next);
+      await this.write(next);
       this.cached = next;
       return next;
     });
   }
 
-  /** Throws on a transient read error so nothing overwrites a file that couldn't be read. */
-  private async load(): Promise<StoredState> {
-    let raw: unknown;
-    try {
-      raw = await readJson(this.path);
-    } catch (error) {
-      if (!(error instanceof SyntaxError)) throw error;
-      await this.backup("unparseable");
-      return emptyState();
+  private async write(state: StoredState): Promise<void> {
+    await writeJsonAtomic(this.path, state);
+    // The registry itself is saved; a snapshot that can't be written only costs a backup.
+    await this.snapshot(state).catch((error: unknown) => console.error("[ZeroSub] could not back up the state file", message(error)));
+  }
+
+  private async snapshot(state: StoredState): Promise<void> {
+    // Not synced: one lost to a crash doesn't parse and is skipped, and the registry itself is.
+    await writeJsonAtomic(join(this.backups, snapshotName(new Date())), state, { durable: false });
+    const names = await this.snapshotNames();
+    const keep = snapshotsToKeep(names);
+    for (const name of names) if (!keep.has(name)) await rm(join(this.backups, name), { force: true });
+  }
+
+  private async snapshotNames(): Promise<string[]> {
+    return (await readdir(this.backups).catch(() => [] as string[])).filter((name) => SNAPSHOT_NAME.test(name));
+  }
+
+  /** The newest snapshot that parses, with its contents if they validate whole. */
+  private async newestSnapshot(): Promise<{ path: string; raw: unknown; whole: StoredState | null } | null> {
+    for (const name of (await this.snapshotNames()).sort().reverse()) {
+      const path = join(this.backups, name);
+      const raw = await readJson(path).catch(() => undefined);
+      if (raw === undefined) continue;
+      const whole = StoredStateSchema.safeParse(raw);
+      return { path, raw, whole: whole.success ? whole.data : null };
     }
-    if (raw === undefined) return emptyState();
-    const { state, dropped } = salvageState(raw);
-    if (dropped) await this.backup("partly invalid");
+    return null;
+  }
+
+  /**
+   * A registry that is missing, empty, not JSON, or has records that don't validate is replaced by
+   * the newest snapshot, and a damaged file kept aside, rather than carrying on with fewer accounts
+   * or none. Throws on a transient read error so nothing overwrites a file that couldn't be read.
+   */
+  private async load(): Promise<StoredState> {
+    const text = await readText(this.path);
+    let raw: unknown;
+    if (text?.trim()) {
+      try {
+        raw = JSON.parse(text);
+      } catch {
+        // Recovered below.
+      }
+    }
+    if (raw !== undefined) {
+      const whole = StoredStateSchema.safeParse(raw);
+      if (whole.success) return whole.data;
+    }
+    const snapshot = await this.newestSnapshot();
+    if (text === undefined && !snapshot) return emptyState(); // A new install.
+    const problem = text === undefined ? "missing" : !text.trim() ? "empty" : raw === undefined ? "not valid JSON" : "partly invalid";
+    const kept = text === undefined ? null : await this.keepAside();
+    let state: StoredState;
+    let outcome: string;
+    if (snapshot?.whole) {
+      state = snapshot.whole;
+      outcome = `restored it from ${snapshot.path}`;
+    } else if (raw !== undefined) {
+      // No snapshot yet, or the newest one doesn't validate either, so another version wrote them
+      // (say, before a downgrade): the file is the newest record, and its valid entries are kept.
+      state = salvageState(raw).state;
+      outcome = "continued with the records that were still valid";
+    } else if (snapshot) {
+      state = salvageState(snapshot.raw).state;
+      outcome = `continued with the records of ${snapshot.path} that were still valid`;
+    } else {
+      state = emptyState();
+      outcome = "continued with an empty registry, as there is no backup";
+    }
+    console.error(`[ZeroSub] ${this.path} was ${problem}${kept ? `; kept it as ${kept}` : ""}; ${outcome}`);
+    await this.write(state).catch((error: unknown) => console.error("[ZeroSub] could not save the recovered state file", message(error)));
     return state;
   }
 
-  private async backup(why: string): Promise<void> {
+  /** Copies a damaged registry aside before it's replaced, so a hand edit isn't lost. */
+  private async keepAside(): Promise<string> {
     const copy = `${this.path}.bad-${Date.now()}`;
-    await copyFile(this.path, copy).catch(() => undefined);
-    console.error(`[ZeroSub] state file was ${why}; kept a copy at ${copy} and continued with what was readable`);
+    await copyFile(this.path, copy);
+    await chmod(copy, 0o600);
+    return copy;
   }
+}
+
+function message(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 export function findAccount(state: StoredState, accountId: string | null | undefined): StoredAccount | undefined {
