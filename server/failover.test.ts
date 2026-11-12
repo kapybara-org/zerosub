@@ -6,6 +6,7 @@ import type { AgentTimelineItem, FamilyAdapter, LimitHit, UsageRead } from "./ad
 import type { FamilyResolver } from "./families";
 import { detectClaudeLimit } from "./limits";
 import type { Reopener } from "./reopen";
+import type { SwitchGuard } from "./switch-guard";
 import { Service } from "./service";
 import { MAIN_ACCOUNT_ID, StateStore, type StoredAccount, type StoredState } from "./state";
 import { preferences } from "../shared/preferences";
@@ -1037,7 +1038,7 @@ describe("changing the default account", () => {
   });
 
   it("leaves an agent with background work when moving idle agents off an account at its limit", async () => {
-    const { service, store, context, reopened } = await setUpAgents(
+    const { service, store, paseo, context, reopened } = await setUpAgents(
       {
         accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
         defaults: { claude: MAIN, codex: null },
@@ -1054,7 +1055,11 @@ describe("changing the default account", () => {
     await service.onTurnEnded({ agent: { id: "failing", provider: "claude" }, turnId: null, outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never, context);
     await vi.waitFor(() => expect(reopened).toContain("quiet"));
     expect(reopened).not.toContain("serving");
-    expect((await store.read()).sessions.serving?.accountId).toBe(MAIN);
+    const state = await store.read();
+    expect(state.sessions.serving?.accountId).toBe(MAIN);
+    // Passed over, not pinned to the next account and left waiting: alignment moves it once its work stops.
+    expect(state.bindings.serving).toBeUndefined();
+    expect((await service.view(paseo)).agents.find((route) => route.agentId === "serving")?.waiting).toBe("background");
   });
 
   it("keeps a deferred move waiting for background work only when nobody asked for it", async () => {
@@ -1663,6 +1668,42 @@ describe("aligning agents with their accounts", () => {
     await service.alignSessions(paseo as never);
     expect(reopened).toEqual([AGENT]);
     expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+  });
+
+  it("doesn't promise a move alignment holds back after a try that didn't land, until it tries again", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const { service, store, reopened, paseo } = await setUp(onMarketing(), hit);
+      await store.update((draft) => {
+        const marketing = draft.accounts.find((entry) => entry.id === MAIN);
+        if (marketing) marketing.limitedUntil = new Date(Date.now() + 24 * 60 * 60_000).toISOString();
+      });
+      const waiting = async () => (await service.view(paseo as never)).agents.find((route) => route.agentId === AGENT)?.waiting;
+      expect(await waiting()).toBe("idle");
+      // As alignment records a reload of it that didn't land (see `alignSessions`).
+      const target = (await service.view(paseo as never)).agents.find((route) => route.agentId === AGENT)!.accountId;
+      (service as unknown as { alignedAt: Map<string, { accountId: string; at: number }> }).alignedAt.set(AGENT, { accountId: target, at: Date.now() });
+      // Alignment won't try again for a while, so the button doesn't say "once it's idle" meanwhile.
+      expect(await waiting()).toBe("restart");
+      expect((await service.alignSessions(paseo as never)).reopened).toEqual([]);
+      vi.setSystemTime(Date.now() + 31 * 60_000);
+      expect(await waiting()).toBe("idle");
+      expect((await service.alignSessions(paseo as never)).reopened).toEqual([AGENT]);
+      expect(reopened).toEqual([AGENT]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("doesn't promise a move the switch guard holds back", async () => {
+    const { service, store, paseo } = await setUp(onMarketing(), hit);
+    await store.update(full(MAIN));
+    const waiting = async () => (await service.view(paseo as never)).agents.find((route) => route.agentId === AGENT)?.waiting;
+    expect(await waiting()).toBe("idle");
+    const guard = (service as unknown as { switchGuard: SwitchGuard }).switchGuard;
+    for (let move = 0; move < guard.limit; move++) guard.note(AGENT, Date.now());
+    expect(await waiting()).toBe("restart");
+    expect((await service.alignSessions(paseo as never)).reopened).toEqual([]);
   });
 
   it("says once that it couldn't move an agent, not at every retry", async () => {
