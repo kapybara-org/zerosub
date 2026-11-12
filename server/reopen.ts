@@ -4,13 +4,40 @@ import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { paseoHome } from "./paths";
 
+/** The part of the plugin's Paseo connection a reopen needs. */
+export interface ReopenHost {
+  agents: { ref(agentId: string): unknown };
+}
+
+/**
+ * The host's own reopen, when it has one: Paseo 0.16's `agents.ref(id).reload()` closes and reopens
+ * the provider session in the daemon with the current configuration, rerunning session-open hooks.
+ * `null` on older hosts.
+ */
+export function hostReload(paseo: ReopenHost | null | undefined, agentId: string): (() => Promise<unknown>) | null {
+  let ref: { reload?: unknown } | undefined;
+  try {
+    ref = paseo?.agents.ref(agentId) as { reload?: unknown } | undefined;
+  } catch {
+    return null;
+  }
+  const reload = ref?.reload;
+  return typeof reload === "function" ? () => (reload as () => Promise<unknown>).call(ref) : null;
+}
+
+/** Whether the host can reopen sessions itself. A ref is a local handle: building one sends nothing. */
+export function hostCanReload(paseo: ReopenHost | null | undefined): boolean {
+  return hostReload(paseo, "zerosub-capability-check") !== null;
+}
+
 /**
  * Reopens an agent's provider session so it picks up a new account.
  *
- * The plugin SDK has no session reopen (`agents.ref(id).refresh()` only refetches data), so this
- * uses the bundled CLI's `paseo agent reload`, which the daemon implements as close + reopen with
- * the current configuration. The CLI connects on its own; on a password-protected daemon it cannot,
- * and the switch then applies the next time the session opens.
+ * Through the host's own reopen when it has one (Paseo 0.16+). Otherwise through the bundled CLI's
+ * `paseo agent reload`, which the daemon implements as close + reopen with the current
+ * configuration. The CLI has to find the agent in its agent list first, which leaves out background
+ * agents, so on older hosts a background agent only changes accounts when its session next opens.
+ * The CLI connects on its own; when it can't, the switch also applies the next time the session opens.
  */
 export class Reopener {
   private cli: { at: number; path: Promise<string | null> } | null = null;
@@ -22,8 +49,18 @@ export class Reopener {
     return this.cli.path;
   }
 
-  /** `timedOut`: the command was stopped before the daemon answered, so the reload may still finish. */
-  async reopen(agentId: string): Promise<{ ok: true } | { ok: false; error: string; timedOut: boolean }> {
+  /** `timedOut`: the reopen was given up on before the daemon answered, so it may still finish. */
+  async reopen(agentId: string, paseo?: ReopenHost | null): Promise<{ ok: true } | { ok: false; error: string; timedOut: boolean }> {
+    const reload = hostReload(paseo, agentId);
+    if (reload) {
+      try {
+        await reload();
+        return { ok: true };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { ok: false, error: message || "Reload failed.", timedOut: /timed? ?out/i.test(message) };
+      }
+    }
     const cli = await this.locate();
     if (!cli) return { ok: false, error: "The paseo command-line tool was not found on the daemon machine.", timedOut: false };
     const args = ["agent", "reload", agentId, "--json", "--home", paseoHome()];

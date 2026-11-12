@@ -41,7 +41,7 @@ import { turnRows } from "./limits";
 import { canSignInWithBrowser } from "./machine";
 import { equivalentMode } from "./modes";
 import { homesDir } from "./paths";
-import { Reopener } from "./reopen";
+import { Reopener, hostCanReload } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
 import { chooseAccount, isLimited, isUsable, mostAvailable } from "./routing";
@@ -1321,7 +1321,7 @@ export class Service {
       return "closed";
     }
     const before = (await this.store.read()).sessions[agentId];
-    const result = await this.reopener.reopen(agentId);
+    const result = await this.reopener.reopen(agentId, paseo);
     if (!result.ok) {
       console.warn(`[ZeroSub] could not reopen ${agentId}: ${result.error}`);
       // Paseo asks for the new session's environment before it closes the old one, so a failed reload
@@ -1550,11 +1550,16 @@ export class Service {
       agents: routes,
       logins: [...this.logins.values()].map((login) => login.view),
       providers: families,
-      canReopen: (await this.reopener.locate()) !== null,
+      canReopen: await this.canReopen(paseo),
       browserSignIn: this.browserSignIn,
       showComposerPill: this.prefs.showComposerPill,
       warnings: await this.warnings(),
     };
+  }
+
+  /** Whether running agents can change accounts right away: through the host's own reopen, or the CLI. */
+  private async canReopen(paseo: PaseoApi | null): Promise<boolean> {
+    return hostCanReload(paseo) || (await this.reopener.locate()) !== null;
   }
 
   /** Agents with a live session: the given ones (looked up fresh), or every one. */
@@ -1593,7 +1598,7 @@ export class Service {
     if (process.env.CODEX_ACCESS_TOKEN) {
       warnings.push("The daemon's environment sets CODEX_ACCESS_TOKEN. Codex agents on your CLI login use it instead of a ChatGPT sign-in.");
     }
-    if ((await this.reopener.locate()) === null) {
+    if (!(await this.canReopen(this.paseo))) {
       warnings.push(
         "Paseo's command-line tool wasn't found, so running agents change accounts the next time their session starts instead of right away.",
       );
