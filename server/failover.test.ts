@@ -909,17 +909,18 @@ describe("changing the default account", () => {
   /** Several agents, each answering for itself. `reopened` lists the ones Paseo was asked to reload. */
   async function setUpAgents(
     state: Partial<StoredState>,
-    listed: Array<{ id: string; status: string; provider?: string; archived?: boolean }>,
+    listed: Array<{ id: string; status: string; provider?: string; archived?: boolean; backgroundWork?: number }>,
     options: { claude?: Partial<FamilyAdapter>; onList?: (service: Service, context: never) => void } = {},
   ) {
     const store = new StateStore(join(root, "state.json"));
     await store.update((draft) => Object.assign(draft, state));
-    const agents = listed.map(({ id, status, provider, archived }) => ({
+    const agents = listed.map(({ id, status, provider, archived, backgroundWork }) => ({
       id,
       provider: provider ?? "claude",
       status,
       archivedAt: archived ? "2026-09-23T08:00:00.000Z" : null,
       lastUserMessageAt: openedAt,
+      backgroundWork: { count: backgroundWork ?? 0 },
     }));
     const paseo = {
       config: { get: async () => ({ config: { providers: {} } }) },
@@ -954,13 +955,13 @@ describe("changing the default account", () => {
     );
     services.push(service);
     service.setPreferences(KEEP);
-    return { service, store, paseo: paseo as never, context, reopened };
+    return { service, store, paseo: paseo as never, context, reopened, agents };
   }
 
-  it("aligns an agent whose last turn failed with the account it's shown on", async () => {
+  it("moves an agent whose last turn failed off an account it can't work on", async () => {
     const { service, store, paseo, reopened } = await setUpAgents(
       {
-        accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
+        accounts: [{ ...account(MAIN, "marketing", "main"), limitedUntil: inFuture() }, account(WORK, "work", "managed")] as never,
         defaults: { claude: MAIN, codex: null },
         sessions: { drifted: session(MAIN) },
         bindings: { drifted: { accountId: WORK, source: "user", at: openedAt } },
@@ -971,6 +972,46 @@ describe("changing the default account", () => {
     await service.alignSessions(paseo);
     expect(reopened).toEqual(["drifted"]);
     expect((await store.read()).sessions.drifted?.accountId).toBe(WORK);
+  });
+
+  it("leaves an agent on an account it can still work on, however it's routed now", async () => {
+    // A reload cancels what the agent is doing (background helpers too), so nothing moves it unasked.
+    const { service, store, paseo, reopened } = await setUpAgents(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
+        defaults: { claude: WORK, codex: null },
+        sessions: { picked: session(MAIN), followed: session(MAIN) },
+        bindings: { picked: { accountId: WORK, source: "user", at: openedAt } },
+      },
+      [
+        { id: "picked", status: "idle" },
+        { id: "followed", status: "idle" },
+      ],
+    );
+    expect((await service.alignSessions(paseo)).reopened).toEqual([]);
+    expect(reopened).toEqual([]);
+    const { agents } = await service.view(paseo);
+    expect(agents.find((route) => route.agentId === "picked")).toMatchObject({ accountId: WORK, pendingAccountId: MAIN });
+    expect((await store.read()).sessions.followed?.accountId).toBe(MAIN);
+  });
+
+  it("waits for an agent's background work before moving it off an account it can't work on", async () => {
+    const { service, store, paseo, reopened, agents } = await setUpAgents(
+      {
+        accounts: [{ ...account(MAIN, "marketing", "main"), limitedUntil: inFuture() }, account(WORK, "work", "managed")] as never,
+        defaults: { claude: WORK, codex: null },
+        sessions: { working: session(MAIN) },
+      },
+      [{ id: "working", status: "idle", backgroundWork: 1 }],
+    );
+    await service.alignSessions(paseo);
+    expect(reopened).toEqual([]);
+    expect((await store.read()).sessions.working?.accountId).toBe(MAIN);
+
+    agents[0]!.backgroundWork.count = 0;
+    await service.alignSessions(paseo);
+    expect(reopened).toEqual(["working"]);
+    expect((await store.read()).sessions.working?.accountId).toBe(WORK);
   });
 
   it("moves an agent whose last turn failed when it's switched", async () => {
@@ -1330,18 +1371,18 @@ describe("a limit hit while the agent is being moved", () => {
     const gate = new Promise<void>((resolve) => (release = resolve));
     let started = () => {};
     const reloading = new Promise<void>((resolve) => (started = resolve));
-    const { service, store, reopened, paseo, limitTurn } = await setUp(state({ [AGENT]: { accountId: HELLO, source: "user", at: openedAt } }), hit, {
+    const { service, store, reopened, paseo, limitTurn } = await setUp(state(), hit, {
       reloading: () => {
         started();
         return gate;
       },
     });
-    const aligning = service.alignSessions(paseo as never);
+    const moving = service.setAgentAccount(paseo as never, AGENT, HELLO);
     await reloading;
     await limitTurn();
     expect(await limitedUntil(store, MAIN)).not.toBeNull();
     release();
-    expect((await aligning).reopened).toEqual([AGENT]);
+    expect((await moving).reopened).toEqual([AGENT]);
     expect(reopened).toEqual([AGENT]);
   });
 
@@ -1416,9 +1457,10 @@ describe("aligning agents with their accounts", () => {
   };
   const turnEnded = { agent: { id: AGENT, provider: "claude" }, turnId: "t", outcome: { kind: "completed" }, timeline: [] } as never;
 
-  it("moves an agent to the account picked for it once switching no longer skips that account", async () => {
-    // The incident: hello was full when the user picked it, so the agent stayed on marketing while
-    // switching was on. Turning switching off left its button naming hello, and nothing moved it.
+  it("leaves an agent on a working account when switching no longer skips the one picked for it", async () => {
+    // hello was full when the user picked it, so the agent stayed on marketing while switching was
+    // on. Turning switching off routes it to hello, but marketing still works: a reload would cancel
+    // what it's doing, so it moves when its session next opens, and its button says so meanwhile.
     const { service, store, reopened, notes, paseo } = await setUp(
       onMarketing({ [AGENT]: { accountId: HELLO, source: "user", at: openedAt } }),
       hit,
@@ -1428,10 +1470,12 @@ describe("aligning agents with their accounts", () => {
     expect((await service.alignSessions(paseo as never)).reopened).toEqual([]);
 
     service.setPreferences(preferences.schema.parse({ autoSwitch: false }));
-    await vi.waitFor(() => expect(notes).toHaveLength(1));
-    expect(reopened).toEqual([AGENT]);
-    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
-    expect(notes[0]).toMatchObject({ from: "marketing", to: "hello", reason: "manual", outcome: "switched" });
+    expect((await service.alignSessions(paseo as never)).reopened).toEqual([]);
+    expect(reopened).toEqual([]);
+    expect(notes).toEqual([]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+    const route = (await service.view(paseo as never)).agents.find((entry) => entry.agentId === AGENT);
+    expect(route).toMatchObject({ accountId: HELLO, pendingAccountId: MAIN });
   });
 
   it("moves an idle agent off an account a usage reading found full when switching is on", async () => {

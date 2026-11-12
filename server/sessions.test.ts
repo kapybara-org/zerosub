@@ -191,7 +191,15 @@ describe("a session that opens without ZeroSub's answer", () => {
     const route = (await service.view(paseo)).agents.find((entry) => entry.agentId === AGENT);
     expect(route).toMatchObject({ accountId: HELLO, pendingAccountId: MAIN });
 
-    // The 30-second check then moves it where it belongs.
+    // The CLI login works, so nothing moves it unattended: a reload would cancel what it's doing.
+    expect((await service.alignSessions(paseo)).reopened).toEqual([]);
+    expect(reopened).toEqual([]);
+
+    // Once it can't work there, the 30-second check moves it where it belongs.
+    await store.update((draft) => {
+      const login = draft.accounts.find((entry) => entry.id === MAIN);
+      if (login) login.limitedUntil = new Date(Date.now() + 30 * 60_000).toISOString();
+    });
     expect((await service.alignSessions(paseo)).reopened).toEqual([AGENT]);
     expect(reopened).toEqual([AGENT]);
     expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
@@ -243,7 +251,7 @@ describe("a session that opens without ZeroSub's answer", () => {
     expect(route).toMatchObject({ accountId: HELLO, pendingAccountId: MAIN, waiting: "restart" });
   });
 
-  it("doesn't pin a new ChatGPT thread to an account it didn't start on", async () => {
+  it("pins a new ChatGPT thread to the CLI login when it starts there", async () => {
     const held = gate();
     const { store, open } = await setUp(
       { accounts: codexAccounts(), defaults: { claude: null, codex: CODEX_WORK }, sessions: {} },
@@ -257,7 +265,7 @@ describe("a session that opens without ZeroSub's answer", () => {
     held.release();
     await opening;
     let state = await store.read();
-    expect(state.bindings[AGENT]).toBeUndefined();
+    expect(state.bindings[AGENT]).toMatchObject({ accountId: CODEX_MAIN, source: "thread" });
     expect(state.sessions[AGENT]).toBeUndefined();
 
     // It started on the CLI login, so that's where it reopens.
@@ -265,6 +273,78 @@ describe("a session that opens without ZeroSub's answer", () => {
     state = await store.read();
     expect(state.bindings[AGENT]).toMatchObject({ accountId: CODEX_MAIN, source: "thread" });
     expect(state.sessions[AGENT]?.accountId).toBe(CODEX_MAIN);
+  });
+
+  it("pins a ChatGPT hand-off to the CLI login when its first open goes unrouted", async () => {
+    const held = gate();
+    const { service, store, paseo, open, reopened } = await setUp(
+      {
+        accounts: codexAccounts(),
+        defaults: { claude: null, codex: CODEX_MAIN },
+        // The hand-off pinned the new thread to work before it first opened.
+        bindings: { [AGENT]: { accountId: CODEX_WORK, source: "thread", at: EARLIER } },
+        sessions: {},
+      },
+      [{ ...live(AGENT, "codex"), lastUserMessageAt: null }],
+      { env: held.wait },
+    );
+    const late = new AbortController();
+    const opening = open(AGENT, "create", late.signal);
+    await held.reached;
+    late.abort();
+    held.release();
+    await opening;
+    expect((await store.read()).bindings[AGENT]).toMatchObject({ accountId: CODEX_MAIN, source: "thread" });
+
+    // Its history is written on the CLI login, which work can't read, so it stays there.
+    expect((await service.alignSessions(paseo)).reopened).toEqual([]);
+    expect(reopened).toEqual([]);
+    await open(AGENT, "resume");
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(CODEX_MAIN);
+  });
+
+  it("pins a ChatGPT thread with no history to the CLI login when a reload of it goes unrouted", async () => {
+    const held = gate();
+    const { store, open } = await setUp(
+      {
+        accounts: codexAccounts(),
+        defaults: { claude: null, codex: CODEX_MAIN },
+        bindings: { [AGENT]: { accountId: CODEX_WORK, source: "thread", at: EARLIER } },
+        sessions: { [AGENT]: { accountId: CODEX_WORK, family: "codex", openedAt: EARLIER } },
+      },
+      [{ ...live(AGENT, "codex"), lastUserMessageAt: null }],
+      { env: held.wait },
+    );
+    const late = new AbortController();
+    const opening = open(AGENT, "refresh", late.signal);
+    await held.reached;
+    late.abort();
+    held.release();
+    await opening;
+    const state = await store.read();
+    expect(state.sessions[AGENT]).toBeUndefined();
+    expect(state.bindings[AGENT]).toMatchObject({ accountId: CODEX_MAIN, source: "thread" });
+  });
+
+  it("leaves a ChatGPT thread with history pinned where its history is when it opens unrouted", async () => {
+    const held = gate();
+    const { store, open } = await setUp(
+      {
+        accounts: codexAccounts(),
+        defaults: { claude: null, codex: CODEX_MAIN },
+        bindings: { [AGENT]: { accountId: CODEX_WORK, source: "thread", at: EARLIER } },
+        sessions: { [AGENT]: { accountId: CODEX_WORK, family: "codex", openedAt: EARLIER } },
+      },
+      [live(AGENT, "codex")],
+      { env: held.wait },
+    );
+    const late = new AbortController();
+    const opening = open(AGENT, "refresh", late.signal);
+    await held.reached;
+    late.abort();
+    held.release();
+    await opening;
+    expect((await store.read()).bindings[AGENT]).toMatchObject({ accountId: CODEX_WORK, source: "thread" });
   });
 });
 

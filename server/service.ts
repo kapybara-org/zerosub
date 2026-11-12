@@ -148,6 +148,8 @@ interface AgentInfo {
   continuedFrom: string | null;
   /** When the user last sent it a message (ms), or 0. */
   lastMessageAt: number;
+  /** Shells and monitors it left running after its turn (Paseo 0.16+; 0 before). A reload cancels them. */
+  backgroundWork: number;
 }
 
 /** `unchecked`: Paseo couldn't say how the agent was doing, so it wasn't reloaded at all. */
@@ -186,8 +188,9 @@ function emptySummary(): ReopenSummary {
   return { reopened: [], deferred: [], failed: [], pending: [], continuedIn: null };
 }
 
+/** In a turn, or between turns with background work still running: a reload would cancel either. */
 function busy(agent: AgentInfo): boolean {
-  return agent.status === "running" || agent.status === "initializing";
+  return agent.status === "running" || agent.status === "initializing" || agent.backgroundWork > 0;
 }
 
 function sameBinding(a: Binding | undefined, b: Binding | undefined): boolean {
@@ -622,13 +625,13 @@ export class Service {
       }
     } catch (error) {
       this.unrouted.add(agentId);
-      await this.openedUnrouted(agentId, opening).catch((undo: unknown) => log(`could not undo routing ${agentId}`, undo));
+      await this.openedUnrouted(context.paseo, request, opening).catch((undo: unknown) => log(`could not undo routing ${agentId}`, undo));
       throw error;
     } finally {
       abandoned?.removeEventListener("abort", giveUp);
       this.routing.delete(routed);
     }
-    await this.openedUnrouted(agentId, opening).catch((undo: unknown) => log(`could not undo routing ${agentId}`, undo));
+    await this.openedUnrouted(context.paseo, request, opening).catch((undo: unknown) => log(`could not undo routing ${agentId}`, undo));
     return undefined;
   }
 
@@ -636,9 +639,18 @@ export class Service {
    * A session routing didn't answer for runs on the CLI login. Forgets the account recorded for it
    * (by this routing, or for the session before when routing never got that far), so `runningOn`
    * reads the CLI login, unless a session opened since replaced the record. A Codex thread's new pin
-   * goes too: the thread starts out where it runs.
+   * goes too: the thread starts out where it runs. A Codex thread with no history yet (a new one, or
+   * a ChatGPT hand-off pinned before it first opened) writes its history on the CLI login, which no
+   * other account can read, so it's pinned there instead.
    */
-  private async openedUnrouted(agentId: string, opening: Opening): Promise<void> {
+  private async openedUnrouted(paseo: PaseoApi, request: PluginSessionOpenRequest, opening: Opening): Promise<void> {
+    const { agentId } = request;
+    const family = (await this.families.resolve(paseo))[request.provider];
+    let startsHere: Family | null = null;
+    if (family && !this.adapters[family].portable) {
+      const info = request.reason === "create" ? null : await agentInfo(paseo, agentId);
+      if (request.reason === "create" || (info && !info.hasHistory)) startsHere = family;
+    }
     const ours = (session: LiveSession) => session.accountId === opening.session?.accountId && session.openedAt === opening.session.openedAt;
     await this.store.update((draft) => {
       const recorded = draft.sessions[agentId];
@@ -648,6 +660,8 @@ export class Service {
         if (pin.replaced) draft.bindings[agentId] = pin.replaced;
         else delete draft.bindings[agentId];
       }
+      const cliLogin = startsHere && !draft.sessions[agentId] ? mainAccount(draft, startsHere) : undefined;
+      if (cliLogin) draft.bindings[agentId] = { accountId: cliLogin.id, source: "thread", at: new Date().toISOString() };
     });
   }
 
@@ -1412,7 +1426,7 @@ export class Service {
       if (!this.switchGuard.allows(agentId, Date.now())) continue;
       const info = await agentInfo(paseo, agentId);
       // One the user is using right now is left for alignment to move once it's quiet.
-      if (!info || info.archived || !settled(info.status) || this.recentlyActive(info, Date.now())) continue;
+      if (!info || info.archived || !settled(info.status) || busy(info) || this.recentlyActive(info, Date.now())) continue;
       // Left for its own failover, or alone when that can't be told.
       if ((await this.lastTurnHitLimit(paseo, agentId, family)) !== false) continue;
       const release = this.tryClaim(agentId);
@@ -1841,12 +1855,14 @@ export class Service {
   }
 
   /**
-   * Moves live agents whose session runs on another account than they're routed to, when nothing
-   * else did: a limit read from usage or cleared, automatic switching turned on or off, a switch
-   * that was waiting for a turn when the plugin restarted or for one that never came. Otherwise the
-   * account button names an account the agent isn't on, and nothing ever moves it there. Idle
-   * agents move now, busy ones after their turn, and ones the user was just using once they've
-   * been quiet a while. A move that doesn't land isn't tried again for a while.
+   * Moves live agents off an account they can't work on (at its limit, signed out, turned off or
+   * removed) to the one they're routed to, when nothing else did: a limit read from usage, say, or a
+   * session that opened before routing answered. Also carries out a switch that was waiting for a
+   * turn that never came. A reload cancels what the agent is doing, so one whose account still works
+   * isn't moved unattended: the account button shows the move still to come, and it happens when the
+   * session next opens. Idle agents move now; busy ones (in a turn, or with background work still
+   * running) after it, and ones the user was just using once they've been quiet a while. A move that
+   * doesn't land isn't tried again for a while.
    */
   async alignSessions(paseo: PaseoApi): Promise<ReopenSummary> {
     if (this.aligning || this.stopped || this.pinning > 0) return emptySummary();
@@ -1872,6 +1888,12 @@ export class Service {
         const current = this.runningOn(state, agentId, family);
         const target = this.targetFor(state, agentId, family, current);
         if (!current || !target || target === current) continue;
+        // A reload cancels what the agent is doing, so nobody having asked, it only leaves an account
+        // it can't work on. One whose account still works moves when its session next opens. A
+        // ChatGPT thread with history can't work anywhere but the account holding it (see `reopenAgent`).
+        const reason = this.driftReason(state, agentId, current, target, now);
+        const stranded = !this.adapters[family].portable && agent.hasHistory;
+        if (!stranded && (reason === "manual" || reason === "default")) continue;
         const tried = this.alignedAt.get(agentId);
         if (tried?.accountId === target && now - tried.at < ALIGN_RETRY_MS) continue;
         if (!this.switchGuard.allows(agentId, now)) continue;
@@ -2678,6 +2700,7 @@ function toAgentInfo(agent: AgentSnapshot): AgentInfo {
     title: agent.title ?? null,
     continuedFrom: agent.labels?.[CONTINUED_FROM_LABEL] ?? null,
     lastMessageAt: Date.parse(agent.lastUserMessageAt ?? "") || 0,
+    backgroundWork: (agent as { backgroundWork?: { count?: number } }).backgroundWork?.count ?? 0,
   };
 }
 
