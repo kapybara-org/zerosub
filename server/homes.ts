@@ -1,10 +1,10 @@
-import { lstat, mkdir, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { ApiSummary, Family } from "../shared/model";
 import { Mutex, readJson } from "./json-file";
 import { REQUIRED_NO_PROXY } from "./proxy";
-import { homesDir, mainClaudeDir, mainClaudeGlobalConfig, mainCodexHome, mainPiDir } from "./paths";
+import { homesDir, isOwnHome, mainClaudeDir, mainClaudeGlobalConfig, mainCodexHome, mainPiDir } from "./paths";
 
 /**
  * A managed account home is a real directory holding that account's own credentials and account
@@ -21,6 +21,11 @@ interface OverlaySpec {
 
 const SYNC_TTL_MS = 30_000;
 const lastSync = new Map<string, number>();
+
+/** Has the next sync of every home run in full: the CLI login's files, which theirs are made from, changed. */
+export function forgetSyncs(): void {
+  lastSync.clear();
+}
 
 async function exists(path: string): Promise<boolean> {
   try {
@@ -53,6 +58,20 @@ async function syncOverlay(home: string, spec: OverlaySpec): Promise<void> {
   await mkdir(home, { recursive: true, mode: 0o700 });
   await mkdir(spec.main, { recursive: true, mode: 0o700 });
   for (const directory of spec.shareDirs) await mkdir(join(spec.main, directory), { recursive: true });
+  // A home that isn't ZeroSub's own (see `isOwnHome`) is the user's: a link there is only changed or
+  // dropped when it points into main, as the ones made here do. One the user made elsewhere stays.
+  const own = await isOwnHome(home);
+  const mains = [resolve(spec.main), await realpath(spec.main).catch(() => resolve(spec.main))];
+  const ours = async (link: string) => {
+    if (own) return true;
+    const raw = await readlink(link).catch(() => null);
+    if (raw === null) return false;
+    const pointsAt = resolve(home, raw);
+    return mains.some((main) => {
+      const inside = relative(main, pointsAt);
+      return inside !== "" && !inside.startsWith("..") && !isAbsolute(inside);
+    });
+  };
 
   for (const name of await readdir(spec.main)) {
     if (name === ".DS_Store" || spec.isPrivate(name)) continue;
@@ -64,7 +83,7 @@ async function syncOverlay(home: string, spec: OverlaySpec): Promise<void> {
     const current = await lstat(link).catch(() => null);
     if (current) {
       if (!current.isSymbolicLink()) continue; // Created here by the CLI; leave it alone.
-      if ((await readlink(link)) === target) continue;
+      if ((await readlink(link)) === target || !(await ours(link))) continue;
       await unlink(link);
     }
     const targetStat = await stat(target).catch(() => null);
@@ -80,7 +99,7 @@ async function syncOverlay(home: string, spec: OverlaySpec): Promise<void> {
   for (const name of await readdir(home)) {
     const link = join(home, name);
     const current = await lstat(link).catch(() => null);
-    if (current?.isSymbolicLink() && !(await exists(link))) await unlink(link).catch(() => undefined);
+    if (current?.isSymbolicLink() && !(await exists(link)) && (await ours(link))) await unlink(link).catch(() => undefined);
   }
 }
 
@@ -110,6 +129,65 @@ export function removeHome(home: string): Promise<void> {
     await rm(home, { recursive: true, force: true });
   });
 }
+
+/**
+ * Moves a home's folder from `from` to `to`, which mustn't exist yet, then runs `commit` (saving
+ * where its account's home is now) while it still holds both homes' locks: a sync of `from` waiting
+ * meanwhile then finds its account gone from there and never makes the folder again. When `commit`
+ * fails the folder goes back. Onto another disk the folder is copied, links as they are, and `from`
+ * only deleted once `commit` worked.
+ */
+export function moveHome(from: string, to: string, commit: () => Promise<void>): Promise<void> {
+  return withHome(from, () =>
+    withHome(to, async () => {
+      const entry = await lstat(from).catch(() => null);
+      if (!entry?.isDirectory()) throw new Error(`${from} isn't a folder`);
+      if (await lstat(to).catch(() => null)) throw new Error(`${to} is already there`);
+      await mkdir(dirname(to), { recursive: true, mode: 0o700 });
+      const copied = await moveFolder(from, to);
+      try {
+        await commit();
+      } catch (error) {
+        if (copied) await rm(to, { recursive: true, force: true });
+        else await rename(to, from);
+        throw error;
+      }
+      if (copied) await removeTree(from);
+      for (const synced of [lastMcpSync, lastMcpKeys] as Map<string, unknown>[]) {
+        if (synced.has(from)) synced.set(to, synced.get(from));
+        synced.delete(from);
+      }
+      lastSync.delete(from);
+    }),
+  );
+}
+
+/** Renames `from` to `to`, or copies it there when that's another disk; says whether it copied. */
+async function moveFolder(from: string, to: string): Promise<boolean> {
+  try {
+    await rename(from, to);
+    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
+  }
+  try {
+    await cp(from, to, { recursive: true, verbatimSymlinks: true, preserveTimestamps: true, errorOnExist: true, force: false });
+  } catch (error) {
+    await rm(to, { recursive: true, force: true });
+    throw error;
+  }
+  return true;
+}
+
+/** Deletes a folder whose top level may link into main: the links go first, never followed. */
+async function removeTree(folder: string): Promise<void> {
+  for (const name of await readdir(folder).catch(() => [] as string[])) {
+    const path = join(folder, name);
+    if ((await lstat(path).catch(() => null))?.isSymbolicLink()) await unlink(path).catch(() => undefined);
+  }
+  await rm(folder, { recursive: true, force: true });
+}
+
 
 /** Atomic-write leftovers and scratch files: never worth sharing. */
 function isTemporary(name: string): boolean {
@@ -427,6 +505,7 @@ export interface PiAccount {
 function piPrivate(name: string): boolean {
   return (
     name === PI_ACCOUNT_FILE ||
+    name === "zerosub.env" ||
     name.startsWith("auth.json") ||
     name.startsWith("models.json") ||
     name.startsWith("models-store.json") ||
@@ -553,6 +632,43 @@ async function syncPiFiles(home: string): Promise<void> {
   await writeIfChanged(join(home, "models.json"), piModels(mainModels, account.baseUrl));
 }
 
+/** Main's `settings.json` files that didn't parse, so each is only logged once. */
+const unreadablePiSettings = new Set<string>();
+
+/**
+ * The account's `settings.json`. Without a proxy of its own it's a link to the CLI login's, like
+ * the other shared entries. With one it's the CLI login's settings with `httpProxy` set to the
+ * proxy, so Pi started on the account's folder anywhere else (`PI_CODING_AGENT_DIR=<folder> pi` in
+ * a terminal, say) goes through it too, as long as its environment names no proxy (Pi only fills
+ * the proxy variables in from `httpProxy` when they're unset). It's remade from the CLI login's at
+ * every sync, so what Pi writes to it there doesn't last. A home ZeroSub made is the only kind a
+ * Pi account has, so the generated file is replaced by the link again once the proxy goes.
+ */
+async function syncPiSettings(home: string, proxy: string | null): Promise<void> {
+  const target = join(home, "settings.json");
+  const current = await lstat(target).catch(() => null);
+  const mainSettings = join(mainPiDir(), "settings.json");
+  if (proxy) {
+    let main: unknown;
+    try {
+      main = await readJson(mainSettings);
+      unreadablePiSettings.delete(mainSettings);
+    } catch {
+      if (!unreadablePiSettings.has(mainSettings)) console.warn(`[ZeroSub] ${mainSettings} isn't valid JSON; added Pi accounts with a proxy keep their settings as they were until it's fixed`);
+      unreadablePiSettings.add(mainSettings);
+      if (current?.isFile()) return;
+    }
+    // Written over the link, never through it: the CLI login's settings stay as they are.
+    await writeIfChanged(target, { ...(isObject(main) ? main : {}), httpProxy: proxy });
+    return;
+  }
+  if (!current?.isFile()) return;
+  const real = await realpath(mainSettings).catch(() => null);
+  if (!real) return; // Pi's own, while the CLI login has none to share.
+  await unlink(target);
+  await symlink(real, target);
+}
+
 /**
  * Brings an added Pi account's home in step with the CLI login's agent directory: shared entries
  * linked, `auth.json` and `models.json` made from it and the account's own settings. `wanted`, if
@@ -564,7 +680,10 @@ export function preparePiHome(home: string, force = false, wanted?: () => Promis
     if (wanted && !(await wanted())) return;
     const last = lastSync.get(home);
     if (!force && last && Date.now() - last < SYNC_TTL_MS) return;
-    await syncOverlay(home, { main: mainPiDir(), shareDirs: ["sessions"], isPrivate: piPrivate });
+    const { proxy } = await readPiAccount(home);
+    await syncPiSettings(home, proxy);
+    const isPrivate = (name: string) => piPrivate(name) || (proxy !== null && name === "settings.json");
+    await syncOverlay(home, { main: mainPiDir(), shareDirs: ["sessions"], isPrivate });
     await syncPiFiles(home);
     lastSync.set(home, Date.now());
   });
@@ -618,6 +737,7 @@ export function writePiAccountProxy(home: string, proxy: string | null, wanted?:
       }
     }
     await writePiAccount(home, { ...previous, proxy });
+    await syncPiSettings(home, proxy);
   });
 }
 
@@ -627,7 +747,7 @@ export function writePiAccountProxy(home: string, proxy: string | null, wanted?:
  * model or an override) that Pi's own `models.json` sends over plain http:// to another machine
  * (see `sentInTheClear`), for the provider or any of its models.
  */
-async function clearTextProviders(): Promise<string[]> {
+export async function clearTextProviders(): Promise<string[]> {
   const auth = (await readJsonObject(join(mainPiDir(), "auth.json"))) ?? {};
   const models = await readJsonObject(join(mainPiDir(), "models.json"));
   const providers = isObject(models?.providers) ? models.providers : {};

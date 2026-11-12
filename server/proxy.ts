@@ -1,7 +1,19 @@
+import { request as httpsRequest } from "node:https";
+import { connect as netConnect, type Socket } from "node:net";
+import { connect as tlsConnect } from "node:tls";
 import { HIDDEN } from "../shared/model";
 
 /** The order Node clients read them in (undici's `EnvHttpProxyAgent`, as Pi uses): the first one set wins. */
 export const PROXY_KEYS = ["https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"] as const;
+
+/** The proxy an environment names, in the order Node clients read the variables in; null without one. */
+export function proxyFromEnv(env: Record<string, string | undefined>): string | null {
+  for (const key of PROXY_KEYS) {
+    const value = env[key]?.trim();
+    if (value) return value;
+  }
+  return null;
+}
 
 export const NO_PROXY_KEYS = ["no_proxy", "NO_PROXY"] as const;
 
@@ -118,4 +130,132 @@ export function maskProxy(proxy: string): string {
   const prefix = scheme ? `${url.protocol}//` : "";
   const credentials = url.password ? `${url.username}:${HIDDEN}` : HIDDEN;
   return `${prefix}${credentials}@${url.host}`;
+}
+
+/**
+ * Opens a raw tunnel to `host:port` through an HTTP(S) proxy with CONNECT. Anything other than an
+ * http:// or https:// proxy is refused rather than skipped, so a misconfigured proxy never turns
+ * into a direct connection.
+ */
+export function openTunnel(proxy: string, host: string, port: number, signal?: AbortSignal): Promise<Socket> {
+  let url: URL;
+  try {
+    url = new URL(proxy);
+  } catch {
+    return Promise.reject(new Error("The account's proxy isn't a valid URL"));
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    return Promise.reject(new Error(`Proxy scheme ${url.protocol} isn't supported here; use an http:// or https:// proxy`));
+  }
+  const proxyPort = Number(url.port) || (url.protocol === "https:" ? 443 : 80);
+  const authority = `${host}:${port}`;
+  const lines = [`CONNECT ${authority} HTTP/1.1`, `Host: ${authority}`];
+  if (url.username || url.password) {
+    const credentials = `${decodeURIComponent(url.username)}:${decodeURIComponent(url.password)}`;
+    lines.push(`Proxy-Authorization: Basic ${Buffer.from(credentials).toString("base64")}`);
+  }
+
+  return new Promise((resolve, reject) => {
+    const socket: Socket =
+      url.protocol === "https:"
+        ? tlsConnect({ host: url.hostname, port: proxyPort, servername: url.hostname })
+        : netConnect({ host: url.hostname, port: proxyPort });
+    let head = Buffer.alloc(0);
+    const fail = (error: Error) => {
+      cleanup();
+      socket.destroy();
+      reject(error);
+    };
+    const onAbort = () => fail(signal?.reason instanceof Error ? signal.reason : new Error("Request aborted"));
+    const onError = (error: Error) => fail(new Error(`Proxy connection failed: ${error.message}`));
+    const onClose = () => fail(new Error("The proxy closed the connection before the tunnel opened"));
+    const onData = (chunk: Buffer) => {
+      head = Buffer.concat([head, chunk]);
+      const end = head.indexOf("\r\n\r\n");
+      if (end === -1) {
+        if (head.length > 16 * 1024) fail(new Error("The proxy sent an oversized reply"));
+        return;
+      }
+      const status = /^HTTP\/1\.[01] (\d{3})/.exec(head.subarray(0, end).toString("latin1"));
+      if (status?.[1] !== "200") {
+        fail(new Error(`The proxy refused the tunnel (${status ? `HTTP ${status[1]}` : "unreadable reply"})`));
+        return;
+      }
+      cleanup();
+      const rest = head.subarray(end + 4);
+      if (rest.length > 0) socket.unshift(rest);
+      resolve(socket);
+    };
+    const cleanup = () => {
+      socket.off("data", onData);
+      socket.off("error", onError);
+      socket.off("close", onClose);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    if (signal?.aborted) return onAbort();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    socket.on("data", onData);
+    socket.on("error", onError);
+    socket.on("close", onClose);
+    socket.once(url.protocol === "https:" ? "secureConnect" : "connect", () => socket.write(`${lines.join("\r\n")}\r\n\r\n`));
+  });
+}
+
+interface ProxiedInit {
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+  signal?: AbortSignal;
+}
+
+/**
+ * `fetch`, but through `proxy` when one is set, the way the account's CLI would reach the same
+ * host for that account. Only https:// targets are supported; that's all ZeroSub calls.
+ */
+export async function proxiedFetch(proxy: string | null, target: string, init: ProxiedInit = {}): Promise<Response> {
+  if (!proxy) return fetch(target, init);
+  const url = new URL(target);
+  if (url.protocol !== "https:") throw new Error("Only https:// requests go through the account's proxy");
+  const port = Number(url.port) || 443;
+  const tunnel = await openTunnel(proxy, url.hostname, port, init.signal);
+
+  return new Promise<Response>((resolve, reject) => {
+    const headers: Record<string, string> = { ...init.headers };
+    if (init.body !== undefined) headers["Content-Length"] = String(Buffer.byteLength(init.body));
+    const req = httpsRequest(
+      {
+        host: url.hostname,
+        port,
+        path: `${url.pathname}${url.search}`,
+        method: init.method ?? "GET",
+        headers,
+        // No agent: Node only uses `createConnection` without one. `agent: false` would make a fresh
+        // agent, which connects straight to the host and leaves the tunnel unused.
+        servername: url.hostname,
+        createConnection: () => tlsConnect({ socket: tunnel, servername: url.hostname }),
+        signal: init.signal,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("error", reject);
+        res.on("end", () => {
+          const responseHeaders = new Headers();
+          for (const [name, value] of Object.entries(res.headers)) {
+            if (Array.isArray(value)) for (const entry of value) responseHeaders.append(name, entry);
+            else if (value !== undefined) responseHeaders.set(name, value);
+          }
+          const status = res.statusCode ?? 502;
+          const empty = status === 204 || status === 304;
+          resolve(new Response(empty ? null : new Uint8Array(Buffer.concat(chunks)), { status, headers: responseHeaders }));
+        });
+      },
+    );
+    req.on("error", (error) => {
+      tunnel.destroy();
+      reject(error);
+    });
+    if (init.body !== undefined) req.write(init.body);
+    req.end();
+  });
 }

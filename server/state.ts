@@ -101,6 +101,16 @@ export const CleanupSchema = z.object({
 });
 export type Cleanup = z.infer<typeof CleanupSchema>;
 
+export const PiHomesSchema = z.object({
+  dir: z.string().nullable().default(null),
+  from: z.array(z.string()).default([]),
+});
+export type PiHomes = z.infer<typeof PiHomesSchema>;
+
+/** A home being moved, written before anything moves, so a move cut short is finished from here. */
+export const MoveSchema = z.object({ from: z.string(), to: z.string(), at: z.string() });
+export type Move = z.infer<typeof MoveSchema>;
+
 export const StoredStateSchema = z.object({
   version: z.literal(1).default(1),
   accounts: z.array(StoredAccountSchema).default([]),
@@ -128,6 +138,10 @@ export const StoredStateSchema = z.object({
       pi: NextAgentPickSchema.nullable().default(null),
     })
     .default({ claude: null, codex: null, pi: null }),
+  /** Where added Pi accounts' homes are kept: `dir` (null: `~/.pi-config`), and folders picked before whose accounts still move to it. */
+  piHomes: PiHomesSchema.default({ dir: null, from: [] }),
+  /** Homes being moved, by account (see `Service.placeHomes`). */
+  moves: z.record(z.string(), MoveSchema).default({}),
 });
 export type StoredState = z.infer<typeof StoredStateSchema>;
 
@@ -174,6 +188,8 @@ export function salvageState(raw: unknown): { state: StoredState; dropped: boole
       continuations: records(ContinuationChainSchema, source.continuations),
       cleanup: records(CleanupSchema, source.cleanup),
       nextAgent: { claude: null, codex: null, pi: null },
+      piHomes: keep(PiHomesSchema, source.piHomes ?? {}) ?? { dir: null, from: [] },
+      moves: records(MoveSchema, source.moves),
     },
     dropped: true,
   };

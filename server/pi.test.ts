@@ -1,7 +1,7 @@
-import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { applyEnv, type FamilyAdapter, type TurnEvent } from "./adapter";
 import { absentPi } from "./fakes.test-support";
 import { familiesFromConfig, type FamilyResolver } from "./families";
@@ -10,7 +10,7 @@ import { detectPiSignOut } from "./limits";
 import { PiAdapter, piSessionDir } from "./pi";
 import type { Reopener } from "./reopen";
 import { Service } from "./service";
-import { MAIN_ACCOUNT_ID, StateStore } from "./state";
+import { MAIN_ACCOUNT_ID, StateStore, findAccount } from "./state";
 
 const KEY = "sk-ant-api03-pppppppppppppppppppppppp-4242";
 /** What an added account's agents get in place of any Anthropic key or token from elsewhere. */
@@ -25,7 +25,7 @@ const BLANK_ANTHROPIC = {
   ANTHROPIC_SERVICE_ACCOUNT_ID: "",
   ANTHROPIC_WORKSPACE_ID: "",
 };
-const SAVED = ["PASEO_HOME", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID", "ANTHROPIC_IDENTITY_TOKEN_FILE", "ANTHROPIC_SERVICE_ACCOUNT_ID", "ANTHROPIC_WORKSPACE_ID", "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "NO_PROXY", "no_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] as const;
+const SAVED = ["PASEO_HOME", "ZEROSUB_PI_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID", "ANTHROPIC_IDENTITY_TOKEN_FILE", "ANTHROPIC_SERVICE_ACCOUNT_ID", "ANTHROPIC_WORKSPACE_ID", "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "NO_PROXY", "no_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] as const;
 
 let root: string;
 let main: string;
@@ -41,6 +41,8 @@ beforeEach(async () => {
   main = join(root, "pi-agent");
   process.env.PI_CODING_AGENT_DIR = main;
   process.env.PASEO_HOME = join(root, "paseo");
+  // Never ~/.pi-config: added accounts' folders and scripts are kept there.
+  process.env.ZEROSUB_PI_DIR = join(root, "pi-config");
   await mkdir(join(main, "sessions"), { recursive: true });
   await mkdir(join(main, "extensions"), { recursive: true });
   await writeFile(join(main, "settings.json"), JSON.stringify({ defaultProvider: "anthropic" }));
@@ -219,6 +221,7 @@ describe("PiAdapter", () => {
     expect(env).toEqual({ PI_CODING_AGENT_DIR: home, ...BLANK_ANTHROPIC });
     expect(await adapter.proxyState(home)).toEqual({
       own: null,
+      file: null,
       inherited: { proxy: "http://10.0.0.1:3128", from: expect.stringContaining("httpProxy in") },
     });
   });
@@ -252,15 +255,58 @@ describe("PiAdapter", () => {
     expect(await adapter.env(null)).toEqual({});
   });
 
-  it("keeps an added account's proxy in its own zerosub.json, and its settings linked to the CLI login's", async () => {
+  it("changes the CLI login's proxy in Pi's own settings only when asked to, and still adds nothing to its agents", async () => {
+    const adapter = new PiAdapter();
+    expect((await adapter.proxyState(null)).own).toBeNull();
+
+    await adapter.setProxy(null, "http://127.0.0.1:7890");
+    expect(JSON.parse(await readFile(join(main, "settings.json"), "utf8"))).toEqual({ defaultProvider: "anthropic", httpProxy: "http://127.0.0.1:7890" });
+    expect((await readdir(join(root, "paseo", "zerosub", "backups"))).filter((name) => name.startsWith("pi-settings-"))).toHaveLength(1);
+    expect(await adapter.proxyState(null)).toMatchObject({ own: "http://127.0.0.1:7890", file: expect.stringContaining("settings.json"), inherited: null });
+    // Pi reads httpProxy itself; the CLI login's agents start as Paseo starts them.
+    expect(await adapter.env(null, { cwd: "/work" })).toEqual({});
+
+    await adapter.setProxy(null, null);
+    expect(JSON.parse(await readFile(join(main, "settings.json"), "utf8"))).toEqual({ defaultProvider: "anthropic" });
+  });
+
+  it("writes a proxy password into the file Pi's settings link to, readable only by the user", async () => {
+    const real = join(root, "dotfiles", "pi-settings.json");
+    await mkdir(join(root, "dotfiles"));
+    await writeFile(real, JSON.stringify({ defaultProvider: "anthropic" }), { mode: 0o644 });
+    await rm(join(main, "settings.json"));
+    await symlink(real, join(main, "settings.json"));
+    const adapter = new PiAdapter();
+
+    await adapter.setProxy(null, "http://u:secret@127.0.0.1:7890");
+    expect((await lstat(join(main, "settings.json"))).isSymbolicLink()).toBe(true);
+    expect(JSON.parse(await readFile(real, "utf8")).httpProxy).toBe("http://u:secret@127.0.0.1:7890");
+    expect((await stat(real)).mode & 0o777).toBe(0o600);
+    const backups = join(root, "paseo", "zerosub", "backups");
+    for (const name of await readdir(backups)) expect((await stat(join(backups, name))).mode & 0o077).toBe(0);
+  });
+
+  it("gives an added account with a proxy its own settings with httpProxy, and the shared ones back without", async () => {
     const home = join(root, "paseo", "zerosub", "homes", "pi-bbbbbbbbbbbb");
     await writePiAccountApi(home, { key: KEY, baseUrl: null });
     await preparePiHome(home, true);
+    expect((await lstat(join(home, "settings.json"))).isSymbolicLink()).toBe(true);
+
     await writePiAccountProxy(home, "http://u:p@127.0.0.1:7890");
-    await preparePiHome(home, true);
-    expect(await readlink(join(home, "settings.json"))).toBe(await realpath(join(main, "settings.json")));
+    expect((await lstat(join(home, "settings.json"))).isSymbolicLink()).toBe(false);
+    expect(JSON.parse(await readFile(join(home, "settings.json"), "utf8"))).toEqual({ defaultProvider: "anthropic", httpProxy: "http://u:p@127.0.0.1:7890" });
+    expect((await stat(join(home, "settings.json"))).mode & 0o777).toBe(0o600);
+    // The CLI login's own settings are never written through the link.
     expect(JSON.parse(await readFile(join(main, "settings.json"), "utf8"))).toEqual({ defaultProvider: "anthropic" });
     expect((await readPiAccount(home)).proxy).toBe("http://u:p@127.0.0.1:7890");
+
+    // Main's settings changing reach it at the next sync, and a sync doesn't link it back.
+    await writeFile(join(main, "settings.json"), JSON.stringify({ defaultProvider: "openai" }));
+    await preparePiHome(home, true);
+    expect(JSON.parse(await readFile(join(home, "settings.json"), "utf8"))).toEqual({ defaultProvider: "openai", httpProxy: "http://u:p@127.0.0.1:7890" });
+
+    await writePiAccountProxy(home, null);
+    expect(await readlink(join(home, "settings.json"))).toBe(await realpath(join(main, "settings.json")));
   });
 
   it("counts an added account signed in while it has a key, and the CLI login always", async () => {
@@ -269,6 +315,44 @@ describe("PiAdapter", () => {
     expect((await adapter.identity(join(root, "empty"))).signedIn).toBe(false);
     await writePiAccountApi(join(root, "home"), { key: KEY, baseUrl: null });
     expect((await adapter.identity(join(root, "home"))).signedIn).toBe(true);
+  });
+});
+
+describe("Pi's own login's key", () => {
+  it("is set in Pi's own files only when asked to, keeping everything else and a private copy of each as it was", async () => {
+    await writeFile(join(main, "models.json"), JSON.stringify({ providers: { ollama: { baseUrl: "http://localhost" } } }));
+    const adapter = new PiAdapter();
+    expect(await adapter.api(null)).toMatchObject({ keyHint: "", baseUrl: null });
+
+    await adapter.setApi(null, { key: KEY, baseUrl: "https://gw.example.com/" });
+    const auth = JSON.parse(await readFile(join(main, "auth.json"), "utf8"));
+    expect(auth.anthropic).toEqual({ type: "api_key", key: KEY });
+    expect(auth.openrouter).toEqual({ type: "api_key", key: "sk-or" });
+    expect(auth.openai).toMatchObject({ type: "oauth" });
+    expect((await stat(join(main, "auth.json"))).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(await readFile(join(main, "models.json"), "utf8"))).toEqual({
+      providers: { ollama: { baseUrl: "http://localhost" }, anthropic: { baseUrl: "https://gw.example.com" } },
+    });
+    expect(await adapter.api(null)).toMatchObject({ keyHint: "4242", baseUrl: "https://gw.example.com" });
+    const backups = join(root, "paseo", "zerosub", "backups");
+    const names = await readdir(backups);
+    expect(names.filter((name) => name.startsWith("pi-auth-"))).toHaveLength(1);
+    expect(names.filter((name) => name.startsWith("pi-models-"))).toHaveLength(1);
+    for (const name of names) expect((await stat(join(backups, name))).mode & 0o077).toBe(0);
+
+    // A kept key only goes where it went before; back to Anthropic's own API with it typed again.
+    await expect(adapter.setApi(null, { key: null, baseUrl: null })).rejects.toThrow(/Enter the key again/);
+    await adapter.setApi(null, { key: KEY, baseUrl: null });
+    expect(JSON.parse(await readFile(join(main, "models.json"), "utf8"))).toEqual({ providers: { ollama: { baseUrl: "http://localhost" } } });
+  });
+
+  it("waits for Pi's own lock on its sign-ins", async () => {
+    await mkdir(join(main, "auth.json.lock"));
+    await expect(new PiAdapter().setApi(null, { key: KEY, baseUrl: null })).rejects.toThrow(/Pi is writing/);
+  });
+
+  it("never checks the CLI login's address", async () => {
+    expect(await new PiAdapter().egress(null)).toBeNull();
   });
 });
 
@@ -303,54 +387,101 @@ describe("Pi's provider", () => {
 });
 
 class InstalledPi extends PiAdapter {
+  /** Homes the process scan says Pi runs on. */
+  readonly inUse = new Set<string>();
+  /** Homes whose address was checked; null is the CLI login. */
+  readonly egressChecks: Array<string | null> = [];
+  /** Runs at each process scan, before it answers. */
+  onScan: ((homes: readonly string[]) => Promise<void>) | null = null;
   override async available() {
     return { ok: true, detail: null };
   }
+  override async egress(home: string | null) {
+    this.egressChecks.push(home);
+    return null;
+  }
+  // Tests never list the machine's processes.
+  override async homesInUse(homes: readonly string[]) {
+    await this.onScan?.(homes);
+    return new Set(homes.filter((home) => this.inUse.has(home)));
+  }
 }
+
+function piService(pi: PiAdapter, store: StateStore, reopener: Partial<Reopener> = { locate: async () => null }): Service {
+  return new Service(
+    { claude: noClaude("claude"), codex: noClaude("codex"), pi },
+    store,
+    { resolve: async () => ({ pi: "pi" as const }) } as unknown as FamilyResolver,
+    reopener as Reopener,
+  );
+}
+
+const open = (service: Service, paseo: unknown, reason = "create") =>
+  service.onSessionOpen({ agentId: "agent-1", provider: "pi", cwd: "/work", reason, purpose: "interactive", env: {} } as never, { paseo } as never);
 
 function noClaude(family: "claude" | "codex"): FamilyAdapter {
   return { ...absentPi(), family } as FamilyAdapter;
 }
 
 describe("Pi accounts in the service", () => {
-  it("adds a Pi API account with its proxy, and routes a Pi agent on it to its own directory", async () => {
+  it("adds a Pi API account with its proxy, keeps it beside its script, and routes a Pi agent on it to its own directory", async () => {
     const store = new StateStore(join(root, "state.json"));
-    const service = new Service(
-      { claude: noClaude("claude"), codex: noClaude("codex"), pi: new InstalledPi() },
-      store,
-      { resolve: async () => ({ pi: "pi" as const }) } as unknown as FamilyResolver,
-      { locate: async () => null } as unknown as Reopener,
-    );
+    const pi = new InstalledPi();
+    const service = piService(pi, store);
     const paseo = { agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false } }) } };
     service.attach(paseo as never);
     await service.start();
     try {
       expect((await store.read()).accounts.map((account) => [account.id, account.label])).toEqual([[MAIN_ACCOUNT_ID.pi, "Pi (CLI login)"]]);
       await expect(service.startLogin("pi", "browser")).rejects.toThrow(/API key/);
+      // With no account added, nothing is checked and no script is written.
+      await (service as unknown as { tick(): Promise<void> }).tick();
+      expect(pi.egressChecks).toEqual([]);
+      await expect(stat(join(root, "pi-config"))).rejects.toThrow();
 
       const id = await service.addApiAccount({ label: "Work key", key: KEY, proxy: "http://127.0.0.1:7890" });
       expect(id).toMatch(/^pi-[0-9a-f]{12}$/);
-      const home = join(root, "paseo", "zerosub", "homes", id);
+      // Set up in homes/, then kept beside its script in ~/.pi-config (ZEROSUB_PI_DIR here).
+      const home = join(root, "pi-config", "pi-work-key");
+      await expect(stat(join(root, "paseo", "zerosub", "homes", id))).rejects.toThrow();
       expect(JSON.parse(await readFile(join(home, "auth.json"), "utf8")).anthropic).toEqual({ type: "api_key", key: KEY });
+      const script = await readFile(join(root, "pi-config", "pi-work-key.sh"), "utf8");
+      expect(script).toContain(`export PI_CODING_AGENT_DIR='${home}'`);
+      expect(script).toContain('. "$PI_CODING_AGENT_DIR/zerosub.env"');
+      expect(script).toContain('exec pi "$@"');
+      const launchEnv = await readFile(join(home, "zerosub.env"), "utf8");
+      expect(launchEnv).toContain("export https_proxy='http://127.0.0.1:7890'");
+      expect(launchEnv).toContain("export NO_PROXY='localhost,127.0.0.1,::1'");
+      expect((await stat(join(home, "zerosub.env"))).mode & 0o777).toBe(0o600);
       expect(JSON.stringify(await store.read())).not.toContain(KEY);
-      expect(await store.read()).toMatchObject({ cleanup: {} });
+      expect(await store.read()).toMatchObject({ cleanup: {}, moves: {} });
       expect((await store.read()).accounts.find((account) => account.id === id)).toMatchObject({ family: "pi", auth: "api", home, label: "Work key" });
       await expect(service.addApiAccount({ label: "Again", key: KEY })).rejects.toThrow(/already added/);
+      // Only the added account's address is checked, never the CLI login's.
+      await vi.waitFor(() => expect(pi.egressChecks).toContain(home));
+      expect(pi.egressChecks).not.toContain(null);
 
       const view = await service.view(paseo as never);
       const card = view.accounts.find((account) => account.id === id);
-      expect(card).toMatchObject({ proxy: "http://127.0.0.1:7890", proxyEditable: true, apiEditable: true, api: { keyHint: "4242", baseUrl: null } });
-      // The CLI login is Pi's own, which ZeroSub leaves alone.
-      expect(view.accounts.find((account) => account.id === MAIN_ACCOUNT_ID.pi)).toMatchObject({ apiEditable: false, proxyEditable: false, api: null });
-      await expect(service.setProxy(MAIN_ACCOUNT_ID.pi, "http://127.0.0.1:7890")).rejects.toThrow(/added Pi accounts/);
-      await expect(service.updateApiAccount(MAIN_ACCOUNT_ID.pi, { key: KEY })).rejects.toThrow(/subscription/);
+      expect(card).toMatchObject({
+        proxy: "http://127.0.0.1:7890",
+        proxyEditable: true,
+        apiEditable: true,
+        api: { keyHint: "4242", baseUrl: null },
+        launcher: "pi-work-key.sh",
+        externalHome: true,
+        moving: null,
+      });
+      expect(view.piLaunchers).toBe(join(root, "pi-config"));
+      // Pi's own login shows the Anthropic key it keeps, and can change it from its card.
+      expect(view.accounts.find((account) => account.id === MAIN_ACCOUNT_ID.pi)).toMatchObject({ apiEditable: true, proxyEditable: true, api: { keyHint: "" }, egress: null });
       expect(view.warnings).toEqual(expect.not.arrayContaining([expect.stringContaining("Pi isn't installed")]));
+      // Its files are still as they were: they change only when edited there.
+      expect(JSON.parse(await readFile(join(main, "settings.json"), "utf8"))).toEqual({ defaultProvider: "anthropic" });
+      expect(JSON.parse(await readFile(join(main, "auth.json"), "utf8")).anthropic).toEqual({ type: "api_key", key: "sk-main" });
 
       await service.setDefault(paseo as never, id);
-      const opened = await service.onSessionOpen(
-        { agentId: "agent-1", provider: "pi", cwd: "/work", reason: "create", purpose: "interactive", env: {} } as never,
-        { paseo } as never,
-      );
+      const opened = await open(service, paseo);
       expect(opened?.env).toMatchObject({
         PI_CODING_AGENT_DIR: home,
         PI_CODING_AGENT_SESSION_DIR: join(main, "sessions", "--work--"),
@@ -358,33 +489,163 @@ describe("Pi accounts in the service", () => {
       });
 
       await service.setProxy(id, "");
-      const plain = await service.onSessionOpen({ agentId: "agent-1", provider: "pi", reason: "refresh", purpose: "interactive", env: {} } as never, { paseo } as never);
+      const plain = await open(service, paseo, "refresh");
       expect(plain?.env.HTTPS_PROXY).toBeUndefined();
+      expect(await readFile(join(home, "zerosub.env"), "utf8")).not.toContain("export");
 
-      // Pi's own files are never written.
-      expect(JSON.parse(await readFile(join(main, "settings.json"), "utf8"))).toEqual({ defaultProvider: "anthropic" });
-      expect(JSON.parse(await readFile(join(main, "auth.json"), "utf8")).anthropic).toEqual({ type: "api_key", key: "sk-main" });
-      await expect(stat(join(main, "models.json"))).rejects.toThrow();
-
-      // Removing it puts its home on the cleanup list, and the cleanup pass deletes it.
+      // Kept outside homes/, removing it only unregisters it: its folder, key and script stay.
       await service.remove(paseo as never, id);
       expect((await store.read()).accounts.some((account) => account.id === id)).toBe(false);
-      await service.cleanUpHomes(paseo as never);
-      await expect(stat(home)).rejects.toThrow();
       expect((await store.read()).cleanup).toEqual({});
+      expect((await stat(join(home, "zerosub.json"))).isFile()).toBe(true);
+      expect(await readFile(join(root, "pi-config", "pi-work-key.sh"), "utf8")).toContain("# No longer managed by ZeroSub");
+
+      // And it comes back from its folder, key, proxy and script as they were.
+      await expect(service.importPiAccount(join(root, "nowhere"))).rejects.toThrow(/no folder/);
+      await expect(service.importPiAccount(main)).rejects.toThrow(/isn't a Pi account's folder/);
+      const back = await service.importPiAccount(home);
+      expect((await store.read()).accounts.find((account) => account.id === back)).toMatchObject({ family: "pi", auth: "api", home, label: "pi-work-key" });
+      await expect(service.importPiAccount(home)).rejects.toThrow(/already added/);
+      expect(await readFile(join(root, "pi-config", "pi-work-key.sh"), "utf8")).toContain("# Generated by ZeroSub");
     } finally {
       await service.stop();
     }
   });
 
+  it("moves a home only once nothing runs on it, and never holds a session up meanwhile", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const store = new StateStore(join(root, "state.json"));
+    const pi = new InstalledPi();
+    const service = piService(pi, store);
+    const paseo = { agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false } }) } };
+    service.attach(paseo as never);
+    try {
+      await service.start();
+      // A terminal runs Pi on every home in homes/, so a new account stays there for now.
+      pi.inUse.add("*");
+      const scan = pi.homesInUse.bind(pi);
+      pi.homesInUse = async (homes) => (pi.inUse.has("*") ? new Set(homes.filter((home) => home.includes("/homes/"))) : scan(homes));
+      const id = await service.addApiAccount({ label: "Work key", key: KEY });
+      const from = join(root, "paseo", "zerosub", "homes", id);
+      const to = join(root, "pi-config", "pi-work-key");
+      expect(findAccount(await store.read(), id)?.home).toBe(from);
+      let card = (await service.view(paseo as never)).accounts.find((account) => account.id === id);
+      expect(card?.moving).toMatchObject({ to: expect.stringContaining("pi-config"), waiting: expect.stringContaining("Pi runs on it"), error: null });
+
+      // A session opens on it straight away, where it is.
+      await service.setDefault(paseo as never, id);
+      expect((await open(service, paseo))?.env.PI_CODING_AGENT_DIR).toBe(from);
+
+      // Once Pi stops there, it still waits for the agent that has just started on it.
+      pi.inUse.clear();
+      await service.placeHomes();
+      expect(findAccount(await store.read(), id)?.home).toBe(from);
+      card = (await service.view(paseo as never)).accounts.find((account) => account.id === id);
+      expect(card?.moving?.waiting).toMatch(/just started/);
+
+      vi.setSystemTime(Date.now() + 31_000);
+      await service.placeHomes();
+      expect(findAccount(await store.read(), id)?.home).toBe(to);
+      await expect(stat(from)).rejects.toThrow();
+      expect(JSON.parse(await readFile(join(to, "auth.json"), "utf8")).anthropic).toEqual({ type: "api_key", key: KEY });
+      expect(await store.read()).toMatchObject({ moves: {} });
+      expect((await open(service, paseo, "refresh"))?.env.PI_CODING_AGENT_DIR).toBe(to);
+    } finally {
+      vi.useRealTimers();
+      await service.stop();
+    }
+  });
+
+  it("gives way, folder and all, to a session routed to the home while it was moving", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const store = new StateStore(join(root, "state.json"));
+    const pi = new InstalledPi();
+    const service = piService(pi, store);
+    const paseo = { agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false } }) } };
+    service.attach(paseo as never);
+    try {
+      await service.start();
+      pi.inUse.add("held");
+      const scan = pi.homesInUse.bind(pi);
+      pi.homesInUse = async (homes) => (pi.inUse.has("held") ? new Set(homes) : scan(homes));
+      const id = await service.addApiAccount({ label: "Work key", key: KEY });
+      await service.setDefault(paseo as never, id);
+      const from = join(root, "paseo", "zerosub", "homes", id);
+      const to = join(root, "pi-config", "pi-work-key");
+      pi.inUse.clear();
+      vi.setSystemTime(Date.now() + 31_000);
+
+      // The scan made once the folder is at its new place: a session opens on the account just then.
+      let routed: string | undefined;
+      pi.onScan = async () => {
+        if (!(await stat(to).catch(() => null)) || routed) return;
+        // It's handed out at once, without waiting for the move.
+        routed = (await open(service, paseo))?.env.PI_CODING_AGENT_DIR as string;
+      };
+      await service.placeHomes();
+      pi.onScan = null;
+
+      expect(routed).toBe(from);
+      expect(findAccount(await store.read(), id)?.home).toBe(from);
+      expect((await stat(join(from, "zerosub.json"))).isFile()).toBe(true);
+      await expect(stat(to)).rejects.toThrow();
+      expect(await store.read()).toMatchObject({ moves: {} });
+      const card = (await service.view(paseo as never)).accounts.find((account) => account.id === id);
+      expect(card?.moving?.waiting).toMatch(/just started/);
+    } finally {
+      vi.useRealTimers();
+      await service.stop();
+    }
+  });
+
+  it("finishes a move a restart cut short after the folder moved, and undoes one cut short before", async () => {
+    const store = new StateStore(join(root, "state.json"));
+    const pi = new InstalledPi();
+    pi.inUse.add("held");
+    const scan = pi.homesInUse.bind(pi);
+    pi.homesInUse = async (homes) => (pi.inUse.has("held") ? new Set(homes) : scan(homes));
+    const first = piService(pi, store);
+    const paseo = { agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false } }) } };
+    first.attach(paseo as never);
+    await first.start();
+    const moved = await first.addApiAccount({ label: "Moved", key: KEY });
+    const stayed = await first.addApiAccount({ label: "Stayed", key: `${KEY}-2` });
+    await first.stop();
+    const homes = join(root, "paseo", "zerosub", "homes");
+    const movedTo = join(root, "pi-config", "moved");
+    // Stopped after the folder was renamed but before the account's new home was saved, and stopped
+    // before the other's folder moved at all.
+    await mkdir(join(root, "pi-config"), { recursive: true });
+    await rename(join(homes, moved), movedTo);
+    const at = new Date().toISOString();
+    await store.update((draft) => {
+      draft.moves[moved] = { from: join(homes, moved), to: movedTo, at };
+      draft.moves[stayed] = { from: join(homes, stayed), to: join(root, "pi-config", "stayed"), at };
+    });
+
+    const second = piService(pi, store);
+    second.attach(paseo as never);
+    try {
+      await second.start();
+      await second.placeHomes();
+      const state = await store.read();
+      expect(findAccount(state, moved)?.home).toBe(movedTo);
+      expect(findAccount(state, stayed)?.home).toBe(join(homes, stayed));
+      expect(state.moves).toEqual({});
+      expect(await readFile(join(root, "pi-config", "pi-moved.sh"), "utf8")).toContain(`export PI_CODING_AGENT_DIR='${movedTo}'`);
+      // Pi still runs on the one left behind, so it moves later.
+      expect((await second.view(paseo as never)).accounts.find((account) => account.id === stayed)?.moving?.waiting).toMatch(/Pi runs on it/);
+    } finally {
+      await second.stop();
+    }
+  });
+
   it("leaves an agent whose key was refused where it is, without moving it to the CLI login or continuing it", async () => {
     const store = new StateStore(join(root, "state.json"));
-    const service = new Service(
-      { claude: noClaude("claude"), codex: noClaude("codex"), pi: new InstalledPi() },
-      store,
-      { resolve: async () => ({ pi: "pi" as const }) } as unknown as FamilyResolver,
-      { locate: async () => "/usr/local/bin/paseo", reopen: async (agentId: string) => (reopened.push(agentId), { ok: true as const }) } as unknown as Reopener,
-    );
+    const service = piService(new InstalledPi(), store, {
+      locate: async () => "/usr/local/bin/paseo",
+      reopen: async (agentId: string) => (reopened.push(agentId), { ok: true as const }),
+    } as unknown as Reopener);
     const reopened: string[] = [];
     const sent: string[] = [];
     const created: unknown[] = [];
@@ -423,7 +684,7 @@ describe("Pi accounts in the service", () => {
       expect(reopened).toEqual([]);
       // Reopened, it stays on its account rather than going to the CLI login's bill.
       const again = await service.onSessionOpen({ agentId: "agent-1", provider: "pi", reason: "refresh", purpose: "interactive", env: {} } as never, { paseo } as never);
-      expect(again?.env.PI_CODING_AGENT_DIR).toBe(join(root, "paseo", "zerosub", "homes", id));
+      expect(again?.env.PI_CODING_AGENT_DIR).toBe(findAccount(await store.read(), id)?.home);
     } finally {
       await service.stop();
     }

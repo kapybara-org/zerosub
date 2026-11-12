@@ -17,7 +17,9 @@ import {
   setNextAgentAccount,
   setAccountEnabled,
   forkAgent,
+  importPiAccount,
   setAccountProxy,
+  setPiHomesDir,
   startLogin,
   submitLoginCode,
   updateApiAccount,
@@ -110,6 +112,8 @@ export default function contribute(server: PluginServerContext) {
     return { ok: true as const };
   });
   server.handle(setAccountProxy, async ({ accountId, proxy }) => ({ ok: true as const, proxy: await service.setProxy(accountId, proxy) }));
+  server.handle(setPiHomesDir, async ({ dir }) => ({ ok: true as const, ...(await service.setPiHomesDir(dir)) }));
+  server.handle(importPiAccount, async ({ path }) => ({ accountId: await service.importPiAccount(path) }));
 
   return async () => {
     stopSettings();

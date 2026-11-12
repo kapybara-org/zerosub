@@ -85,6 +85,12 @@ describe("account presentation", () => {
     proxy: null,
     proxyEditable: false,
     inheritedProxy: null,
+    proxyFile: null,
+    proxyFollowers: [],
+    launcher: null,
+    egress: null,
+    externalHome: false,
+    moving: null,
   };
 
   it("summarises the busiest window", () => {

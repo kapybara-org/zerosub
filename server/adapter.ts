@@ -74,6 +74,8 @@ export interface LoginHandle {
 export interface ProxyState {
   /** Its own proxy, or null when it uses whatever it inherits. */
   own: string | null;
+  /** The user's file its own proxy is kept in, where setting one changes it; null when that's ZeroSub's own. */
+  file: string | null;
   /** The proxy it goes through without one of its own, and where that's set; null when that's direct. */
   inherited: { proxy: string; from: string } | null;
 }
@@ -118,20 +120,29 @@ export interface FamilyAdapter {
   login(home: string | null, method: LoginMethod): Promise<LoginHandle>;
   logout(home: string): Promise<void>;
   /**
-   * The rest is only there for providers whose added accounts are API keys with a proxy each (Pi's),
-   * and only for those added accounts: the CLI's own login is left as it is.
-   * An account's key (reduced to a hint) and base URL.
+   * The rest is only there for providers whose added accounts are API keys with a proxy each (Pi's).
+   * An account's key (reduced to a hint) and base URL; `home === null` (the CLI login) only where
+   * `mainApi` says so.
    */
-  api?(home: string): Promise<ApiSummary | null>;
+  api?(home: string | null): Promise<ApiSummary | null>;
+  /** The CLI login's Anthropic key and base URL can be set here too. */
+  readonly mainApi?: boolean;
   /**
    * Stores an account's key (`null` keeps the current one) and base URL. `wanted`, if given, is asked
    * once nothing else works on the home; false throws and writes nothing.
    */
-  setApi?(home: string, config: { key: string | null; baseUrl: string | null }, wanted?: () => Promise<boolean>): Promise<void>;
-  /** Where an account's CLI gets its proxy. */
-  proxyState?(home: string): Promise<ProxyState>;
-  /** Sets (or clears, with `null`) an account's proxy, for sessions started afterwards. `wanted` as for `setApi`. */
-  setProxy?(home: string, proxy: string | null, wanted?: () => Promise<boolean>): Promise<void>;
+  setApi?(home: string | null, config: { key: string | null; baseUrl: string | null }, wanted?: () => Promise<boolean>): Promise<void>;
+  /** Where an account's CLI (`home === null`: the CLI's own login) gets its proxy. */
+  proxyState?(home: string | null): Promise<ProxyState>;
+  /** Sets (or clears, with `null`) an account's proxy, for processes started afterwards. `wanted` as for `setApi`. */
+  setProxy?(home: string | null, proxy: string | null, wanted?: () => Promise<boolean>): Promise<void>;
+  /** The address Anthropic sees the account's requests come from; null when they go somewhere else first. */
+  egress?(home: string | null): Promise<{ ip: string; country: string | null } | null>;
+  /**
+   * Which of `homes` a process of the provider's CLI runs on right now, so a home isn't moved under
+   * it (see `Service.placeHomes`). Providers that have it keep added accounts' homes outside `homes/`.
+   */
+  homesInUse?(homes: readonly string[]): Promise<Set<string>>;
   /** Looks for a subscription usage-limit failure in a finished turn. */
   detectLimit(event: TurnEvent): LimitHit | null;
   /** Looks for a turn that failed because the account's login is no longer valid. */
