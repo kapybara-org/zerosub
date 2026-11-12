@@ -512,6 +512,25 @@ describe("Pi accounts in the service", () => {
     }
   });
 
+  it("sets no new proxy on the CLI login while an added account without its own sends its key over plain http://", async () => {
+    const store = new StateStore(join(root, "state.json"));
+    const service = piService(new InstalledPi(), store);
+    const paseo = { agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false } }) } };
+    service.attach(paseo as never);
+    await service.start();
+    try {
+      const id = await service.addApiAccount({ label: "Gateway", key: KEY, baseUrl: "http://gw.example.com" });
+      await expect(service.setProxy(MAIN_ACCOUNT_ID.pi, "http://127.0.0.1:7890")).rejects.toThrow(/Gateway has no proxy of its own/);
+      expect(JSON.parse(await readFile(join(main, "settings.json"), "utf8"))).toEqual({ defaultProvider: "anthropic" });
+      // Once it's gone, nothing would send a key through the proxy in the clear.
+      await service.remove(paseo as never, id);
+      await service.setProxy(MAIN_ACCOUNT_ID.pi, "http://127.0.0.1:7890");
+      expect(JSON.parse(await readFile(join(main, "settings.json"), "utf8")).httpProxy).toBe("http://127.0.0.1:7890");
+    } finally {
+      await service.stop();
+    }
+  });
+
   it("moves a home only once nothing runs on it, and never holds a session up meanwhile", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const store = new StateStore(join(root, "state.json"));

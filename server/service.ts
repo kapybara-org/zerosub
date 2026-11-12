@@ -40,7 +40,7 @@ import { FamilyResolver } from "./families";
 import { sameAccountIdentity, withoutWorkspace } from "./account-identity";
 import { CodexContinuations } from "./continuations";
 import { CONTINUED_FROM_LABEL, continueInNewAgent, type Continuation } from "./handoff";
-import { isAccountHome, moveHome, normalizeBaseUrl, readPiAccount, removeHome } from "./homes";
+import { isAccountHome, moveHome, normalizeBaseUrl, readPiAccount, removeHome, sentInTheClear } from "./homes";
 import { launcherNames, piLauncherDir, writeLaunchers, type LauncherAccount } from "./launchers";
 import { Mutex } from "./json-file";
 import { turnRows } from "./limits";
@@ -2849,12 +2849,32 @@ export class Service {
       const main = account.kind === "main" && adapter.mainApi === true;
       if (!adapter.setProxy || !(main || (account.kind === "managed" && account.home))) throw new Error("A proxy can only be set for Pi accounts.");
       const proxy = input.trim() ? normalizeProxy(input) : null;
+      if (main && proxy && proxy !== (await adapter.proxyState?.(null))?.own) await this.refuseClearTextFollowers(account.family);
       await adapter.setProxy(main ? null : account.home, proxy, this.stillHas(account));
       return { account, proxy };
     });
     if (account.kind === "main") await this.followMainSettings(account.family);
     else void this.checkEgress(account);
     return proxy ? maskProxy(proxy) : null;
+  }
+
+  /**
+   * A new proxy on the CLI login is also every added account's without one of its own, so it's
+   * refused while one of those sends its key over plain http:// to another machine, as a new proxy
+   * on that account itself would be.
+   */
+  private async refuseClearTextFollowers(family: Family): Promise<void> {
+    const adapter = this.adapters[family];
+    for (const account of accountsOf(await this.store.read(), family)) {
+      if (account.kind !== "managed" || !account.home) continue;
+      if ((await adapter.proxyState?.(account.home))?.own) continue;
+      const { key, baseUrl } = await readPiAccount(account.home);
+      if (key && sentInTheClear(baseUrl)) {
+        throw new Error(
+          `${account.label} has no proxy of its own and sends its key over plain http:// to ${baseUrl}, so this proxy could read it. Give ${account.label} its key again with an https:// base URL, or a proxy of its own, first.`,
+        );
+      }
+    }
   }
 
   /**
