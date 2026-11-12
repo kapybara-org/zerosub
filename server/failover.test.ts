@@ -1014,6 +1014,58 @@ describe("changing the default account", () => {
     expect((await store.read()).sessions.working?.accountId).toBe(WORK);
   });
 
+  it("doesn't wait for background work when an agent is switched by hand or fails over at a limit", async () => {
+    // A dev server can run for hours: only moves nobody asked for wait for it.
+    const { service, store, paseo, context, reopened } = await setUpAgents(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
+        defaults: { claude: MAIN, codex: null },
+        sessions: { picked: session(MAIN), failing: session(MAIN) },
+      },
+      [
+        { id: "picked", status: "idle", backgroundWork: 1 },
+        { id: "failing", status: "idle", backgroundWork: 1 },
+      ],
+    );
+    await service.setAgentAccount(paseo, "picked", WORK);
+    expect(reopened).toEqual(["picked"]);
+    expect((await store.read()).sessions.picked?.accountId).toBe(WORK);
+
+    await service.onTurnEnded({ agent: { id: "failing", provider: "claude" }, turnId: null, outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never, context);
+    expect(reopened).toEqual(["picked", "failing"]);
+    expect((await store.read()).sessions.failing?.accountId).toBe(WORK);
+  });
+
+  it("says when each pending move happens", async () => {
+    const limited = await setUpAgents(
+      {
+        accounts: [{ ...account(MAIN, "marketing", "main"), limitedUntil: inFuture() }, account(WORK, "work", "managed")] as never,
+        defaults: { claude: WORK, codex: null },
+        sessions: { idle: session(MAIN), working: session(MAIN), busy: session(MAIN) },
+      },
+      [
+        { id: "idle", status: "idle" },
+        { id: "working", status: "idle", backgroundWork: 2 },
+        { id: "busy", status: "running", backgroundWork: 2 },
+      ],
+    );
+    // Off a limited account, alignment moves it once it's idle, its background work stops, or its turn ends.
+    const off = Object.fromEntries((await limited.service.view(limited.paseo)).agents.map((route) => [route.agentId, route.waiting]));
+    expect(off).toEqual({ idle: "idle", working: "background", busy: "turn" });
+
+    // Off an account that still works, nothing moves it unasked: it moves when its session next starts.
+    const working = await setUpAgents(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
+        defaults: { claude: MAIN, codex: null },
+        sessions: { picked: session(MAIN) },
+        bindings: { picked: { accountId: WORK, source: "user", at: openedAt } },
+      },
+      [{ id: "picked", status: "idle" }],
+    );
+    expect((await working.service.view(working.paseo)).agents).toEqual([expect.objectContaining({ agentId: "picked", pendingAccountId: MAIN, waiting: "restart" })]);
+  });
+
   it("moves an agent whose last turn failed when it's switched", async () => {
     // A failed turn leaves the agent in "error" with its session still open: its next message goes to
     // that session as it is, so only a reload moves it.

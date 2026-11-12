@@ -94,6 +94,7 @@ export function shortLabel(account: Pick<AccountView, "label">, max = 18): strin
 const MOVES_WHEN: Record<NonNullable<AgentRoute["waiting"]>, string> = {
   idle: "once it's idle",
   turn: "when its current turn ends",
+  background: "once the background work it left running stops",
   restart: "when its session next starts",
 };
 

@@ -188,9 +188,18 @@ function emptySummary(): ReopenSummary {
   return { reopened: [], deferred: [], failed: [], pending: [], continuedIn: null };
 }
 
-/** In a turn, or between turns with background work still running: a reload would cancel either. */
+/** In a turn (or starting one), which a reload would cancel. Every move waits for it. */
 function busy(agent: AgentInfo): boolean {
-  return agent.status === "running" || agent.status === "initializing" || agent.backgroundWork > 0;
+  return agent.status === "running" || agent.status === "initializing";
+}
+
+/**
+ * Between turns with background work still running (Paseo 0.16+: shells or monitors left after a
+ * turn), which a reload would also cancel. Only moves nobody asked for wait for it: a dev server can
+ * run for hours, so failover at a limit and switches the user makes go ahead.
+ */
+function hasBackgroundWork(agent: AgentInfo): boolean {
+  return agent.backgroundWork > 0;
 }
 
 function sameBinding(a: Binding | undefined, b: Binding | undefined): boolean {
@@ -1426,7 +1435,7 @@ export class Service {
       if (!this.switchGuard.allows(agentId, Date.now())) continue;
       const info = await agentInfo(paseo, agentId);
       // One the user is using right now is left for alignment to move once it's quiet.
-      if (!info || info.archived || !settled(info.status) || busy(info) || this.recentlyActive(info, Date.now())) continue;
+      if (!info || info.archived || !settled(info.status) || busy(info) || hasBackgroundWork(info) || this.recentlyActive(info, Date.now())) continue;
       // Left for its own failover, or alone when that can't be told.
       if ((await this.lastTurnHitLimit(paseo, agentId, family)) !== false) continue;
       const release = this.tryClaim(agentId);
@@ -1665,8 +1674,8 @@ export class Service {
    * Reopens an idle agent now, or defers a busy one until its turn ends. `settle` waits a moment for
    * an agent whose turn just ended to report idle, since nothing else would reopen it later. A reload
    * cancels a running turn, so the agent is looked at again right before it; a `background` move,
-   * which nobody asked for just now, then also waits for the turn of an agent that was in use a
-   * moment ago (alignment carries it out if no turn comes).
+   * which nobody asked for just now, then also waits for background work to stop and for the turn of
+   * an agent that was in use a moment ago (alignment carries it out once it's quiet).
    */
   private async reopenAgent(
     paseo: PaseoApi,
@@ -1710,7 +1719,7 @@ export class Service {
       return unchecked(error);
     }
     if (!latest || latest.archived || latest.status === "closed") return { outcome: "closed" };
-    if (busy(latest) || (background && this.recentlyActive(latest, Date.now()))) return this.defer(agentId, row);
+    if (busy(latest) || (background && (hasBackgroundWork(latest) || this.recentlyActive(latest, Date.now())))) return this.defer(agentId, row);
     const reload: Reload = { opens: 0 };
     this.reloads.set(agentId, reload);
     let result: Awaited<ReturnType<Reopener["reopen"]>>;
@@ -1860,8 +1869,8 @@ export class Service {
    * session that opened before routing answered. Also carries out a switch that was waiting for a
    * turn that never came. A reload cancels what the agent is doing, so one whose account still works
    * isn't moved unattended: the account button shows the move still to come, and it happens when the
-   * session next opens. Idle agents move now; busy ones (in a turn, or with background work still
-   * running) after it, and ones the user was just using once they've been quiet a while. A move that
+   * session next opens. Idle agents move now; busy ones after their turn, ones with background work
+   * still running once it stops, and ones the user was just using once they've been quiet a while. A move that
    * doesn't land isn't tried again for a while.
    */
   async alignSessions(paseo: PaseoApi): Promise<ReopenSummary> {
@@ -1891,9 +1900,7 @@ export class Service {
         // A reload cancels what the agent is doing, so nobody having asked, it only leaves an account
         // it can't work on. One whose account still works moves when its session next opens. A
         // ChatGPT thread with history can't work anywhere but the account holding it (see `reopenAgent`).
-        const reason = this.driftReason(state, agentId, current, target, now);
-        const stranded = !this.adapters[family].portable && agent.hasHistory;
-        if (!stranded && (reason === "manual" || reason === "default")) continue;
+        if (!this.movesUnattended(state, agent, family, current, target, now)) continue;
         const tried = this.alignedAt.get(agentId);
         if (tried?.accountId === target && now - tried.at < ALIGN_RETRY_MS) continue;
         if (!this.switchGuard.allows(agentId, now)) continue;
@@ -1912,6 +1919,37 @@ export class Service {
     } finally {
       this.aligning = false;
     }
+  }
+
+  /**
+   * When an agent whose session runs on `current` moves to `target`: after its turn, once its
+   * background work stops, once it's idle (alignment), or only when its session next starts.
+   */
+  private movesWhen(
+    state: StoredState,
+    agent: AgentInfo,
+    family: Family,
+    current: string,
+    target: string,
+    canReopen: boolean,
+    now: number,
+  ): NonNullable<AgentRoute["waiting"]> {
+    if (!canReopen || this.failedMoves.get(agent.id) === target) return "restart";
+    if (busy(agent)) return "turn";
+    const deferred = this.deferred.has(agent.id);
+    if (!deferred && !this.movesUnattended(state, agent, family, current, target, now)) return "restart";
+    if (hasBackgroundWork(agent)) return "background";
+    return deferred ? "turn" : "idle";
+  }
+
+  /**
+   * Whether alignment moves the agent by itself: only off an account it can't work on, or a ChatGPT
+   * thread with history away from the account holding it.
+   */
+  private movesUnattended(state: StoredState, agent: AgentInfo, family: Family, current: string, target: string, now: number): boolean {
+    const reason = this.driftReason(state, agent.id, current, target, now);
+    const stranded = !this.adapters[family].portable && agent.hasHistory;
+    return stranded || (reason !== "manual" && reason !== "default");
   }
 
   /** Why an agent's session no longer runs on the account it's routed to, for its timeline note. */
@@ -2068,13 +2106,7 @@ export class Service {
             ? "weekly_reset"
             : undefined,
         pendingAccountId: pending,
-        waiting: !pending
-          ? null
-          : !canReopen || this.failedMoves.get(agent.id) === accountId
-            ? "restart"
-            : this.deferred.has(agent.id) || busy(agent)
-              ? "turn"
-              : "idle",
+        waiting: !pending ? null : this.movesWhen(state, agent, family, pending, accountId, canReopen, now),
         movable: this.adapters[family].portable || !agent.hasHistory,
       });
     }

@@ -100,10 +100,11 @@ export const AgentRouteSchema = z.object({
   pendingAccountId: z.string().nullable(),
   /**
    * While `pendingAccountId` is set, when the session moves: `idle` once the agent is idle (within
-   * half a minute), `turn` when its current turn ends, `restart` when its session next starts
-   * (reloading it didn't work, or Paseo's CLI isn't there to do it).
+   * half a minute), `turn` when its current turn ends, `background` once background work it left
+   * running stops, `restart` when its session next starts (it isn't moved unattended, reloading it
+   * didn't work, or Paseo's CLI isn't there to do it).
    */
-  waiting: z.enum(["idle", "turn", "restart"]).nullable().default(null),
+  waiting: z.enum(["idle", "turn", "background", "restart"]).nullable().default(null),
   /**
    * The conversation can move to another account in place. False for Codex agents that already
    * have history: ChatGPT accounts can't read each other's encrypted reasoning, so switching

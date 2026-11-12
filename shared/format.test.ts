@@ -133,7 +133,10 @@ describe("pillText", () => {
     expect(pillText(work, { label: "personal" }, "turn").title).toBe(
       "Account: personal, moving to work (ada@example.com) when its current turn ends",
     );
-    // A reload that didn't work, or no CLI to reload with: not "once it's idle", which won't happen.
+    expect(pillText(work, { label: "personal" }, "background").title).toBe(
+      "Account: personal, moving to work (ada@example.com) once the background work it left running stops",
+    );
+    // Not moved unattended, a reload that didn't work, or no CLI to reload with: not "once it's idle", which won't happen.
     expect(pillText(work, { label: "personal" }, "restart").title).toBe(
       "Account: personal, moving to work (ada@example.com) when its session next starts",
     );
