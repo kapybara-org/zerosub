@@ -12,7 +12,7 @@ describe("finding the paseo CLI", () => {
 
   afterEach(() => {
     Object.assign(process.env, saved);
-    if (root) rmSync(root, { recursive: true, force: true });
+    if (root) rmSync(root, { recursive: true, force: true, maxRetries: 5 });
     root = null;
   });
 

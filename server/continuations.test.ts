@@ -16,8 +16,13 @@ type Create = Parameters<ReturnType<PaseoApi["workspaces"]["ref"]>["agents"]["cr
 type Snapshot = NonNullable<Awaited<ReturnType<ReturnType<PaseoApi["agents"]["ref"]>["refresh"]>>>["agent"];
 type Entry = { item: AgentTimelineItem; timestamp: string; seqStart: number; seqEnd: number; turnId?: string };
 let dir: string;
+/** The services the current test made, stopped once it ends. */
+const services: Service[] = [];
 beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "zerosub-continuations-")); });
-afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+afterEach(async () => {
+  await Promise.all(services.splice(0).map((service) => service.stop()));
+  await rm(dir, { recursive: true, force: true, maxRetries: 5 });
+});
 
 async function setup() {
   const path = join(dir, "state.json");
@@ -106,7 +111,11 @@ async function setup() {
     detectSignOut: () => null, env: async (home: string) => ({ CODEX_HOME: home }), prepareHome: async () => {},
     redeemReset: async () => ({ outcome: "reset", message: "Synthetic reset", left: 0 }),
   } as unknown as FamilyAdapter;
-  const service = () => new Service({ codex: adapter, claude: adapter }, store, { resolve: async () => ({ codex: "codex" }) } as unknown as FamilyResolver);
+  const service = () => {
+    const made = new Service({ codex: adapter, claude: adapter }, store, { resolve: async () => ({ codex: "codex" }) } as unknown as FamilyResolver);
+    services.push(made);
+    return made;
+  };
   const restart = () => { store = new StateStore(path); return new CodexContinuations(store); };
   return { path, get store() { return store; }, accounts, agents, addAgent, timelines, epochs, add, created, sent, notes, create, send, refetch, paseo, switchTo, manager, service, restart };
 }
