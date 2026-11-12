@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Usage } from "../shared/model";
 import { applyEnv } from "./adapter";
 import { parseRateLimits } from "./codex";
-import { chooseAccount, mostAvailable } from "./routing";
+import { chooseAccount, fiveHourGated, mostAvailable } from "./routing";
 import { emptyState, type StoredAccount, type StoredState } from "./state";
 
 const NOW = Date.parse("2026-09-23T12:00:00Z");
@@ -174,7 +174,8 @@ describe("chooseAccount", () => {
         ...base, family: "codex", portable: false, balanceNewAgents: true, reason: "create",
         usageOf: (id) => reading(id === soon.id),
       });
-      expect(decision?.account.id).toBe(later.id);
+      // Past its reset, the near window starts again empty: by headroom it is then the roomier one.
+      expect(decision?.account.id).toBe(condition === "past-reset" ? soon.id : later.id);
       expect(decision?.bind?.selectionReason).toBe("headroom");
     },
   );
@@ -346,5 +347,69 @@ describe("headroom", () => {
     expect(headroomScore(opusFull)).toBe(10);
     expect(headroomScore(reading([{ id: "primary", label: "5h", usedPercent: 70, resetsAt: null }]))).toBe(70);
     expect(headroomScore(null)).toBe(50);
+    // A window that reset since the reading counts as empty.
+    const reset = reading([
+      { id: "five_hour", label: "5h", usedPercent: 100, resetsAt: "2026-09-23T13:00:00Z" },
+      { id: "seven_day", label: "Week", usedPercent: 40, resetsAt: "2026-09-26T00:00:00Z" },
+    ]);
+    expect(headroomScore(reset, Date.parse("2026-09-23T13:01:00Z"))).toBe(40);
+    expect(headroomScore(reset, Date.parse("2026-09-23T12:59:00Z"))).toBe(100);
+  });
+});
+
+describe("the 5-hour gate", () => {
+  const main = account({ id: "claude-main", kind: "main", home: null });
+  const second = account({ id: "claude-second" });
+  const reading = (fiveHour: number, weekly: number): Usage => ({
+    fetchedAt: "2026-09-23T11:59:00Z",
+    windows: [
+      { id: "five_hour", label: "5-hour", usedPercent: fiveHour, resetsAt: "2026-09-23T13:00:00Z" },
+      { id: "seven_day", label: "Weekly", usedPercent: weekly, resetsAt: "2026-09-25T00:00:00Z" },
+    ],
+    error: null,
+    cached: false,
+    resets: null,
+    credits: null,
+  });
+
+  it("starts a new agent on an account under the gate, though the gated one has the lower peak", () => {
+    // By peak alone the second account (81%) beats the CLI login (88% of its week), and fills up minutes later.
+    const usageOf = (id: string) => (id === "claude-second" ? reading(81, 85) : reading(7, 88));
+    const decision = chooseAccount(stateWith([main, second]), { ...base, balanceNewAgents: true, reason: "create", usageOf });
+    expect(decision?.account.id).toBe("claude-main");
+    expect(decision?.bind?.selectionReason).toBe("headroom");
+  });
+
+  it("still ranks by peak while both are under the gate, or both past it", () => {
+    const under = (id: string) => (id === "claude-second" ? reading(50, 85) : reading(7, 88));
+    expect(mostAvailable(stateWith([main, second]), "claude", under, NOW)?.id).toBe("claude-second");
+    const both = (id: string) => (id === "claude-second" ? reading(85, 85) : reading(90, 88));
+    expect(mostAvailable(stateWith([main, second]), "claude", both, NOW)?.id).toBe("claude-second");
+  });
+
+  it("ranks an account that just reset by what it has left, though its last reading showed it full", () => {
+    const third = account({ id: "claude-third" });
+    const usageOf = (id: string) => (id === "claude-second" ? reading(100, 30) : reading(70, 60));
+    expect(mostAvailable(stateWith([second, third]), "claude", usageOf, Date.parse("2026-09-23T13:01:00Z"))?.id).toBe("claude-second");
+    expect(mostAvailable(stateWith([second, third]), "claude", usageOf, Date.parse("2026-09-23T12:59:00Z"))?.id).toBe("claude-third");
+  });
+
+  it("applies to ChatGPT's 5-hour window too", () => {
+    const busy = account({ id: "codex-busy", family: "codex" });
+    const quiet = account({ id: "codex-quiet", family: "codex" });
+    const codex = (short: number, weekly: number): Usage => ({
+      ...usage(0),
+      windows: codexWindows([short, "2026-09-23T16:00:00Z"], [weekly, "2026-09-27T10:00:00Z"]),
+    });
+    const usageOf = (id: string) => (id === busy.id ? codex(82, 40) : codex(10, 85));
+    expect(mostAvailable(stateWith([busy, quiet]), "codex", usageOf, NOW)?.id).toBe(quiet.id);
+  });
+
+  it("counts a 5-hour window that already reset, or no reading, as under the gate", () => {
+    const past = { ...reading(95, 85), windows: [{ id: "five_hour", label: "5-hour", usedPercent: 95, resetsAt: "2026-09-23T11:00:00Z" }] };
+    expect(fiveHourGated(past, NOW)).toBe(false);
+    expect(fiveHourGated(null, NOW)).toBe(false);
+    expect(fiveHourGated(reading(80, 0), NOW)).toBe(true);
+    expect(fiveHourGated(reading(79, 0), NOW)).toBe(false);
   });
 });

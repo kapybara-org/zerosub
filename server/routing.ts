@@ -1,5 +1,5 @@
 import { accountPeak } from "../shared/format";
-import type { Family, Usage } from "../shared/model";
+import type { Family, Usage, UsageWindow } from "../shared/model";
 import { FIVE_HOUR_MINUTES, WEEK_MINUTES } from "./codex";
 import {
   accountsOf,
@@ -17,6 +17,11 @@ const FRESH_READING_MS = 30 * 60_000;
 const NEAR_RESET_MS = 24 * 60 * 60_000;
 /** The most a near-reset account may have used of any window, so it still has room to spare. */
 const NEAR_RESET_MAX_USED_PERCENT = 80;
+/**
+ * An account that has used this much of its 5-hour window is about to run out of it: when spreading
+ * new agents, any account under this ranks ahead of every account past it.
+ */
+const FIVE_HOUR_GATE_PERCENT = 80;
 
 export function isLimited(account: StoredAccount, now: number): boolean {
   if (!account.limitedUntil) return false;
@@ -31,13 +36,38 @@ export function isUsable(account: StoredAccount, now: number): boolean {
 /**
  * Lower is better. Unknown usage ranks in the middle so a known-quiet account wins over a mystery.
  * A full window of one model only, such as "Weekly · Opus", leaves the account its room for the rest.
+ * A window whose reset has passed since the reading starts again empty, so an account that just
+ * reset ranks by what it has left, not by the full window its last reading showed.
  */
-export function headroomScore(usage: Usage | null | undefined): number {
-  const peak = usage ? accountPeak(usage.windows) : null;
+export function headroomScore(usage: Usage | null | undefined, now = Date.now()): number {
+  const windows = usage?.windows.map((window) =>
+    window.resetsAt && Date.parse(window.resetsAt) <= now ? { ...window, usedPercent: 0 } : window);
+  const peak = windows ? accountPeak(windows) : null;
   return peak ? peak.usedPercent : 50;
 }
 
-/** The usable account with the most room, preferring the default, then the CLI login, on ties. */
+/** The 5-hour window: Codex says how long its windows are, Claude's is known by id. */
+function fiveHourWindow(usage: Usage): UsageWindow | undefined {
+  return usage.windows.find((window) => window.minutes === FIVE_HOUR_MINUTES) ??
+    usage.windows.find((window) => window.minutes == null && (window.id === "five_hour" || window.id === "primary"));
+}
+
+/**
+ * Whether the account has used `FIVE_HOUR_GATE_PERCENT` of its 5-hour window, and that window hasn't
+ * reset yet. Unknown counts as under the gate.
+ */
+export function fiveHourGated(usage: Usage | null | undefined, now: number): boolean {
+  const short = usage ? fiveHourWindow(usage) : undefined;
+  if (!short || !Number.isFinite(short.usedPercent)) return false;
+  if (short.resetsAt && Date.parse(short.resetsAt) <= now) return false;
+  return short.usedPercent >= FIVE_HOUR_GATE_PERCENT;
+}
+
+/**
+ * The usable account with the most room: one under the 5-hour gate before one past it (by peak alone,
+ * an account at 81% of its 5 hours beats one at 88% of its week, and runs out minutes later), then
+ * the lowest peak, preferring the default, then the CLI login, on ties.
+ */
 export function mostAvailable(
   state: StoredState,
   family: Family,
@@ -50,7 +80,8 @@ export function mostAvailable(
     (account) => !exclude.has(account.id) && isUsable(account, now),
   );
   const rank = (account: StoredAccount) => [
-    headroomScore(usageOf(account.id)),
+    fiveHourGated(usageOf(account.id), now) ? 1 : 0,
+    headroomScore(usageOf(account.id), now),
     account.id === preferred ? 0 : 1,
     account.kind === "main" ? 0 : 1,
     Date.parse(account.createdAt) || 0,
