@@ -1,6 +1,6 @@
 import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mergeShared, prepareClaudeHome, prepareCodexHome, removeHome } from "./homes";
 
@@ -177,6 +177,15 @@ describe("removeHome", () => {
     const outside = join(root, "elsewhere");
     await mkdir(outside, { recursive: true });
     await removeHome(outside);
+    expect((await lstat(outside)).isDirectory()).toBe(true);
+  });
+
+  it("refuses a path that only starts with the homes directory", async () => {
+    process.env.PASEO_HOME = root;
+    const outside = join(root, "zerosub", "elsewhere");
+    await mkdir(outside, { recursive: true });
+    await mkdir(join(root, "zerosub", "homes", "claude-x"), { recursive: true });
+    await removeHome([join(root, "zerosub", "homes", "claude-x"), "..", "..", "elsewhere"].join(sep));
     expect((await lstat(outside)).isDirectory()).toBe(true);
   });
 });
