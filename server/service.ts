@@ -886,7 +886,14 @@ export class Service {
       this.deferred.delete(agentId);
       const state = await this.store.read();
       const current = this.runningOn(state, agentId, family);
-      if (!current || this.targetFor(state, agentId, family, current) === current) return; // Switched back meanwhile.
+      const target = this.targetFor(state, agentId, family, current);
+      if (!current || !target || target === current) return; // Switched back meanwhile.
+      if (entry?.unattended) {
+        // Left by alignment for a turn, during which the account may have come back (a limit lifted):
+        // nobody asked for this move, so it only goes ahead off an account the agent can't work on.
+        const info = await lookUpAgent(paseo, agentId).catch(() => null);
+        if (info && !this.movesUnattended(state, info, family, current, target, Date.now())) return;
+      }
       const result = await this.reopenAgent(paseo, agentId, { row, settle: !polled, background: polled, unattended: entry?.unattended ?? false });
       if (row) await this.noteOutcome(paseo, agentId, row, result);
     } finally {
@@ -1917,10 +1924,7 @@ export class Service {
         // A reload cancels what the agent is doing, so nobody having asked, it only leaves an account
         // it can't work on. One whose account still works moves when its session next opens. A
         // ChatGPT thread with history can't work anywhere but the account holding it (see `reopenAgent`).
-        if (!this.movesUnattended(state, agent, family, current, target, now)) continue;
-        const tried = this.alignedAt.get(agentId);
-        if (tried?.accountId === target && now - tried.at < ALIGN_RETRY_MS) continue;
-        if (!this.switchGuard.allows(agentId, now)) continue;
+        if (!this.alignmentTries(state, agent, family, current, target, now)) continue;
         due.set(agentId, target);
       }
       for (const { agentId, family } of waiting) await this.finishDeferred(paseo, agentId, family, true);
@@ -1953,11 +1957,22 @@ export class Service {
   ): NonNullable<AgentRoute["waiting"]> {
     if (!canReopen || this.failedMoves.get(agent.id) === target) return "restart";
     const deferred = this.deferred.get(agent.id);
-    // Only a move left for its turn, or one alignment makes, happens before the session next starts.
-    if (!deferred && !this.movesUnattended(state, agent, family, current, target, now)) return "restart";
+    // Only a move left for its turn, or one alignment tries, happens before the session next starts.
+    if (!deferred && !this.alignmentTries(state, agent, family, current, target, now)) return "restart";
     if (busy(agent)) return "turn";
     if (hasBackgroundWork(agent) && (deferred?.unattended ?? true)) return "background";
     return "idle";
+  }
+
+  /**
+   * Whether alignment's next passes try to move the agent from `current` to `target`: a move it makes
+   * (see `movesUnattended`), not tried just now without landing, and not held back by the switch guard.
+   */
+  private alignmentTries(state: StoredState, agent: AgentInfo, family: Family, current: string, target: string, now: number): boolean {
+    if (!this.movesUnattended(state, agent, family, current, target, now)) return false;
+    const tried = this.alignedAt.get(agent.id);
+    if (tried?.accountId === target && now - tried.at < ALIGN_RETRY_MS) return false;
+    return this.switchGuard.allows(agent.id, now);
   }
 
   /**

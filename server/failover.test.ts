@@ -1614,6 +1614,25 @@ describe("aligning agents with their accounts", () => {
     expect(reopened).toEqual([]);
   });
 
+  it("drops a move it left for the turn when the account came back meanwhile", async () => {
+    const { service, store, reopened, paseo, agent } = await setUp(onMarketing(), hit);
+    await store.update((draft) => {
+      full(MAIN)(draft);
+      draft.defaults.claude = HELLO;
+    });
+    agent.status = "running";
+    expect((await service.alignSessions(paseo as never)).deferred).toEqual([AGENT]);
+    // The limit lifts during the turn: marketing works again, so nobody's asked for the move any more.
+    await store.update((draft) => {
+      const target = draft.accounts.find((entry) => entry.id === MAIN);
+      if (target) target.limitedUntil = null;
+    });
+    agent.status = "idle";
+    await service.onTurnEnded(turnEnded, { paseo } as never);
+    expect(reopened).toEqual([]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+  });
+
   it("moves a busy agent after its turn", async () => {
     const { service, store, reopened, paseo, agent } = await setUp(onMarketing(), hit);
     await store.update(full(MAIN));
