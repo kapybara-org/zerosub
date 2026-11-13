@@ -480,4 +480,33 @@ describe("the 5-hour gate", () => {
     expect(fiveHourGated(reading(80, 0), NOW)).toBe(true);
     expect(fiveHourGated(reading(79, 0), NOW)).toBe(false);
   });
+
+  it("ranks an account with a full week last, though its 5-hour window reset and lifted its limit", () => {
+    // Its limit lifted at the 5-hour reset, but the week it also used up hasn't reset: it has no room.
+    const lifted = account({ id: "claude-lifted", limitedUntil: "2026-09-23T11:00:00Z" });
+    const stale: Usage = {
+      ...reading(100, 100),
+      fetchedAt: "2026-09-23T10:30:00Z",
+      windows: [
+        { id: "five_hour", label: "5-hour", usedPercent: 100, resetsAt: "2026-09-23T11:00:00Z" },
+        { id: "seven_day", label: "Weekly", usedPercent: 100, resetsAt: "2026-09-25T00:00:00Z" },
+      ],
+    };
+    const usageOf = (id: string) => (id === lifted.id ? stale : reading(85, 10));
+    expect(mostAvailable(stateWith([second, lifted]), "claude", usageOf, NOW)?.id).toBe(second.id);
+  });
+
+  it("ranks a ChatGPT account with a full week last, though credits keep it going", () => {
+    const busy = account({ id: "codex-busy", family: "codex" });
+    const full = account({ id: "codex-full", family: "codex" });
+    const usageOf = (id: string): Usage =>
+      id === busy.id
+        ? { ...usage(0), windows: codexWindows([80, "2026-09-23T16:00:00Z"], [10, "2026-09-27T10:00:00Z"]) }
+        : {
+            ...usage(0),
+            windows: codexWindows([0, "2026-09-23T16:00:00Z"], [100, "2026-09-27T10:00:00Z"]),
+            credits: { balance: 500, unlimited: false },
+          };
+    expect(mostAvailable(stateWith([busy, full]), "codex", usageOf, NOW)?.id).toBe(busy.id);
+  });
 });

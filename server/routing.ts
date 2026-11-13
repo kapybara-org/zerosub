@@ -19,7 +19,8 @@ const NEAR_RESET_MS = 24 * 60 * 60_000;
 const NEAR_RESET_MAX_USED_PERCENT = 80;
 /**
  * An account that has used this much of its 5-hour window is about to run out of it: when spreading
- * new agents, any account under this ranks ahead of every account past it.
+ * new agents, any account under this ranks ahead of every account past it, unless a window that caps
+ * it is full (see `mostAvailable`).
  */
 const FIVE_HOUR_GATE_PERCENT = 80;
 
@@ -66,7 +67,9 @@ export function fiveHourGated(usage: Usage | null | undefined, now: number): boo
 /**
  * The usable account with the most room: one under the 5-hour gate before one past it (by peak alone,
  * an account at 81% of its 5 hours beats one at 88% of its week, and runs out minutes later), then
- * the lowest peak, preferring the default, then the CLI login, on ties.
+ * the lowest peak, preferring the default, then the CLI login, on ties. An account with a full window
+ * that caps it ranks last, gate or not, though it's usable: its limit lifted at the 5-hour reset with
+ * its week still full, say, or ChatGPT credits keep it going.
  */
 export function mostAvailable(
   state: StoredState,
@@ -79,13 +82,17 @@ export function mostAvailable(
   const candidates = accountsOf(state, family).filter(
     (account) => !exclude.has(account.id) && isUsable(account, now),
   );
-  const rank = (account: StoredAccount) => [
-    fiveHourGated(usageOf(account.id), now) ? 1 : 0,
-    headroomScore(usageOf(account.id), now),
-    account.id === preferred ? 0 : 1,
-    account.kind === "main" ? 0 : 1,
-    Date.parse(account.createdAt) || 0,
-  ];
+  const rank = (account: StoredAccount) => {
+    const usage = usageOf(account.id);
+    const score = headroomScore(usage, now);
+    return [
+      score >= 100 ? 2 : fiveHourGated(usage, now) ? 1 : 0,
+      score,
+      account.id === preferred ? 0 : 1,
+      account.kind === "main" ? 0 : 1,
+      Date.parse(account.createdAt) || 0,
+    ];
+  };
   candidates.sort((a, b) => {
     const left = rank(a);
     const right = rank(b);
