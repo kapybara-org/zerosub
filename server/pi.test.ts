@@ -458,6 +458,26 @@ describe("Pi's own login's key", () => {
     await expect(new PiAdapter().setApi(null, { key: KEY, baseUrl: null })).rejects.toThrow(/Pi is writing/);
   });
 
+  it("waits for Pi's lock wherever that Pi version takes it for a linked auth.json: beside the link (to 1.5.0) or the file it points to (from 1.5.1)", async () => {
+    const real = join(root, "dotfiles", "pi-auth.json");
+    await mkdir(join(root, "dotfiles"));
+    await writeFile(real, JSON.stringify({ anthropic: { type: "api_key", key: "sk-main" } }), { mode: 0o600 });
+    await rm(join(main, "auth.json"));
+    await symlink(real, join(main, "auth.json"));
+    const adapter = new PiAdapter();
+    for (const lock of [`${join(main, "auth.json")}.lock`, `${real}.lock`]) {
+      await mkdir(lock);
+      await expect(adapter.setApi(null, { key: "sk-new-key-0000000000", baseUrl: null }), lock).rejects.toThrow(/right now/);
+      expect(JSON.parse(await readFile(real, "utf8")).anthropic.key, lock).toBe("sk-main");
+      await rm(lock, { recursive: true });
+      // Nothing of ZeroSub's own is left behind to hold Pi up.
+      expect((await readdir(main)).concat(await readdir(join(root, "dotfiles"))).filter((name) => name.endsWith(".lock"))).toEqual([]);
+    }
+    await adapter.setApi(null, { key: "sk-new-key-0000000000", baseUrl: null });
+    expect(JSON.parse(await readFile(real, "utf8")).anthropic.key).toBe("sk-new-key-0000000000");
+    expect((await readdir(main)).concat(await readdir(join(root, "dotfiles"))).filter((name) => name.endsWith(".lock"))).toEqual([]);
+  });
+
   it("never checks the CLI login's address", async () => {
     expect(await new PiAdapter().egress(null)).toBeNull();
   });

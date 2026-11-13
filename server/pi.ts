@@ -1,6 +1,6 @@
 import { mkdir, readdir, readFile, realpath, rename, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import type { ApiSummary, LoginMethod } from "../shared/model";
 import type { EnvPatch, FamilyAdapter, Identity, LoginHandle, ProxyState, RedeemReply, TurnEvent, UsageRead } from "./adapter";
 import { providerCommand } from "./binaries";
@@ -48,7 +48,7 @@ async function settingsProxy(): Promise<string | null> {
 
 /**
  * The folder Pi keeps the CLI login's sessions for `cwd` in: `sessions/--<cwd with / as ->--` in its
- * agent directory, as Pi names it (`getDefaultSessionDirPath`, 1.4.0 to 1.5.0). Pi names it after its
+ * agent directory, as Pi names it (`getDefaultSessionDirPath`, 1.4.0 to 1.5.2). Pi names it after its
  * `process.cwd()`, which is the folder's real path (`/private/tmp/x` for `/tmp/x` on macOS).
  */
 export async function piSessionDir(cwd: string): Promise<string> {
@@ -168,23 +168,32 @@ const PI_LOCK_STALE_MS = 30_000;
 /**
  * Runs `action` holding the lock Pi takes on `file` (`auth.json`, `settings.json`: proper-lockfile's
  * `<file>.lock` folder), so a Pi process writing it meanwhile doesn't write over the change, or the
- * other way round.
+ * other way round. For a file that's a link, Pi takes the lock beside the link (`auth.json` to
+ * 1.5.0, `settings.json` still in 1.5.2) or beside the file it points to (`auth.json` from 1.5.1),
+ * so both are held: whichever Pi runs is kept out.
  */
 async function withPiLock<T>(file: string, action: () => Promise<T>): Promise<T> {
-  const lock = `${file}.lock`;
+  // Both named through the real folder, so a folder reached through a link isn't taken for two.
+  const beside = join(await realpath(dirname(file)).catch(() => dirname(file)), basename(file));
+  const real = await realpath(file).catch(() => beside);
+  const locks = [...new Set([`${beside}.lock`, `${real}.lock`])];
+  const held: string[] = [];
   try {
-    await mkdir(lock);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    const age = Date.now() - ((await stat(lock).catch(() => null))?.mtimeMs ?? 0);
-    if (age < PI_LOCK_STALE_MS) throw new Error(`Pi is writing ${shownPath(file)} right now. Try again in a moment.`);
-    await rmdir(lock).catch(() => undefined);
-    await mkdir(lock);
-  }
-  try {
+    for (const lock of locks) {
+      try {
+        await mkdir(lock);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        const age = Date.now() - ((await stat(lock).catch(() => null))?.mtimeMs ?? 0);
+        if (age < PI_LOCK_STALE_MS) throw new Error(`Pi is writing ${shownPath(file)} right now. Try again in a moment.`);
+        await rmdir(lock).catch(() => undefined);
+        await mkdir(lock);
+      }
+      held.push(lock);
+    }
     return await action();
   } finally {
-    await rmdir(lock).catch(() => undefined);
+    for (const lock of held.reverse()) await rmdir(lock).catch(() => undefined);
   }
 }
 

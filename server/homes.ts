@@ -330,7 +330,7 @@ async function readJsonObject(path: string): Promise<Record<string, unknown> | n
 /**
  * One of Pi's own files as Pi reads it, so nothing Pi acts on is hidden from ZeroSub: a byte order
  * mark is dropped, and in `models.json` (`comments`) so are `//` comments and trailing commas
- * (`stripJsonComments` in Pi 1.4.0). Undefined without the file; throws when Pi couldn't parse it either.
+ * (`stripJsonComments` in Pi, the same from 1.4.0 to 1.5.2). Undefined without the file; throws when Pi couldn't parse it either.
  */
 export async function readPiOwnJson(path: string, comments = false): Promise<unknown | undefined> {
   let text: string;
@@ -814,7 +814,7 @@ export function writePiAccountProxy(
 
 /**
  * The variable Pi takes each of its own providers' key from when it has none stored
- * (`getApiKeyEnvVars` in pi-ai 1.4.0). Anthropic's are in `PI_ANTHROPIC_CREDENTIAL_ENV`.
+ * (`getApiKeyEnvVars` in pi-ai, 1.4.0 to 1.5.2). Anthropic's are in `PI_ANTHROPIC_CREDENTIAL_ENV`.
  */
 const PI_KEY_ENV: Readonly<Record<string, string>> = {
   "github-copilot": "COPILOT_GITHUB_TOKEN",
@@ -822,6 +822,7 @@ const PI_KEY_ENV: Readonly<Record<string, string>> = {
   "qwen-token-plan": "QWEN_TOKEN_PLAN_API_KEY",
   "qwen-token-plan-cn": "QWEN_TOKEN_PLAN_CN_API_KEY",
   "qwen-token-plan-individual": "QWEN_TOKEN_PLAN_API_KEY",
+  "qwen-token-plan-individual-cn": "QWEN_TOKEN_PLAN_CN_API_KEY",
   openai: "OPENAI_API_KEY",
   azure: "AZURE_OPENAI_API_KEY",
   nvidia: "NVIDIA_API_KEY",
