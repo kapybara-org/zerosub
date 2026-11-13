@@ -162,6 +162,8 @@ describe("no-proxy lists", () => {
     // the list; a trailing dot names the same host to every version.
     expect(withoutDomains("corp.example,*:443,*:8443", anthropic)).toBe("corp.example");
     expect(withoutDomains("anthropic.com.,api.anthropic.com.:443,.claude.ai.,corp.example.", anthropic)).toBe("corp.example.");
+    // Nor any entry that's `*` once a port, a leading `*.` or `.` and a trailing dot are dropped.
+    for (const entry of [".*", "*.*", ".*.", "*.*:443"]) expect(withoutDomains(`corp.example,${entry}`, anthropic), entry).toBe("corp.example");
   });
 
   it("keep this machine direct when a proxy is installed", () => {

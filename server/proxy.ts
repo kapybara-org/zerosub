@@ -69,7 +69,7 @@ export function withoutDomains(noProxy: string | null, domains: readonly string[
         .replace(/:\d*$/, "")
         .replace(/^\*?\.?/, "")
         .replace(/\.$/, "");
-      if (!host) return false;
+      if (!host || host === "*") return false;
       return !wanted.some((domain) => host === domain || domain.endsWith(`.${host}`) || host.endsWith(`.${domain}`));
     })
     .join(",");

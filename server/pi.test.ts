@@ -1,4 +1,6 @@
 import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -348,6 +350,31 @@ describe("PiAdapter", () => {
     // Encrypted, or nothing to send: nothing a proxy could read.
     expect(crossesInheritedProxy("https://127.0.0.1:4000", {})).toBe(false);
     expect(crossesInheritedProxy(null, {})).toBe(false);
+  });
+
+  it("checks an added account's address through the proxy Pi takes while no_proxy, which Pi reads before NO_PROXY, doesn't keep Anthropic direct", async () => {
+    const tunnels: string[] = [];
+    const proxy = createServer().on("connect", (req, socket) => {
+      tunnels.push(req.url ?? "");
+      socket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
+    });
+    await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+    const direct = vi.fn(async () => new Response("ip=203.0.113.7\nloc=NL\n"));
+    vi.stubGlobal("fetch", direct);
+    try {
+      const home = join(root, "home");
+      await writePiAccountApi(home, { key: KEY, baseUrl: null });
+      process.env.https_proxy = `http://127.0.0.1:${(proxy.address() as AddressInfo).port}`;
+      // NO_PROXY would keep Anthropic direct, but Pi reads no_proxy in its place.
+      process.env.no_proxy = "intranet.example";
+      process.env.NO_PROXY = ".anthropic.com";
+      await expect(new PiAdapter().egress(home)).rejects.toThrow(/refused the tunnel/);
+      expect(tunnels).toEqual(["api.anthropic.com:443"]);
+      expect(direct).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+      await new Promise((resolve) => proxy.close(resolve));
+    }
   });
 
   it("reads Pi's own proxy past a byte order mark, as Pi does", async () => {
@@ -714,6 +741,12 @@ describe("Pi accounts in the service", () => {
       delete process.env.NO_PROXY;
       await expect(service.importPiAccount(home)).rejects.toThrow(/plain http:\/\//);
       expect((await store.read()).accounts.some((account) => account.home === home)).toBe(false);
+      // Nor with the gateway only in NO_PROXY while no_proxy, which Pi reads in its place, leaves it out.
+      process.env.no_proxy = "intranet.example";
+      process.env.NO_PROXY = "127.0.0.1";
+      await expect(service.importPiAccount(home)).rejects.toThrow(/plain http:\/\//);
+      expect((await store.read()).accounts.some((account) => account.home === home)).toBe(false);
+      delete process.env.no_proxy;
       process.env.NO_PROXY = "127.0.0.1";
       await service.importPiAccount(home);
       expect((await store.read()).accounts.some((account) => account.home === home)).toBe(true);
@@ -902,6 +935,12 @@ describe("Pi accounts in the service", () => {
       await writeFile(join(main, "settings.json"), JSON.stringify({ defaultProvider: "anthropic", httpProxy: "http://10.0.0.1:3128" }));
       await expect(service.setProxy(id, "")).rejects.toThrow(/plain http:\/\//);
       expect(JSON.parse(await readFile(join(home, "zerosub.json"), "utf8")).proxy).toBe("http://127.0.0.1:7890");
+      // Nor with the gateway only in NO_PROXY while no_proxy, which Pi reads in its place, leaves it out.
+      process.env.no_proxy = "intranet.example";
+      process.env.NO_PROXY = "127.0.0.1";
+      await expect(service.setProxy(id, "")).rejects.toThrow(/plain http:\/\//);
+      expect(JSON.parse(await readFile(join(home, "zerosub.json"), "utf8")).proxy).toBe("http://127.0.0.1:7890");
+      delete process.env.no_proxy;
       // With the gateway in NO_PROXY, the key goes straight to it.
       process.env.NO_PROXY = "127.0.0.1";
       await service.setProxy(id, "");

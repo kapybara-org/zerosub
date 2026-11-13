@@ -90,7 +90,7 @@ function proxyVariables(proxy: string, baseUrl: string | null): Record<string, s
 export async function inheritedPiProxy(target = ANTHROPIC_API): Promise<{ proxy: string; from: string } | null> {
   const provider = providerEnv("pi");
   const env: Record<string, string | undefined> = { ...process.env, ...provider };
-  if (bypassesProxy(noProxyFromEnv(env), target)) return null;
+  if (bypassesProxy(env.no_proxy ?? env.NO_PROXY ?? null, target)) return null;
   const key = PROXY_KEYS.find((name) => env[name]?.trim());
   if (key) return { proxy: env[key]!.trim(), from: key in provider ? "the Pi provider's env in Paseo's config" : "the daemon's environment" };
   const own = await settingsProxy();
@@ -103,7 +103,7 @@ export async function inheritedPiProxy(target = ANTHROPIC_API): Promise<{ proxy:
  */
 async function piProxyFor(env: Record<string, string | undefined>, target: string): Promise<string | null> {
   const proxy = proxyFromEnv(env) ?? (await settingsProxy());
-  return proxy && !bypassesProxy(noProxyFromEnv(env), target) ? proxy : null;
+  return proxy && !bypassesProxy(env.no_proxy ?? env.NO_PROXY ?? null, target) ? proxy : null;
 }
 
 // --------------------------------------------------------------------------- the CLI login's files
