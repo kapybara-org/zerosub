@@ -32,7 +32,7 @@ describe("salvageState", () => {
       accounts: [account, { id: "broken", family: "gemini" }],
       bindings: { a: { accountId: "claude-main", source: "thread", at: "x" }, b: { accountId: 7 } },
       sessions: {},
-      defaults: { claude: "claude-main", codex: null },
+      defaults: { claude: "claude-main", codex: null, pi: null },
     });
     expect(dropped).toBe(true);
     expect(state.accounts.map((entry) => entry.id)).toEqual(["claude-main"]);

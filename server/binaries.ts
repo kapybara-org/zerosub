@@ -1,5 +1,6 @@
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { FAMILIES, type Family } from "../shared/model";
 import { readJson } from "./json-file";
 import { dataDir, paseoHome } from "./paths";
 
@@ -13,14 +14,14 @@ const CACHE_MS = 60_000;
 let cache: { at: number; value: Record<string, Command> } | null = null;
 
 /** The CLI Paseo launches for a provider: `agents.providers.<id>.command` when set, else the name on PATH. */
-export async function providerCommand(provider: "claude" | "codex"): Promise<Command> {
+export async function providerCommand(provider: Family): Promise<Command> {
   if (!cache || Date.now() - cache.at > CACHE_MS) {
     const value: Record<string, Command> = {};
     try {
       const config = (await readJson(join(paseoHome(), "config.json"))) as
         | { agents?: { providers?: Record<string, { command?: unknown }> } }
         | undefined;
-      for (const id of ["claude", "codex"]) {
+      for (const id of FAMILIES) {
         const command = config?.agents?.providers?.[id]?.command;
         if (Array.isArray(command) && typeof command[0] === "string" && command.every((part) => typeof part === "string")) {
           value[id] = { command: command[0], prefix: command.slice(1) as string[] };
@@ -31,7 +32,9 @@ export async function providerCommand(provider: "claude" | "codex"): Promise<Com
     }
     cache = { at: Date.now(), value };
   }
-  return cache.value[provider] ?? { command: provider, prefix: [] };
+  // Paseo's Pi provider also takes its binary from PI_COMMAND (or the older PI_ACP_PI_COMMAND).
+  const fallback = provider === "pi" ? process.env.PI_COMMAND?.trim() || process.env.PI_ACP_PI_COMMAND?.trim() || "pi" : provider;
+  return cache.value[provider] ?? { command: fallback, prefix: [] };
 }
 
 let browserShim: Promise<string | null> | null = null;

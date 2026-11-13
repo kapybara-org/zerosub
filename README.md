@@ -1,6 +1,6 @@
 # ZeroSub
 
-Use several Claude and ChatGPT (Codex) subscriptions side by side in [Paseo](https://paseo.sh), without logging in and out of the CLI.
+Use several Claude and ChatGPT (Codex) subscriptions side by side in [Paseo](https://paseo.sh), without logging in and out of the CLI, and run Paseo's Pi agents on several Anthropic API keys, each with its own proxy.
 
 - **Add accounts in the app.** Click **Add account** under Claude or ChatGPT and sign in on any device, including your phone. You don't need a terminal, environment variables or config files.
 - **Your existing CLI logins show up automatically.** Nothing changes until you add a second account.
@@ -11,6 +11,7 @@ Use several Claude and ChatGPT (Codex) subscriptions side by side in [Paseo](htt
 - **Set an account aside.** Disable an account for a while and its agents move to your other accounts, then come back when you enable it again.
 - **Several hosts.** Each Paseo host keeps its own accounts, and the Accounts screen says which host you're looking at.
 - **Fork to the other provider (optional).** When every Claude account is out, a stopped chat can carry on in a new ChatGPT agent, and the other way round.
+- **Pi accounts.** Add Anthropic API keys for Paseo's Pi agents, each with an optional base URL and its own proxy, and pick one per Pi agent. See [Pi accounts](#pi-accounts).
 - **Everything else stays the same.** Every account shares your settings, skills, plugins, MCP servers, `CLAUDE.md`/`AGENTS.md` and conversation history.
 
 ## Install
@@ -98,6 +99,29 @@ ZeroSub tries these in order, and a timeline note says which one happened:
    - With the option off, a stopped agent's account button offers **Continue on ChatGPT (new agent)…** (or Claude) instead, with a confirmation.
 3. **Stop and say so**, with the time the account frees up.
 
+## Pi accounts
+
+Paseo's built-in **Pi** agents get a section of their own once [Pi](https://github.com/earendil-works/pi) is installed where the daemon runs. Its first card is Pi's own login, `~/.pi/agent` (or `PI_CODING_AGENT_DIR` in the daemon's environment), with whatever it's signed in to; ZeroSub never changes its files (it only makes the directory and its `sessions` folder if they're missing, for added accounts to share), and a Pi agent on it runs as Paseo would run it without ZeroSub. Nothing changes for Pi until you add an account. **Add account** under Pi adds an Anthropic API key as an account, each with:
+
+- **Anthropic API key**, sent as `x-api-key`.
+- **Base URL** (optional): a gateway that speaks Anthropic's API. Empty uses `https://api.anthropic.com`, even when Pi's own `models.json` sends Anthropic's requests somewhere else.
+- **Proxy** (optional): every request its Pi agents make goes through it, Anthropic's and any other provider's alike. Change it later with the globe button on its card.
+
+Pick an account for a Pi agent from the agent's account button or with `/account`, or make it the default. ZeroSub never moves agents onto a Pi account by itself, the CLI login included, since either may be billed per use: "Balance new agents" leaves new Pi agents on the default, and an agent whose key is refused stays where it is until you pick another account. A Pi agent moves between accounts in place: Pi reopens its session file on the other key. Pi doesn't report usage, so Pi accounts have no usage bars, banked resets or automatic switching, and they're never forked to another provider.
+
+How it works:
+
+- Each account has an agent directory of its own in `$PASEO_HOME/zerosub/homes/pi-<id>`, which its agents get as `PI_CODING_AGENT_DIR`.
+- Everything in Pi's own directory (settings, extensions, skills, prompts, sessions and the rest) is linked in, except Pi's sign-ins (`auth.json`), `models.json` and its model catalog cache (`models-store.json`).
+- The account's key, base URL and proxy are in its folder's `zerosub.json` (readable only by you); the registry keeps only a short hash of the key. `auth.json` is made from it and Pi's own: the account's key for Anthropic, plus the API keys Pi's login keeps for other providers. Pi's subscription sign-ins (`/login`, OAuth) aren't copied, because each copy would refresh its token on its own and leave the other with a spent one: models that need one stay on Pi's login. Pi reads a stored key as config (a value starting with `!` is run as a command, and `$NAME` is filled in from the environment), so the account's key is written escaped (`$` as `$$`, a leading `!` as `$!`) and Pi reads it exactly as you typed it. Pi uses a stored key before one in the environment, and the account's agents get `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_OAUTH_TOKEN` blanked anyway, so nothing from the daemon's environment goes to the account's base URL in its place. So are `ANTHROPIC_CUSTOM_HEADERS`, whose headers the Anthropic SDK adds to every request (an `x-api-key` line there would replace the account's key), and the workload identity federation variables (`ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID`, `ANTHROPIC_IDENTITY_TOKEN_FILE`, `ANTHROPIC_SERVICE_ACCOUNT_ID`, `ANTHROPIC_WORKSPACE_ID`), which Pi would use for a token when no key comes out. `models.json` is Pi's own with Anthropic's base URL set to the account's, and any other key, headers, or a model's own `baseUrl` or `headers` for Anthropic left out, so no model carries the account's key to wherever Pi's own login sends it. Both are remade before an agent opens on the account, so don't edit them, or run `/login` with that directory.
+- Agents on an account keep their sessions in the folder Pi's own login uses for that project (`~/.pi/agent/sessions/--<project path>--`, given as `PI_CODING_AGENT_SESSION_DIR` unless the daemon, the Pi provider's `env` or Pi's settings set a sessions folder already), so `pi --resume` finds them, and Paseo still resumes them after the account is removed.
+- An account's proxy goes to its agents as `https_proxy`, `HTTPS_PROXY`, `http_proxy` and `HTTP_PROXY`, which Pi puts before its `httpProxy` setting, with `no_proxy` and `NO_PROXY` set to the list they'd otherwise have minus anything that would send Anthropic's or the base URL's traffic around it, plus `localhost`, `127.0.0.1` and `::1`. An account without one gets no proxy variables from ZeroSub: it uses the daemon's network, or `httpProxy` in Pi's settings, as Pi would. A kept key is never sent somewhere new: changing the base URL takes the key again, and so does a new proxy for an account whose base URL is plain `http://` to another machine (the proxy could read the key); remove and add that account again with both. Typing the key yourself is what allows it: the guard keeps a saved key from being sent somewhere new by someone who only sees its last characters, so a key typed together with a plain `http://` base URL and a proxy is used as given (the form warns about plain `http://`). A proxy is also refused while Pi's own `models.json` sends another provider's API key (which every account gets) over plain `http://` to another machine.
+- Pi extensions are shared with every account, and one can still change where Anthropic's requests go after `models.json` is read (`pi.registerProvider("anthropic", { baseUrl })`, say): the account's key then goes there too. Only install extensions you trust with your keys.
+- Anthropic refusing an account's key (`authentication_error`) marks it signed out; **Fix key** on its card takes a working one.
+- Removing a Pi account puts its folder on the cleanup list, and the cleanup pass deletes it, key and all, once no open agent uses it. Pi accounts can't be disabled, since no other Pi account would stand in for one: make another the default or remove it instead.
+
+Tested on macOS with Pi 1.4.0 and Paseo 0.15.0.
+
 ## Several hosts
 
 Paseo installs plugins per host (daemon), so install ZeroSub on each host whose agents should use it. When more than one host has it, Paseo shows a single **Accounts (ZeroSub)** item with a host picker at the top.
@@ -171,7 +195,7 @@ paseo plugin logs zerosub
 Code layout:
 
 - `client/`: React Native UI (Accounts surface, sign-in modal, composer pill, commands, timeline note).
-- `server/`: routing, account homes, Claude and Codex adapters, failover.
+- `server/`: routing, account homes, Claude, Codex and Pi adapters, failover.
 - `shared/`: RPC contracts and the view model.
 
 Report problems at [github.com/kapybara-org/ZeroSub/issues](https://github.com/kapybara-org/ZeroSub/issues).

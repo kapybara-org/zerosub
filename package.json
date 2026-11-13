@@ -31,6 +31,7 @@
     "server/",
     "shared/",
     "!**/*.test.ts",
+    "!**/*.test-support.ts",
     "README.md",
     "LICENSE"
   ],

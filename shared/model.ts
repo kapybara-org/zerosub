@@ -1,13 +1,27 @@
 import { z } from "zod";
 
-/** The two subscription families this plugin manages. Custom provider profiles map onto one of them. */
-export const FamilySchema = z.enum(["claude", "codex"]);
+/**
+ * The provider families this plugin manages: the two subscription CLIs, and Pi, whose added accounts
+ * are Anthropic API keys. Custom provider profiles map onto one of them.
+ */
+export const FamilySchema = z.enum(["claude", "codex", "pi"]);
 export type Family = z.infer<typeof FamilySchema>;
+export const FAMILIES: readonly Family[] = FamilySchema.options;
 
 export const FAMILY_LABEL: Record<Family, string> = {
   claude: "Claude",
   codex: "ChatGPT",
+  pi: "Pi",
 };
+
+/**
+ * The provider a stopped chat can carry on with when every account of its own is out (Claude ↔
+ * ChatGPT); null for Pi, whose added accounts are billed per use and never take work over by themselves.
+ */
+export const OTHER_FAMILY: Record<Family, Family | null> = { claude: "codex", codex: "claude", pi: null };
+
+/** Stands for a proxy's password (or a user name with none) wherever the proxy is shown. */
+export const HIDDEN = "•••";
 
 export const UsageWindowSchema = z.object({
   /** Stable key, e.g. `five_hour`, `seven_day`, `seven_day_opus`, `primary`, `secondary`. */
@@ -68,6 +82,23 @@ export const AccountKindSchema = z.enum([
 ]);
 export type AccountKind = z.infer<typeof AccountKindSchema>;
 
+export const AuthKindSchema = z.enum([
+  /** Signed in with a Claude or ChatGPT subscription (or, for Pi's own login, whatever Pi is signed in to). */
+  "subscription",
+  /** An added Pi account: an Anthropic API key, billed per use, so never picked automatically. */
+  "api",
+]);
+export type AuthKind = z.infer<typeof AuthKindSchema>;
+
+/** An API key's settings as shown in the app; the key itself never leaves the host. */
+export const ApiSummarySchema = z.object({
+  /** The key's last four characters, or empty for a key too short to show any of it. */
+  keyHint: z.string(),
+  /** Where Anthropic's requests go, or null for Anthropic's own API. */
+  baseUrl: z.string().nullable(),
+});
+export type ApiSummary = z.infer<typeof ApiSummarySchema>;
+
 /** `disabled`: the user set it aside for a while; it stays signed in but nothing is routed to it. */
 export const AccountStatusSchema = z.enum(["ready", "signed_out", "limited", "checking", "disabled"]);
 export type AccountStatus = z.infer<typeof AccountStatusSchema>;
@@ -86,6 +117,17 @@ export const AccountViewSchema = z.object({
   usage: UsageSchema.nullable(),
   agentCount: z.number(),
   home: z.string().nullable(),
+  auth: AuthKindSchema.default("subscription"),
+  /** An added Pi account's key (reduced to a hint) and base URL. */
+  api: ApiSummarySchema.nullable().default(null),
+  /** Its Anthropic key and base URL can be changed from its card (added Pi accounts). */
+  apiEditable: z.boolean().default(false),
+  /** The account's own proxy, password hidden (as `HIDDEN`). Null when it uses whatever it inherits. */
+  proxy: z.string().nullable().default(null),
+  /** A proxy can be set for this account here (added Pi accounts). */
+  proxyEditable: z.boolean().default(false),
+  /** The proxy it goes through without one of its own, password hidden, and where that's set. */
+  inheritedProxy: z.object({ proxy: z.string(), from: z.string() }).nullable().default(null),
 });
 export type AccountView = z.infer<typeof AccountViewSchema>;
 

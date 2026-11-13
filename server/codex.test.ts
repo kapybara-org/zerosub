@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CodexAdapter } from "./codex";
+import { absentPi } from "./fakes.test-support";
 import type { FamilyResolver } from "./families";
 import type { Reopener } from "./reopen";
 import { Service } from "./service";
@@ -75,7 +76,7 @@ describe("an identity check while Codex can't read the rate limits", () => {
     await store.update((draft) => {
       draft.accounts.push({
         id: MAIN_ACCOUNT_ID.codex, family: "codex", label: "first", autoLabel: false,
-        kind: "main", home: null, email: "first@example.com", plan: "team", organization: null,
+        kind: "main", auth: "subscription", home: null, email: "first@example.com", plan: "team", organization: null,
         identity, signedIn: true, disabled: false, limitedUntil, limitKind: "window",
         limitedAt: new Date().toISOString(), limitSource: "turn", createdAt: new Date().toISOString(),
       });
@@ -83,7 +84,7 @@ describe("an identity check while Codex can't read the rate limits", () => {
     responses.limitsFail = true;
     const adapter = new CodexAdapter();
     const service = new Service(
-      { claude: adapter as never, codex: adapter },
+      { claude: adapter as never, codex: adapter, pi: absentPi() },
       store,
       { resolve: async () => ({ codex: "codex" as const }) } as unknown as FamilyResolver,
       { locate: async () => null } as unknown as Reopener,

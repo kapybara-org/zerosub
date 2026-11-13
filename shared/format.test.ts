@@ -79,6 +79,12 @@ describe("account presentation", () => {
     },
     agentCount: 2,
     home: "/homes/claude-a",
+    auth: "subscription",
+    api: null,
+    apiEditable: false,
+    proxy: null,
+    proxyEditable: false,
+    inheritedProxy: null,
   };
 
   it("summarises the busiest window", () => {
