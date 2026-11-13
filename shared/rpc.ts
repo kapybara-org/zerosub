@@ -37,21 +37,24 @@ export const renameAccount = defineRpc({
   output: z.object({ ok: z.literal(true) }),
 });
 
-export const removeAccount = defineRpc({
-  name: "zerosub.accounts.remove",
-  input: z.object({ accountId: z.string() }),
-  output: z.object({ ok: z.literal(true), movedAgents: z.number() }),
-});
-
 export const ReopenSummarySchema = z.object({
   reopened: z.array(z.string()),
   /** Busy agents move when their current turn ends. */
   deferred: z.array(z.string()),
   failed: z.array(z.object({ agentId: z.string(), error: z.string() })),
+  /** Still being moved when the answer was sent; the move goes on, and each agent's timeline says how it went. */
+  pending: z.array(z.string()).default([]),
   /** A conversation that could not move in place and continues in this account's agent instead. */
   continuedIn: z.object({ agentId: z.string(), title: z.string() }).nullable().default(null),
 });
 export type ReopenSummary = z.infer<typeof ReopenSummarySchema>;
+
+/** `movedAgents`: how many agents ran on the account. `moves`: how moving them went (older servers don't say). */
+export const removeAccount = defineRpc({
+  name: "zerosub.accounts.remove",
+  input: z.object({ accountId: z.string() }),
+  output: z.object({ ok: z.literal(true), movedAgents: z.number(), moves: ReopenSummarySchema.optional() }),
+});
 
 export const clearAccountLimit = defineRpc({
   name: "zerosub.accounts.available",
@@ -73,6 +76,8 @@ export const RedeemOutcomeSchema = z.enum([
   "unavailable",
   /** The request failed or its result is unknown. */
   "error",
+  /** Still going when the answer was sent (or one already was); the account's usage shows the result. */
+  "pending",
 ]);
 export type RedeemOutcome = z.infer<typeof RedeemOutcomeSchema>;
 

@@ -1,5 +1,5 @@
 import { accountPeak } from "../shared/format";
-import type { Family, Usage } from "../shared/model";
+import type { Family, Usage, UsageWindow } from "../shared/model";
 import { FIVE_HOUR_MINUTES, WEEK_MINUTES } from "./codex";
 import {
   accountsOf,
@@ -17,6 +17,12 @@ const FRESH_READING_MS = 30 * 60_000;
 const NEAR_RESET_MS = 24 * 60 * 60_000;
 /** The most a near-reset account may have used of any window, so it still has room to spare. */
 const NEAR_RESET_MAX_USED_PERCENT = 80;
+/**
+ * An account that has used this much of its 5-hour window is about to run out of it: when spreading
+ * new agents, any account under this ranks ahead of every account past it, unless a window that caps
+ * it is full (see `mostAvailable`).
+ */
+const FIVE_HOUR_GATE_PERCENT = 80;
 
 export function isLimited(account: StoredAccount, now: number): boolean {
   if (!account.limitedUntil) return false;
@@ -31,13 +37,40 @@ export function isUsable(account: StoredAccount, now: number): boolean {
 /**
  * Lower is better. Unknown usage ranks in the middle so a known-quiet account wins over a mystery.
  * A full window of one model only, such as "Weekly · Opus", leaves the account its room for the rest.
+ * A window whose reset has passed since the reading starts again empty, so an account that just
+ * reset ranks by what it has left, not by the full window its last reading showed.
  */
-export function headroomScore(usage: Usage | null | undefined): number {
-  const peak = usage ? accountPeak(usage.windows) : null;
+export function headroomScore(usage: Usage | null | undefined, now = Date.now()): number {
+  const windows = usage?.windows.map((window) =>
+    window.resetsAt && Date.parse(window.resetsAt) <= now ? { ...window, usedPercent: 0 } : window);
+  const peak = windows ? accountPeak(windows) : null;
   return peak ? peak.usedPercent : 50;
 }
 
-/** The usable account with the most room, preferring the default, then the CLI login, on ties. */
+/** The 5-hour window: Codex says how long its windows are, Claude's is known by id. */
+function fiveHourWindow(usage: Usage): UsageWindow | undefined {
+  return usage.windows.find((window) => window.minutes === FIVE_HOUR_MINUTES) ??
+    usage.windows.find((window) => window.minutes == null && (window.id === "five_hour" || window.id === "primary"));
+}
+
+/**
+ * Whether the account has used `FIVE_HOUR_GATE_PERCENT` of its 5-hour window, and that window hasn't
+ * reset yet. Unknown counts as under the gate.
+ */
+export function fiveHourGated(usage: Usage | null | undefined, now: number): boolean {
+  const short = usage ? fiveHourWindow(usage) : undefined;
+  if (!short || !Number.isFinite(short.usedPercent)) return false;
+  if (short.resetsAt && Date.parse(short.resetsAt) <= now) return false;
+  return short.usedPercent >= FIVE_HOUR_GATE_PERCENT;
+}
+
+/**
+ * The usable account with the most room: one under the 5-hour gate before one past it (by peak alone,
+ * an account at 81% of its 5 hours beats one at 88% of its week, and runs out minutes later), then
+ * the lowest peak, preferring the default, then the CLI login, on ties. An account with a full window
+ * that caps it ranks last, gate or not, though it's usable: its limit lifted at the 5-hour reset with
+ * its week still full, say, or ChatGPT credits keep it going.
+ */
 export function mostAvailable(
   state: StoredState,
   family: Family,
@@ -49,12 +82,17 @@ export function mostAvailable(
   const candidates = accountsOf(state, family).filter(
     (account) => !exclude.has(account.id) && isUsable(account, now),
   );
-  const rank = (account: StoredAccount) => [
-    headroomScore(usageOf(account.id)),
-    account.id === preferred ? 0 : 1,
-    account.kind === "main" ? 0 : 1,
-    Date.parse(account.createdAt) || 0,
-  ];
+  const rank = (account: StoredAccount) => {
+    const usage = usageOf(account.id);
+    const score = headroomScore(usage, now);
+    return [
+      score >= 100 ? 2 : fiveHourGated(usage, now) ? 1 : 0,
+      score,
+      account.id === preferred ? 0 : 1,
+      account.kind === "main" ? 0 : 1,
+      Date.parse(account.createdAt) || 0,
+    ];
+  };
   candidates.sort((a, b) => {
     const left = rank(a);
     const right = rank(b);
@@ -102,6 +140,12 @@ export interface RouteInput {
    */
   portable: boolean;
   usageOf(accountId: string): Usage | null | undefined;
+  /**
+   * The account the agent's session runs on now. When the account it's routed to has to be skipped
+   * and this one can stand in, the agent stays on it rather than following whichever account ranks
+   * first at the moment, which would move it again each time two accounts swap places.
+   */
+  current?: string;
   /** Whether this session may use the one-time "next new agent" pick (interactive sessions only). */
   allowNextPick?: boolean;
 }
@@ -118,10 +162,12 @@ export interface RouteDecision {
 
 /**
  * Which account a session opens on: the agent's own binding, else (for balanced new agents) the
- * roomiest account, else the default. An exhausted or signed-out choice is swapped for the roomiest
- * usable account when automatic switching is on — for new agents always, and for existing ones
- * only when their conversation can move between accounts. A disabled choice is always swapped,
- * and the agent keeps its own binding so it returns once the account is enabled again.
+ * roomiest account, else the default (the CLI login for an existing Codex thread ZeroSub never
+ * routed). An exhausted or signed-out choice is swapped for the roomiest usable account when
+ * automatic switching is on — for new agents always, and for existing ones only when their
+ * conversation can move between accounts. A disabled choice is always swapped,
+ * and the agent keeps its own binding so it returns once the account is enabled again. An agent
+ * already running on a usable stand-in keeps it (see `RouteInput.current`).
  */
 export function chooseAccount(state: StoredState, input: RouteInput): RouteDecision | null {
   const accounts = accountsOf(state, input.family);
@@ -164,7 +210,11 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   const why = !account.signedIn ? "signed_out" : account.disabled ? "disabled" : isLimited(account, input.now) ? "limited" : null;
   const mayMove = fresh || input.portable;
   if (why && mayMove && (input.autoSwitch || why !== "limited")) {
-    const alternative = mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]));
+    const staying = findAccount(state, input.current);
+    const alternative =
+      staying && staying.family === input.family && staying.id !== account.id && isUsable(staying, input.now)
+        ? staying
+        : mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]));
     if (alternative) {
       skipped = { account, why };
       account = alternative;

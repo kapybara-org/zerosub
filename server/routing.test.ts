@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Usage } from "../shared/model";
 import { applyEnv } from "./adapter";
 import { parseRateLimits } from "./codex";
-import { chooseAccount, mostAvailable } from "./routing";
+import { chooseAccount, fiveHourGated, mostAvailable } from "./routing";
 import { emptyState, type StoredAccount, type StoredState } from "./state";
 
 const NOW = Date.parse("2026-09-23T12:00:00Z");
@@ -174,7 +174,8 @@ describe("chooseAccount", () => {
         ...base, family: "codex", portable: false, balanceNewAgents: true, reason: "create",
         usageOf: (id) => reading(id === soon.id),
       });
-      expect(decision?.account.id).toBe(later.id);
+      // Past its reset, the near window starts again empty: by headroom it is then the roomier one.
+      expect(decision?.account.id).toBe(condition === "past-reset" ? soon.id : later.id);
       expect(decision?.bind?.selectionReason).toBe("headroom");
     },
   );
@@ -221,6 +222,23 @@ describe("mostAvailable", () => {
     const work = account({ id: "claude-work" });
     const state = stateWith([main, work], { defaults: { claude: "claude-work", codex: null } });
     expect(mostAvailable(state, "claude", () => usage(20), NOW)?.id).toBe("claude-work");
+  });
+
+  it("ranks accounts by the room they have for any model, not by one model's full window", () => {
+    const main = account({ id: "claude-main", kind: "main", home: null });
+    const work = account({ id: "claude-work" });
+    const state = stateWith([main, work], { defaults: { claude: "claude-main", codex: null } });
+    const usageOf = (id: string): Usage =>
+      id === "claude-work"
+        ? {
+            ...usage(10),
+            windows: [
+              { id: "five_hour", label: "5-hour", usedPercent: 10, resetsAt: null },
+              { id: "seven_day_opus", label: "Weekly · Opus", usedPercent: 100, resetsAt: null },
+            ],
+          }
+        : usage(60);
+    expect(mostAvailable(state, "claude", usageOf, NOW)?.id).toBe("claude-work");
   });
 
   it("never picks a signed-out account", () => {
@@ -333,6 +351,57 @@ describe("disabled accounts", () => {
     const usageOf = (id: string) => usage(id === "claude-main" ? 90 : 5);
     expect(mostAvailable(state, "claude", usageOf, NOW)?.id).toBe("claude-main");
   });
+
+  it("leaves an agent on the stand-in it runs on, rather than whichever ranks first now", () => {
+    // Otherwise every time two accounts swap places, alignment reloads every agent of the disabled one.
+    const disabled = account({ id: "claude-work", ...off });
+    const bindings = { "agent-1": { accountId: "claude-work", source: "user" as const, at: "2026-09-23T00:00:00Z" } };
+    const usageOf = (id: string) => usage(id === "claude-main" ? 5 : 60);
+    const route = (others: StoredAccount[], current?: string) =>
+      chooseAccount(stateWith([main, disabled, ...others], { bindings }), { ...base, reason: "refresh", usageOf, current });
+    const personal = account({ id: "claude-personal" });
+    expect(route([personal])?.account.id).toBe("claude-main");
+    expect(route([personal], "claude-personal")?.account.id).toBe("claude-personal");
+    expect(route([personal], "claude-personal")?.bind).toBeNull(); // so it still returns once work is enabled
+    // Only an account routing could have picked by itself stands in: not the disabled one or a full one.
+    expect(route([personal], "claude-work")?.account.id).toBe("claude-main");
+    expect(route([account({ id: "claude-personal", limitedUntil: "2026-09-23T14:00:00Z" })], "claude-personal")?.account.id).toBe(
+      "claude-main",
+    );
+  });
+});
+
+describe("threads ZeroSub never routed (Codex)", () => {
+  const main = account({ id: "codex-main", family: "codex", kind: "main", home: null });
+  const work = account({ id: "codex-work", family: "codex" });
+  const codex = { ...base, family: "codex" as const, portable: false };
+  const byDefault = (patch: Partial<StoredState> = {}) => stateWith([main, work], { defaults: { claude: null, codex: "codex-work" }, ...patch });
+
+  it("belong to the CLI login they ran on, whether resumed, reloaded or imported", () => {
+    // Started while ZeroSub was off, say: no pin and no session record.
+    for (const reason of ["resume", "refresh", "import"] as const) {
+      const decision = chooseAccount(byDefault(), { ...codex, reason, usageOf: () => null });
+      expect(decision?.account.id).toBe("codex-main");
+      expect(decision?.bind).toMatchObject({ accountId: "codex-main", source: "thread" });
+    }
+  });
+
+  it("still start new agents on the default", () => {
+    expect(chooseAccount(byDefault(), { ...codex, reason: "create", usageOf: () => null })?.account.id).toBe("codex-work");
+  });
+
+  it("follow the default when ZeroSub routed their session but the pin is gone", () => {
+    // Removing an account drops its pins; a thread without history then moves like a new one.
+    const recorded = byDefault({ sessions: { "agent-1": { accountId: "codex-gone", family: "codex", openedAt: "x" } } });
+    expect(chooseAccount(recorded, { ...codex, reason: "refresh", usageOf: () => null })?.account.id).toBe("codex-work");
+  });
+
+  it("leave Claude conversations following the default", () => {
+    const claudeMain = account({ id: "claude-main", kind: "main", home: null });
+    const claudeWork = account({ id: "claude-work" });
+    const state = stateWith([claudeMain, claudeWork], { defaults: { claude: "claude-work", codex: null } });
+    expect(chooseAccount(state, { ...base, reason: "resume", usageOf: () => null })?.account.id).toBe("claude-work");
+  });
 });
 
 describe("headroom", () => {
@@ -346,5 +415,98 @@ describe("headroom", () => {
     expect(headroomScore(opusFull)).toBe(10);
     expect(headroomScore(reading([{ id: "primary", label: "5h", usedPercent: 70, resetsAt: null }]))).toBe(70);
     expect(headroomScore(null)).toBe(50);
+    // A window that reset since the reading counts as empty.
+    const reset = reading([
+      { id: "five_hour", label: "5h", usedPercent: 100, resetsAt: "2026-09-23T13:00:00Z" },
+      { id: "seven_day", label: "Week", usedPercent: 40, resetsAt: "2026-09-26T00:00:00Z" },
+    ]);
+    expect(headroomScore(reset, Date.parse("2026-09-23T13:01:00Z"))).toBe(40);
+    expect(headroomScore(reset, Date.parse("2026-09-23T12:59:00Z"))).toBe(100);
+  });
+});
+
+describe("the 5-hour gate", () => {
+  const main = account({ id: "claude-main", kind: "main", home: null });
+  const second = account({ id: "claude-second" });
+  const reading = (fiveHour: number, weekly: number): Usage => ({
+    fetchedAt: "2026-09-23T11:59:00Z",
+    windows: [
+      { id: "five_hour", label: "5-hour", usedPercent: fiveHour, resetsAt: "2026-09-23T13:00:00Z" },
+      { id: "seven_day", label: "Weekly", usedPercent: weekly, resetsAt: "2026-09-25T00:00:00Z" },
+    ],
+    error: null,
+    cached: false,
+    resets: null,
+    credits: null,
+  });
+
+  it("starts a new agent on an account under the gate, though the gated one has the lower peak", () => {
+    // By peak alone the second account (81%) beats the CLI login (88% of its week), and fills up minutes later.
+    const usageOf = (id: string) => (id === "claude-second" ? reading(81, 85) : reading(7, 88));
+    const decision = chooseAccount(stateWith([main, second]), { ...base, balanceNewAgents: true, reason: "create", usageOf });
+    expect(decision?.account.id).toBe("claude-main");
+    expect(decision?.bind?.selectionReason).toBe("headroom");
+  });
+
+  it("still ranks by peak while both are under the gate, or both past it", () => {
+    const under = (id: string) => (id === "claude-second" ? reading(50, 85) : reading(7, 88));
+    expect(mostAvailable(stateWith([main, second]), "claude", under, NOW)?.id).toBe("claude-second");
+    const both = (id: string) => (id === "claude-second" ? reading(85, 85) : reading(90, 88));
+    expect(mostAvailable(stateWith([main, second]), "claude", both, NOW)?.id).toBe("claude-second");
+  });
+
+  it("ranks an account that just reset by what it has left, though its last reading showed it full", () => {
+    const third = account({ id: "claude-third" });
+    const usageOf = (id: string) => (id === "claude-second" ? reading(100, 30) : reading(70, 60));
+    expect(mostAvailable(stateWith([second, third]), "claude", usageOf, Date.parse("2026-09-23T13:01:00Z"))?.id).toBe("claude-second");
+    expect(mostAvailable(stateWith([second, third]), "claude", usageOf, Date.parse("2026-09-23T12:59:00Z"))?.id).toBe("claude-third");
+  });
+
+  it("applies to ChatGPT's 5-hour window too", () => {
+    const busy = account({ id: "codex-busy", family: "codex" });
+    const quiet = account({ id: "codex-quiet", family: "codex" });
+    const codex = (short: number, weekly: number): Usage => ({
+      ...usage(0),
+      windows: codexWindows([short, "2026-09-23T16:00:00Z"], [weekly, "2026-09-27T10:00:00Z"]),
+    });
+    const usageOf = (id: string) => (id === busy.id ? codex(82, 40) : codex(10, 85));
+    expect(mostAvailable(stateWith([busy, quiet]), "codex", usageOf, NOW)?.id).toBe(quiet.id);
+  });
+
+  it("counts a 5-hour window that already reset, or no reading, as under the gate", () => {
+    const past = { ...reading(95, 85), windows: [{ id: "five_hour", label: "5-hour", usedPercent: 95, resetsAt: "2026-09-23T11:00:00Z" }] };
+    expect(fiveHourGated(past, NOW)).toBe(false);
+    expect(fiveHourGated(null, NOW)).toBe(false);
+    expect(fiveHourGated(reading(80, 0), NOW)).toBe(true);
+    expect(fiveHourGated(reading(79, 0), NOW)).toBe(false);
+  });
+
+  it("ranks an account with a full week last, though its 5-hour window reset and lifted its limit", () => {
+    // Its limit lifted at the 5-hour reset, but the week it also used up hasn't reset: it has no room.
+    const lifted = account({ id: "claude-lifted", limitedUntil: "2026-09-23T11:00:00Z" });
+    const stale: Usage = {
+      ...reading(100, 100),
+      fetchedAt: "2026-09-23T10:30:00Z",
+      windows: [
+        { id: "five_hour", label: "5-hour", usedPercent: 100, resetsAt: "2026-09-23T11:00:00Z" },
+        { id: "seven_day", label: "Weekly", usedPercent: 100, resetsAt: "2026-09-25T00:00:00Z" },
+      ],
+    };
+    const usageOf = (id: string) => (id === lifted.id ? stale : reading(85, 10));
+    expect(mostAvailable(stateWith([second, lifted]), "claude", usageOf, NOW)?.id).toBe(second.id);
+  });
+
+  it("ranks a ChatGPT account with a full week last, though credits keep it going", () => {
+    const busy = account({ id: "codex-busy", family: "codex" });
+    const full = account({ id: "codex-full", family: "codex" });
+    const usageOf = (id: string): Usage =>
+      id === busy.id
+        ? { ...usage(0), windows: codexWindows([80, "2026-09-23T16:00:00Z"], [10, "2026-09-27T10:00:00Z"]) }
+        : {
+            ...usage(0),
+            windows: codexWindows([0, "2026-09-23T16:00:00Z"], [100, "2026-09-27T10:00:00Z"]),
+            credits: { balance: 500, unlimited: false },
+          };
+    expect(mostAvailable(stateWith([busy, full]), "codex", usageOf, NOW)?.id).toBe(busy.id);
   });
 });
