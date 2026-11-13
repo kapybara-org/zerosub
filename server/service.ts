@@ -882,19 +882,21 @@ export class Service {
     if (!release) return;
     try {
       const entry = this.deferred.get(agentId);
-      const row = entry?.row ?? null;
+      // Dropped or done meanwhile (a turn end, a fresh session): nobody wants this move any more.
+      if (!entry) return;
+      const { row } = entry;
       this.deferred.delete(agentId);
       const state = await this.store.read();
       const current = this.runningOn(state, agentId, family);
       const target = this.targetFor(state, agentId, family, current);
       if (!current || !target || target === current) return; // Switched back meanwhile.
-      if (entry?.unattended) {
+      if (entry.unattended) {
         // Left by alignment for a turn, during which the account may have come back (a limit lifted):
         // nobody asked for this move, so it only goes ahead off an account the agent can't work on.
         const info = await lookUpAgent(paseo, agentId).catch(() => null);
         if (info && !this.movesUnattended(state, info, family, current, target, Date.now())) return;
       }
-      const result = await this.reopenAgent(paseo, agentId, { row, settle: !polled, background: polled, unattended: entry?.unattended ?? false });
+      const result = await this.reopenAgent(paseo, agentId, { row, settle: !polled, background: polled, unattended: entry.unattended });
       if (row) await this.noteOutcome(paseo, agentId, row, result);
     } finally {
       release();
@@ -924,12 +926,14 @@ export class Service {
     ranOn: string | null,
   ): Promise<void> {
     if (!ranOn) return;
-    const release = this.tryClaim(agentId);
+    let release = this.tryClaim(agentId);
     if (!release) {
-      // A manual Codex handoff racing the old thread's limit event, say, or a switch asked for as the
-      // turn ended: that move owns the agent.
+      // Another move has the agent (alignment, a switch asked for as the turn ended, a manual Codex
+      // handoff). The limit is recorded now, so nothing is routed to the account meanwhile, then this
+      // waits for that move: giving up would leave the agent waiting on the limit with nobody to carry
+      // it on. Failover then finds the agent moved, or its task continued, and leaves it there.
       await this.noteLimit(ranOn, problem);
-      return;
+      release = await this.claim(agentId);
     }
     let exhausted: string | null = null;
     try {
@@ -1958,7 +1962,10 @@ export class Service {
     if (!canReopen || this.failedMoves.get(agent.id) === target) return "restart";
     const deferred = this.deferred.get(agent.id);
     // Only a move left for its turn, or one alignment tries, happens before the session next starts.
-    if (!deferred && !this.alignmentTries(state, agent, family, current, target, now)) return "restart";
+    // One left for its turn goes ahead as `finishDeferred` checks: always when asked for, and when
+    // nobody asked, only while alignment would still make it.
+    const happens = deferred ? !deferred.unattended || this.movesUnattended(state, agent, family, current, target, now) : this.alignmentTries(state, agent, family, current, target, now);
+    if (!happens) return "restart";
     if (busy(agent)) return "turn";
     if (hasBackgroundWork(agent) && (deferred?.unattended ?? true)) return "background";
     return "idle";

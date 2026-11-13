@@ -312,9 +312,12 @@ describe("Codex account continuations", () => {
     const switching = service.setAgentAccount(t.paseo, "root", "b");
     await entered;
     await expect(service.forkAgent(t.paseo, "root")).rejects.toThrow(/already switching/);
-    await service.onTurnEnded({ agent: t.agents.get("root"), turnId: "limit-turn", outcome: { kind: "failed" }, timeline: [] } as never, { paseo: t.paseo } as never);
+    // The limit waits for the switch, which continues the task once: failover then finds it continued.
+    const limited = service.onTurnEnded({ agent: t.agents.get("root"), turnId: "limit-turn", outcome: { kind: "failed" }, timeline: [] } as never, { paseo: t.paseo } as never);
+    await vi.waitFor(async () => expect((await t.store.read()).accounts.find((account) => account.id === "a")!.limitedUntil).not.toBeNull());
     release();
     await switching;
+    await limited;
     expect(t.created).toHaveLength(1);
     expect(t.send).toHaveBeenCalledTimes(1);
     expect((await t.store.read()).accounts.find((account) => account.id === "a")!.limitedUntil).not.toBeNull();

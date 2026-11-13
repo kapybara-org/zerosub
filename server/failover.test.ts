@@ -1037,6 +1037,60 @@ describe("changing the default account", () => {
     expect((await store.read()).sessions.failing?.accountId).toBe(WORK);
   });
 
+  it("carries an agent on at a limit once the move that had it is done, background work and all", async () => {
+    const { service, store, context, reopened } = await setUpAgents(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
+        defaults: { claude: MAIN, codex: null },
+        sessions: { failing: session(MAIN) },
+      },
+      [{ id: "failing", status: "idle", backgroundWork: 1 }],
+    );
+    // Alignment has the agent (looking it over, say) as its turn ends at the limit.
+    const release = (service as unknown as { tryClaim(agentId: string): (() => void) | null }).tryClaim("failing")!;
+    const ended = service.onTurnEnded({ agent: { id: "failing", provider: "claude" }, turnId: null, outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never, context);
+    await vi.waitFor(async () => expect((await store.read()).accounts.find((entry) => entry.id === MAIN)?.limitedUntil).not.toBeNull());
+    expect(reopened).toEqual([]);
+    release();
+    await ended;
+    expect(reopened).toEqual(["failing"]);
+    expect((await store.read()).sessions.failing?.accountId).toBe(WORK);
+  });
+
+  it("leaves an agent alone when the move alignment was about to finish was dropped meanwhile", async () => {
+    const { service, store, paseo, reopened } = await setUpAgents(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
+        defaults: { claude: MAIN, codex: null },
+        sessions: { serving: session(MAIN) },
+        bindings: { serving: { accountId: WORK, source: "user", at: openedAt } },
+      },
+      [{ id: "serving", status: "idle", backgroundWork: 1 }],
+    );
+    // As when alignment reaches an agent whose waiting move a turn end has just dropped.
+    await (service as unknown as { finishDeferred(paseo: unknown, agentId: string, family: string, polled: boolean): Promise<void> }).finishDeferred(paseo, "serving", "claude", true);
+    expect(reopened).toEqual([]);
+    expect((await store.read()).sessions.serving?.accountId).toBe(MAIN);
+  });
+
+  it("doesn't promise a move left for the turn that will be dropped when it ends", async () => {
+    const { service, paseo } = await setUpAgents(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
+        defaults: { claude: MAIN, codex: null },
+        sessions: { busy: session(MAIN) },
+        bindings: { busy: { accountId: WORK, source: "user", at: openedAt } },
+      },
+      [{ id: "busy", status: "running" }],
+    );
+    // Left by alignment for the turn, though the agent's account works: it's dropped at the turn's end.
+    (service as unknown as { deferred: Map<string, { row: null; unattended: boolean }> }).deferred.set("busy", { row: null, unattended: true });
+    expect((await service.view(paseo)).agents.find((route) => route.agentId === "busy")?.waiting).toBe("restart");
+    // One the user asked for still happens when the turn ends.
+    (service as unknown as { deferred: Map<string, { row: null; unattended: boolean }> }).deferred.set("busy", { row: null, unattended: false });
+    expect((await service.view(paseo)).agents.find((route) => route.agentId === "busy")?.waiting).toBe("turn");
+  });
+
   it("leaves an agent with background work when moving idle agents off an account at its limit", async () => {
     const { service, store, paseo, context, reopened } = await setUpAgents(
       {
@@ -1487,7 +1541,7 @@ describe("a limit hit while the agent is being moved", () => {
     expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
   });
 
-  it("records the limit when another move has the agent", async () => {
+  it("records the limit when another move has the agent, and leaves the agent where that move put it", async () => {
     let release = () => {};
     const gate = new Promise<void>((resolve) => (release = resolve));
     let started = () => {};
@@ -1500,11 +1554,14 @@ describe("a limit hit while the agent is being moved", () => {
     });
     const moving = service.setAgentAccount(paseo as never, AGENT, HELLO);
     await reloading;
-    await limitTurn();
-    expect(await limitedUntil(store, MAIN)).not.toBeNull();
+    // Recorded at once; failover waits for the move, then finds the agent already moved.
+    const limiting = limitTurn();
+    await vi.waitFor(async () => expect(await limitedUntil(store, MAIN)).not.toBeNull());
     release();
     expect((await moving).reopened).toEqual([AGENT]);
+    await limiting;
     expect(reopened).toEqual([AGENT]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
   });
 
   it("leaves the other idle agents on an account a reset refilled just before the limit came in", async () => {

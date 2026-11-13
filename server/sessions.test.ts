@@ -28,7 +28,11 @@ beforeEach(async () => {
   process.env.PASEO_HOME = root;
 });
 
+/** Every service a test set up, stopped before its directory goes so nothing it saves lands in the next test's. */
+const services: Service[] = [];
+
 afterEach(async () => {
+  await Promise.all(services.splice(0).map((service) => service.stop()));
   if (previousHome === undefined) delete process.env.PASEO_HOME;
   else process.env.PASEO_HOME = previousHome;
   await rm(root, { recursive: true, force: true });
@@ -154,6 +158,7 @@ async function setUp(state: Partial<StoredState>, agents: Agent[], options: Opti
     { resolve: async () => ({ claude: "claude" as const, codex: "codex" as const }) } as unknown as FamilyResolver,
     reopener as unknown as Reopener,
   );
+  services.push(service);
   service.setPreferences(preferences.schema.parse({}));
   service.attach(paseo as never);
   return { service, store, paseo: paseo as never, context, open, reopened, notes, background };
