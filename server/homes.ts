@@ -4,6 +4,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 import type { ApiSummary, Family } from "../shared/model";
 import { Mutex, readJson } from "./json-file";
 import { REQUIRED_NO_PROXY, maskProxy } from "./proxy";
+import { providerEnv } from "./provider-env";
 import { homesDir, isOwnHome, mainClaudeDir, mainClaudeGlobalConfig, mainCodexHome, mainPiDir } from "./paths";
 
 /**
@@ -326,6 +327,34 @@ async function readJsonObject(path: string): Promise<Record<string, unknown> | n
   }
 }
 
+/**
+ * One of Pi's own files as Pi reads it, so nothing Pi acts on is hidden from ZeroSub: a byte order
+ * mark is dropped, and in `models.json` (`comments`) so are `//` comments and trailing commas
+ * (`stripJsonComments` in Pi 1.4.0). Undefined without the file; throws when Pi couldn't parse it either.
+ */
+export async function readPiOwnJson(path: string, comments = false): Promise<unknown | undefined> {
+  let text: string;
+  try {
+    text = await readFile(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+  if (text.startsWith("\uFEFF")) text = text.slice(1);
+  if (comments) {
+    text = text
+      .replace(/"(?:\\.|[^"\\])*"|\/\/[^\n]*/g, (match) => (match[0] === '"' ? match : ""))
+      .replace(/"(?:\\.|[^"\\])*"|,(\s*[}\]])/g, (match, tail: string | undefined) => tail ?? (match[0] === '"' ? match : ""));
+  }
+  return JSON.parse(text) as unknown;
+}
+
+/** `readPiOwnJson` for a file that should hold an object: null without one, or when it doesn't parse. */
+async function readPiOwnObject(path: string, comments = false): Promise<Record<string, unknown> | null> {
+  const value = await readPiOwnJson(path, comments).catch(() => undefined);
+  return isObject(value) ? value : null;
+}
+
 async function writeJsonAtomically(path: string, value: unknown): Promise<void> {
   const temporary = `${path}.zerosub.${randomBytes(4).toString("hex")}.tmp`;
   await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
@@ -632,16 +661,16 @@ async function writeIfChanged(path: string, value: unknown): Promise<void> {
 async function syncPiFiles(home: string): Promise<void> {
   const account = await readPiAccount(home);
   const mainDir = mainPiDir();
-  const mainAuth = await readJsonObject(join(mainDir, "auth.json"));
+  const mainAuth = await readPiOwnObject(join(mainDir, "auth.json"));
   await writeIfChanged(join(home, "auth.json"), piAuth(mainAuth, account.key));
   const modelsPath = join(mainDir, "models.json");
   let mainModels: unknown = {};
   try {
-    mainModels = (await readJson(modelsPath)) ?? {};
+    mainModels = (await readPiOwnJson(modelsPath, true)) ?? {};
     unreadablePiModels.delete(modelsPath);
   } catch {
     // Still written, so the account's key never goes to a base URL it wasn't set up with.
-    if (!unreadablePiModels.has(modelsPath)) console.warn(`[ZeroSub] ${modelsPath} isn't valid JSON; added Pi accounts don't get its models until it's fixed`);
+    if (!unreadablePiModels.has(modelsPath)) console.warn(`[ZeroSub] ${modelsPath} doesn't parse; added Pi accounts don't get its models until it's fixed`);
     unreadablePiModels.add(modelsPath);
   }
   await writeIfChanged(join(home, "models.json"), piModels(mainModels, account.baseUrl));
@@ -657,7 +686,8 @@ const unreadablePiSettings = new Set<string>();
  * a terminal, say) goes through it too, as long as its environment names no proxy (Pi only fills
  * the proxy variables in from `httpProxy` when they're unset). It's remade from the CLI login's at
  * every sync, so what Pi writes to it there doesn't last. A home ZeroSub made is the only kind a
- * Pi account has, so the generated file is replaced by the link again once the proxy goes.
+ * Pi account has, so the generated file is replaced by the link again once the proxy goes; while
+ * the CLI login has no settings to link to, it stays with `httpProxy` taken out.
  */
 async function syncPiSettings(home: string, proxy: string | null): Promise<void> {
   const target = join(home, "settings.json");
@@ -666,12 +696,13 @@ async function syncPiSettings(home: string, proxy: string | null): Promise<void>
   if (proxy) {
     let main: unknown;
     try {
-      main = await readJson(mainSettings);
+      main = await readPiOwnJson(mainSettings);
       unreadablePiSettings.delete(mainSettings);
     } catch {
-      if (!unreadablePiSettings.has(mainSettings)) console.warn(`[ZeroSub] ${mainSettings} isn't valid JSON; added Pi accounts with a proxy keep their settings as they were until it's fixed`);
+      if (!unreadablePiSettings.has(mainSettings)) console.warn(`[ZeroSub] ${mainSettings} isn't valid JSON; added Pi accounts with a proxy keep the rest of their settings as they were until it's fixed`);
       unreadablePiSettings.add(mainSettings);
-      if (current?.isFile()) return;
+      // The rest stays as it was, but never the proxy: the account's may have changed since.
+      if (current?.isFile()) main = await readJsonObject(target);
     }
     // Written over the link, never through it: the CLI login's settings stay as they are.
     await writeIfChanged(target, { ...(isObject(main) ? main : {}), httpProxy: proxy });
@@ -679,7 +710,16 @@ async function syncPiSettings(home: string, proxy: string | null): Promise<void>
   }
   if (!current?.isFile()) return;
   const real = await realpath(mainSettings).catch(() => null);
-  if (!real) return; // Pi's own, while the CLI login has none to share.
+  if (!real) {
+    // The CLI login has none to share, so the file stays, without the proxy that was the account's:
+    // Pi started on this folder would otherwise still go through it.
+    const own = await readJsonObject(target);
+    if (own && "httpProxy" in own) {
+      const { httpProxy: _gone, ...rest } = own;
+      await writeIfChanged(target, rest);
+    }
+    return;
+  }
   await unlink(target);
   await symlink(real, target);
 }
@@ -760,7 +800,7 @@ export function writePiAccountProxy(
           "This account sends its key over plain http://, which a proxy can read. To use a new proxy, remove the account and add it again with its key and the proxy, or switch to an https:// base URL.",
         );
       }
-      const exposed = await clearTextProviders();
+      const exposed = await clearTextProviders(false);
       if (exposed.length > 0) {
         throw new Error(
           `Pi's own models.json sends the API key for ${exposed.join(", ")} over plain http://, and every Pi account gets that key, so a proxy could read it. Use https:// there, or a gateway on this machine, before setting a proxy.`,
@@ -773,26 +813,94 @@ export function writePiAccountProxy(
 }
 
 /**
- * Providers whose credentials every account gets from the CLI login (an API key in its `auth.json`,
- * see `piAuth`, or an `apiKey`, `headers` or `authHeader` in its `models.json`, for the provider, a
- * model or an override) that Pi's own `models.json` sends over plain http:// to another machine
- * (see `sentInTheClear`), for the provider or any of its models.
+ * The variable Pi takes each of its own providers' key from when it has none stored
+ * (`getApiKeyEnvVars` in pi-ai 1.4.0). Anthropic's are in `PI_ANTHROPIC_CREDENTIAL_ENV`.
  */
-export async function clearTextProviders(): Promise<string[]> {
-  const auth = (await readJsonObject(join(mainPiDir(), "auth.json"))) ?? {};
-  const models = await readJsonObject(join(mainPiDir(), "models.json"));
-  const providers = isObject(models?.providers) ? models.providers : {};
+const PI_KEY_ENV: Readonly<Record<string, string>> = {
+  "github-copilot": "COPILOT_GITHUB_TOKEN",
+  "ant-ling": "ANT_LING_API_KEY",
+  "qwen-token-plan": "QWEN_TOKEN_PLAN_API_KEY",
+  "qwen-token-plan-cn": "QWEN_TOKEN_PLAN_CN_API_KEY",
+  "qwen-token-plan-individual": "QWEN_TOKEN_PLAN_API_KEY",
+  openai: "OPENAI_API_KEY",
+  azure: "AZURE_OPENAI_API_KEY",
+  nvidia: "NVIDIA_API_KEY",
+  deepseek: "DEEPSEEK_API_KEY",
+  google: "GEMINI_API_KEY",
+  "google-vertex": "GOOGLE_CLOUD_API_KEY",
+  groq: "GROQ_API_KEY",
+  cerebras: "CEREBRAS_API_KEY",
+  xai: "XAI_API_KEY",
+  typesafe: "TYPESAFE_API_KEY",
+  radius: "RADIUS_API_KEY",
+  openrouter: "OPENROUTER_API_KEY",
+  "vercel-ai-gateway": "AI_GATEWAY_API_KEY",
+  zai: "ZAI_API_KEY",
+  "zai-coding-cn": "ZAI_CODING_CN_API_KEY",
+  mistral: "MISTRAL_API_KEY",
+  minimax: "MINIMAX_API_KEY",
+  "minimax-cn": "MINIMAX_CN_API_KEY",
+  moonshotai: "MOONSHOT_API_KEY",
+  "moonshotai-cn": "MOONSHOT_API_KEY",
+  huggingface: "HF_TOKEN",
+  fireworks: "FIREWORKS_API_KEY",
+  together: "TOGETHER_API_KEY",
+  baseten: "BASETEN_API_KEY",
+  opencode: "OPENCODE_API_KEY",
+  "opencode-go": "OPENCODE_API_KEY",
+  "kimi-coding": "KIMI_API_KEY",
+  meta: "META_API_KEY",
+  "cloudflare-workers-ai": "CLOUDFLARE_API_KEY",
+  "cloudflare-ai-gateway": "CLOUDFLARE_API_KEY",
+  xiaomi: "XIAOMI_API_KEY",
+  "xiaomi-token-plan-cn": "XIAOMI_TOKEN_PLAN_CN_API_KEY",
+  "xiaomi-token-plan-ams": "XIAOMI_TOKEN_PLAN_AMS_API_KEY",
+  "xiaomi-token-plan-sgp": "XIAOMI_TOKEN_PLAN_SGP_API_KEY",
+};
+
+/**
+ * The variables that give Pi's own login something of Anthropic's to send: a key or token, headers
+ * the SDK adds to every request, or the federation rule Pi gets a token for when it has no key.
+ */
+const PI_ANTHROPIC_CREDENTIAL_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_FEDERATION_RULE_ID"];
+
+/**
+ * Providers that Pi's own `models.json` sends over plain http:// to another machine (see
+ * `sentInTheClear`), for the provider or any of its models, along with a credential a proxy could
+ * then read: an entry in the CLI login's `auth.json`, an `apiKey`, `headers` or `authHeader` in its
+ * `models.json` (for the provider, a model or an override), or a key in the environment Pi starts
+ * with (the daemon's, under the Pi provider's `env` in Paseo's config).
+ *
+ * For an added account's proxy these are the credentials every account gets from the CLI login: its
+ * `auth.json` API keys (see `piAuth`; its sign-ins aren't copied) and everything but Anthropic's, which
+ * the account has its own of (see `piModels`). For the proxy of Pi's own login (`login`) it's whatever
+ * that login sends: Anthropic's too, and its sign-ins. There a `models.json` that doesn't parse is
+ * refused, as nothing can be told from it; an added account gets none of it (see `syncPiFiles`).
+ */
+export async function clearTextProviders(login: boolean): Promise<string[]> {
+  const auth = (await readPiOwnObject(join(mainPiDir(), "auth.json"))) ?? {};
+  const modelsPath = join(mainPiDir(), "models.json");
+  let models: unknown;
+  try {
+    models = await readPiOwnJson(modelsPath, true);
+  } catch {
+    if (login) throw new Error(`${modelsPath} doesn't parse, so ZeroSub can't tell whether a key there would cross the proxy over plain http://. Fix it before setting a proxy.`);
+  }
+  const providers = isObject(models) && isObject(models.providers) ? models.providers : {};
+  const env: Record<string, string | undefined> = { ...process.env, ...providerEnv("pi") };
+  const inEnv = (name: string) => (name === "anthropic" ? PI_ANTHROPIC_CREDENTIAL_ENV : PI_KEY_ENV[name] ? [PI_KEY_ENV[name]] : []).some((key) => env[key]?.trim());
   const clear = (value: unknown) => typeof value === "string" && sentInTheClear(value);
   // Set to something: an empty key or header list, or `authHeader: false`, sends nothing.
   const set = (value: unknown) => (isObject(value) ? Object.keys(value).length > 0 : value !== undefined && value !== null && value !== false && value !== "");
   const carries = (entry: unknown) => isObject(entry) && ["apiKey", "headers", "authHeader"].some((key) => set(entry[key]));
   return Object.entries(providers)
     .filter(([name, config]) => {
-      if (name === "anthropic" || !isObject(config)) return false;
+      if ((name === "anthropic" && !login) || !isObject(config)) return false;
       const list = Array.isArray(config.models) ? config.models.filter(isObject) : [];
       const overrides = isObject(config.modelOverrides) ? Object.values(config.modelOverrides) : [];
-      const stored = isObject(auth[name]) && auth[name].type === "api_key";
-      const shared = stored || carries(config) || overrides.some(carries);
+      const entry = auth[name];
+      const stored = isObject(entry) && (login || entry.type === "api_key");
+      const shared = stored || inEnv(name) || carries(config) || overrides.some(carries);
       // A model sends what the provider carries, plus its own headers, to its own base URL or the provider's.
       return list.some((model) => clear(model.baseUrl ?? config.baseUrl) && (shared || carries(model))) || (clear(config.baseUrl) && shared);
     })

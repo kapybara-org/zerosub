@@ -25,7 +25,7 @@ const BLANK_ANTHROPIC = {
   ANTHROPIC_SERVICE_ACCOUNT_ID: "",
   ANTHROPIC_WORKSPACE_ID: "",
 };
-const SAVED = ["PASEO_HOME", "ZEROSUB_PI_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID", "ANTHROPIC_IDENTITY_TOKEN_FILE", "ANTHROPIC_SERVICE_ACCOUNT_ID", "ANTHROPIC_WORKSPACE_ID", "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "NO_PROXY", "no_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] as const;
+const SAVED = ["PASEO_HOME", "ZEROSUB_PI_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID", "ANTHROPIC_IDENTITY_TOKEN_FILE", "ANTHROPIC_SERVICE_ACCOUNT_ID", "ANTHROPIC_WORKSPACE_ID", "OPENROUTER_API_KEY", "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "NO_PROXY", "no_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] as const;
 
 let root: string;
 let main: string;
@@ -187,6 +187,18 @@ describe("a Pi account's home", () => {
     // An empty header list, or `authHeader: false`, sends nothing to read.
     await writeFile(join(main, "models.json"), JSON.stringify({ providers: { ollama: { baseUrl: remote, headers: {}, authHeader: false } } }));
     await writePiAccountProxy(home, "http://10.0.0.2:3128");
+
+    // A key Pi takes from the environment for one of its own providers crosses the proxy as well.
+    await writeFile(join(main, "auth.json"), JSON.stringify({ anthropic: { type: "api_key", key: "sk-main" } }));
+    await writeFile(join(main, "models.json"), JSON.stringify({ providers: { openrouter: { baseUrl: remote } } }));
+    await writePiAccountProxy(home, "http://10.0.0.3:3128");
+    process.env.OPENROUTER_API_KEY = "sk-or-env";
+    await expect(writePiAccountProxy(home, "http://10.0.0.4:3128")).rejects.toThrow(/openrouter/);
+    delete process.env.OPENROUTER_API_KEY;
+
+    // Pi reads models.json past a byte order mark, `//` comments and trailing commas, so they hide nothing.
+    await writeFile(join(main, "models.json"), `\uFEFF{\n  // my gateway\n  "providers": { "ollama": { "baseUrl": "${remote}", "apiKey": "k", }, },\n}\n`);
+    await expect(writePiAccountProxy(home, "http://10.0.0.4:3128")).rejects.toThrow(/ollama/);
   });
 });
 
@@ -270,6 +282,57 @@ describe("PiAdapter", () => {
     expect(JSON.parse(await readFile(join(main, "settings.json"), "utf8"))).toEqual({ defaultProvider: "anthropic" });
   });
 
+  it("sets no new proxy on Pi's own login while an Anthropic credential of its own, wherever Pi takes it from, would cross it over plain http://", async () => {
+    const adapter = new PiAdapter();
+    const remote = "http://gw.example.com";
+    const keyed = { anthropic: { type: "api_key", key: "sk-main" } };
+    const refused = async (label: string, auth: unknown, models: string | object, env: Record<string, string> = {}) => {
+      await writeFile(join(main, "auth.json"), JSON.stringify(auth));
+      await writeFile(join(main, "models.json"), typeof models === "string" ? models : JSON.stringify(models));
+      Object.assign(process.env, env);
+      try {
+        await expect(adapter.setProxy(null, "http://10.0.0.1:3128"), label).rejects.toThrow(/Anthropic.*plain http:\/\//);
+      } finally {
+        for (const key of Object.keys(env)) delete process.env[key];
+      }
+      expect(JSON.parse(await readFile(join(main, "settings.json"), "utf8")), label).toEqual({ defaultProvider: "anthropic" });
+    };
+    await refused("a stored key", keyed, { providers: { anthropic: { baseUrl: remote } } });
+    await refused("a stored sign-in", { anthropic: { type: "oauth", access: "a", refresh: "r", expires: 1 } }, { providers: { anthropic: { baseUrl: remote } } });
+    await refused("a key in models.json", {}, { providers: { anthropic: { baseUrl: remote, apiKey: "sk-in-models" } } });
+    await refused("headers in models.json", {}, { providers: { anthropic: { baseUrl: remote, headers: { "x-api-key": "k" } } } });
+    await refused("one model's base URL", keyed, { providers: { anthropic: { models: [{ id: "claude-x", baseUrl: remote }] } } });
+    for (const name of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_FEDERATION_RULE_ID"]) {
+      await refused(name, {}, { providers: { anthropic: { baseUrl: remote } } }, { [name]: "x-api-key: sk-env" });
+    }
+    await refused("a models.json with a comment and a byte order mark", keyed, `\uFEFF{\n  // gateway\n  "providers": { "anthropic": { "baseUrl": "${remote}" } },\n}\n`);
+    // Another provider's sign-in is Pi's own login's to send too, though no added account gets it.
+    await writeFile(join(main, "auth.json"), JSON.stringify({ openai: { type: "oauth", access: "a", refresh: "r", expires: 1 } }));
+    await writeFile(join(main, "models.json"), JSON.stringify({ providers: { openai: { baseUrl: remote } } }));
+    await expect(adapter.setProxy(null, "http://10.0.0.1:3128")).rejects.toThrow(/openai/);
+    // A models.json Pi can't read either leaves nothing to tell from, so it's refused rather than guessed at.
+    await writeFile(join(main, "models.json"), "{ not json");
+    await expect(adapter.setProxy(null, "http://10.0.0.1:3128")).rejects.toThrow(/models\.json/);
+
+    // Nothing of Anthropic's to send, or nowhere another machine could read it: the proxy is set.
+    await writeFile(join(main, "auth.json"), "{}");
+    await writeFile(join(main, "models.json"), JSON.stringify({ providers: { anthropic: { baseUrl: remote } } }));
+    await adapter.setProxy(null, "http://10.0.0.1:3128");
+    await writeFile(join(main, "auth.json"), JSON.stringify(keyed));
+    await writeFile(join(main, "models.json"), JSON.stringify({ providers: { anthropic: { baseUrl: "http://127.0.0.1:4000", apiKey: "k" } } }));
+    await adapter.setProxy(null, "http://10.0.0.2:3128");
+    expect(JSON.parse(await readFile(join(main, "settings.json"), "utf8")).httpProxy).toBe("http://10.0.0.2:3128");
+  });
+
+  it("reads Pi's own proxy past a byte order mark, as Pi does", async () => {
+    await writeFile(join(main, "settings.json"), `\uFEFF${JSON.stringify({ httpProxy: "http://10.0.0.1:3128" })}`);
+    const adapter = new PiAdapter();
+    expect((await adapter.proxyState(null)).own).toBe("http://10.0.0.1:3128");
+    const home = join(root, "home");
+    await writePiAccountApi(home, { key: KEY, baseUrl: null });
+    expect((await adapter.proxyState(home)).inherited?.proxy).toBe("http://10.0.0.1:3128");
+  });
+
   it("writes a proxy password into the file Pi's settings link to, readable only by the user", async () => {
     const real = join(root, "dotfiles", "pi-settings.json");
     await mkdir(join(root, "dotfiles"));
@@ -307,6 +370,30 @@ describe("PiAdapter", () => {
 
     await writePiAccountProxy(home, null);
     expect(await readlink(join(home, "settings.json"))).toBe(await realpath(join(main, "settings.json")));
+  });
+
+  it("takes a cleared or changed proxy out of the account's own settings when Pi's login has none to share, or none that parse", async () => {
+    const home = join(root, "paseo", "zerosub", "homes", "pi-cccccccccccc");
+    await writePiAccountApi(home, { key: KEY, baseUrl: null });
+    await rm(join(main, "settings.json"));
+    await writePiAccountProxy(home, "http://u:p@127.0.0.1:7890");
+    expect(JSON.parse(await readFile(join(home, "settings.json"), "utf8"))).toEqual({ httpProxy: "http://u:p@127.0.0.1:7890" });
+
+    // Nothing to link to: the file stays, without the proxy Pi would otherwise still go through.
+    await writePiAccountProxy(home, null);
+    expect(JSON.parse(await readFile(join(home, "settings.json"), "utf8"))).toEqual({});
+    await preparePiHome(home, true);
+    expect(JSON.parse(await readFile(join(home, "settings.json"), "utf8"))).toEqual({});
+    // Once Pi's login has settings, they're shared again.
+    await writeFile(join(main, "settings.json"), JSON.stringify({ defaultProvider: "anthropic" }));
+    await preparePiHome(home, true);
+    expect(await readlink(join(home, "settings.json"))).toBe(await realpath(join(main, "settings.json")));
+
+    // While Pi's settings don't parse, the rest of the account's stays as it was, but not its proxy.
+    await writePiAccountProxy(home, "http://127.0.0.1:7890");
+    await writeFile(join(main, "settings.json"), "{ not json");
+    await writePiAccountProxy(home, "http://127.0.0.1:7891");
+    expect(JSON.parse(await readFile(join(home, "settings.json"), "utf8"))).toEqual({ defaultProvider: "anthropic", httpProxy: "http://127.0.0.1:7891" });
   });
 
   it("counts an added account signed in while it has a key, and the CLI login always", async () => {
@@ -354,6 +441,16 @@ describe("Pi's own login's key", () => {
     const before = await backups();
     await adapter.setApi(null, { key: "!echo$X", baseUrl: null });
     expect(await backups()).toBe(before);
+  });
+
+  it("leaves the key as it was when models.json can't take the new base URL", async () => {
+    // Pi reads comments there; written back they'd be lost, so it's left alone, and so is the key.
+    const commented = `{\n  // mine\n  "providers": {}\n}\n`;
+    await writeFile(join(main, "models.json"), commented);
+    const before = await readFile(join(main, "auth.json"), "utf8");
+    await expect(new PiAdapter().setApi(null, { key: "sk-new-key-0000000000", baseUrl: "https://gw.example.com" })).rejects.toThrow(/by hand/);
+    expect(await readFile(join(main, "auth.json"), "utf8")).toBe(before);
+    expect(await readFile(join(main, "models.json"), "utf8")).toBe(commented);
   });
 
   it("waits for Pi's own lock on its sign-ins", async () => {

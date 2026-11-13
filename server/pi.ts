@@ -4,7 +4,7 @@ import { join, resolve } from "node:path";
 import type { ApiSummary, LoginMethod } from "../shared/model";
 import type { EnvPatch, FamilyAdapter, Identity, LoginHandle, ProxyState, RedeemReply, TurnEvent, UsageRead } from "./adapter";
 import { providerCommand } from "./binaries";
-import { clearTextProviders, forgetSyncs, normalizeBaseUrl, piLiteral, preparePiHome, readPiAccount, readPiAccountApi, readPiAccountForAgents, sentInTheClear, writePiAccountApi, writePiAccountProxy } from "./homes";
+import { clearTextProviders, forgetSyncs, normalizeBaseUrl, piLiteral, preparePiHome, readPiAccount, readPiOwnJson, readPiAccountApi, readPiAccountForAgents, writePiAccountApi, writePiAccountProxy } from "./homes";
 import { PI_LAUNCH_ENV } from "./launchers";
 import { Mutex, readJson, writeJsonAtomic } from "./json-file";
 import { eachProcessEnvironment, homesInEnvironment, parseTrace } from "./processes";
@@ -42,7 +42,7 @@ function mainSettingsPath(): string {
  * written when the user sets the CLI login's proxy from its card (see `writePiMainProxy`).
  */
 async function settingsProxy(): Promise<string | null> {
-  const settings = await readJson(mainSettingsPath()).catch(() => undefined);
+  const settings = await readPiOwnJson(mainSettingsPath()).catch(() => undefined);
   return isObject(settings) && typeof settings.httpProxy === "string" && settings.httpProxy.trim() ? settings.httpProxy.trim() : null;
 }
 
@@ -60,7 +60,7 @@ export async function piSessionDir(cwd: string): Promise<string> {
 /** Whether Pi's sessions directory is set somewhere other than its default under the agent directory. */
 async function sessionDirConfigured(): Promise<boolean> {
   if (process.env.PI_CODING_AGENT_SESSION_DIR?.trim() || providerEnv("pi").PI_CODING_AGENT_SESSION_DIR?.trim()) return true;
-  const settings = await readJson(mainSettingsPath()).catch(() => undefined);
+  const settings = await readPiOwnJson(mainSettingsPath()).catch(() => undefined);
   return isObject(settings) && typeof settings.sessionDir === "string" && settings.sessionDir.trim() !== "";
 }
 
@@ -121,7 +121,7 @@ function mainModelsPath(): string {
 
 /** The base URL the CLI login's `models.json` sends Anthropic's requests to, if it sets one. */
 async function mainAnthropicBaseUrl(): Promise<string | null> {
-  const models = await readJson(mainModelsPath()).catch(() => undefined);
+  const models = await readPiOwnJson(mainModelsPath(), true).catch(() => undefined);
   const providers = isObject(models) && isObject(models.providers) ? models.providers : {};
   const anthropic = isObject(providers.anthropic) ? providers.anthropic : {};
   return typeof anthropic.baseUrl === "string" && anthropic.baseUrl.trim() ? anthropic.baseUrl.trim() : null;
@@ -132,7 +132,7 @@ const KEY_HINT_MIN_LENGTH = 12;
 
 /** The Anthropic API key Pi's own login keeps in its `auth.json`; null when it has none (or signs in to Anthropic with OAuth). */
 async function mainAnthropicKey(): Promise<string | null> {
-  const auth = await readJson(mainAuthPath()).catch(() => undefined);
+  const auth = await readPiOwnJson(mainAuthPath()).catch(() => undefined);
   const entry = isObject(auth) ? auth.anthropic : undefined;
   return isObject(entry) && entry.type === "api_key" && typeof entry.key === "string" && entry.key.trim() ? entry.key.trim() : null;
 }
@@ -216,22 +216,25 @@ const mainWrites = new Mutex();
  * Sets (or clears, with `null`) Pi's own login's proxy as `httpProxy` in its `settings.json`, which
  * Pi applies wherever it runs on that login while its environment names no proxy, and which added
  * accounts without a proxy of their own share. ZeroSub gives Pi agents nothing for it: Pi reads it
- * itself. Like an added account's, a new proxy is refused while a key it would carry goes over
- * plain http:// to another machine. The file is backed up first and written under Pi's own lock.
+ * itself. Like an added account's, a new proxy is refused while a key or sign-in it would carry goes
+ * over plain http:// to another machine, wherever Pi takes it from (see `clearTextProviders`). The
+ * file is backed up first and written under Pi's own lock.
  */
 async function writePiMainProxy(proxy: string | null): Promise<void> {
   await mainWrites.run(async () => {
     if (proxy && proxy !== (await settingsProxy())) {
-      if ((await mainAnthropicKey()) && sentInTheClear(await mainAnthropicBaseUrl())) {
-        throw new Error("Pi's own login sends its Anthropic key over plain http://, which a proxy can read. Set its key again with an https:// base URL first.");
+      const exposed = await clearTextProviders(true);
+      if (exposed.includes("anthropic")) {
+        throw new Error(
+          "Pi's own login sends its Anthropic key or sign-in over plain http://, which a proxy can read. Use an https:// base URL for Anthropic and its models (in Pi's models.json), or a gateway on this machine, before setting a proxy.",
+        );
       }
-      const exposed = await clearTextProviders();
       if (exposed.length > 0) {
-        throw new Error(`Pi's own models.json sends the API key for ${exposed.join(", ")} over plain http://, so a proxy could read it. Use https:// there, or a gateway on this machine, before setting a proxy.`);
+        throw new Error(`Pi's own models.json sends the key or sign-in for ${exposed.join(", ")} over plain http://, so a proxy could read it. Use https:// there, or a gateway on this machine, before setting a proxy.`);
       }
     }
     await withPiLock(mainSettingsPath(), async () => {
-      const settings = await readJson(await realpath(mainSettingsPath()).catch(() => mainSettingsPath()));
+      const settings = await readPiOwnJson(await realpath(mainSettingsPath()).catch(() => mainSettingsPath()));
       if (settings !== undefined && !isObject(settings)) throw new Error(`${shownPath(mainSettingsPath())} isn't a JSON object`);
       if (settings === undefined && !proxy) return;
       const next: Record<string, unknown> = { ...(settings ?? {}) };
@@ -257,8 +260,18 @@ async function writeMainPiApi(config: { key: string | null; baseUrl: string | nu
     const baseUrl = config.baseUrl?.trim() ? normalizeBaseUrl(config.baseUrl) : null;
     const typed = config.key?.trim() || null;
     const previousBase = await mainAnthropicBaseUrl();
+    // Read before the key is written, so a models.json that can't take the new base URL leaves the
+    // key as it was too: a new key must never go to the old address. Read strictly: it's written
+    // back as plain JSON, and the comments Pi allows there would be lost.
+    const models =
+      previousBase === baseUrl
+        ? undefined
+        : await readJson(await realpath(mainModelsPath()).catch(() => mainModelsPath())).catch(() => {
+            throw new Error(`${shownPath(mainModelsPath())} isn't plain JSON (it may have comments), so ZeroSub leaves it as it is. Change the Anthropic base URL there by hand.`);
+          });
+    if (models !== undefined && !isObject(models)) throw new Error(`${shownPath(mainModelsPath())} isn't a JSON object`);
     await withPiLock(mainAuthPath(), async () => {
-      const auth = await readJson(await realpath(mainAuthPath()).catch(() => mainAuthPath()));
+      const auth = await readPiOwnJson(await realpath(mainAuthPath()).catch(() => mainAuthPath()));
       if (auth !== undefined && !isObject(auth)) throw new Error(`${shownPath(mainAuthPath())} isn't a JSON object`);
       const current = auth?.anthropic;
       const kept = isObject(current) && current.type === "api_key" && typeof current.key === "string" && current.key.trim() ? current.key.trim() : null;
@@ -273,8 +286,6 @@ async function writeMainPiApi(config: { key: string | null; baseUrl: string | nu
       }
     });
     if (previousBase !== baseUrl) {
-      const models = await readJson(await realpath(mainModelsPath()).catch(() => mainModelsPath()));
-      if (models !== undefined && !isObject(models)) throw new Error(`${shownPath(mainModelsPath())} isn't a JSON object`);
       if (models) await backUp("models", models);
       const next: Record<string, unknown> = { ...(models ?? {}) };
       const providers: Record<string, unknown> = isObject(next.providers) ? { ...next.providers } : {};
