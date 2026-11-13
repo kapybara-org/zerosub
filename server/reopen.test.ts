@@ -32,29 +32,25 @@ describe("finding the paseo CLI", () => {
 });
 
 describe("reopening through the host", () => {
-  const saved = { PATH: process.env.PATH, HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
-  let root: string | null = null;
-
-  afterEach(() => {
-    Object.assign(process.env, saved);
-    if (root) rmSync(root, { recursive: true, force: true });
-    root = null;
-  });
-
-  /** No paseo CLI anywhere it's looked for, so a CLI reload can't happen and the real one never runs. */
-  function withoutCli(): void {
-    root = mkdtempSync(join(tmpdir(), "zerosub-reopen-"));
-    process.env.PATH = "";
-    process.env.HOME = root;
-    process.env.USERPROFILE = root;
+  /**
+   * A reopener that finds no paseo CLI, so a CLI reload can't happen and the real one never runs.
+   * Emptying PATH and HOME isn't enough: on a Mac with Paseo installed, the CLI is also looked for in
+   * /Applications/Paseo.app. `looked` counts how often it was looked for.
+   */
+  function withoutCli(): { reopener: Reopener; looked: () => number } {
+    let count = 0;
+    const reopener = new Reopener();
+    reopener.locate = async () => (count++, null);
+    return { reopener, looked: () => count };
   }
 
   it("uses the host's reload when it has one, without looking for the CLI", async () => {
-    withoutCli();
+    const { reopener, looked } = withoutCli();
     const reloaded: string[] = [];
     const host = { agents: { ref: (id: string) => ({ id, reload: async function (this: { id: string }) { reloaded.push(this.id); } }) } };
-    expect(await new Reopener().reopen("a", host)).toEqual({ ok: true });
+    expect(await reopener.reopen("a", host)).toEqual({ ok: true });
     expect(reloaded).toEqual(["a"]);
+    expect(looked()).toBe(0);
   });
 
   it("reports the host's error, and says when it gave up waiting", async () => {
@@ -67,9 +63,10 @@ describe("reopening through the host", () => {
   });
 
   it("falls back to the CLI on a host without its own reload", async () => {
-    withoutCli();
-    const result = await new Reopener().reopen("a", { agents: { ref: () => ({ refresh: async () => null }) } });
+    const { reopener, looked } = withoutCli();
+    const result = await reopener.reopen("a", { agents: { ref: () => ({ refresh: async () => null }) } });
     expect(result).toMatchObject({ ok: false, error: expect.stringMatching(/command-line tool was not found/) });
+    expect(looked()).toBe(1);
   });
 
   it("tells a host that can reload from one that can't", () => {

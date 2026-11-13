@@ -36,7 +36,8 @@ afterEach(async () => {
   await Promise.all(services.splice(0).map((service) => service.stop()));
   if (previousHome === undefined) delete process.env.PASEO_HOME;
   else process.env.PASEO_HOME = previousHome;
-  await rm(root, { recursive: true, force: true });
+  // Retried: a write the test set off in the background can still be landing in it.
+  await rm(root, { recursive: true, force: true, maxRetries: 5 });
 });
 
 function account(id: string, family: "claude" | "codex", label: string, kind: "main" | "managed") {
