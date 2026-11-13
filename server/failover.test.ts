@@ -1334,6 +1334,33 @@ describe("forking to the other provider", () => {
       expect(Object.keys((await second.store.read()).opencodeHolds)).toEqual(["agent-older"]);
     });
 
+    describe("a global hold that can't be settled", () => {
+      const holdAndFork = async () => {
+        vi.spyOn(console, "error").mockImplementation(() => undefined);
+        await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+        await writeFile(join(root, "state.json"), "{ not json");
+        return setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      };
+
+      it("keeps the hold when the agent list can't be read", async () => {
+        const second = await holdAndFork();
+        (second.paseo as { agents: { list: unknown } }).agents.list = async () => {
+          throw new Error("Not connected");
+        };
+        await expect(second.service.forkAgent(second.paseo, AGENT, "opencode")).rejects.toThrow("Not connected");
+        expect(second.created).toHaveLength(0);
+        expect(Object.keys((await second.store.read()).opencodeHolds)).toEqual(["*"]);
+      });
+
+      it("keeps the hold when the agent list is incomplete", async () => {
+        const second = await holdAndFork();
+        (second.paseo as { agents: { list: unknown } }).agents.list = async () => ({ entries: [], pageInfo: { hasMore: true, nextCursor: "more" } });
+        await second.service.forkAgent(second.paseo, AGENT, "opencode").catch(() => undefined);
+        expect(Object.keys((await second.store.read()).opencodeHolds)).toContain("*");
+        expect(second.created).toHaveLength(0);
+      });
+    });
+
     /** Runs `change` when `continueInNewAgent` itself refreshes the source, after every earlier check. */
     const atHelperRefresh = (setup: Awaited<ReturnType<typeof setUpFork>>, change: (source: Record<string, unknown>) => void) => {
       setup.hooks.onRefresh = (id) => {
@@ -2119,6 +2146,21 @@ describe("forking to the other provider", () => {
       await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/already continued in “Fix the build \(continued on ChatGPT\)”/);
       expect(setup.created).toHaveLength(1);
       expect(setup.sends).toHaveLength(0);
+    });
+
+    it("keeps an OpenCode reservation when a later ChatGPT fork is refused before it starts", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: { autoSwitch: false }, noChatGPT: true });
+      const paseo = setup.paseo as { workspaces: { ref: unknown } };
+      const workspaces = paseo.workspaces.ref;
+      paseo.workspaces.ref = () => ({ agents: { create: async () => { throw new Error("OpenCode couldn't start"); } } });
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/couldn't start/);
+      paseo.workspaces.ref = workspaces;
+      const reserved = (await setup.store.read()).opencodeForks[AGENT]!.pending!;
+      await expect(setup.service.forkAgent(setup.paseo, AGENT)).rejects.toThrow();
+      expect(setup.created).toHaveLength(0);
+      expect((await setup.store.read()).opencodeForks[AGENT]?.pending?.targetId).toBe(reserved.targetId);
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(setup.created[0]?.agentId).toBe(reserved.targetId);
     });
 
     it("creates no ChatGPT fork while an OpenCode reservation's fork exists", async () => {

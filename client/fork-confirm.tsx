@@ -88,7 +88,7 @@ export function openCodeForkPopover(store: ZeroSubStore, agentId: string): Compo
             durationMs: 5_000,
           });
         } else if (fork.delivery === "uncertain") {
-          toast.show(`The last handoff to “${fork.title}” couldn't be confirmed. Nothing more was sent; open that chat before retrying.`, {
+          toast.show(`The last handoff to “${fork.title}” couldn't be confirmed. Nothing more was sent; open that chat before retrying. To continue in a new chat instead, archive that one.`, {
             variant: "default",
             durationMs: 5_000,
           });

@@ -1753,9 +1753,6 @@ export class Service {
     if (reservation) {
       const target = (await paseo.agents.ref(reservation.targetId).refresh())?.agent;
       if (target && !target.archivedAt) return { skipped: alreadyContinued(forkRef(target)) };
-      await this.store.update((draft) => {
-        if (draft.opencodeForks[agentId]?.pending?.messageId === reservation.messageId) delete draft.opencodeForks[agentId];
-      });
     }
 
     if (this.availability.get(other)?.ok === false) return { skipped: `${PROVIDER_NAME[other]} isn't installed where the daemon runs.` };
@@ -1781,6 +1778,12 @@ export class Service {
       };
     }
 
+    // Every check that can refuse has passed, so the stale reservation goes now.
+    if (reservation) {
+      await this.store.update((draft) => {
+        if (draft.opencodeForks[agentId]?.pending?.messageId === reservation.messageId) delete draft.opencodeForks[agentId];
+      });
+    }
     const fork = await continueInNewAgent({
       paseo,
       sourceAgentId: agentId,
@@ -1910,11 +1913,6 @@ export class Service {
   }
 
   /**
-   * Nothing proves what this source's OpenCode fork already received. An automatic fork never goes
-   * ahead; a person is told once, and the next manual request may start a new fork. The hold is
-   * cleared when that fork's reservation is written.
-   */
-  /**
    * Settles the hold recovery put on every source when it couldn't read the fork records at all.
    * Only a source with an OpenCode continuation (archived ones included) can have lost a record, so
    * each such source gets a hold of its own and the global hold goes: agents without one, and agents
@@ -1935,6 +1933,11 @@ export class Service {
     });
   }
 
+  /**
+   * Nothing proves what this source's OpenCode fork already received. An automatic fork never goes
+   * ahead; a person is told once, and the next manual request may start a new fork. The hold is
+   * cleared when that fork's reservation is written.
+   */
   private async askBeforeUnproven(agentId: string, source: "auto" | "user"): Promise<ForkOutcome | undefined> {
     if (source === "user" && (await this.store.read()).opencodeHolds[agentId]?.told) return undefined;
     const at = new Date().toISOString();
