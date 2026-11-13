@@ -30,12 +30,13 @@ function account(id: string, isDefault: boolean): AccountView {
 async function menu(route: Partial<AgentRoute>): Promise<readonly PluginButtonMenuEntry[]> {
   const state: StateView = {
     accounts: [account("work", true), account("home", false)],
-    agents: [{ agentId: "agent-1", family: "codex", accountId: "work", pinned: true, pendingAccountId: null, movable: false, ...route }],
+    agents: [{ agentId: "agent-1", family: "codex", accountId: "work", pinned: true, pendingAccountId: null, waiting: null, movable: false, ...route }],
     logins: [],
     providers: { codex: "codex" },
     canReopen: true,
     browserSignIn: true,
     showComposerPill: true,
+    autoSwitch: true,
     warnings: [],
   };
   const buttons: PluginButton[] = [];

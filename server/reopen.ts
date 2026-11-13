@@ -49,7 +49,7 @@ export class Reopener {
     return this.cli.path;
   }
 
-  /** `timedOut`: the reopen was given up on before the daemon answered, so it may still finish. */
+  /** `timedOut`: the reopen was stopped, or gave up, before the daemon answered, so it may still finish. */
   async reopen(agentId: string, paseo?: ReopenHost | null): Promise<{ ok: true } | { ok: false; error: string; timedOut: boolean }> {
     const reload = hostReload(paseo, agentId);
     if (reload) {
@@ -76,16 +76,21 @@ export class Reopener {
         (error, _stdout, stderr) => {
           if (!error) return resolve({ ok: true });
           const detail = `${stderr || error.message}`.trim().split("\n").slice(-3).join(" ");
-          resolve({ ok: false, error: explainFailure(detail), timedOut: error.killed === true });
+          // The CLI gives up on the daemon's answer by itself after a minute, which says as little.
+          const timedOut = error.killed === true || STOPPED_WAITING.test(`${stderr}\n${error.message}`);
+          resolve({ ok: false, error: explainFailure(detail), timedOut });
         },
       );
     });
   }
 }
 
+/** The Paseo CLI's own "no answer in time" (`DAEMON_REQUEST_TIMEOUT`), e.g. "Timeout waiting for message (60000ms)". */
+const STOPPED_WAITING = /Timeout waiting for message|DAEMON_REQUEST_TIMEOUT/;
+
 function explainFailure(detail: string): string {
   if (/transport closed|cannot connect|cannot reach|password|unauthori[sz]ed|DAEMON_NOT_RUNNING/i.test(detail)) {
-    return "Paseo's CLI could not connect to this daemon (it may require a password). The agent switches accounts the next time its session starts.";
+    return "Paseo's CLI could not connect to this daemon (it may require a password)";
   }
   return detail || "Reload failed.";
 }

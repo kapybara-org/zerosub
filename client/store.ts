@@ -267,6 +267,14 @@ function describeIssue(issue: Issue): string {
   return field ? `${field}: ${issue.message}` : issue.message;
 }
 
+/**
+ * Paseo stopped waiting for the daemon's answer. The plugin doesn't stop with it, so what was asked
+ * for may still be under way, or done: say that rather than that it failed.
+ */
+export function stoppedWaiting(error: unknown): boolean {
+  return /Plugin RPC timed out|Timeout waiting for message/i.test(describe(error));
+}
+
 export function useStore(store: ZeroSubStore): StoreSnapshot {
   return useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
 }
