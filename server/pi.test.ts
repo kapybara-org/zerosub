@@ -346,6 +346,16 @@ describe("Pi's own login's key", () => {
     expect(JSON.parse(await readFile(join(main, "models.json"), "utf8"))).toEqual({ providers: { ollama: { baseUrl: "http://localhost" } } });
   });
 
+  it("is stored so Pi reads it as typed, and kept as it is when the same key is typed again", async () => {
+    const adapter = new PiAdapter();
+    await adapter.setApi(null, { key: "!echo$X", baseUrl: null });
+    expect(JSON.parse(await readFile(join(main, "auth.json"), "utf8")).anthropic).toEqual({ type: "api_key", key: "$!echo$$X" });
+    const backups = async () => (await readdir(join(root, "paseo", "zerosub", "backups"))).filter((name) => name.startsWith("pi-auth-")).length;
+    const before = await backups();
+    await adapter.setApi(null, { key: "!echo$X", baseUrl: null });
+    expect(await backups()).toBe(before);
+  });
+
   it("waits for Pi's own lock on its sign-ins", async () => {
     await mkdir(join(main, "auth.json.lock"));
     await expect(new PiAdapter().setApi(null, { key: KEY, baseUrl: null })).rejects.toThrow(/Pi is writing/);

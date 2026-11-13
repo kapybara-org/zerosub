@@ -4,7 +4,7 @@ import { join, resolve } from "node:path";
 import type { ApiSummary, LoginMethod } from "../shared/model";
 import type { EnvPatch, FamilyAdapter, Identity, LoginHandle, ProxyState, RedeemReply, TurnEvent, UsageRead } from "./adapter";
 import { providerCommand } from "./binaries";
-import { clearTextProviders, forgetSyncs, normalizeBaseUrl, preparePiHome, readPiAccount, readPiAccountApi, sentInTheClear, writePiAccountApi, writePiAccountProxy } from "./homes";
+import { clearTextProviders, forgetSyncs, normalizeBaseUrl, piLiteral, preparePiHome, readPiAccount, readPiAccountApi, sentInTheClear, writePiAccountApi, writePiAccountProxy } from "./homes";
 import { PI_LAUNCH_ENV } from "./launchers";
 import { Mutex, readJson, writeJsonAtomic } from "./json-file";
 import { eachProcessEnvironment, homesInEnvironment, parseTrace } from "./processes";
@@ -265,10 +265,11 @@ async function writeMainPiApi(config: { key: string | null; baseUrl: string | nu
       const key = typed ?? kept;
       if (!key) throw new Error("Enter the API key");
       if (!typed && previousBase !== baseUrl) throw new Error("Enter the key again to use it with a different base URL");
-      if (typed && typed !== kept) {
+      // Stored escaped, as an added account's is (see `piLiteral`), so Pi reads it as typed.
+      if (typed && piLiteral(typed) !== kept) {
         if (auth) await backUp("auth", auth);
         const entry = isObject(current) && current.type === "api_key" ? { ...current } : {};
-        await writePiFile(mainAuthPath(), { ...(auth ?? {}), anthropic: { ...entry, type: "api_key", key } }, true);
+        await writePiFile(mainAuthPath(), { ...(auth ?? {}), anthropic: { ...entry, type: "api_key", key: piLiteral(typed) } }, true);
       }
     });
     if (previousBase !== baseUrl) {
