@@ -2215,9 +2215,15 @@ export class Service {
       // A window limit clears once usage shows room again, or once credits cover it if a reading set
       // it: a limit a turn ran into stands, credits or not. Budget limits never appear in usage
       // windows, and a fresh limit is trusted for a while (it may be on a window we can't see).
+      // A reading only takes a limit from the account's own windows, so its limit clears on those:
+      // one model's full window (Claude's "Weekly · Fable") doesn't hold it, nor one set by a
+      // version that still took any full window for the account's.
       const settled = account.limitedAt ? now - Date.parse(account.limitedAt) > LIMIT_TRUST_MS : true;
-      const roomy = (creditsCover && account.limitSource === "reading") || Math.max(...usage.windows.map((window) => window.usedPercent)) < 90;
-      if (!full && account.limitedUntil && account.limitKind === "window" && settled && roomy) {
+      const fromReading = account.limitSource === "reading";
+      const watched = fromReading ? usage.windows.filter(capsAccount) : usage.windows;
+      const stillFull = fromReading ? cutOff : full;
+      const roomy = (creditsCover && fromReading) || Math.max(...watched.map((window) => window.usedPercent)) < 90;
+      if (!stillFull && account.limitedUntil && account.limitKind === "window" && settled && roomy) {
         await this.store.update((draft) => {
           const target = findAccount(draft, accountId);
           if (!target) return;
