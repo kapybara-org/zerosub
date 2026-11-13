@@ -4,7 +4,7 @@ import { SettingsCard, SettingsSwitch } from "@getpaseo/plugin/client/ui";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ScrollView, Text, View } from "react-native";
 import { accountSubtitle, describeReopen, formatAge, formatCredits, formatPlan, staleNotice, usageSummary } from "../shared/format";
-import { FAMILY_LABEL, type AccountView, type Family } from "../shared/model";
+import { FAMILIES, FAMILY_LABEL, type AccountView, type Family, type StateView } from "../shared/model";
 import { preferences } from "../shared/preferences";
 import {
   clearAccountLimit,
@@ -15,6 +15,7 @@ import {
   setNextAgentAccount,
 } from "../shared/rpc";
 import { AddAccountModal } from "./add-account";
+import { AddPiAccountModal, ApiKeyModal, PiSectionNotes, ProxyModal, piCardDetails } from "./pi-accounts";
 import { ResetConfirm, redeemToast, resetBadge } from "./reset-confirm";
 import { describe, stoppedWaiting, useStore, VISIBLE_POLL_MS, type ZeroSubStore } from "./store";
 import { Badge, Button, Card, IconButton, UsageBar, useText } from "./ui";
@@ -43,7 +44,8 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
   // Keep usage moving while the screen is open.
   useEffect(() => store.watch(VISIBLE_POLL_MS), [store]);
 
-  const families: Family[] = ["claude", "codex"];
+  // Pi shows once its CLI login is registered (Pi is installed where the daemon runs) or an account of it was added.
+  const families = FAMILIES.filter((family) => family !== "pi" || state?.accounts.some((account) => account.family === "pi"));
   return (
     <View style={{ flex: 1, backgroundColor: theme.colors.surface0 }}>
       <ScrollView
@@ -74,8 +76,8 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
             ) : null}
           </View>
           <Text style={text.muted}>
-            Keep several Claude and ChatGPT accounts signed in. Each agent uses one; when an account
-            hits its limit, agents move to another and keep going.
+            Keep several Claude and ChatGPT accounts signed in, and run Pi on several Anthropic API keys. Each
+            agent uses one; when an account hits its limit, agents move to another and keep going.
           </Text>
         </View>
 
@@ -120,6 +122,7 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
                 key={family}
                 family={family}
                 accounts={state.accounts.filter((account) => account.family === family)}
+                state={state}
                 theme={theme}
                 compact={layout.compact}
                 store={store}
@@ -132,7 +135,9 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
         <AutomationSettings theme={theme} />
       </ScrollView>
 
-      {adding ? (
+      {adding?.family === "pi" ? (
+        <AddPiAccountModal theme={theme} store={store} onClose={() => setAdding(null)} />
+      ) : adding ? (
         <AddAccountModal
           theme={theme}
           layout={layout}
@@ -212,9 +217,12 @@ function HostScope({ theme, label }: { theme: Theme; label: string }) {
   );
 }
 
+const SECTION_TITLE: Record<Family, string> = { claude: "Claude", codex: "ChatGPT (Codex)", pi: "Pi" };
+
 function FamilySection({
   family,
   accounts,
+  state,
   theme,
   compact,
   store,
@@ -223,6 +231,7 @@ function FamilySection({
 }: {
   family: Family;
   accounts: AccountView[];
+  state: StateView;
   theme: Theme;
   compact: boolean;
   store: ZeroSubStore;
@@ -234,14 +243,14 @@ function FamilySection({
     <View style={{ gap: 10 }}>
       <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
         <Text style={text.heading} accessibilityRole="header">
-          {family === "claude" ? "Claude" : "ChatGPT (Codex)"}
+          {SECTION_TITLE[family]}
         </Text>
         <Button
           theme={theme}
           icon="Plus"
           label={compact ? "Add" : "Add account"}
           accessibilityLabel={`Add ${FAMILY_LABEL[family]} account`}
-          tooltip={`Sign in another ${FAMILY_LABEL[family]} account`}
+          tooltip={family === "pi" ? "Add a Pi account with an Anthropic API key and its own proxy" : `Sign in another ${FAMILY_LABEL[family]} account`}
           tooltipAlign="end"
           onPress={onAdd}
         />
@@ -249,6 +258,7 @@ function FamilySection({
       {accounts.length === 0 ? (
         <Text style={text.muted}>No {FAMILY_LABEL[family]} accounts yet.</Text>
       ) : null}
+      {family === "pi" ? <PiSectionNotes theme={theme} /> : null}
       {chunk(accounts, compact ? 1 : 2).map((row) => (
         <View key={row.map((account) => account.id).join()} style={{ flexDirection: "row", gap: 10 }}>
           {row.map((account) => (
@@ -282,6 +292,10 @@ function AccountCard({
   const toast = useToast();
   const [busy, setBusy] = useState<"default" | "remove" | "clear" | "toggle" | "next" | null>(null);
   const [renaming, setRenaming] = useState(false);
+  const [editingApi, setEditingApi] = useState(false);
+  const [editingProxy, setEditingProxy] = useState(false);
+  const api = account.auth === "api";
+  const details = piCardDetails(account);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const resets = account.usage?.resets ?? null;
@@ -438,25 +452,36 @@ function AccountCard({
               onPress={() => void makeDefault()}
             />
           ) : null}
-          <IconButton
-            theme={theme}
-            icon={disabled ? "CirclePlay" : "CirclePause"}
-            label={disabled ? "Enable account" : "Disable for now (agents won't use it)"}
-            tooltip={
-              disabled
-                ? "Enable: agents can use this account again"
-                : "Disable for now: agents stop using it and move to your other accounts"
-            }
-            busy={busy === "toggle"}
-            onPress={() => void toggle()}
-          />
+          {/* No Pi account stands in for another, so one can't be disabled (see setAccountEnabled). */}
+          {account.family === "pi" && !disabled ? null : (
+            <IconButton
+              theme={theme}
+              icon={disabled ? "CirclePlay" : "CirclePause"}
+              label={disabled ? "Enable account" : "Disable for now (agents won't use it)"}
+              tooltip={
+                disabled
+                  ? "Enable: agents can use this account again"
+                  : "Disable for now: agents stop using it and move to your other accounts"
+              }
+              busy={busy === "toggle"}
+              onPress={() => void toggle()}
+            />
+          )}
+          {account.apiEditable ? (
+            <IconButton theme={theme} icon="KeyRound" label="API settings" tooltip="API settings: key and base URL" onPress={() => setEditingApi(true)} />
+          ) : null}
+          {account.proxyEditable ? (
+            <IconButton theme={theme} icon="Globe" label="Proxy" tooltip="Proxy: the network this account uses" onPress={() => setEditingProxy(true)} />
+          ) : null}
           <IconButton theme={theme} icon="Pencil" label="Rename" tooltip="Rename this account" onPress={() => setRenaming(true)} />
           {account.kind !== "main" ? (
             <IconButton
               theme={theme}
               icon="Trash2"
               label="Remove"
-              tooltip="Remove: sign it out and delete its saved login"
+              tooltip={
+                api ? "Remove: delete its saved key" : "Remove: sign it out and delete its saved login"
+              }
               tone="danger"
               busy={busy === "remove"}
               onPress={() => setConfirmRemove(true)}
@@ -469,15 +494,24 @@ function AccountCard({
         {account.isDefault ? <Badge theme={theme} label="Default" tone="accent" /> : null}
         {disabled ? <Badge theme={theme} label="Disabled" /> : null}
         {plan ? <Badge theme={theme} label={plan} /> : null}
+        {api ? <Badge theme={theme} label="API" /> : null}
         {account.kind === "main" ? <Badge theme={theme} label="CLI login" /> : null}
         {account.status === "limited" ? <Badge theme={theme} label="Limit reached" tone="danger" /> : null}
         {account.status === "signed_out" ? <Badge theme={theme} label="Signed out" tone="warning" /> : null}
         {resets && !signedOut ? <Badge theme={theme} label={resetBadge(resets)} tone="accent" /> : null}
       </View>
 
+      {details ? (
+        <Text selectable style={[text.small, faded]} numberOfLines={3}>
+          {details}
+        </Text>
+      ) : null}
+
       <View style={[{ gap: 10 }, faded]}>
         {signedOut ? (
-          <Text style={text.small}>Sign in again to use this account.</Text>
+          <Text style={text.small}>{api ? "The key was refused. Enter a working one to use this account." : "Sign in again to use this account."}</Text>
+        ) : api ? (
+          <Text style={text.small}>Billed per use · used only as the default or when picked for an agent</Text>
         ) : windows.length > 0 ? (
           windows.map((limit) => <UsageBar key={limit.id} theme={theme} limit={limit} />)
         ) : (
@@ -512,11 +546,11 @@ function AccountCard({
             theme={theme}
             size="small"
             tone="primary"
-            icon="LogIn"
-            label="Sign in"
-            tooltip="Sign this account in again"
+            icon={api ? "KeyRound" : "LogIn"}
+            label={api ? "Fix key" : "Sign in"}
+            tooltip={api ? "Enter a working key for this account" : "Sign this account in again"}
             tooltipAlign="end"
-            onPress={onSignIn}
+            onPress={api ? () => setEditingApi(true) : onSignIn}
           />
         ) : disabled ? (
           <Button
@@ -565,12 +599,16 @@ function AccountCard({
       {renaming ? (
         <RenameModal theme={theme} account={account} store={store} onClose={() => setRenaming(false)} />
       ) : null}
+      {editingApi ? <ApiKeyModal theme={theme} store={store} account={account} onClose={() => setEditingApi(false)} /> : null}
+      {editingProxy ? <ProxyModal theme={theme} store={store} account={account} onClose={() => setEditingProxy(false)} /> : null}
       <Modal title={`Remove ${account.label}?`} open={confirmRemove} onOpenChange={setConfirmRemove}>
         <Modal.Content>
           <Text style={text.body}>
-            {account.family === "claude"
-              ? "This signs the account out on this machine and deletes its saved login. Agents using it move to the default account; their conversations are kept."
-              : "This signs the account out on this machine and deletes its saved login. New agents use the default account. Existing ChatGPT conversations on it can't move, so start new agents for them."}
+            {account.family === "pi"
+              ? "This deletes the account's folder and saved key on this machine. Agents using it move to the default account; their conversations are kept."
+              : account.family === "claude"
+                ? "This signs the account out on this machine and deletes its saved login. Agents using it move to the default account; their conversations are kept."
+                : "This signs the account out on this machine and deletes its saved login. New agents use the default account. Existing ChatGPT conversations on it can't move, so start new agents for them."}
           </Text>
           <View style={{ flexDirection: "row", gap: 8, justifyContent: "flex-end" }}>
             <Button theme={theme} label="Cancel" tooltip="Keep this account" tooltipAlign="end" onPress={() => setConfirmRemove(false)} />
@@ -579,7 +617,9 @@ function AccountCard({
               tone="danger"
               icon="Trash2"
               label="Remove"
-              tooltip="Sign it out and delete its saved login; its agents move to the default"
+              tooltip={
+                api ? "Delete its saved key; its agents move to the default" : "Sign it out and delete its saved login; its agents move to the default"
+              }
               tooltipAlign="end"
               busy={busy === "remove"}
               onPress={() => void remove()}

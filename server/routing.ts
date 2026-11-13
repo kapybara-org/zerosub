@@ -36,6 +36,15 @@ export function isUsable(account: StoredAccount, now: number): boolean {
 }
 
 /**
+ * Routing may put agents on this account by itself: it's usable and not billed per use. No Pi
+ * account is ever picked that way: an added one is an API key, and Pi's own login may be one too,
+ * so moving work onto either would move it onto a bill nobody chose.
+ */
+export function canStandIn(account: StoredAccount, now: number): boolean {
+  return account.family !== "pi" && account.auth !== "api" && isUsable(account, now);
+}
+
+/**
  * Lower is better. Unknown usage ranks in the middle so a known-quiet account wins over a mystery.
  * A full window of one model only, such as "Weekly · Opus", leaves the account its room for the rest.
  * A window whose reset has passed since the reading starts again empty, so an account that just
@@ -81,7 +90,7 @@ export function mostAvailable(
 ): StoredAccount | undefined {
   const preferred = defaultAccount(state, family)?.id;
   const candidates = accountsOf(state, family).filter(
-    (account) => !exclude.has(account.id) && isUsable(account, now),
+    (account) => !exclude.has(account.id) && canStandIn(account, now),
   );
   const rank = (account: StoredAccount) => {
     const usage = usageOf(account.id);

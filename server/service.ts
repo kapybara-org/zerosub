@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
 import type {
@@ -7,8 +7,11 @@ import type {
   PluginSessionOpenRequest,
 } from "@getpaseo/plugin/server";
 import {
+  FAMILIES,
   FAMILY_LABEL,
+  OTHER_FAMILY,
   type AccountView,
+  type ApiSummary,
   type AgentRoute,
   type Family,
   type LoginMethod,
@@ -28,20 +31,22 @@ import {
   type LimitHit,
   type LimitKind,
   type LoginHandle,
+  type ProxyState,
   type RedeemReply,
   type UsageRead,
 } from "./adapter";
 import { FamilyResolver } from "./families";
-import { sameAccountIdentity } from "./account-identity";
+import { sameAccountIdentity, withoutWorkspace } from "./account-identity";
 import { CodexContinuations } from "./continuations";
 import { CONTINUED_FROM_LABEL, continueInNewAgent, type Continuation } from "./handoff";
-import { isAccountHome, removeHome } from "./homes";
+import { isAccountHome, normalizeBaseUrl, removeHome } from "./homes";
 import { Mutex } from "./json-file";
 import { turnRows } from "./limits";
 import { canSignInWithBrowser } from "./machine";
 import { equivalentMode } from "./modes";
 import { homesDir } from "./paths";
-import { Reopener } from "./reopen";
+import { maskProxy, normalizeProxy } from "./proxy";
+import { Reopener, hostCanReload } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
 import { chooseAccount, isLimited, isUsable, mostAvailable, type RouteDecision, type RouteInput } from "./routing";
@@ -64,9 +69,7 @@ import {
 type PaseoApi = PluginHookContext["paseo"];
 type TurnEnded = PluginLifecycleEvents["agent.turn_ended"];
 
-const FAMILIES: readonly Family[] = ["claude", "codex"];
-const PROVIDER_NAME: Record<Family, string> = { claude: "Claude Code", codex: "Codex" };
-const OTHER_FAMILY: Record<Family, Family> = { claude: "codex", codex: "claude" };
+const PROVIDER_NAME: Record<Family, string> = { claude: "Claude Code", codex: "Codex", pi: "Pi" };
 /** How often to read usage: accounts in use, the defaults, and the rest. Adapters space reads further. */
 const USAGE_BUSY_MS = 60_000;
 const USAGE_DEFAULT_MS = 5 * 60_000;
@@ -253,7 +256,9 @@ export class Service {
   private readonly identityCheckedAt = new Map<string, number>();
   private readonly availability = new Map<Family, { ok: boolean; detail: string | null; at: number }>();
   private readonly logins = new Map<string, LoginSession>();
-  private readonly loginLocks: Record<Family, Mutex> = { claude: new Mutex(), codex: new Mutex() };
+  private readonly loginLocks: Record<Family, Mutex> = { claude: new Mutex(), codex: new Mutex(), pi: new Mutex() };
+  /** Homes of API accounts being set up, which cleanup must leave alone. */
+  private readonly creatingHomes = new Set<string>();
   /**
    * Agents whose account changed mid-turn (or while starting); reopened when the turn ends, or by
    * alignment once they're idle without one.
@@ -384,16 +389,20 @@ export class Service {
     if (!availability.ok) return;
     const identity = await adapter.identity(null).catch(() => null);
     this.identityCheckedAt.set(MAIN_ACCOUNT_ID[family], Date.now());
+    let handedOver = false;
     await this.store.update((draft) => {
       let main = findAccount(draft, MAIN_ACCOUNT_ID[family]);
       if (!main) {
         main = newAccount({ id: MAIN_ACCOUNT_ID[family], family, kind: "main", home: null });
         main.signedIn = false;
+        // Kept until a sign-in names it: Pi's never does.
+        main.label = `${FAMILY_LABEL[family]} (CLI login)`;
         draft.accounts.unshift(main);
       }
-      if (identity) applyIdentity(main, identity, draft);
+      if (identity) handedOver = applyIdentity(main, identity, draft);
       if (!main.label) main.label = `${FAMILY_LABEL[family]} (CLI login)`;
     });
+    if (handedOver) this.forgetReading(MAIN_ACCOUNT_ID[family]);
   }
 
   private async tick(): Promise<void> {
@@ -433,17 +442,31 @@ export class Service {
   private async refreshIdentity(accountId: string): Promise<void> {
     this.identityCheckedAt.set(accountId, Date.now());
     const account = findAccount(await this.store.read(), accountId);
-    if (!account) return;
+    // A Pi API account's key is only known to work from a turn: a refused one is learned from a failed turn.
+    if (!account || account.auth === "api") return;
     // A check that can't tell (Claude's keychain unreadable just now, say) changes nothing; the next one may.
     const identity = await this.adapters[account.family].identity(account.home).catch((error: unknown) => {
       log(`could not check whether ${account.label} is signed in`, error);
       return null;
     });
     if (!identity) return;
+    let handedOver = false;
     await this.store.update((draft) => {
       const target = findAccount(draft, accountId);
-      if (target) applyIdentity(target, identity, draft);
+      if (target) handedOver = applyIdentity(target, identity, draft);
     });
+    if (handedOver) this.forgetReading(accountId);
+  }
+
+  /** The CLI login now belongs to someone else, so the last reading, its refresh timing and a reset just spent were the previous person's. */
+  private forgetReading(accountId: string): void {
+    console.log(`[ZeroSub] the CLI login for ${accountId} changed hands; dropping its old usage and limit`);
+    this.setUsage(accountId, null);
+    this.usageLive.delete(accountId);
+    this.usageRetryAt.delete(accountId);
+    this.usageAttemptAt.delete(accountId);
+    this.lastRedeemAt.delete(accountId);
+    void this.refreshUsage(accountId, true).catch(() => undefined);
   }
 
   /**
@@ -537,6 +560,7 @@ export class Service {
       const active = !login.finishedAt || login.saving || Date.now() - login.finishedAt < LOGIN_GRACE_MS;
       if (active && login.home) busy.add(login.home);
     }
+    for (const home of this.creatingHomes) busy.add(home);
     for (const [home, entry] of Object.entries(state.cleanup)) {
       if (busy.has(home)) continue;
       if (!isAccountHome(home, entry.family)) {
@@ -570,7 +594,9 @@ export class Service {
     // A sign-in this run saw end without an account is its own to undo. One left by an earlier run
     // only goes if it isn't signed in: a registry restored from an older copy can still list a
     // sign-in that has since become an account the registry no longer knows.
-    const earlier = entry.why === "unfinished" && !this.endedHere(home);
+    // A Pi account is saved, and its entry dropped, in one write (see `addApiAccount`): an entry left
+    // means it never became an account, so its home goes, key and all.
+    const earlier = entry.why === "unfinished" && entry.family !== "pi" && !this.endedHere(home);
     let deleteFolder = true;
     let outcome: string;
     try {
@@ -582,7 +608,7 @@ export class Service {
           : `deleted ${home}, left by a sign-in that never finished`;
       } else {
         await this.adapters[entry.family].logout(home);
-        outcome = `signed out and deleted ${home}`;
+        outcome = entry.why === "unfinished" && entry.family === "pi" ? `deleted ${home}, left by a Pi account that was never saved` : `signed out and deleted ${home}`;
       }
     } catch (error) {
       const failures = (this.cleanupFailures.get(home) ?? 0) + 1;
@@ -746,7 +772,7 @@ export class Service {
     let decision = first;
     const prepare = async (account: StoredAccount) => {
       if (account.kind === "managed" && account.home) {
-        await adapter.prepareHome(account.home).catch((error: unknown) => log(`could not refresh the home of ${account.label}`, error));
+        await adapter.prepareHome(account.home, this.stillHas(account)).catch((error: unknown) => log(`could not refresh the home of ${account.label}`, error));
       }
     };
 
@@ -788,7 +814,8 @@ export class Service {
         decision.skipped ? `; skipped ${decision.skipped.account.label}: ${decision.skipped.why}` : ""
       })`,
     );
-    return { ...request, env: applyEnv(await adapter.env(account.home), request.env) };
+    const session = typeof request.cwd === "string" && request.cwd ? { cwd: request.cwd } : undefined;
+    return { ...request, env: applyEnv(await adapter.env(account.home, session), request.env) };
   }
 
   /**
@@ -912,6 +939,15 @@ export class Service {
   /** Re-checks the account an agent was using; true when it really is signed out now. */
   private async confirmSignedOut(accountId: string | null): Promise<boolean> {
     if (!accountId) return false;
+    const state = await this.store.read();
+    if (findAccount(state, accountId)?.auth === "api") {
+      // Nothing to re-check against: the refusal itself is the answer.
+      await this.store.update((draft) => {
+        const target = findAccount(draft, accountId);
+        if (target) target.signedIn = false;
+      });
+      return true;
+    }
     await this.refreshIdentity(accountId);
     return findAccount(await this.store.read(), accountId)?.signedIn === false;
   }
@@ -1131,10 +1167,11 @@ export class Service {
       }
       if (reason !== "limit") return;
       let detail: string | null = null;
-      if (this.prefs.forkOtherProvider) {
+      const otherFamily = OTHER_FAMILY[family];
+      if (this.prefs.forkOtherProvider && otherFamily) {
         // Opt-in: every account of this provider is out, so carry on with the other provider.
         const result = await this.forkToOtherProvider(paseo, agentId, family, timeline, "auto").catch((error: unknown) => ({
-          skipped: `Couldn't continue on ${FAMILY_LABEL[OTHER_FAMILY[family]]}: ${describe(error)}`,
+          skipped: `Couldn't continue on ${FAMILY_LABEL[otherFamily]}: ${describe(error)}`,
         }));
         if ("fork" in result) {
           this.switchGuard.note(agentId, now);
@@ -1149,10 +1186,10 @@ export class Service {
           });
           return;
         }
-        console.log(`[ZeroSub] not continuing ${agentId} on ${FAMILY_LABEL[OTHER_FAMILY[family]]}: ${result.skipped}`);
+        console.log(`[ZeroSub] not continuing ${agentId} on ${FAMILY_LABEL[otherFamily]}: ${result.skipped}`);
         detail = result.skipped;
-      } else if (mostAvailable(latest, OTHER_FAMILY[family], (id) => this.usage.get(id), now, new Set())) {
-        detail = `Or continue on ${FAMILY_LABEL[OTHER_FAMILY[family]]} in a new agent from the account button.`;
+      } else if (otherFamily && mostAvailable(latest, otherFamily, (id) => this.usage.get(id), now, new Set())) {
+        detail = `Or continue on ${FAMILY_LABEL[otherFamily]} in a new agent from the account button.`;
       }
       await this.appendRow(paseo, agentId, { ...base, to: account.label, reason: "exhausted", outcome: "stayed", detail });
       return;
@@ -1256,10 +1293,9 @@ export class Service {
     await this.store.update((draft) => {
       const account = findAccount(draft, accountId);
       if (!account) return;
-      account.limitedUntil = until;
-      account.limitKind = kind;
-      account.limitedAt = new Date().toISOString();
-      account.limitSource = source;
+      const limit: Limit = { limitedUntil: until, limitKind: kind, limitedAt: new Date().toISOString(), limitSource: source };
+      // A quota belongs to the subscription, so every slot signed into it is out of room.
+      for (const slot of [account, ...sameSubscription(draft, account)]) Object.assign(slot, limit);
     });
   }
 
@@ -1295,7 +1331,10 @@ export class Service {
           .catch((error: unknown): RedeemReply => ({ outcome: "error", message: describe(error), left: null }));
         console.log(`[ZeroSub] banked reset on ${account.label}: ${reply.outcome}`);
         if (reply.outcome === "reset") {
-          this.lastRedeemAt.set(account.id, Date.now());
+          const at = Date.now();
+          this.lastRedeemAt.set(account.id, at);
+          // The reset refilled the subscription, so stale notices from its other slots are past too.
+          for (const twin of sameSubscription(await this.store.read(), account)) this.lastRedeemAt.set(twin.id, at);
           await this.afterReset(account.id, reply.left);
         } else if (reply.left !== null) {
           this.updateResetCount(account.id, reply.left);
@@ -1311,8 +1350,10 @@ export class Service {
     await this.store.update((draft) => {
       const account = findAccount(draft, accountId);
       if (!account) return;
-      account.limitedUntil = null;
-      account.limitKind = null;
+      for (const slot of [account, ...sameSubscription(draft, account)]) {
+        slot.limitedUntil = null;
+        slot.limitKind = null;
+      }
     });
     if (left !== null) this.updateResetCount(accountId, left);
     // Give the provider a moment to settle before reading the refilled usage.
@@ -1549,6 +1590,7 @@ export class Service {
     source: "auto" | "user",
   ): Promise<{ fork: Continuation; account: StoredAccount; family: Family } | { skipped: string }> {
     const other = OTHER_FAMILY[family];
+    if (!other) return { skipped: `${FAMILY_LABEL[family]} agents don't carry on with another provider.` };
     const name = FAMILY_LABEL[other];
     const families = await this.families.resolve(paseo);
     const state = await this.store.read();
@@ -1794,7 +1836,7 @@ export class Service {
     this.reloads.set(agentId, reload);
     let result: Awaited<ReturnType<Reopener["reopen"]>>;
     try {
-      result = await this.reopener.reopen(agentId);
+      result = await this.reopener.reopen(agentId, paseo);
     } finally {
       this.reloads.delete(agentId);
     }
@@ -1951,8 +1993,8 @@ export class Service {
     if (this.aligning || this.stopped || this.pinning > 0) return emptySummary();
     this.aligning = true;
     try {
-      // Without the CLI nothing can be reopened; agents move when their sessions next start.
-      if ((await this.reopener.locate()) === null) return emptySummary();
+      // Without the host's own reopen or the CLI nothing can be reopened; agents move when their sessions next start.
+      if (!(await this.canReopen(paseo))) return emptySummary();
       const state = await this.store.read();
       const families = await this.families.resolve(paseo);
       const routing = new Set(this.routing.values());
@@ -2077,7 +2119,8 @@ export class Service {
     const since = now - (this.usageAttemptAt.get(accountId) ?? 0);
     const task = (async () => {
       const account = findAccount(await this.store.read(), accountId);
-      if (!account) return;
+      // An API account (an added Pi account) has no subscription windows to read.
+      if (!account || account.auth === "api") return;
       const spacing = this.adapters[account.family].usageSpacingMs;
       if (since < (force ? spacing : Math.max(spacing, 60_000))) return;
       this.usageAttemptAt.set(accountId, Date.now());
@@ -2166,7 +2209,7 @@ export class Service {
     const state = await this.store.read();
     const families = await this.families.resolve(paseo);
     const agents = await this.cachedAgents(paseo);
-    const canReopen = (await this.reopener.locate()) !== null;
+    const canReopen = await this.canReopen(paseo);
     const now = Date.now();
 
     const routes: AgentRoute[] = [];
@@ -2197,8 +2240,19 @@ export class Service {
       });
     }
 
+    const proxies = new Map<string, ProxyState>();
+    const apis = new Map<string, ApiSummary | null>();
+    await Promise.all(
+      state.accounts.map(async (account) => {
+        const adapter = this.adapters[account.family];
+        if (account.kind !== "managed" || !account.home) return;
+        if (adapter.proxyState) proxies.set(account.id, await adapter.proxyState(account.home).catch((): ProxyState => ({ own: null, inherited: null })));
+        if (account.auth === "api" && adapter.api) apis.set(account.id, await adapter.api(account.home).catch(() => null));
+      }),
+    );
     const accounts: AccountView[] = state.accounts.map((account) => {
       const limited = isLimited(account, now);
+      const proxy = proxies.get(account.id);
       return {
         id: account.id,
         family: account.family,
@@ -2214,6 +2268,12 @@ export class Service {
         usage: this.usage.get(account.id) ?? null,
         agentCount: counts.get(account.id) ?? 0,
         home: account.home,
+        auth: account.auth,
+        api: apis.get(account.id) ?? null,
+        apiEditable: account.auth === "api",
+        proxy: proxy?.own ? maskProxy(proxy.own) : null,
+        proxyEditable: proxy !== undefined,
+        inheritedProxy: proxy?.inherited ? { ...proxy.inherited, proxy: maskProxy(proxy.inherited.proxy) } : null,
       };
     });
 
@@ -2228,6 +2288,11 @@ export class Service {
       autoSwitch: this.prefs.autoSwitch,
       warnings: await this.warnings(),
     };
+  }
+
+  /** Whether running agents can change accounts right away: through the host's own reopen, or the CLI. */
+  private async canReopen(paseo: PaseoApi | null): Promise<boolean> {
+    return hostCanReload(paseo) || (await this.reopener.locate()) !== null;
   }
 
   /** Agents with a live session: the given ones (looked up fresh), or every one. */
@@ -2250,8 +2315,11 @@ export class Service {
 
   private async warnings(): Promise<string[]> {
     const warnings: string[] = [];
+    const state = await this.store.read();
     for (const family of FAMILIES) {
       const availability = this.availability.get(family);
+      // Pi is optional: it's only missed once an account of it was added.
+      if (family === "pi" && !state.accounts.some((account) => account.family === "pi" && account.kind === "managed")) continue;
       if (availability && !availability.ok) {
         warnings.push(
           `${PROVIDER_NAME[family]} isn't installed where the daemon can run it${availability.detail ? ` (${availability.detail})` : ""}. Install it to add ${FAMILY_LABEL[family]} accounts.`,
@@ -2266,7 +2334,7 @@ export class Service {
     if (process.env.CODEX_ACCESS_TOKEN) {
       warnings.push("The daemon's environment sets CODEX_ACCESS_TOKEN. Codex agents on your CLI login use it instead of a ChatGPT sign-in.");
     }
-    if ((await this.reopener.locate()) === null) {
+    if (!(await this.canReopen(this.paseo))) {
       warnings.push(
         "Paseo's command-line tool wasn't found, so running agents change accounts the next time their session starts instead of right away.",
       );
@@ -2345,6 +2413,10 @@ export class Service {
     const account = findAccount(state, accountId);
     if (!account) throw new Error("That account no longer exists.");
     if (account.disabled === !enabled) return { ...emptySummary(), stayed: 0 };
+    if (!enabled && account.family === "pi") {
+      // No Pi account stands in for another (each may be billed), so a disabled one would still be used.
+      throw new Error("Pi accounts can't be disabled. Make another one the default, or pick another for its agents, or remove it.");
+    }
     if (!enabled && !mostAvailable(state, account.family, (id) => this.usage.get(id), Date.now(), new Set([account.id]))) {
       // Routing only stands in a usable account for a disabled one. Without one, its
       // agents and new ones would stay on it, or quietly fall back to the CLI login.
@@ -2454,8 +2526,10 @@ export class Service {
     const state = await this.store.update((draft) => {
       const account = findAccount(draft, accountId);
       if (!account) return;
-      account.limitedUntil = null;
-      account.limitKind = null;
+      for (const slot of [account, ...sameSubscription(draft, account)]) {
+        slot.limitedUntil = null;
+        slot.limitKind = null;
+      }
     });
     if (!findAccount(state, accountId)) throw new Error("That account no longer exists.");
     void this.refreshUsage(accountId, true).catch(() => undefined);
@@ -2562,7 +2636,7 @@ export class Service {
     const account = findAccount(state, accountId);
     if (!account) throw new Error("That account no longer exists.");
     if (account.kind === "main") {
-      throw new Error("Your CLI login can't be removed here. Sign out with `claude auth logout` or `codex logout` instead.");
+      throw new Error("Your CLI login can't be removed here. Sign out with `claude auth logout`, `codex logout` or Pi's /logout instead.");
     }
     if (!this.adapters[account.family].portable) {
       // These conversations can't move to another ChatGPT account, so removing theirs would strand them.
@@ -2603,6 +2677,105 @@ export class Service {
     return { affected: affected.length, moves };
   }
 
+  // ------------------------------------------------------------------ Pi accounts
+
+  /**
+   * Whether `account` is still registered, asked with its home's lock held before anything is
+   * written to it: a home whose account was removed meanwhile is never written to (or made again).
+   */
+  private stillHas(account: StoredAccount): () => Promise<boolean> {
+    return async () => {
+      const current = findAccount(await this.store.read(), account.id);
+      return current !== undefined && current.home === account.home;
+    };
+  }
+
+  /** Sets an added Pi account's proxy; an empty value clears it. Processes started afterwards use it. */
+  async setProxy(accountId: string, input: string): Promise<string | null> {
+    const account = findAccount(await this.store.read(), accountId);
+    if (!account) throw new Error("That account no longer exists.");
+    const adapter = this.adapters[account.family];
+    if (!adapter.setProxy || account.kind !== "managed" || !account.home) throw new Error("A proxy can only be set for added Pi accounts.");
+    const proxy = input.trim() ? normalizeProxy(input) : null;
+    await adapter.setProxy(account.home, proxy, this.stillHas(account));
+    return proxy ? maskProxy(proxy) : null;
+  }
+
+  /** Adds a Pi account: an Anthropic API key, optionally sent to another base URL, with an optional proxy. */
+  async addApiAccount(input: { label: string; key: string; baseUrl?: string; proxy?: string }): Promise<string> {
+    const adapter = this.adapters.pi;
+    if (!adapter.setApi) throw new Error("API accounts aren't supported here.");
+    const baseUrl = input.baseUrl?.trim() ? normalizeBaseUrl(input.baseUrl) : null;
+    const proxy = input.proxy?.trim() ? normalizeProxy(input.proxy) : null;
+    const key = input.key.trim();
+    if (!key) throw new Error("Enter the API key.");
+    const identity = apiIdentity(baseUrl, keyDigest(key));
+    const duplicate = accountsOf(await this.store.read(), "pi").find((account) => account.identity === identity);
+    if (duplicate) throw new Error(`That key is already added as "${duplicate.label}".`);
+
+    // A managed account's ID matches its home's folder name, as its cleanup entry does.
+    const id = `pi-${randomBytes(6).toString("hex")}`;
+    const home = join(homesDir(), id);
+    this.creatingHomes.add(home);
+    try {
+      // On the cleanup list until the account is saved, so a home left half made is cleaned up even
+      // after a restart. While it's being made, cleanup leaves it alone.
+      await this.store.update((draft) => {
+        draft.cleanup[home] = { family: "pi", accountId: id, why: "unfinished", at: new Date().toISOString() };
+      });
+      if (proxy) await adapter.setProxy?.(home, proxy);
+      await adapter.setApi(home, { key, baseUrl });
+      await adapter.prepareHome(home);
+      await this.store.update((draft) => {
+        // Checked again here too: another add of the same key may have finished meanwhile.
+        const twin = accountsOf(draft, "pi").find((entry) => entry.identity === identity);
+        if (twin) throw new Error(`That key is already added as "${twin.label}".`);
+        const account = newAccount({ id, family: "pi", kind: "managed", home, auth: "api" });
+        account.label = input.label.trim();
+        account.autoLabel = false;
+        account.identity = identity;
+        draft.accounts.push(account);
+        delete draft.cleanup[home];
+      });
+    } catch (error) {
+      // Gone now, or left on the cleanup list for a later pass.
+      const removed = await removeHome(home).then(
+        () => true,
+        () => false,
+      );
+      if (removed) await this.store.update((draft) => void delete draft.cleanup[home]).catch(() => undefined);
+      throw error;
+    } finally {
+      this.creatingHomes.delete(home);
+    }
+    return id;
+  }
+
+  /** Changes an added Pi account's key (empty keeps it) or base URL. */
+  async updateApiAccount(accountId: string, input: { key?: string; baseUrl?: string }): Promise<void> {
+    const account = findAccount(await this.store.read(), accountId);
+    if (!account) throw new Error("That account no longer exists.");
+    const adapter = this.adapters[account.family];
+    if (account.auth !== "api" || !account.home || !adapter.setApi) throw new Error(`${account.label} signs in with a subscription, not an API key.`);
+    const key = input.key?.trim() || null;
+    const baseUrl = input.baseUrl?.trim() ? normalizeBaseUrl(input.baseUrl) : null;
+    // A kept key stays on its base URL (the adapter refuses to move it), so its identity holds.
+    const identity = key ? apiIdentity(baseUrl, keyDigest(key)) : null;
+    if (identity) {
+      const duplicate = accountsOf(await this.store.read(), account.family).find((entry) => entry.id !== account.id && entry.identity === identity);
+      if (duplicate) throw new Error(`That key is already added as "${duplicate.label}".`);
+    }
+    await adapter.setApi(account.home, { key, baseUrl }, this.stillHas(account));
+    await this.store.update((draft) => {
+      const target = findAccount(draft, accountId);
+      if (!target) return;
+      if (!identity) return;
+      target.identity = identity;
+      // A new key is worth trying again even if the old one had been refused.
+      target.signedIn = true;
+    });
+  }
+
   // ------------------------------------------------------------------ RPC: sign-in
 
   startLogin(family: Family, method: LoginMethod, accountId?: string): Promise<LoginView> {
@@ -2610,6 +2783,8 @@ export class Service {
   }
 
   private async beginLogin(family: Family, method: LoginMethod, accountId?: string): Promise<LoginView> {
+    // Pi's added accounts are API keys, and its own login signs in inside Pi.
+    if (family === "pi") throw new Error("Pi accounts use an Anthropic API key: add one with Add account, or change its key from its card. Sign Pi's own login in with /login inside Pi.");
     let availability = this.availability.get(family);
     if (!availability?.ok) {
       await this.ensureFamily(family);
@@ -2737,6 +2912,7 @@ export class Service {
     session.finishedAt = Date.now(); // Claim completion before writing, so a late cancel can't race it.
 
     let accountId = session.accountId;
+    let handedOver = false;
     session.saving = true;
     try {
       await this.store.update((draft) => {
@@ -2748,9 +2924,10 @@ export class Service {
           draft.accounts.push(account);
           if (session.home) delete draft.cleanup[session.home];
         }
-        applyIdentity(account, identity, draft);
+        // Cleared first, so a limit the account brings from another slot (see applyIdentity) stands.
         account.limitedUntil = null;
         account.limitKind = null;
+        handedOver = applyIdentity(account, identity, draft);
       });
     } catch (error) {
       // A new account's home is then cleaned up as an unfinished sign-in, like any that failed.
@@ -2762,6 +2939,7 @@ export class Service {
       session.saving = false;
     }
     if (accountId) this.identityCheckedAt.set(accountId, Date.now());
+    if (accountId && handedOver) this.forgetReading(accountId);
     session.accountId = accountId;
     session.view = { ...session.view, step: "done", accountId, message: null };
     if (accountId) void this.refreshUsage(accountId, true).catch(() => undefined);
@@ -2778,8 +2956,18 @@ export class Service {
 
 // -------------------------------------------------------------------- helpers
 
-function newAccount(fields: Pick<StoredAccount, "id" | "family" | "kind" | "home">): StoredAccount {
+/** What tells an API key's account from another: where the key goes, and a short hash of the key. */
+function apiIdentity(baseUrl: string | null, digest: string): string {
+  return `api|${baseUrl ?? "anthropic"}|${digest}`;
+}
+
+function keyDigest(key: string): string {
+  return createHash("sha256").update(key).digest("hex").slice(0, 16);
+}
+
+function newAccount(fields: Pick<StoredAccount, "id" | "family" | "kind" | "home"> & Partial<Pick<StoredAccount, "auth">>): StoredAccount {
   return {
+    auth: "subscription",
     ...fields,
     label: "",
     autoLabel: true,
@@ -2796,17 +2984,45 @@ function newAccount(fields: Pick<StoredAccount, "id" | "family" | "kind" | "home
   };
 }
 
-function applyIdentity(account: StoredAccount, identity: Identity, state: StoredState): void {
+type Limit = Pick<StoredAccount, "limitedUntil" | "limitKind" | "limitedAt" | "limitSource">;
+
+/** The other accounts signed into the same subscription (and so sharing its quota). */
+function sameSubscription(state: StoredState, account: StoredAccount): StoredAccount[] {
+  return accountsOf(state, account.family).filter((other) => other.id !== account.id && sameAccountIdentity(account.family, other, account));
+}
+
+/** Returns true when the CLI login's account was replaced by a different one, which drops what the slot knew of the old one's limit. */
+function applyIdentity(account: StoredAccount, identity: Identity, state: StoredState): boolean {
+  const handedOver = account.kind === "main" && identity.signedIn && !!account.identity && !!identity.identity && !sameAccountIdentity(account.family, account, identity);
+  applyIdentityFields(account, identity, state);
+  if (!handedOver) return false;
+  account.limitedUntil = null;
+  account.limitKind = null;
+  account.limitedAt = null;
+  account.limitSource = undefined;
+  const now = Date.now();
+  const limited = sameSubscription(state, account).find((other) => isLimited(other, now));
+  if (limited) {
+    const { limitedUntil, limitKind, limitedAt, limitSource } = limited;
+    Object.assign(account, { limitedUntil, limitKind, limitedAt, limitSource });
+  }
+  return true;
+}
+
+function applyIdentityFields(account: StoredAccount, identity: Identity, state: StoredState): void {
   account.signedIn = identity.signedIn;
   if (!identity.signedIn) {
     dropNextPick(state, account);
     return;
   }
+  // A key read without its workspace says less than the one stored for the same person, which stays.
+  const vaguer = withoutWorkspace(identity.identity) && !withoutWorkspace(account.identity) && sameAccountIdentity(account.family, account, identity);
   account.email = identity.email ?? account.email;
   account.plan = identity.plan ?? account.plan;
   account.organization = identity.organization ?? account.organization;
-  account.identity = identity.identity ?? account.identity;
-  if (account.autoLabel || !account.label) {
+  if (!vaguer) account.identity = identity.identity ?? account.identity;
+  // An identity without an email (Pi's) has nothing better to call an account that has a name.
+  if ((account.autoLabel && (identity.email || !account.label)) || !account.label) {
     account.label = suggestLabel(account, state);
     account.autoLabel = true;
   }

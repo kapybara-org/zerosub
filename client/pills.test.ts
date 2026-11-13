@@ -23,6 +23,12 @@ function account(id: string, isDefault: boolean): AccountView {
     usage: null,
     agentCount: 1,
     home: null,
+    auth: "subscription",
+    api: null,
+    apiEditable: false,
+    proxy: null,
+    proxyEditable: false,
+    inheritedProxy: null,
   };
 }
 

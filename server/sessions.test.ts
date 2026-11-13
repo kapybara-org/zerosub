@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { FamilyAdapter } from "./adapter";
+import { absentPi } from "./fakes.test-support";
 import type { FamilyResolver } from "./families";
 import type { Reopener } from "./reopen";
 import { Service } from "./service";
@@ -153,7 +154,7 @@ async function setUp(state: Partial<StoredState>, agents: Agent[], options: Opti
   const gated = options.abandonReload ? gate() : undefined;
   if (gated) options.env = gated.wait;
   const service: Service = new Service(
-    { claude: adapter("claude"), codex: adapter("codex") },
+    { claude: adapter("claude"), codex: adapter("codex"), pi: absentPi() },
     store,
     { resolve: async () => ({ claude: "claude" as const, codex: "codex" as const }) } as unknown as FamilyResolver,
     reopener as unknown as Reopener,
@@ -178,7 +179,7 @@ describe("a session that opens without ZeroSub's answer", () => {
     const { service, store, paseo, open, reopened } = await setUp(
       {
         accounts: claudeAccounts(),
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         bindings: { [AGENT]: { accountId: HELLO, source: "user", at: EARLIER } },
         sessions: {},
       },
@@ -215,7 +216,7 @@ describe("a session that opens without ZeroSub's answer", () => {
     const { store, open } = await setUp(
       {
         accounts: claudeAccounts(),
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         bindings: { [AGENT]: { accountId: HELLO, source: "user", at: EARLIER } },
         sessions: { [AGENT]: { accountId: HELLO, family: "claude", openedAt: EARLIER } },
       },
@@ -238,7 +239,7 @@ describe("a session that opens without ZeroSub's answer", () => {
     const { service, store, paseo, notes, background } = await setUp(
       {
         accounts: claudeAccounts(),
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         sessions: { [AGENT]: { accountId: MAIN, family: "claude", openedAt: EARLIER } },
       },
       [live(AGENT)],
@@ -259,7 +260,7 @@ describe("a session that opens without ZeroSub's answer", () => {
   it("pins a new ChatGPT thread to the CLI login when it starts there", async () => {
     const held = gate();
     const { store, open } = await setUp(
-      { accounts: codexAccounts(), defaults: { claude: null, codex: CODEX_WORK }, sessions: {} },
+      { accounts: codexAccounts(), defaults: { claude: null, codex: CODEX_WORK, pi: null }, sessions: {} },
       [{ ...live(AGENT, "codex"), lastUserMessageAt: null }],
       { env: held.wait },
     );
@@ -285,7 +286,7 @@ describe("a session that opens without ZeroSub's answer", () => {
     const { service, store, paseo, open, reopened } = await setUp(
       {
         accounts: codexAccounts(),
-        defaults: { claude: null, codex: CODEX_MAIN },
+        defaults: { claude: null, codex: CODEX_MAIN, pi: null },
         // The hand-off pinned the new thread to work before it first opened.
         bindings: { [AGENT]: { accountId: CODEX_WORK, source: "thread", at: EARLIER } },
         sessions: {},
@@ -313,7 +314,7 @@ describe("a session that opens without ZeroSub's answer", () => {
     const { store, open } = await setUp(
       {
         accounts: codexAccounts(),
-        defaults: { claude: null, codex: CODEX_MAIN },
+        defaults: { claude: null, codex: CODEX_MAIN, pi: null },
         bindings: { [AGENT]: { accountId: CODEX_WORK, source: "thread", at: EARLIER } },
         sessions: { [AGENT]: { accountId: CODEX_WORK, family: "codex", openedAt: EARLIER } },
       },
@@ -336,7 +337,7 @@ describe("a session that opens without ZeroSub's answer", () => {
     const { store, open } = await setUp(
       {
         accounts: codexAccounts(),
-        defaults: { claude: null, codex: CODEX_MAIN },
+        defaults: { claude: null, codex: CODEX_MAIN, pi: null },
         bindings: { [AGENT]: { accountId: CODEX_WORK, source: "thread", at: EARLIER } },
         sessions: { [AGENT]: { accountId: CODEX_WORK, family: "codex", openedAt: EARLIER } },
       },
@@ -358,7 +359,7 @@ describe("closed agents", () => {
     const { service, store, paseo } = await setUp(
       {
         accounts: claudeAccounts(),
-        defaults: { claude: HELLO, codex: null },
+        defaults: { claude: HELLO, codex: null, pi: null },
         sessions: { [AGENT]: { accountId: HELLO, family: "claude", openedAt: EARLIER } },
       },
       [live(AGENT)],
@@ -371,7 +372,7 @@ describe("closed agents", () => {
 
   it("keep a session that opened after the close", async () => {
     const { service, store, open } = await setUp(
-      { accounts: claudeAccounts(), defaults: { claude: HELLO, codex: null }, sessions: {} },
+      { accounts: claudeAccounts(), defaults: { claude: HELLO, codex: null, pi: null }, sessions: {} },
       [live(AGENT)],
     );
     const closing = service.onAgentClosed(AGENT);
@@ -384,7 +385,7 @@ describe("closed agents", () => {
     const { service, store } = await setUp(
       {
         accounts: claudeAccounts(),
-        defaults: { claude: HELLO, codex: null },
+        defaults: { claude: HELLO, codex: null, pi: null },
         sessions: {
           closed: { accountId: HELLO, family: "claude", openedAt: EARLIER },
           archived: { accountId: HELLO, family: "claude", openedAt: EARLIER },
@@ -427,7 +428,7 @@ describe("agents Paseo doesn't list", () => {
     const { service, store, paseo } = await setUp(
       {
         accounts: claudeAccounts(),
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         sessions: recorded("background", "gone", "helper", "unsure"),
         bindings: bound("background", "gone", "helper", "unsure"),
       },
@@ -446,7 +447,7 @@ describe("agents Paseo doesn't list", () => {
     const { service, store, paseo } = await setUp(
       {
         accounts: claudeAccounts(),
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
         sessions: recorded("background", "gone", "helper", "unsure"),
       },
       [live("open")],
@@ -462,7 +463,7 @@ describe("ChatGPT threads with history", () => {
     const { service, store, paseo, reopened } = await setUp(
       {
         accounts: codexAccounts(),
-        defaults: { claude: null, codex: CODEX_MAIN },
+        defaults: { claude: null, codex: CODEX_MAIN, pi: null },
         bindings: { [AGENT]: { accountId: CODEX_WORK, source: "thread", at: EARLIER } },
         sessions: {},
       },
@@ -479,7 +480,7 @@ describe("ChatGPT threads with history", () => {
     const { service, store, paseo, reopened } = await setUp(
       {
         accounts: codexAccounts(),
-        defaults: { claude: null, codex: CODEX_MAIN },
+        defaults: { claude: null, codex: CODEX_MAIN, pi: null },
         bindings: { [AGENT]: { accountId: CODEX_WORK, source: "thread", at: EARLIER } },
         sessions: { [AGENT]: { accountId: CODEX_MAIN, family: "codex", openedAt: EARLIER } },
       },

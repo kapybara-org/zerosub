@@ -10,6 +10,7 @@ import { StateStore, StoredAccountSchema, salvageState } from "./state";
 import type { FamilyResolver } from "./families";
 import { preferences } from "../shared/preferences";
 import type { SwitchRow } from "../shared/timeline";
+import { absentPi } from "./fakes.test-support";
 
 type PaseoApi = PluginHookContext["paseo"];
 type Create = Parameters<ReturnType<PaseoApi["workspaces"]["ref"]>["agents"]["create"]>[0];
@@ -112,7 +113,7 @@ async function setup() {
     redeemReset: async () => ({ outcome: "reset", message: "Synthetic reset", left: 0 }),
   } as unknown as FamilyAdapter;
   const service = () => {
-    const made = new Service({ codex: adapter, claude: adapter }, store, { resolve: async () => ({ codex: "codex" }) } as unknown as FamilyResolver);
+    const made = new Service({ codex: adapter, claude: adapter, pi: absentPi() }, store, { resolve: async () => ({ codex: "codex" }) } as unknown as FamilyResolver);
     services.push(made);
     return made;
   };

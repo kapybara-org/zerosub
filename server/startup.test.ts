@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FamilyAdapter } from "./adapter";
+import { absentPi } from "./fakes.test-support";
 import type { FamilyResolver } from "./families";
 import type { Reopener } from "./reopen";
 import { Service } from "./service";
@@ -62,7 +63,7 @@ describe("starting up", () => {
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     const store = new StateStore(join(root, "state.json"));
     const service = new Service(
-      { claude: adapter("claude"), codex: adapter("codex") },
+      { claude: adapter("claude"), codex: adapter("codex"), pi: absentPi() },
       store,
       { resolve: async () => ({ claude: "claude" as const }) } as unknown as FamilyResolver,
       { locate: async () => null } as unknown as Reopener,
