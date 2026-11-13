@@ -71,8 +71,9 @@ export function contributeCommands(client: PluginClientContext, store: ZeroSubSt
     dynamic = [];
     if (!state) return;
     state.accounts.forEach((account, index) => {
-      if (account.status !== "signed_out" && account.status !== "disabled") {
-        const pending = Boolean(account.nextAgentUntil);
+      const pending = Boolean(account.nextAgentUntil);
+      // A waiting pick can always be canceled, whatever has become of its account since.
+      if (pending || (account.status !== "signed_out" && account.status !== "disabled")) {
         dynamic.push(
           client.addCommandCenterItem({
             id: `next-agent-${index}`,

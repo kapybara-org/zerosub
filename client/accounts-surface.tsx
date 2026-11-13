@@ -413,7 +413,8 @@ function AccountCard({
               onPress={() => void markAvailable()}
             />
           ) : null}
-          {!signedOut && !disabled ? (
+          {/* A pick waiting here can always be canceled, whatever has become of the account since. */}
+          {account.nextAgentUntil || (!signedOut && !disabled) ? (
             <IconButton
               theme={theme}
               icon={account.nextAgentUntil ? "CircleX" : "SquarePlus"}

@@ -61,7 +61,7 @@ Turn on **Spread new agents across accounts** to select an account from its usag
 
 ### Pick the account for the next new agent
 
-A new workspace has no agent yet, so its message box has no account button. To choose the account of the agent you're about to start, use **⌘K → "Next new … agent: use …"** or the **plus-square** button on an account card. The next agent of that provider you start (in a new workspace or a new tab) opens on that account, then new agents follow the default again. The pick is used once, expires after 10 minutes, and doesn't affect agents that already have an account, resumed conversations or background sessions. Choose it again to cancel.
+A new workspace has no agent yet, so its message box has no account button. To choose the account of the agent you're about to start, use **⌘K → "Next new … agent: use …"** or the **plus-square** button on an account card. The pick goes to the next new agent of that provider this daemon opens, wherever it's started: from any device, the CLI, another agent or a schedule. That agent opens on the picked account, even with **Spread new agents across accounts** on, and new agents after it follow the default again. If by then the account can't take new agents (signed out, disabled, or at its limit with automatic switching on), the pick is used up anyway and the agent starts where it would have without one. Removing, disabling or signing out the account cancels the pick, and a pick no agent takes expires silently after 10 minutes. It doesn't affect agents that already have an account, resumed conversations, background agents, or Paseo's own helpers that write branch names, commit messages and PR text. Choose it again to cancel.
 
 ### Claude vs. ChatGPT when switching mid-conversation
 

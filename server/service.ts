@@ -44,7 +44,7 @@ import { homesDir } from "./paths";
 import { Reopener } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
-import { chooseAccount, isLimited, isUsable, mostAvailable, type RouteDecision } from "./routing";
+import { chooseAccount, isLimited, isUsable, mostAvailable, type RouteDecision, type RouteInput } from "./routing";
 import {
   MAIN_ACCOUNT_ID,
   StateStore,
@@ -56,6 +56,7 @@ import {
   type Cleanup,
   type ContinuationChain,
   type LiveSession,
+  type NextAgentPick,
   type StoredAccount,
   type StoredState,
 } from "./state";
@@ -220,6 +221,26 @@ const NEXT_PICK_MS = 10 * 60_000;
 function nextPickUntil(state: StoredState, accountId: string, family: Family, now: number): string | null {
   const pick = state.nextAgent?.[family];
   return pick && pick.accountId === accountId && Date.parse(pick.until) > now ? pick.until : null;
+}
+
+function samePick(a: NextAgentPick | null | undefined, b: NextAgentPick | null | undefined): boolean {
+  return a?.accountId === b?.accountId && a?.until === b?.until;
+}
+
+/** Forgets the "next new agent" pick of an account that can't take agents any more. */
+function dropNextPick(state: StoredState, account: StoredAccount): void {
+  if (state.nextAgent[account.family]?.accountId === account.id) state.nextAgent[account.family] = null;
+}
+
+/**
+ * Whether a session may take the "next new agent" pick: one of the user's own agents, which always
+ * open in a workspace. Paseo's helpers for branch names, commit messages and PR text open in none.
+ * From Paseo 0.16 a helper hidden from tabs and lists says `background: true`, and older hosts don't
+ * send `background` at all, so only `false` or no `background` lets a session take the pick.
+ */
+function takesNextPick(request: PluginSessionOpenRequest): boolean {
+  const { background } = request as { background?: unknown };
+  return request.purpose === "interactive" && Boolean(request.workspaceId) && (background === undefined || background === false);
 }
 
 export class Service {
@@ -707,7 +728,7 @@ export class Service {
     if (reload) reload.opens += 1;
     const ownReload = reload?.opens === 1;
     const state = await this.store.read();
-    const decision = chooseAccount(state, {
+    const input: RouteInput = {
       agentId: request.agentId,
       family,
       reason: request.reason,
@@ -718,38 +739,48 @@ export class Service {
       usageOf: (id) => this.usage.get(id),
       // Alignment and the account button decide with the same stand-in rule, so a reopen lands where they expect.
       current: request.reason === "create" ? undefined : this.standingIn(state, request.agentId, family, request.reason === "refresh"),
-      allowNextPick: request.purpose === "interactive",
-    });
-    if (!decision) return undefined;
-    const { account } = decision;
-    if (decision.usedNextPick) {
-      await this.store.update((draft) => {
-        if (draft.nextAgent?.[family]?.accountId === account.id) draft.nextAgent[family] = null;
-      });
-      console.log(`[ZeroSub] next-agent pick used: ${request.agentId} starts on ${account.label}`);
-    }
+      allowNextPick: takesNextPick(request),
+    };
+    const first = chooseAccount(state, input);
+    if (!first) return undefined;
+    let decision = first;
+    const prepare = async (account: StoredAccount) => {
+      if (account.kind === "managed" && account.home) {
+        await adapter.prepareHome(account.home).catch((error: unknown) => log(`could not refresh the home of ${account.label}`, error));
+      }
+    };
 
-    if (account.kind === "managed" && account.home) {
-      await adapter.prepareHome(account.home).catch((error: unknown) => log(`could not refresh the home of ${account.label}`, error));
-    }
+    await prepare(first.account);
     const seenBinding = state.bindings[request.agentId]?.accountId;
-    const bindingChanged = decision.bind !== null && seenBinding !== decision.bind.accountId;
+    const bindingChanged = (bind: Binding | null) => bind !== null && seenBinding !== bind.accountId;
     // An interactive session is recorded even when it opens on the account the last one did: when it
     // opened tells it from a session that has ended since (see `onAgentClosed`, `forgetEndedSessions`).
-    if (bindingChanged || interactive) {
+    if (bindingChanged(first.bind) || interactive) {
       await this.store.update((draft) => {
+        // The pick is claimed here, with the binding it brings, so only one session gets it: one that
+        // finds it taken or changed since it decided decides again on what's there now.
+        if (decision.nextPick && !samePick(draft.nextAgent[family], decision.nextPick)) {
+          decision = chooseAccount(draft, input) ?? { ...first, nextPick: undefined };
+        }
+        if (decision.nextPick) draft.nextAgent[family] = null;
+        const { bind } = decision;
         // Don't overwrite a choice the user made while this decision was being taken.
-        if (decision.bind && bindingChanged && draft.bindings[request.agentId]?.accountId === seenBinding) {
-          if (opening && !adapter.portable) opening.pin = { wrote: decision.bind, replaced: draft.bindings[request.agentId] };
-          draft.bindings[request.agentId] = decision.bind;
+        if (bind && bindingChanged(bind) && draft.bindings[request.agentId]?.accountId === seenBinding) {
+          if (opening && !adapter.portable) opening.pin = { wrote: bind, replaced: draft.bindings[request.agentId] };
+          draft.bindings[request.agentId] = bind;
         }
         // Paseo has opened the session without waiting: `onSessionOpen` sorts out its record.
         if (!interactive || abandoned?.aborted) return;
-        const session = { accountId: account.id, family, openedAt: new Date(now).toISOString() };
+        const session = { accountId: decision.account.id, family, openedAt: new Date(now).toISOString() };
         if (reload && ownReload) reload.opened = { replaced: draft.sessions[request.agentId], wrote: session };
         draft.sessions[request.agentId] = session;
         if (opening) opening.session = session;
       });
+    }
+    const { account } = decision;
+    if (account.id !== first.account.id) await prepare(account);
+    if (decision.nextPick && Date.parse(decision.nextPick.until) > now) {
+      console.log(`[ZeroSub] next-agent pick ${decision.bind?.source === "user" ? "used" : "dropped, as its account can't take agents now"}: ${request.agentId}`);
     }
     this.activeAt.set(account.id, now);
     console.log(
@@ -2327,6 +2358,7 @@ export class Service {
     await this.store.update((draft) => {
       const target = findAccount(draft, accountId);
       if (target) target.disabled = !enabled;
+      if (target && !enabled) dropNextPick(draft, target);
     });
     console.log(`[ZeroSub] ${account.label} is ${enabled ? "enabled" : "disabled"}`);
     let stayed = 0;
@@ -2560,6 +2592,7 @@ export class Service {
         if (binding.accountId === accountId) delete draft.bindings[agentId];
       }
       if (draft.defaults[account.family] === accountId) draft.defaults[account.family] = null;
+      dropNextPick(draft, account);
     });
     this.setUsage(accountId, null);
     // Idle agents move now and busy ones after their turn. The home is signed out and deleted by the
@@ -2765,7 +2798,10 @@ function newAccount(fields: Pick<StoredAccount, "id" | "family" | "kind" | "home
 
 function applyIdentity(account: StoredAccount, identity: Identity, state: StoredState): void {
   account.signedIn = identity.signedIn;
-  if (!identity.signedIn) return;
+  if (!identity.signedIn) {
+    dropNextPick(state, account);
+    return;
+  }
   account.email = identity.email ?? account.email;
   account.plan = identity.plan ?? account.plan;
   account.organization = identity.organization ?? account.organization;
