@@ -36,7 +36,7 @@ import {
   type UsageRead,
 } from "./adapter";
 import { FamilyResolver } from "./families";
-import { sameAccountIdentity } from "./account-identity";
+import { sameAccountIdentity, withoutWorkspace } from "./account-identity";
 import { CodexContinuations } from "./continuations";
 import { CONTINUED_FROM_LABEL, continueInNewAgent, type Continuation } from "./handoff";
 import { isAccountHome, normalizeBaseUrl, removeHome } from "./homes";
@@ -46,7 +46,7 @@ import { canSignInWithBrowser } from "./machine";
 import { equivalentMode } from "./modes";
 import { homesDir } from "./paths";
 import { maskProxy, normalizeProxy } from "./proxy";
-import { Reopener } from "./reopen";
+import { Reopener, hostCanReload } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
 import { chooseAccount, isLimited, isUsable, mostAvailable, type RouteDecision } from "./routing";
@@ -360,6 +360,7 @@ export class Service {
     if (!availability.ok) return;
     const identity = await adapter.identity(null).catch(() => null);
     this.identityCheckedAt.set(MAIN_ACCOUNT_ID[family], Date.now());
+    let handedOver = false;
     await this.store.update((draft) => {
       let main = findAccount(draft, MAIN_ACCOUNT_ID[family]);
       if (!main) {
@@ -369,9 +370,10 @@ export class Service {
         main.label = `${FAMILY_LABEL[family]} (CLI login)`;
         draft.accounts.unshift(main);
       }
-      if (identity) applyIdentity(main, identity, draft);
+      if (identity) handedOver = applyIdentity(main, identity, draft);
       if (!main.label) main.label = `${FAMILY_LABEL[family]} (CLI login)`;
     });
+    if (handedOver) this.forgetReading(MAIN_ACCOUNT_ID[family]);
   }
 
   private async tick(): Promise<void> {
@@ -419,10 +421,23 @@ export class Service {
       return null;
     });
     if (!identity) return;
+    let handedOver = false;
     await this.store.update((draft) => {
       const target = findAccount(draft, accountId);
-      if (target) applyIdentity(target, identity, draft);
+      if (target) handedOver = applyIdentity(target, identity, draft);
     });
+    if (handedOver) this.forgetReading(accountId);
+  }
+
+  /** The CLI login now belongs to someone else, so the last reading, its refresh timing and a reset just spent were the previous person's. */
+  private forgetReading(accountId: string): void {
+    console.log(`[ZeroSub] the CLI login for ${accountId} changed hands; dropping its old usage and limit`);
+    this.setUsage(accountId, null);
+    this.usageLive.delete(accountId);
+    this.usageRetryAt.delete(accountId);
+    this.usageAttemptAt.delete(accountId);
+    this.lastRedeemAt.delete(accountId);
+    void this.refreshUsage(accountId, true).catch(() => undefined);
   }
 
   /**
@@ -1232,10 +1247,9 @@ export class Service {
     await this.store.update((draft) => {
       const account = findAccount(draft, accountId);
       if (!account) return;
-      account.limitedUntil = until;
-      account.limitKind = kind;
-      account.limitedAt = new Date().toISOString();
-      account.limitSource = source;
+      const limit: Limit = { limitedUntil: until, limitKind: kind, limitedAt: new Date().toISOString(), limitSource: source };
+      // A quota belongs to the subscription, so every slot signed into it is out of room.
+      for (const slot of [account, ...sameSubscription(draft, account)]) Object.assign(slot, limit);
     });
   }
 
@@ -1271,7 +1285,10 @@ export class Service {
           .catch((error: unknown): RedeemReply => ({ outcome: "error", message: describe(error), left: null }));
         console.log(`[ZeroSub] banked reset on ${account.label}: ${reply.outcome}`);
         if (reply.outcome === "reset") {
-          this.lastRedeemAt.set(account.id, Date.now());
+          const at = Date.now();
+          this.lastRedeemAt.set(account.id, at);
+          // The reset refilled the subscription, so stale notices from its other slots are past too.
+          for (const twin of sameSubscription(await this.store.read(), account)) this.lastRedeemAt.set(twin.id, at);
           await this.afterReset(account.id, reply.left);
         } else if (reply.left !== null) {
           this.updateResetCount(account.id, reply.left);
@@ -1287,8 +1304,10 @@ export class Service {
     await this.store.update((draft) => {
       const account = findAccount(draft, accountId);
       if (!account) return;
-      account.limitedUntil = null;
-      account.limitKind = null;
+      for (const slot of [account, ...sameSubscription(draft, account)]) {
+        slot.limitedUntil = null;
+        slot.limitKind = null;
+      }
     });
     if (left !== null) this.updateResetCount(accountId, left);
     // Give the provider a moment to settle before reading the refilled usage.
@@ -1771,7 +1790,7 @@ export class Service {
     this.reloads.set(agentId, reload);
     let result: Awaited<ReturnType<Reopener["reopen"]>>;
     try {
-      result = await this.reopener.reopen(agentId);
+      result = await this.reopener.reopen(agentId, paseo);
     } finally {
       this.reloads.delete(agentId);
     }
@@ -1928,8 +1947,8 @@ export class Service {
     if (this.aligning || this.stopped || this.pinning > 0) return emptySummary();
     this.aligning = true;
     try {
-      // Without the CLI nothing can be reopened; agents move when their sessions next start.
-      if ((await this.reopener.locate()) === null) return emptySummary();
+      // Without the host's own reopen or the CLI nothing can be reopened; agents move when their sessions next start.
+      if (!(await this.canReopen(paseo))) return emptySummary();
       const state = await this.store.read();
       const families = await this.families.resolve(paseo);
       const routing = new Set(this.routing.values());
@@ -2144,7 +2163,7 @@ export class Service {
     const state = await this.store.read();
     const families = await this.families.resolve(paseo);
     const agents = await this.cachedAgents(paseo);
-    const canReopen = (await this.reopener.locate()) !== null;
+    const canReopen = await this.canReopen(paseo);
     const now = Date.now();
 
     const routes: AgentRoute[] = [];
@@ -2224,6 +2243,11 @@ export class Service {
     };
   }
 
+  /** Whether running agents can change accounts right away: through the host's own reopen, or the CLI. */
+  private async canReopen(paseo: PaseoApi | null): Promise<boolean> {
+    return hostCanReload(paseo) || (await this.reopener.locate()) !== null;
+  }
+
   /** Agents with a live session: the given ones (looked up fresh), or every one. */
   private async liveAgents(paseo: PaseoApi, agentIds?: readonly string[]): Promise<AgentInfo[]> {
     const agents = agentIds
@@ -2263,7 +2287,7 @@ export class Service {
     if (process.env.CODEX_ACCESS_TOKEN) {
       warnings.push("The daemon's environment sets CODEX_ACCESS_TOKEN. Codex agents on your CLI login use it instead of a ChatGPT sign-in.");
     }
-    if ((await this.reopener.locate()) === null) {
+    if (!(await this.canReopen(this.paseo))) {
       warnings.push(
         "Paseo's command-line tool wasn't found, so running agents change accounts the next time their session starts instead of right away.",
       );
@@ -2438,8 +2462,10 @@ export class Service {
     const state = await this.store.update((draft) => {
       const account = findAccount(draft, accountId);
       if (!account) return;
-      account.limitedUntil = null;
-      account.limitKind = null;
+      for (const slot of [account, ...sameSubscription(draft, account)]) {
+        slot.limitedUntil = null;
+        slot.limitKind = null;
+      }
     });
     if (!findAccount(state, accountId)) throw new Error("That account no longer exists.");
     void this.refreshUsage(accountId, true).catch(() => undefined);
@@ -2821,6 +2847,7 @@ export class Service {
     session.finishedAt = Date.now(); // Claim completion before writing, so a late cancel can't race it.
 
     let accountId = session.accountId;
+    let handedOver = false;
     session.saving = true;
     try {
       await this.store.update((draft) => {
@@ -2832,9 +2859,10 @@ export class Service {
           draft.accounts.push(account);
           if (session.home) delete draft.cleanup[session.home];
         }
-        applyIdentity(account, identity, draft);
+        // Cleared first, so a limit the account brings from another slot (see applyIdentity) stands.
         account.limitedUntil = null;
         account.limitKind = null;
+        handedOver = applyIdentity(account, identity, draft);
       });
     } catch (error) {
       // A new account's home is then cleaned up as an unfinished sign-in, like any that failed.
@@ -2846,6 +2874,7 @@ export class Service {
       session.saving = false;
     }
     if (accountId) this.identityCheckedAt.set(accountId, Date.now());
+    if (accountId && handedOver) this.forgetReading(accountId);
     session.accountId = accountId;
     session.view = { ...session.view, step: "done", accountId, message: null };
     if (accountId) void this.refreshUsage(accountId, true).catch(() => undefined);
@@ -2890,13 +2919,40 @@ function newAccount(fields: Pick<StoredAccount, "id" | "family" | "kind" | "home
   };
 }
 
-function applyIdentity(account: StoredAccount, identity: Identity, state: StoredState): void {
+type Limit = Pick<StoredAccount, "limitedUntil" | "limitKind" | "limitedAt" | "limitSource">;
+
+/** The other accounts signed into the same subscription (and so sharing its quota). */
+function sameSubscription(state: StoredState, account: StoredAccount): StoredAccount[] {
+  return accountsOf(state, account.family).filter((other) => other.id !== account.id && sameAccountIdentity(account.family, other, account));
+}
+
+/** Returns true when the CLI login's account was replaced by a different one, which drops what the slot knew of the old one's limit. */
+function applyIdentity(account: StoredAccount, identity: Identity, state: StoredState): boolean {
+  const handedOver = account.kind === "main" && identity.signedIn && !!account.identity && !!identity.identity && !sameAccountIdentity(account.family, account, identity);
+  applyIdentityFields(account, identity, state);
+  if (!handedOver) return false;
+  account.limitedUntil = null;
+  account.limitKind = null;
+  account.limitedAt = null;
+  account.limitSource = undefined;
+  const now = Date.now();
+  const limited = sameSubscription(state, account).find((other) => isLimited(other, now));
+  if (limited) {
+    const { limitedUntil, limitKind, limitedAt, limitSource } = limited;
+    Object.assign(account, { limitedUntil, limitKind, limitedAt, limitSource });
+  }
+  return true;
+}
+
+function applyIdentityFields(account: StoredAccount, identity: Identity, state: StoredState): void {
   account.signedIn = identity.signedIn;
   if (!identity.signedIn) return;
+  // A key read without its workspace says less than the one stored for the same person, which stays.
+  const vaguer = withoutWorkspace(identity.identity) && !withoutWorkspace(account.identity) && sameAccountIdentity(account.family, account, identity);
   account.email = identity.email ?? account.email;
   account.plan = identity.plan ?? account.plan;
   account.organization = identity.organization ?? account.organization;
-  account.identity = identity.identity ?? account.identity;
+  if (!vaguer) account.identity = identity.identity ?? account.identity;
   // An identity without an email (Pi's) has nothing better to call an account that has a name.
   if ((account.autoLabel && (identity.email || !account.label)) || !account.label) {
     account.label = suggestLabel(account, state);
