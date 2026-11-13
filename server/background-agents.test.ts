@@ -53,8 +53,11 @@ function adapter(): FamilyAdapter {
   } as unknown as FamilyAdapter;
 }
 
-/** A host like Paseo 0.16: background agents left out of its list, and a reload of its own. */
-async function setUp() {
+/**
+ * A host like Paseo 0.16: background agents left out of its list, and a reload of its own. Given
+ * `refusal`, the reload fails with it once Paseo has asked where the new session opens.
+ */
+async function setUp(refusal?: string) {
   const store = new StateStore(join(root, "state.json"));
   await store.update((draft) =>
     Object.assign(draft, {
@@ -82,6 +85,7 @@ async function setUp() {
             { agentId: id, provider: "claude", reason: "refresh", purpose: "interactive", env: {} } as never,
             { paseo } as never,
           );
+          if (refusal) throw new Error(refusal);
         },
       }),
     },
@@ -105,5 +109,18 @@ describe("a background agent", () => {
     const state = await store.read();
     expect(state.bindings[HELPER]).toMatchObject({ accountId: MAIN, source: "user" });
     expect(state.sessions[HELPER]?.accountId).toBe(MAIN);
+  });
+
+  it("keeps its session where it was when the daemon times out reloading it", async () => {
+    // The daemon answered: it gave up closing the old session, so the new one it asked about never opened.
+    const refusal = "Timed out closing previous session during refresh requestType=refresh_agent_request code=agent_refresh_failed";
+    const { service, store, paseo, reloads } = await setUp(refusal);
+    const summary = await service.setAgentAccount(paseo, HELPER, MAIN);
+    expect(reloads).toEqual([HELPER]);
+    expect(summary.reopened).toEqual([]);
+    expect(summary.failed).toEqual([{ agentId: HELPER, error: refusal }]);
+    const state = await store.read();
+    expect(state.bindings[HELPER]).toMatchObject({ accountId: MAIN, source: "user" }); // where it goes when its session next opens
+    expect(state.sessions[HELPER]).toEqual({ accountId: OTHER, family: "claude", openedAt: LONG_AGO });
   });
 });

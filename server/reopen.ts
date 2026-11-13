@@ -58,7 +58,7 @@ export class Reopener {
         return { ok: true };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        return { ok: false, error: message || "Reload failed.", timedOut: /timed? ?out/i.test(message) };
+        return { ok: false, error: message || "Reload failed.", timedOut: STOPPED_WAITING.test(message) };
       }
     }
     const cli = await this.locate();

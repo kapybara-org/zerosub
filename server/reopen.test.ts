@@ -60,7 +60,10 @@ describe("reopening through the host", () => {
   it("reports the host's error, and says when it gave up waiting", async () => {
     const failing = (message: string) => ({ agents: { ref: () => ({ reload: async () => Promise.reject(new Error(message)) }) } });
     expect(await new Reopener().reopen("a", failing("Agent a is not loaded"))).toEqual({ ok: false, error: "Agent a is not loaded", timedOut: false });
-    expect(await new Reopener().reopen("a", failing("Request timed out after 60000ms"))).toMatchObject({ ok: false, timedOut: true });
+    expect(await new Reopener().reopen("a", failing("Timeout waiting for message (60000ms)"))).toMatchObject({ ok: false, timedOut: true });
+    // The daemon timing out on its own work is an answer: it failed the reload without reopening the session.
+    const refused = "Timed out closing previous session during refresh requestType=refresh_agent_request code=agent_refresh_failed";
+    expect(await new Reopener().reopen("a", failing(refused))).toEqual({ ok: false, error: refused, timedOut: false });
   });
 
   it("falls back to the CLI on a host without its own reload", async () => {
