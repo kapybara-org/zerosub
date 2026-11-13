@@ -394,7 +394,8 @@ export class PiAdapter implements FamilyAdapter {
 
   /**
    * Brings the account's `zerosub.env` in step with the proxy its agents get, and the Anthropic
-   * variables they get blanked, so a shell's key never stands in for the account's (see `writeLaunchEnv`).
+   * variables they get blanked (`PI_ANTHROPIC_ENV`), so nothing in a shell's environment stands in for
+   * the account's key or goes along with it (see `writeLaunchEnv`).
    */
   private async writeLaunchEnv(home: string): Promise<void> {
     const patch = await this.env(home);

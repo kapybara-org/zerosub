@@ -505,7 +505,7 @@ describe("Pi accounts in the service", () => {
       expect(plain?.env.HTTPS_PROXY).toBeUndefined();
       const plainEnv = await readFile(join(home, "zerosub.env"), "utf8");
       expect(plainEnv).not.toMatch(/^export \w*proxy/im);
-      expect(plainEnv).toContain("export ANTHROPIC_API_KEY=''");
+      for (const key of Object.keys(BLANK_ANTHROPIC)) expect(plainEnv).toContain(`export ${key}=''`);
 
       // Kept outside homes/, removing it only unregisters it: its folder, key and script stay.
       await service.remove(paseo as never, id);
