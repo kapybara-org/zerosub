@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { ApiSummary, Family } from "../shared/model";
 import { Mutex, readJson } from "./json-file";
-import { REQUIRED_NO_PROXY } from "./proxy";
+import { REQUIRED_NO_PROXY, maskProxy } from "./proxy";
 import { homesDir, isOwnHome, mainClaudeDir, mainClaudeGlobalConfig, mainCodexHome, mainPiDir } from "./paths";
 
 /**
@@ -749,7 +749,7 @@ export function writePiAccountProxy(
       const next = await inherited?.(previous.baseUrl);
       if (next) {
         throw new Error(
-          `This account sends its key over plain http://, and without its own proxy it would go through ${next.proxy} (${next.from}), which could read it. Switch to an https:// base URL first, or keep this proxy.`,
+          `This account sends its key over plain http://, and without its own proxy it would go through ${maskProxy(next.proxy)} (${next.from}), which could read it. Switch to an https:// base URL first, or keep this proxy.`,
         );
       }
     }

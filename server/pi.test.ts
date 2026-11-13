@@ -534,12 +534,16 @@ describe("Pi accounts in the service", () => {
     await service.start();
     try {
       const id = await service.addApiAccount({ label: "Gateway", key: KEY, baseUrl: "http://gw.example.com" });
+      const home = findAccount(await store.read(), id)!.home!;
       await expect(service.setProxy(MAIN_ACCOUNT_ID.pi, "http://127.0.0.1:7890")).rejects.toThrow(/Gateway has no proxy of its own/);
       expect(JSON.parse(await readFile(join(main, "settings.json"), "utf8"))).toEqual({ defaultProvider: "anthropic" });
       // Once it's gone, nothing would send a key through the proxy in the clear.
       await service.remove(paseo as never, id);
       await service.setProxy(MAIN_ACCOUNT_ID.pi, "http://127.0.0.1:7890");
       expect(JSON.parse(await readFile(join(main, "settings.json"), "utf8")).httpProxy).toBe("http://127.0.0.1:7890");
+      // Adding its kept folder back would put the key behind that proxy, so it's refused too.
+      await expect(service.importPiAccount(home)).rejects.toThrow(/plain http:\/\//);
+      expect((await store.read()).accounts.some((account) => account.home === home)).toBe(false);
     } finally {
       await service.stop();
     }
@@ -697,8 +701,11 @@ describe("Pi accounts in the service", () => {
       const id = await service.addApiAccount({ label: "Gateway", key: KEY, baseUrl: "http://gw.example.com", proxy: "http://127.0.0.1:7890" });
       const home = findAccount(await store.read(), id)!.home!;
       // The CLI login has a proxy of its own, which an account without one goes through.
-      await writeFile(join(main, "settings.json"), JSON.stringify({ defaultProvider: "anthropic", httpProxy: "http://10.0.0.1:3128" }));
-      await expect(service.setProxy(id, "")).rejects.toThrow(/plain http:\/\//);
+      await writeFile(join(main, "settings.json"), JSON.stringify({ defaultProvider: "anthropic", httpProxy: "http://alice:S3cr3tPw@10.0.0.1:3128" }));
+      const refused = await service.setProxy(id, "").then(() => null, (error: unknown) => String(error));
+      expect(refused).toMatch(/plain http:\/\//);
+      // The message names the proxy without its password, as the card does.
+      expect(refused).not.toContain("S3cr3tPw");
       expect(JSON.parse(await readFile(join(home, "zerosub.json"), "utf8")).proxy).toBe("http://127.0.0.1:7890");
       // Without one there, the key goes straight to the gateway, as it would without ZeroSub.
       await writeFile(join(main, "settings.json"), JSON.stringify({ defaultProvider: "anthropic" }));

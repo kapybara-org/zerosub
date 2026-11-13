@@ -3020,8 +3020,18 @@ export class Service {
   async importPiAccount(input: string): Promise<string> {
     const home = await chooseImportedPiHome(input, (await this.store.read()).accounts);
     const shown = shownPath(home);
-    const { key, baseUrl } = await readPiAccount(home);
+    const { key, baseUrl, proxy } = await readPiAccount(home);
     if (!key) throw new Error(`${shown} has no API key in its zerosub.json. Add a new account with its API key instead.`);
+    // As for a new proxy on the CLI login (see `refuseClearTextFollowers`): without a proxy of its own it
+    // would go through the one it inherits, which could read a key sent over plain http://.
+    if (!proxy && sentInTheClear(baseUrl)) {
+      const inherited = (await this.adapters.pi.proxyState?.(home))?.inherited;
+      if (inherited) {
+        throw new Error(
+          `${shown} sends its key over plain http:// to ${baseUrl} and has no proxy of its own, so it would go through ${maskProxy(inherited.proxy)} (${inherited.from}), which could read it. Add it as a new account with its key instead.`,
+        );
+      }
+    }
     const identity = apiIdentity(baseUrl, keyDigest(key));
     let account: StoredAccount | undefined;
     await this.store.update((draft) => {
