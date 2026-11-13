@@ -114,8 +114,9 @@ export class PiAdapter implements FamilyAdapter {
     const account = await readPiAccount(home);
     const patch: EnvPatch = { PI_CODING_AGENT_DIR: home };
     // Pi takes Anthropic's key from these when the stored one comes out empty, and would send it to
-    // the account's base URL: an added account's agents only ever use its own key.
-    for (const key of PI_ANTHROPIC_ENV) if (process.env[key]) patch[key] = "";
+    // the account's base URL: an added account's agents only ever use its own key. Always blanked,
+    // since they can come from the Pi provider's `env` in Paseo's config as well as the daemon's.
+    for (const key of PI_ANTHROPIC_ENV) patch[key] = "";
     // Pi writes a new session in its agent directory's `sessions`, which is the CLI login's linked in,
     // so the file would be named through the account's home: Paseo resumes it by that name, which
     // goes when the account does. Pi is told the folder it would use for the CLI login instead.

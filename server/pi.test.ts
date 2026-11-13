@@ -2,7 +2,7 @@ import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, stat, writeFil
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { FamilyAdapter, TurnEvent } from "./adapter";
+import { applyEnv, type FamilyAdapter, type TurnEvent } from "./adapter";
 import { absentPi } from "./fakes.test-support";
 import { familiesFromConfig, type FamilyResolver } from "./families";
 import { piAuth, piLiteral, piModels, preparePiHome, readPiAccount, readPiAccountApi, sentInTheClear, writePiAccountApi, writePiAccountProxy } from "./homes";
@@ -13,6 +13,8 @@ import { Service } from "./service";
 import { MAIN_ACCOUNT_ID, StateStore } from "./state";
 
 const KEY = "sk-ant-api03-pppppppppppppppppppppppp-4242";
+/** What an added account's agents get in place of any Anthropic key or token from elsewhere. */
+const BLANK_ANTHROPIC = { ANTHROPIC_API_KEY: "", ANTHROPIC_AUTH_TOKEN: "", ANTHROPIC_OAUTH_TOKEN: "" };
 const SAVED = ["PASEO_HOME", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "NO_PROXY", "no_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] as const;
 
 let root: string;
@@ -203,8 +205,8 @@ describe("PiAdapter", () => {
     const adapter = new PiAdapter();
     const env = await adapter.env(home, { cwd: "/work" });
     expect(env.PI_CODING_AGENT_SESSION_DIR).toBeUndefined();
-    // Pi applies httpProxy from the settings it shares; ZeroSub adds nothing over it.
-    expect(env).toEqual({ PI_CODING_AGENT_DIR: home });
+    // Pi applies httpProxy from the settings it shares; ZeroSub adds no proxy over it.
+    expect(env).toEqual({ PI_CODING_AGENT_DIR: home, ...BLANK_ANTHROPIC });
     expect(await adapter.proxyState(home)).toEqual({
       own: null,
       inherited: { proxy: "http://10.0.0.1:3128", from: expect.stringContaining("httpProxy in") },
@@ -216,13 +218,19 @@ describe("PiAdapter", () => {
     expect(await new PiAdapter().env(null, { cwd: "/work" })).toEqual({});
   });
 
-  it("keeps the daemon's Anthropic key and tokens from an added account's agents, and leaves them to the CLI login's", async () => {
+  it("keeps any other Anthropic key or token from an added account's agents, and leaves them to the CLI login's", async () => {
     process.env.ANTHROPIC_API_KEY = "sk-daemon";
-    process.env.ANTHROPIC_AUTH_TOKEN = "token-daemon";
     const home = join(root, "home");
     await writePiAccountApi(home, { key: KEY, baseUrl: "https://gw.example.com" });
     const adapter = new PiAdapter();
-    expect(await adapter.env(home)).toEqual({ PI_CODING_AGENT_DIR: home, ANTHROPIC_API_KEY: "", ANTHROPIC_AUTH_TOKEN: "" });
+    const patch = await adapter.env(home);
+    expect(patch).toEqual({ PI_CODING_AGENT_DIR: home, ...BLANK_ANTHROPIC });
+    // Whether the daemon has them or the Pi provider's env in Paseo's config gives them.
+    expect(applyEnv(patch, { ANTHROPIC_AUTH_TOKEN: "token-from-config", OPENAI_API_KEY: "sk-openai" })).toEqual({
+      PI_CODING_AGENT_DIR: home,
+      ...BLANK_ANTHROPIC,
+      OPENAI_API_KEY: "sk-openai",
+    });
     expect(await adapter.env(null)).toEqual({});
   });
 
