@@ -122,8 +122,12 @@ export const StoredStateSchema = z.object({
    */
   cleanup: z.record(z.string(), CleanupSchema).default({}),
   nextAgent: z
-    .object({ claude: NextAgentPickSchema.nullable().default(null), codex: NextAgentPickSchema.nullable().default(null) })
-    .default({ claude: null, codex: null }),
+    .object({
+      claude: NextAgentPickSchema.nullable().default(null),
+      codex: NextAgentPickSchema.nullable().default(null),
+      pi: NextAgentPickSchema.nullable().default(null),
+    })
+    .default({ claude: null, codex: null, pi: null }),
 });
 export type StoredState = z.infer<typeof StoredStateSchema>;
 
@@ -169,7 +173,7 @@ export function salvageState(raw: unknown): { state: StoredState; dropped: boole
       sessions: records(LiveSessionSchema, source.sessions),
       continuations: records(ContinuationChainSchema, source.continuations),
       cleanup: records(CleanupSchema, source.cleanup),
-      nextAgent: { claude: null, codex: null },
+      nextAgent: { claude: null, codex: null, pi: null },
     },
     dropped: true,
   };

@@ -19,6 +19,12 @@ function account(status: AccountView["status"], nextAgentUntil: string | null): 
     usage: null,
     agentCount: 0,
     home: null,
+    auth: "subscription",
+    api: null,
+    apiEditable: false,
+    proxy: null,
+    proxyEditable: false,
+    inheritedProxy: null,
   };
 }
 

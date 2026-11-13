@@ -28,7 +28,7 @@ const pick = { accountId: "work", until: later(60_000) };
 const withPick = (next: StoredState["nextAgent"]["claude"], accounts = [main, work]): StoredState => ({
   ...emptyState(),
   accounts,
-  nextAgent: { claude: next, codex: null },
+  nextAgent: { claude: next, codex: null, pi: null },
 });
 const limited = { ...work, limitedUntil: later(30 * 60_000), limitKind: "window" as const };
 
@@ -158,7 +158,7 @@ function setUp(store: StateStore, options: Options = {}) {
     detectSignOut: () => null,
   } as unknown as FamilyAdapter;
   const service = new Service(
-    { claude, codex: claude },
+    { claude, codex: claude, pi: claude },
     store,
     { resolve: async () => ({ claude: "claude" as const }) } as unknown as FamilyResolver,
     { locate: async () => null } as unknown as Reopener,
@@ -180,7 +180,7 @@ function setUp(store: StateStore, options: Options = {}) {
 
 describe("the next new agent pick, as sessions open", () => {
   it("starts one new agent on the picked account, then is gone", async () => {
-    const { service, store, paseo, open } = setUp(await storeWith({ accounts: accounts(), defaults: { claude: MAIN, codex: null } }));
+    const { service, store, paseo, open } = setUp(await storeWith({ accounts: accounts(), defaults: { claude: MAIN, codex: null, pi: null } }));
     const { until } = await service.setNextAgent(HELLO, true);
     expect((await service.view(paseo)).accounts.find((entry) => entry.id === HELLO)?.nextAgentUntil).toBe(until);
 
@@ -220,9 +220,9 @@ describe("the next new agent pick, as sessions open", () => {
               ...(hello ? [stored(HELLO, "hello", "managed", hello)] : []),
               stored(WORK, "work", "managed"),
             ] as never,
-            defaults: { claude: MAIN, codex: null },
+            defaults: { claude: MAIN, codex: null, pi: null },
             // Picked while the account could still take agents.
-            nextAgent: { claude: { accountId: HELLO, until: inFuture() }, codex: null },
+            nextAgent: { claude: { accountId: HELLO, until: inFuture() }, codex: null, pi: null },
           }),
           { usage: (home) => reading(home === null ? 70 : 10) },
         );
@@ -246,7 +246,7 @@ describe("the next new agent pick, as sessions open", () => {
     let arrived = 0;
     let bothDecided = () => {};
     const together = new Promise<void>((resolve) => (bothDecided = resolve));
-    const { service, store, open } = setUp(await storeWith({ accounts: accounts(), defaults: { claude: MAIN, codex: null } }), {
+    const { service, store, open } = setUp(await storeWith({ accounts: accounts(), defaults: { claude: MAIN, codex: null, pi: null } }), {
       // Both have chosen where to open before either records it.
       prepareHome: async () => {
         arrived += 1;
@@ -267,7 +267,7 @@ describe("the next new agent pick, as sessions open", () => {
   });
 
   it("is left for the user's own agent by sessions with no workspace and by background agents", async () => {
-    const { service, store, open } = setUp(await storeWith({ accounts: accounts(), defaults: { claude: MAIN, codex: null } }));
+    const { service, store, open } = setUp(await storeWith({ accounts: accounts(), defaults: { claude: MAIN, codex: null, pi: null } }));
     const { until } = await service.setNextAgent(HELLO, true);
     // Paseo's branch-name generator starts as a new worktree workspace gets its first prompt, and
     // opens in no workspace, as its commit and PR text helpers do.
@@ -293,18 +293,18 @@ describe("the next new agent pick, as sessions open", () => {
           stored(HELLO, "hello", "managed", { signedIn: false }),
           stored(WORK, "work", "managed", { disabled: true }),
         ] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, pi: null },
       }),
     );
     await expect(service.setNextAgent("claude-gone", true)).rejects.toThrow(/no longer exists/);
     await expect(service.setNextAgent(HELLO, true)).rejects.toThrow(/hello is signed out/);
     await expect(service.setNextAgent(WORK, true)).rejects.toThrow(/work is disabled/);
-    expect((await store.read()).nextAgent).toEqual({ claude: null, codex: null });
+    expect((await store.read()).nextAgent).toEqual({ claude: null, codex: null, pi: null });
   });
 
   it("is canceled when its account is removed, disabled or signed out", async () => {
     for (const how of ["removed", "disabled", "signed out"] as const) {
-      const { service, store, paseo } = setUp(await storeWith({ accounts: accounts(), defaults: { claude: MAIN, codex: null } }), {
+      const { service, store, paseo } = setUp(await storeWith({ accounts: accounts(), defaults: { claude: MAIN, codex: null, pi: null } }), {
         identity: async (home) => ({ signedIn: home === null, email: null, plan: null, organization: null, identity: null }),
       });
       await service.setNextAgent(HELLO, true);
@@ -330,7 +330,7 @@ describe("the next new agent pick, as sessions open", () => {
     const earlier = {
       version: 1,
       accounts: [stored(MAIN, "marketing", "main"), stored(HELLO, "hello", "managed")],
-      defaults: { claude: MAIN, codex: null },
+      defaults: { claude: MAIN, codex: null, pi: null },
       bindings: {},
       sessions: {},
       continuations: {},
@@ -338,7 +338,7 @@ describe("the next new agent pick, as sessions open", () => {
     await writeFile(path, JSON.stringify(earlier));
     const store = new StateStore(path);
     const state = await store.read();
-    expect(state.nextAgent).toEqual({ claude: null, codex: null });
+    expect(state.nextAgent).toEqual({ claude: null, codex: null, pi: null });
     expect(state.accounts.map((entry) => entry.id)).toEqual([MAIN, HELLO]);
     // Nothing set aside as damaged, and nothing restored from a backup.
     expect(await readdir(dir)).toEqual(["state.json"]);
@@ -347,6 +347,6 @@ describe("the next new agent pick, as sessions open", () => {
     expect(await open("before")).toBe(MAIN);
     await service.setNextAgent(HELLO, true);
     expect(await open("after")).toBe(HELLO);
-    expect(JSON.parse(await readFile(path, "utf8")).nextAgent).toEqual({ claude: null, codex: null });
+    expect(JSON.parse(await readFile(path, "utf8")).nextAgent).toEqual({ claude: null, codex: null, pi: null });
   });
 });

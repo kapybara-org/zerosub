@@ -944,7 +944,10 @@ export class Service {
       // Nothing to re-check against: the refusal itself is the answer.
       await this.store.update((draft) => {
         const target = findAccount(draft, accountId);
-        if (target) target.signedIn = false;
+        if (target) {
+          target.signedIn = false;
+          dropNextPick(draft, target);
+        }
       });
       return true;
     }
@@ -2352,7 +2355,7 @@ export class Service {
     if (enabled && account.disabled) throw new Error(`${account.label} is disabled. Enable it first.`);
     const until = enabled ? new Date(Date.now() + NEXT_PICK_MS).toISOString() : null;
     await this.store.update((draft) => {
-      draft.nextAgent ??= { claude: null, codex: null };
+      draft.nextAgent ??= { claude: null, codex: null, pi: null };
       if (enabled) draft.nextAgent[account.family] = { accountId: account.id, until: until! };
       else if (draft.nextAgent[account.family]?.accountId === account.id) draft.nextAgent[account.family] = null;
     });
