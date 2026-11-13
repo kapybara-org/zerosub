@@ -1249,6 +1249,34 @@ describe("forking to the other provider", () => {
       expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
     });
 
+    it("retries a failed create with a new model pick and a renamed source, under the same target ID", async () => {
+      const catalog = [
+        { id: "opencode/glm-5p3-flash", label: "GLM 5.3 Flash", isDefault: true, thinkingOptions: [{ id: "high", label: "High" }] },
+        { id: "opencode/kimi-k3", label: "Kimi K3", thinkingOptions: [{ id: "high", label: "High" }] },
+      ];
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS, catalog });
+      const paseo = setup.paseo as { workspaces: { ref: unknown } };
+      const workspaces = paseo.workspaces.ref;
+      paseo.workspaces.ref = () => ({ agents: { create: async () => { throw new Error("GLM is down"); } } });
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/GLM is down/);
+      paseo.workspaces.ref = workspaces;
+      const reserved = (await setup.store.read()).opencodeForks[AGENT]!.pending!;
+      setup.service.setPreferences(preferences.schema.parse({ ...PREFS, forkOpenCodeModel: "opencode/kimi-k3" }));
+      setup.byId.get(AGENT)!.title = "Fix the build and the tests";
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("sent");
+      expect(setup.created).toHaveLength(1);
+      // The target ID stays the create's idempotency key: a first create that did land can't double.
+      expect(setup.created[0]).toMatchObject({
+        agentId: reserved.targetId,
+        idempotencyKey: reserved.targetId,
+        title: "Fix the build and the tests (continued on OpenCode)",
+        config: { provider: "opencode/opencode/kimi-k3" },
+      });
+      expect(setup.sends).toHaveLength(1);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
+    });
+
     const damage = {
       "the registry is not JSON": "{ not json",
       "the source's record doesn't validate": JSON.stringify({ accounts: [], opencodeForks: { [AGENT]: { forkAgentId: 7 } } }),

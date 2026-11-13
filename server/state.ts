@@ -84,7 +84,10 @@ export const OpenCodeForkSchema = z.object({
           provider: z.string(),
           modeId: z.string(),
           thinkingOptionId: z.string().optional(),
-          /** Original request identity and location, frozen so a retry cannot create a different target. */
+          /**
+           * Original request identity and location, checked against the created target before its
+           * handoff is sent. A create that never landed is built again from current settings.
+           */
           workspaceId: z.string().nullable().optional(),
           cwd: z.string().nullable().optional(),
           parentId: z.string().nullable().optional(),

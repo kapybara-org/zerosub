@@ -1858,8 +1858,10 @@ export class Service {
           return this.deliverReservedOpenCode(paseo, agentId, fork);
         }
         if (!fork) {
-          // The target vanished before anything was sent: retry the identical promptless create.
-          return this.retryReservedCreate(paseo, agentId, pending);
+          // The create never landed, so nothing was sent. Build it again from today's settings and
+          // source, under the same target ID: it stays the create's idempotency key, so a first
+          // create that lands late can't make a second fork.
+          return this.createOpenCodeFork(paseo, agentId, original, source, pending);
         }
         if (fork.archivedAt) {
           // Nothing was sent, so dropping the reservation cannot duplicate work.
@@ -2139,9 +2141,16 @@ export class Service {
 
   /**
    * Starts a fresh OpenCode fork: reserve the target and its create request, create promptless, then
-   * deliver the initial handoff under the reserved message ID.
+   * deliver the initial handoff under the reserved message ID. `retry` is a reservation whose create
+   * never landed: its target ID, message ID and reason are kept, and the rest is read afresh.
    */
-  private async createOpenCodeFork(paseo: PaseoApi, agentId: string, original: Agent, source: "auto" | "user"): Promise<ForkOutcome> {
+  private async createOpenCodeFork(
+    paseo: PaseoApi,
+    agentId: string,
+    original: Agent,
+    source: "auto" | "user",
+    retry?: NonNullable<OpenCodeFork["pending"]>,
+  ): Promise<ForkOutcome> {
     const chatGptCopy = (await listAgents(paseo, false)).agents.find((agent) => agent.continuedFrom === agentId && agent.provider !== OPENCODE_PROVIDER);
     if (chatGptCopy) return { skipped: alreadyContinued(chatGptCopy.title ?? `${PROVIDER_NAME["codex"]} agent ${chatGptCopy.id}`) };
     const { models, error } = await paseo.providers.listModels(OPENCODE_PROVIDER);
@@ -2176,11 +2185,11 @@ export class Service {
       return { skipped: HISTORY_GAP_DETAIL };
     }
 
-    const targetId = randomUUID();
-    const messageId = `${MESSAGE_PREFIX}${randomUUID()}`;
+    const targetId = retry?.targetId ?? randomUUID();
+    const messageId = retry?.messageId ?? `${MESSAGE_PREFIX}${randomUUID()}`;
     const parentId = await this.continuations.parentFor(paseo, agentId);
     const title = `${original.title?.trim() || "Task"} (continued on ${OPENCODE_LABEL})`;
-    const why = source === "auto" ? "every Claude account reached its usage limit" : "the work was moved to OpenCode";
+    const why = retry?.config?.why ?? (source === "auto" ? "every Claude account reached its usage limit" : "the work was moved to OpenCode");
     const prompt = [continuationPrompt(buildTranscript(delta.entries.map((entry) => entry.item)), why, PROVIDER_NAME.claude), transferMarker(messageId)].join("\n");
     await this.store.update((draft) => {
       // A new reservation is this source's journal again; a hold it was told about is spent.
@@ -2226,44 +2235,6 @@ export class Service {
     });
     const fork = await waitForCreated(paseo, targetId);
     if (!fork) return this.openCodeUncertain(targetId, null, messageId);
-    return this.deliverReservedOpenCode(paseo, agentId, fork);
-  }
-
-  /** A lost create acknowledgement: repeat the identical promptless create from the stored config. */
-  private async retryReservedCreate(
-    paseo: PaseoApi,
-    agentId: string,
-    pending: NonNullable<OpenCodeFork["pending"]>,
-  ): Promise<ForkOutcome> {
-    const config = pending.config;
-    if (!config) return this.openCodeUncertain(pending.targetId, null, pending.messageId);
-    const { title, workspaceId, cwd, parentId } = config;
-    if (title === undefined || workspaceId === undefined || cwd === undefined || parentId === undefined) {
-      return this.openCodeUncertain(pending.targetId, title, pending.messageId);
-    }
-    // Fresh snapshots only validate the frozen request; they never change what is sent under its key.
-    const checked = await this.openCodeSource(paseo, agentId, config);
-    if (!checked) return this.openCodeUncertain(pending.targetId, title, pending.messageId);
-    const model = config.provider.slice(OPENCODE_PROVIDER.length + 1);
-    await continueInNewAgent({
-      paseo,
-      sourceAgentId: agentId,
-      previous: PROVIDER_NAME.claude,
-      agentId: pending.targetId,
-      deferPrompt: true,
-      target: {
-        provider: OPENCODE_PROVIDER,
-        label: OPENCODE_LABEL,
-        modeId: config.modeId,
-        model,
-        ...(config.thinkingOptionId ? { thinkingOptionId: config.thinkingOptionId } : {}),
-      },
-      parentId: parentId ?? undefined,
-      reserved: { title, workspaceId, cwd },
-      bind: async () => {}, // OpenCode is a harness, not an account provider: no binding to record.
-    });
-    const fork = await waitForCreated(paseo, pending.targetId);
-    if (!fork) return this.openCodeUncertain(pending.targetId, null, pending.messageId);
     return this.deliverReservedOpenCode(paseo, agentId, fork);
   }
 
