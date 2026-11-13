@@ -58,7 +58,60 @@ export const LiveSessionSchema = z.object({
 });
 export type LiveSession = z.infer<typeof LiveSessionSchema>;
 
-const TimelineMarkSchema = z.object({ epoch: z.string(), seq: z.number().int().nonnegative() });
+export const TimelineMarkSchema = z.object({ epoch: z.string(), seq: z.number().int().nonnegative() });
+export type TimelineMark = z.infer<typeof TimelineMarkSchema>;
+
+/** An OpenCode fork of one source agent: where the work continues and how much of the source it has. */
+export const OpenCodeForkSchema = z.object({
+  /** The OpenCode agent carrying the source's work. */
+  forkAgentId: z.string(),
+  /** How much of the source the fork has already received. */
+  seen: TimelineMarkSchema.optional(),
+  /**
+   * Written before a create or a send. An uncertain dispatch must never start a second fork or send
+   * a second copy: retry it exactly, or reconcile its receipt. Only IDs, marks, digests and the
+   * create configuration are stored; no transcript text or credentials.
+   */
+  pending: z
+    .object({
+      stage: z.enum(["creating", "sending"]),
+      targetId: z.string(),
+      messageId: z.string(),
+      seen: TimelineMarkSchema,
+      /** The exact create configuration (`provider` is Paseo's `provider/model` string). */
+      config: z
+        .object({
+          provider: z.string(),
+          modeId: z.string(),
+          thinkingOptionId: z.string().optional(),
+          /** Original request identity and location, frozen so a retry cannot create a different target. */
+          workspaceId: z.string().nullable().optional(),
+          cwd: z.string().nullable().optional(),
+          parentId: z.string().nullable().optional(),
+          title: z.string().optional(),
+          /**
+           * The exact generic reason the first prompt gave for this fork, frozen with it: a retry
+           * must rebuild the same prompt, whatever trigger the retry itself came from. Missing on
+           * reservations saved by earlier versions, which then stay uncertain rather than guess.
+           */
+          why: z.string().optional(),
+        })
+        .optional(),
+      /** SHA-256 of the exact sent text, so a receipt survives a provider reload. */
+      sentDigest: z.string().optional(),
+    })
+    .optional(),
+});
+export type OpenCodeFork = z.infer<typeof OpenCodeForkSchema>;
+
+/**
+ * Set when recovery lost a source's OpenCode fork record (key: the source agent ID), or every
+ * source's (key `*`, when the registry couldn't be read at all). Until that source has a record
+ * again, nothing is sent or forked for it automatically; a manual fork asks once (`told`) first.
+ */
+export const OpenCodeHoldSchema = z.object({ at: z.string(), told: z.boolean().optional() });
+export const ALL_SOURCES = "*";
+
 const ContinuationMemberSchema = z.object({
   accountId: z.string(),
   identity: z.string().nullable(),
@@ -126,6 +179,9 @@ export const StoredStateSchema = z.object({
   /** Which account each agent's live provider session was opened with. */
   sessions: z.record(z.string(), LiveSessionSchema).default({}),
   continuations: z.record(z.string(), ContinuationChainSchema).default({}),
+  /** Per-source OpenCode fork records. OpenCode is a harness, not an account provider. */
+  opencodeForks: z.record(z.string(), OpenCodeForkSchema).default({}),
+  opencodeHolds: z.record(z.string(), OpenCodeHoldSchema).default({}),
   /**
    * Homes to clean up, by path. Only these are ever signed out or deleted: a home missing from
    * `accounts` may just be missing from a damaged or hand-edited registry.
@@ -186,6 +242,8 @@ export function salvageState(raw: unknown): { state: StoredState; dropped: boole
       bindings: records(BindingSchema, source.bindings),
       sessions: records(LiveSessionSchema, source.sessions),
       continuations: records(ContinuationChainSchema, source.continuations),
+      opencodeForks: records(OpenCodeForkSchema, source.opencodeForks),
+      opencodeHolds: records(OpenCodeHoldSchema, source.opencodeHolds),
       cleanup: records(CleanupSchema, source.cleanup),
       nextAgent: { claude: null, codex: null, pi: null },
       piHomes: keep(PiHomesSchema, source.piHomes ?? {}) ?? { dir: null, from: [] },
@@ -332,6 +390,10 @@ export class StateStore {
       state = emptyState();
       outcome = "continued with an empty registry, as there is no backup";
     }
+    // OpenCode fork records are the registry's own journal of what was sent. A snapshot can lag the
+    // file (it's written second, and its failure is tolerated), so its records are never restored:
+    // only the file's valid ones stay, and every record that was lost becomes a hold.
+    Object.assign(state, recoveredForks(raw, new Date().toISOString()));
     console.error(`[ZeroSub] ${this.path} was ${problem}${kept ? `; kept it as ${kept}` : ""}; ${outcome}`);
     await this.write(state).catch((error: unknown) => console.error("[ZeroSub] could not save the recovered state file", message(error)));
     return state;
@@ -344,6 +406,29 @@ export class StateStore {
     await chmod(copy, 0o600);
     return copy;
   }
+}
+
+/**
+ * The file's own valid fork records and holds, plus a fresh hold for each record or hold that
+ * couldn't be kept. A lost record is a new event, so an earlier acknowledgement doesn't carry over;
+ * a list that can't be read at all holds every source.
+ */
+function recoveredForks(raw: unknown, at: string): Pick<StoredState, "opencodeForks" | "opencodeHolds"> {
+  const all = { opencodeForks: {}, opencodeHolds: { [ALL_SOURCES]: { at } } };
+  if (!isRecord(raw)) return all;
+  const { opencodeForks, opencodeHolds } = salvageState(raw).state;
+  for (const list of [raw.opencodeForks, raw.opencodeHolds]) {
+    if (list !== undefined && !isRecord(list)) return { opencodeForks, opencodeHolds: { ...opencodeHolds, ...all.opencodeHolds } };
+  }
+  const forks = (raw.opencodeForks ?? {}) as Record<string, unknown>;
+  const holds = (raw.opencodeHolds ?? {}) as Record<string, unknown>;
+  for (const source of Object.keys(forks)) if (!opencodeForks[source]) opencodeHolds[source] = { at };
+  for (const source of Object.keys(holds)) if (!opencodeHolds[source]) opencodeHolds[source] = { at };
+  return { opencodeForks, opencodeHolds };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function message(error: unknown): string {

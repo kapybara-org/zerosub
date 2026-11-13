@@ -102,7 +102,8 @@ describe("hand-off transcript", () => {
       ...Array.from({ length: 200 }, (_, index): AgentTimelineItem => ({ type: "assistant_message", text: `step ${index} ${"x".repeat(200)}` })),
     ];
     const transcript = buildTranscript(long, 5_000);
-    expect(transcript.startsWith("User (original request): The original task.")).toBe(true);
+    // The only user message is also the latest instruction, so it goes last, after the progress.
+    expect(transcript.endsWith("User (original request and latest instruction): The original task.")).toBe(true);
     expect(transcript).toContain("[… earlier conversation omitted …]");
     expect(transcript).toContain("step 199");
     expect(transcript.length).toBeLessThan(5_500);

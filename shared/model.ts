@@ -14,6 +14,9 @@ export const FAMILY_LABEL: Record<Family, string> = {
   pi: "Pi",
 };
 
+/** Paseo's OpenCode harness provider. It runs on the host itself, so a fork to it uses no account. */
+export const OPENCODE_PROVIDER = "opencode";
+export const OPENCODE_LABEL = "OpenCode";
 /**
  * The provider a stopped chat can carry on with when every account of its own is out (Claude ↔
  * ChatGPT); null for Pi, whose added accounts are billed per use and never take work over by themselves.
@@ -243,6 +246,8 @@ export const StateViewSchema = z.object({
   /** The folder added Pi accounts' homes are kept in (`~/.pi-config`, say), and whether it's the default. */
   piHomes: z.object({ dir: z.string(), isDefault: z.boolean() }).nullable().default(null),
   showComposerPill: z.boolean(),
+  /** This host's Paseo lists OpenCode as available, so "Continue on OpenCode" can work. */
+  openCodeAvailable: z.boolean().default(false),
   /** Accounts at their limit are skipped, so agents can't be moved onto one by hand either. */
   autoSwitch: z.boolean().default(true),
   warnings: z.array(z.string()),

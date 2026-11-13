@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { PluginHookContext } from "@getpaseo/plugin/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentTimelineItem, FamilyAdapter } from "./adapter";
-import { CodexContinuations, fitInstructions } from "./continuations";
+import { CodexContinuations, fitInstructions, readUpdates } from "./continuations";
 import { Service } from "./service";
 import { StateStore, StoredAccountSchema, salvageState } from "./state";
 import type { FamilyResolver } from "./families";
@@ -1037,5 +1037,17 @@ describe("fitting pending instructions", () => {
     expect(text).toContain("[… 1 earlier instruction omitted to fit this update …]");
     expect(text).not.toContain("middle");
     expect(text).toMatch(/TAIL$/);
+  });
+});
+
+describe("reading a source's updates", () => {
+  it("refuses older history it can't page instead of treating the scan as complete", async () => {
+    // Older rows exist past the watermark, but the page gives no cursor to reach them.
+    const page = {
+      epoch: "e1", window: { maxSeq: 900 }, hasOlder: true, startCursor: null, gap: false, staleCursor: false,
+      entries: [{ item: { type: "user_message", text: "STOP" }, seqStart: 400, seqEnd: 900 }],
+    };
+    const paseo = { agents: { ref: () => ({ timeline: { refetch: async () => page } }) } } as unknown as PaseoApi;
+    await expect(readUpdates(paseo, "source", { epoch: "e1", seq: 5 })).rejects.toThrow(/complete handoff history/);
   });
 });

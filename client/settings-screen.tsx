@@ -9,6 +9,7 @@ import {
 import { useState } from "react";
 import { Text } from "react-native";
 import { DEFAULT_CONTINUE_PROMPT, preferences, type Preferences } from "../shared/preferences";
+import { ForkDestinationRows, OpenCodeForkRows } from "./fork-settings";
 
 /** Settings → Plugins → zerosub. Accounts themselves live in the sidebar surface. */
 export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurfaceProps & { onOpenAccounts(): void }) {
@@ -133,11 +134,12 @@ export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurface
           />
           <SettingsSwitch
             label="When every account is out, fork the chat to the other provider"
-            hint="A stopped Claude chat carries on in a new ChatGPT agent, or the other way round, with the conversation so far and no more permissions than the original. The original stays as it was."
+            hint="A stopped Claude chat carries on in a new ChatGPT or OpenCode agent (pick the destination below) with the conversation so far. ChatGPT gets a mode no looser than this agent's. OpenCode gets Plan or Build under the host's own permission policy, which can allow more than Claude does. The original stays as it was."
             value={settings.values.forkOtherProvider}
             disabled={settings.saving || !settings.values.autoSwitch}
             onValueChange={(forkOtherProvider) => save({ forkOtherProvider })}
           />
+          <ForkDestinationRows values={settings.values} saving={settings.saving} onSave={save} />
           <SettingsSwitch
             label="Show the account pill in the composer"
             hint="Appears on Claude and Codex agents once a provider has two or more accounts."
@@ -145,6 +147,11 @@ export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurface
             disabled={settings.saving}
             onValueChange={(showComposerPill) => save({ showComposerPill })}
           />
+        </SettingsCard>
+      </SettingsSection>
+      <SettingsSection title="Continue on OpenCode">
+        <SettingsCard>
+          <OpenCodeForkRows values={settings.values} saving={settings.saving} onSave={save} />
         </SettingsCard>
       </SettingsSection>
     </>

@@ -10,7 +10,7 @@ Use several Claude and ChatGPT (Codex) subscriptions side by side in [Paseo](htt
 - **Banked resets.** If a provider has banked limit resets on an account, you can use one from the account card or the agent's account button.
 - **Set an account aside.** Disable an account for a while and its agents move to your other accounts, then come back when you enable it again.
 - **Several hosts.** Each Paseo host keeps its own accounts, and the Accounts screen says which host you're looking at.
-- **Fork to the other provider (optional).** When every Claude account is out, a stopped chat can carry on in a new ChatGPT agent, and the other way round.
+- **Fork to the other provider (optional).** When every Claude account is out, a stopped chat can carry on in a new ChatGPT agent, and the other way round. A stopped Claude chat can instead continue on the host's OpenCode.
 - **Pi accounts.** Add Anthropic API keys for Paseo's Pi agents, each with an optional base URL and its own proxy, and pick one per Pi agent. See [Pi accounts](#pi-accounts).
 - **Everything else stays the same.** Every account shares your settings, skills, plugins, MCP servers, `CLAUDE.md`/`AGENTS.md` and conversation history.
 
@@ -98,9 +98,11 @@ ZeroSub tries these in order, and a timeline note says which one happened:
 1. **Use a banked reset**, if you turned on **Use banked resets when every account is out**.
 2. **Fork the chat to the other provider**, if you turned on **When every account is out, fork the chat to the other provider** (off by default). A stopped Claude chat continues in a new ChatGPT agent, or the other way round:
    - The new agent opens in the same workspace (under the same parent, for a sub-agent) with the conversation so far and goes straight back to work. If that conversation began as a hand-off itself, only the start and end of the earlier one are quoted. It uses the other provider's default model and its account with the most room left.
-   - Its permission mode matches the original's level. Bypass becomes Full Access, and Accept File Edits becomes Default Permissions. Codex has no read-only or ask-first mode, so a Claude agent in Plan Mode or Always Ask isn't forked. ZeroSub never gives a fork more freedom than you gave the original.
+   - **OpenCode instead:** in the settings under the fork switch, **Fork a stopped Claude chat to** can point at **OpenCode** rather than ChatGPT. A stopped Claude chat then continues on this host's OpenCode, using the model and thinking option picked there from OpenCode's catalog (or the host's default when the host marks one). OpenCode is a harness, not an account provider: the fork uses no ZeroSub account, and nothing is added to your accounts. If the saved model or thinking option is no longer in the host's catalog, the fork is refused with a note rather than falling back to another model.
+   - On ChatGPT the fork gets a mode no looser than the original's. Bypass becomes Full Access, and Accept File Edits becomes Default Permissions. Codex has no read-only or ask-first mode, so a Claude agent in Plan Mode or Always Ask isn't forked to ChatGPT. On OpenCode the fork gets Plan (for a Claude agent in Plan or Default mode) or Build, under the host's own permission policy, where Build edits files and runs shell without asking. That can allow more than the original's Claude mode; hosts that want it tighter can restrict `permissions` in their `opencode.jsonc`. Choosing OpenCode as the destination is the opt-in.
    - The original agent stays as it was, and prompting it again while its provider is still out points to the same fork rather than starting another.
    - With the option off, a stopped agent's account button offers **Continue on ChatGPT (new agent)…** (or Claude) instead, with a confirmation.
+   - By hand, a stopped Claude chat can also continue on OpenCode at any time: its account button offers **Continue on OpenCode (new agent)…**, with or without the automatic fork turned on, using the OpenCode model and thinking option picked in the settings.
 3. **Stop and say so**, with the time the account frees up.
 
 ## Pi accounts
@@ -194,11 +196,13 @@ npm install
 paseo plugin install "$(pwd)"   # run the working copy
 
 npm run typecheck      # client and server bundles, separately
-npm test               # routing, failover, limit detection, usage, resets, forks
+npm test               # .context guard first, then routing, failover, limit detection, usage, resets, forks
 npm run audit:mobile   # no DOM/HTML in client code
 paseo plugin reload zerosub
 paseo plugin logs zerosub
 ```
+
+`npm run guard:context` (also runs first inside `npm test`) fails when any tracked or staged path sits under `.context/`, and `npm run guard:history` fails when any commit since `origin/main` contains one. Keep local scratch out of the repository; the guard works on any machine, no local hook needed.
 
 Code layout:
 

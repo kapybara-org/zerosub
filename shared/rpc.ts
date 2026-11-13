@@ -171,11 +171,20 @@ export const setAccountEnabled = defineRpc({
   }),
 });
 
-/** Carries an agent's work on in a new agent on the other provider (Claude ↔ ChatGPT). */
+/** Carries an agent's work on in a new agent on the other provider (Claude ↔ ChatGPT), or on this host's OpenCode. */
 export const forkAgent = defineRpc({
   name: "zerosub.agents.fork",
-  input: z.object({ agentId: z.string() }),
-  output: z.object({ agentId: z.string(), title: z.string() }),
+  input: z.object({ agentId: z.string(), destination: z.enum(["other", "opencode"]).default("other") }),
+  output: z.object({
+    agentId: z.string(),
+    title: z.string(),
+    /**
+     * Whether the conversation was delivered: `sent` and confirmed, `up-to-date` (nothing new to
+     * send), `found` (an existing continuation without a provable checkpoint; nothing was sent),
+     * or `uncertain` (a previous handoff has no trustworthy receipt; nothing more was sent).
+     */
+    delivery: z.enum(["sent", "up-to-date", "found", "uncertain"]).default("sent"),
+  }),
 });
 
 export const setAgentAccount = defineRpc({
