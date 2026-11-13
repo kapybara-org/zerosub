@@ -11,6 +11,8 @@ import { StateStore, type StoredState } from "./state";
 
 let root: string;
 let previousHome: string | undefined;
+/** The services the current test made, stopped once it ends. */
+const services: Service[] = [];
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "zerosub-cleanup-"));
@@ -19,6 +21,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  // Stopping saves a pending reading now, while PASEO_HOME is still this test's folder.
+  await Promise.all(services.splice(0).map((service) => service.stop()));
   if (previousHome === undefined) delete process.env.PASEO_HOME;
   else process.env.PASEO_HOME = previousHome;
   await rm(root, { recursive: true, force: true, maxRetries: 5 });
@@ -74,6 +78,7 @@ async function setUp(state: Partial<StoredState>, options: { signedIn?: (home: s
     { resolve: async () => ({ claude: "claude" as const }) } as unknown as FamilyResolver,
     { locate: async () => null } as unknown as Reopener,
   );
+  services.push(service);
   return { service, store, loggedOut, logins, paseo: paseo as never };
 }
 

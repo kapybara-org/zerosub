@@ -12,7 +12,7 @@ beforeEach(async () => { root = await mkdtemp(join(tmpdir(), "zerosub-login-"));
 afterEach(async () => {
   await service?.stop();
   vi.unstubAllEnvs();
-  await rm(root, { recursive: true, force: true });
+  await rm(root, { recursive: true, force: true, maxRetries: 5 });
 });
 
 async function login(email: string | null, existingId?: string, storedEmail = "first@example.com") {

@@ -20,7 +20,7 @@ afterEach(async () => {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
-  await rm(root, { recursive: true, force: true });
+  await rm(root, { recursive: true, force: true, maxRetries: 5 });
 });
 
 async function isLinkTo(path: string, target: string): Promise<boolean> {
