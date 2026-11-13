@@ -19,9 +19,9 @@ export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurface
   const [draft, setDraft] = useState<{ over: string; text: string } | null>(null);
   // Whether the last save was the follow-up's: its box says why that failed, the top any other.
   const [savedPrompt, setSavedPrompt] = useState(false);
+  const muted = { color: theme.colors.foregroundMuted };
   // The box goes while the settings can't be shown (a refresh failed, say), and what's typed with it.
   if (settings.status !== "ready" && draft) setDraft(null);
-  const muted = { color: theme.colors.foregroundMuted };
   if (settings.status === "loading") return <Text style={muted}>Loading…</Text>;
   if (settings.status !== "ready") {
     return (
@@ -48,10 +48,10 @@ export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurface
   const typed = draft?.over === saved ? draft.text.trim() : "";
   return (
     <>
-      {settings.saveError && !savedPrompt ? <Text style={{ color: theme.colors.statusDanger }}>{settings.saveError}</Text> : null}
       {multiHost ? (
         <Text style={muted}>These apply to agents on {host.label}. Each host keeps its own accounts and preferences.</Text>
       ) : null}
+      {settings.saveError && !savedPrompt ? <Text style={{ color: theme.colors.statusDanger }}>{settings.saveError}</Text> : null}
       <SettingsSection title="Accounts">
         <SettingsCard>
           <SettingsAction
@@ -79,9 +79,9 @@ export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurface
           />
           <SettingsSwitch
             label="Keep going after a switch"
-            hint="Sends the follow-up below so the interrupted task continues."
+            hint="Sends the follow-up below so the interrupted task continues, also after you use a banked reset. Off, a ChatGPT task that hits its limit stays where it stopped, since carrying it on means starting it in another tab."
             value={settings.values.autoContinue}
-            disabled={settings.saving || !settings.values.autoSwitch}
+            disabled={settings.saving}
             onValueChange={(autoContinue) => save({ autoContinue })}
           />
           <SettingsInput

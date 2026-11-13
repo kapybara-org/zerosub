@@ -80,6 +80,8 @@ export function fiveHourGated(usage: Usage | null | undefined, now: number): boo
  * the lowest peak, preferring the default, then the CLI login, on ties. An account with a full window
  * that caps it ranks last, gate or not, though it's usable: its limit lifted at the 5-hour reset with
  * its week still full, say, or ChatGPT credits keep it going.
+ * API accounts are billed per use, so they're never picked here: only when chosen (default or
+ * per agent).
  */
 export function mostAvailable(
   state: StoredState,
@@ -229,7 +231,7 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   if (why && mayMove && (input.autoSwitch || why !== "limited")) {
     const staying = findAccount(state, input.current);
     const alternative =
-      staying && staying.family === input.family && staying.id !== account.id && isUsable(staying, input.now)
+      staying && staying.family === input.family && staying.id !== account.id && canStandIn(staying, input.now)
         ? staying
         : mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]));
     if (alternative) {

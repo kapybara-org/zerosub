@@ -366,6 +366,7 @@ const cleanups: Array<() => Promise<void>> = [];
 beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "zerosub-continuations-sdk-")); });
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+  // Retried: a write the test set off in the background can still be landing in it.
   await rm(dir, { recursive: true, force: true, maxRetries: 5 });
 });
 

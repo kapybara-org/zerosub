@@ -1,17 +1,25 @@
 import { access, constants, lstat, mkdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { idSuffix, piName, slug } from "./launchers";
-import { dataDir, homesDir, inHomesDir, mainClaudeDir, mainCodexHome, mainPiDir, piLauncherDir, shownPath } from "./paths";
-import type { PiHomes, StoredAccount } from "./state";
+import { idSuffix, kindName, slug, type LauncherKind } from "./launchers";
+import { dataDir, homesDir, inHomesDir, launcherDir, mainClaudeDir, mainCodexHome, mainPiDir, piLauncherDir, shownPath } from "./paths";
+import type { ClaudeHomes, StoredAccount } from "./state";
 
 /**
- * Where added Pi accounts' homes are kept: the folder picked in the app, else the script directory
- * (`~/.pi-config`), beside each account's script. ZeroSub sets new accounts up inside its own
- * `homes/` and moves them here once they're saved (see `Service.placeHomes`).
+ * Where added Claude accounts' homes are kept: the folder picked in the app, else the launcher
+ * directory (`~/.claude-config`), beside each account's terminal script. ZeroSub signs new accounts
+ * in inside its own `homes/` and moves them here once they're saved (see `Service.placeHomes`).
  */
-export function piHomesDir(homes: PiHomes): string {
-  return homes.dir ?? piLauncherDir();
+export function claudeHomesDir(homes: ClaudeHomes): string {
+  return homes.dir ?? launcherDir();
+}
+
+/** The families whose added accounts' homes ZeroSub keeps outside its own folder: Claude's and Pi's. */
+export type PlacedFamily = LauncherKind;
+
+/** Where `family`'s added accounts' homes are kept: the folder picked in the app, else beside their scripts. */
+export function homesDirFor(family: PlacedFamily, homes: ClaudeHomes): string {
+  return homes.dir ?? (family === "pi" ? piLauncherDir() : launcherDir());
 }
 
 /** Whether `path` is `folder` or inside it. */
@@ -28,16 +36,16 @@ function typedPath(typed: string, example: string): string {
 }
 
 /**
- * The folder typed in the app for added Pi accounts' homes, as a full path (`~` is the home folder),
- * made if it isn't there yet; null for the default (empty, or the default typed out). Refused,
- * saying why: a path that isn't full; the home folder or `/` itself; anywhere in ZeroSub's own
- * folder, where homes it may delete live; in a CLI's own home or an account's; a file; a folder it
- * can't write to.
+ * The folder typed in the app for added Claude accounts' homes, as a full path (`~` is the home
+ * folder), made if it isn't there yet; null for the default (empty, or the default typed out).
+ * Refused, saying why: a path that isn't full; the home folder or `/` itself; anywhere in
+ * ZeroSub's own folder, where homes it may delete live; in a CLI's own home or an account's; a
+ * file; a folder it can't write to.
  */
-export async function choosePiHomesDir(input: string, accounts: readonly StoredAccount[]): Promise<string | null> {
+export async function chooseHomesDir(input: string, accounts: readonly StoredAccount[], family: PlacedFamily = "claude"): Promise<string | null> {
   const typed = input.trim();
   if (!typed) return null;
-  const dir = typedPath(typed, "~/.pi-config or /Volumes/Data/pi-accounts");
+  const dir = typedPath(typed, family === "pi" ? "~/.pi-config or /Volumes/Data/pi-accounts" : "~/.claude-config or /Volumes/Data/claude-accounts");
   if (dir === resolve(homedir()) || dir === resolve("/")) throw new Error(`Pick a folder of their own for the accounts, not ${shownPath(dir)} itself.`);
   if (within(dir, dataDir())) throw new Error(`${shownPath(dir)} is inside ZeroSub's own folder (${shownPath(dataDir())}). Pick one outside it.`);
   for (const main of [mainClaudeDir(), mainCodexHome(), mainPiDir()]) {
@@ -53,15 +61,42 @@ export async function choosePiHomesDir(input: string, accounts: readonly StoredA
   } catch (error) {
     throw new Error(`ZeroSub can't use ${shownPath(dir)}: ${error instanceof Error ? error.message : String(error)}`);
   }
-  return dir === resolve(piLauncherDir()) ? null : dir;
+  return dir === resolve(homesDirFor(family, { dir: null, from: [] })) ? null : dir;
+}
+
+/**
+ * The folder typed in the app to add as a Claude account as it is (see `Service.importAccount`), as
+ * a full path. Refused, saying why: a path that isn't full, or isn't a folder; the CLI login's own;
+ * one already added, inside an added account's folder or holding one; anywhere in ZeroSub's own
+ * folder but directly in `homes/`, where a removed account's folder is kept; and one without the
+ * `.claude.json` Claude Code keeps in a folder it's started with, so asking Claude Code about a
+ * folder typed by mistake (a project, say) never leaves its files there.
+ */
+export async function chooseImportedHome(input: string, accounts: readonly StoredAccount[]): Promise<string> {
+  const home = typedPath(input.trim(), "~/.claude-config/claude-work");
+  const shown = shownPath(home);
+  const notClaudeCode = `${shown} isn't a Claude Code folder`;
+  const example = "Enter the folder Claude Code was started with as CLAUDE_CONFIG_DIR.";
+  if (home === resolve(homedir()) || home === resolve("/")) throw new Error(`${notClaudeCode}. ${example}`);
+  if (home === resolve(mainClaudeDir())) throw new Error(`${shown} is the CLI login's own folder, which ZeroSub has already as the CLI login.`);
+  const added = accounts.find((account) => account.home && resolve(account.home) === home);
+  if (added) throw new Error(`${shown} is already added, as ${added.label}.`);
+  const holder = accounts.find((account) => account.home && within(home, account.home));
+  if (holder) throw new Error(`${shown} is inside the folder of ${holder.label}. Enter the account's folder itself.`);
+  const held = accounts.find((account) => account.home && within(account.home, home));
+  if (held) throw new Error(`${shown} holds the folder of ${held.label}. Enter the folder of the account to add itself.`);
+  if (within(home, dataDir()) && dirname(home) !== homesDir()) throw new Error(`${shown} is inside ZeroSub's own folder (${shownPath(dataDir())}).`);
+  const entry = await stat(home).catch(() => null);
+  if (!entry) throw new Error(`There's no folder at ${shown}.`);
+  if (!entry.isDirectory()) throw new Error(`${shown} is a file, not a folder.`);
+  if (!(await stat(join(home, ".claude.json")).catch(() => null))?.isFile()) throw new Error(`${notClaudeCode}: there's no .claude.json in it. ${example}`);
+  return home;
 }
 
 /**
  * The folder typed in the app to add back as a Pi account (one ZeroSub set up, kept when its account
- * was removed), as a full path. Refused, saying why: a path that isn't full, or isn't a folder; Pi's
- * own; one already added, inside an added account's folder or holding one; anywhere in ZeroSub's own
- * folder but directly in `homes/`; and a folder without the `zerosub.json` ZeroSub keeps an
- * account's key in.
+ * was removed), as a full path. Refused, saying why, as for `chooseImportedHome`, and for a folder
+ * without the `zerosub.json` ZeroSub keeps an account's key in.
  */
 export async function chooseImportedPiHome(input: string, accounts: readonly StoredAccount[]): Promise<string> {
   const home = typedPath(input.trim(), "~/.pi-config/pi-work");
@@ -82,14 +117,15 @@ export async function chooseImportedPiHome(input: string, accounts: readonly Sto
 }
 
 /**
- * Where an account's home goes in `dir`. One ZeroSub set up inside `homes/` is named after the
- * account, `pi-<name>` like its script; one from a folder picked before keeps its name. A name
- * already there, or in `taken` (other accounts' homes and places), gets the first six hex digits of
- * the account's ID added, then a number. The name stays when the account is renamed later.
+ * Where an account's home goes in `dir`. One ZeroSub signed in inside `homes/` is named after the
+ * account, `claude-<name>` like its terminal script; one from a folder picked before keeps its name.
+ * A name already there, or in `taken` (other accounts' homes and places), gets the first six hex
+ * digits of the account's ID added, then a number. The name stays when the account is renamed later.
  */
 export async function placeFor(account: StoredAccount & { home: string }, dir: string, taken: ReadonlySet<string>): Promise<string> {
+  const kind: LauncherKind = account.family === "pi" ? "pi" : "claude";
   const suffix = idSuffix(account.id);
-  const base = inHomesDir(account.home) ? (slug(account.label) ? piName(account.label) : `pi-${suffix}`) : basename(account.home);
+  const base = inHomesDir(account.home) ? (slug(account.label) ? kindName(kind, account.label) : `${kind}-${suffix}`) : basename(account.home);
   const free = async (name: string) => !taken.has(resolve(dir, name)) && (await lstat(join(dir, name)).catch(() => null)) === null;
   let name = base;
   if (!(await free(name))) name = `${base}-${suffix}`;

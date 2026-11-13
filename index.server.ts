@@ -5,7 +5,6 @@ import { PiAdapter } from "./server/pi";
 import { Service, describe } from "./server/service";
 import { preferences } from "./shared/preferences";
 import {
-  addApiAccount,
   cancelLogin,
   clearAccountLimit,
   getState,
@@ -16,13 +15,16 @@ import {
   setDefaultAccount,
   setNextAgentAccount,
   setAccountEnabled,
-  forkAgent,
-  importPiAccount,
   setAccountProxy,
+  setClaudeHomesDir,
   setPiHomesDir,
+  addApiAccount,
+  importAccount,
+  importPiAccount,
+  updateApiAccount,
+  forkAgent,
   startLogin,
   submitLoginCode,
-  updateApiAccount,
 } from "./shared/rpc";
 
 export default function contribute(server: PluginServerContext) {
@@ -84,8 +86,18 @@ export default function contribute(server: PluginServerContext) {
     console.error("[ZeroSub] this Paseo doesn't report closed agents", describe(error));
   }
 
-  server.handle(getState, ({ refreshUsage }, { paseo }) => service.view(paseo, refreshUsage));
-  server.handle(startLogin, ({ family, method, accountId }) => service.startLogin(family, method, accountId));
+  server.handle(getState, ({ refreshUsage, accountId }, { paseo }) => service.view(paseo, refreshUsage, accountId));
+  server.handle(startLogin, ({ family, method, accountId, proxy }) => service.startLogin(family, method, accountId, proxy));
+  server.handle(setAccountProxy, async ({ accountId, proxy }) => ({ ok: true as const, proxy: await service.setProxy(accountId, proxy) }));
+  server.handle(setClaudeHomesDir, async ({ dir }) => ({ ok: true as const, ...(await service.setClaudeHomesDir(dir)) }));
+  server.handle(setPiHomesDir, async ({ dir }) => ({ ok: true as const, ...(await service.setPiHomesDir(dir)) }));
+  server.handle(addApiAccount, async (input) => ({ accountId: await service.addApiAccount(input) }));
+  server.handle(importAccount, async ({ path }) => ({ accountId: await service.importAccount(path) }));
+  server.handle(importPiAccount, async ({ path }) => ({ accountId: await service.importPiAccount(path) }));
+  server.handle(updateApiAccount, async ({ accountId, ...input }) => {
+    await service.updateApiAccount(accountId, input);
+    return { ok: true as const };
+  });
   server.handle(submitLoginCode, ({ loginId, code }) => service.submitCode(loginId, code));
   server.handle(cancelLogin, ({ loginId }) => service.cancelLogin(loginId));
   server.handle(renameAccount, async ({ accountId, label }) => {
@@ -106,14 +118,6 @@ export default function contribute(server: PluginServerContext) {
   server.handle(setAgentAccount, ({ agentId, accountId }, { paseo }) => service.setAgentAccount(paseo, agentId, accountId));
   server.handle(forkAgent, ({ agentId }, { paseo }) => service.forkAgent(paseo, agentId));
   server.handle(setAccountEnabled, ({ accountId, enabled }, { paseo }) => service.setAccountEnabled(paseo, accountId, enabled));
-  server.handle(addApiAccount, async (input) => ({ accountId: await service.addApiAccount(input) }));
-  server.handle(updateApiAccount, async ({ accountId, ...input }) => {
-    await service.updateApiAccount(accountId, input);
-    return { ok: true as const };
-  });
-  server.handle(setAccountProxy, async ({ accountId, proxy }) => ({ ok: true as const, proxy: await service.setProxy(accountId, proxy) }));
-  server.handle(setPiHomesDir, async ({ dir }) => ({ ok: true as const, ...(await service.setPiHomesDir(dir)) }));
-  server.handle(importPiAccount, async ({ path }) => ({ accountId: await service.importPiAccount(path) }));
 
   return async () => {
     stopSettings();

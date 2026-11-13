@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ClaudeAdapter } from "./claude";
+import { ClaudeAdapter, keychainService } from "./claude";
 
 const { spawn } = vi.hoisted(() => ({ spawn: vi.fn() }));
 vi.mock("node:child_process", () => ({ spawn }));
@@ -71,5 +71,97 @@ describe("Claude sign-in process cleanup", () => {
     child.stderr.write(failure.subarray(cut));
     child.emit("close", 1);
     await expect(login.finished).resolves.toEqual({ ok: false, message: "Sign-in failed: no account for zoë@example.com" });
+  });
+});
+
+describe("signing a home out on macOS", () => {
+  const platform = process.platform;
+  beforeEach(() => Object.defineProperty(process, "platform", { value: "darwin" }));
+  afterEach(() => {
+    Object.defineProperty(process, "platform", { value: platform });
+    vi.clearAllMocks();
+  });
+
+  /** Each command run next exits with the given code: the CLI's logout first, then `security`. */
+  function exitWith(...codes: number[]) {
+    for (const code of codes) {
+      spawn.mockImplementationOnce(() => {
+        const child = childProcess();
+        setImmediate(() => child.emit("close", code));
+        return child;
+      });
+    }
+  }
+
+  it.each([
+    [0, 0],
+    [0, 44],
+    [1, 0],
+    [1, 44],
+  ])("is done once the keychain entry is gone (the CLI's logout exits %i, security %i)", async (cli, code) => {
+    exitWith(cli, code);
+    await expect(new ClaudeAdapter().logout("/tmp/zerosub-home")).resolves.toBeUndefined();
+    expect(spawn.mock.calls.map(([command]) => command)).toEqual(["fake-claude", "/usr/bin/security"]);
+    expect(spawn.mock.calls[1]?.[1]).toContain(keychainService("/tmp/zerosub-home"));
+  });
+
+  it("fails while the keychain entry is still there, so the home isn't deleted over a live sign-in", async () => {
+    exitWith(1, 51);
+    await expect(new ClaudeAdapter().logout("/tmp/zerosub-home")).rejects.toThrow(
+      `Couldn't sign /tmp/zerosub-home out, but couldn't remove its keychain entry "${keychainService("/tmp/zerosub-home")}" (exit 51)`,
+    );
+  });
+
+  it("fails after a logout the CLI calls done whose keychain entry is left behind", async () => {
+    exitWith(0, 51);
+    await expect(new ClaudeAdapter().logout("/tmp/zerosub-home")).rejects.toThrow("Signed /tmp/zerosub-home out, but couldn't remove its keychain entry");
+  });
+});
+
+describe("reading whether a home is signed in, on macOS", () => {
+  const platform = process.platform;
+  beforeEach(() => Object.defineProperty(process, "platform", { value: "darwin" }));
+  afterEach(() => {
+    Object.defineProperty(process, "platform", { value: platform });
+    vi.clearAllMocks();
+  });
+
+  /** Each command run next prints `stdout` and exits with `code`: the CLI's `auth status` first, then `security`. */
+  function answer(...replies: Array<{ stdout?: string; code: number }>) {
+    for (const { stdout = "", code } of replies) {
+      spawn.mockImplementationOnce(() => {
+        const child = childProcess();
+        setImmediate(() => {
+          child.stdout.write(stdout);
+          setImmediate(() => child.emit("close", code));
+        });
+        return child;
+      });
+    }
+  }
+  const noSignIn = { stdout: JSON.stringify({ loggedIn: false }), code: 0 };
+  const signIn = JSON.stringify({ claudeAiOauth: { accessToken: "token-for-test", expiresAt: 0, scopes: [] } });
+
+  it.each([
+    ["is gone", { code: 44 }],
+    ["holds no sign-in", { stdout: JSON.stringify({ mcpOAuth: {} }), code: 0 }],
+  ])("takes the CLI's word that it's signed out once its keychain entry %s", async (_, entry) => {
+    answer(noSignIn, entry);
+    await expect(new ClaudeAdapter().identity("/tmp/zerosub-home")).resolves.toMatchObject({ signedIn: false });
+    expect(spawn.mock.calls.map(([command]) => command)).toEqual(["fake-claude", "/usr/bin/security"]);
+  });
+
+  it.each([
+    ["can't be read (keychain locked)", { code: 36 }],
+    ["still holds a sign-in", { stdout: signIn, code: 0 }],
+  ])("can't tell, rather than call it signed out, when its keychain entry %s", async (_, entry) => {
+    answer(noSignIn, entry);
+    await expect(new ClaudeAdapter().identity("/tmp/zerosub-home")).rejects.toThrow("couldn't be read or still holds one");
+  });
+
+  it("doesn't look at the keychain for a home the CLI says is signed in", async () => {
+    answer({ stdout: JSON.stringify({ loggedIn: true, email: "work@example.com" }), code: 0 });
+    await expect(new ClaudeAdapter().identity("/tmp/zerosub-home")).resolves.toMatchObject({ signedIn: true, email: "work@example.com" });
+    expect(spawn).toHaveBeenCalledTimes(1);
   });
 });

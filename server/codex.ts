@@ -219,8 +219,8 @@ export class CodexAdapter implements FamilyAdapter {
     return { ok: false, detail: (result.stderr || result.stdout).trim().split("\n")[0] || `${command} not found` };
   }
 
-  prepareHome(home: string): Promise<void> {
-    return prepareCodexHome(home);
+  prepareHome(home: string, wanted?: () => Promise<boolean>): Promise<void> {
+    return prepareCodexHome(home, false, wanted);
   }
 
   async identity(home: string | null): Promise<Identity> {
@@ -267,7 +267,7 @@ export class CodexAdapter implements FamilyAdapter {
   }
 
   private async readSnapshot(home: string | null, signal: AbortSignal): Promise<Snapshot> {
-    const server = await AppServer.open(spawnEnv(await this.env(home)), signal);
+    const server = await AppServer.open(spawnEnv(await this.env(home), "codex"), signal);
     try {
       const account = ((await server.request("account/read", {})) ?? {}) as Json;
       const details = account.account as { type?: unknown; email?: unknown; planType?: unknown } | null;
@@ -329,13 +329,13 @@ export class CodexAdapter implements FamilyAdapter {
 
   async login(home: string | null, method: LoginMethod): Promise<LoginHandle> {
     this.snapshots.delete(home ?? "");
-    const server = await AppServer.open(spawnEnv(await this.env(home)));
+    const server = await AppServer.open(spawnEnv(await this.env(home), "codex"));
     return new CodexLogin(server, method, () => this.snapshots.delete(home ?? ""));
   }
 
   async logout(home: string): Promise<void> {
     this.snapshots.delete(home);
-    const server = await AppServer.open(spawnEnv(await this.env(home)));
+    const server = await AppServer.open(spawnEnv(await this.env(home), "codex"));
     try {
       await server.request("account/logout");
     } finally {
@@ -349,7 +349,7 @@ export class CodexAdapter implements FamilyAdapter {
    */
   async redeemReset(home: string | null): Promise<RedeemReply> {
     this.snapshots.delete(home ?? "");
-    const server = await AppServer.open(spawnEnv(await this.env(home)));
+    const server = await AppServer.open(spawnEnv(await this.env(home), "codex"));
     try {
       // One idempotency key per attempt, so a retried request can never spend a second credit.
       const reply = (await server.request(

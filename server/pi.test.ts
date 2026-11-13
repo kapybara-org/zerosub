@@ -799,7 +799,9 @@ describe("Pi accounts in the service", () => {
     }
   });
 
-  it("gives way, folder and all, to a session routed to the home while it was moving, which never opens without the account's proxy", async () => {
+  // ZeroSub moves Pi homes with the machinery its Claude homes use: the session is seen before the
+  // folder moves, not after, so there's no moving it back.
+  it("gives way to a session routed to the home as its move starts, which opens on the account with its proxy", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const store = new StateStore(join(root, "state.json"));
     const pi = new InstalledPi();
@@ -819,78 +821,21 @@ describe("Pi accounts in the service", () => {
       pi.inUse.clear();
       vi.setSystemTime(Date.now() + 31_000);
 
-      // The scan made once the folder is at its new place: a session opens on the account just then.
-      let routed: Record<string, unknown> | null | undefined;
+      // A session opens on the account during the move's check that nothing runs on the folder.
+      let routed: Promise<Awaited<ReturnType<typeof open>>> | undefined;
       pi.onScan = async () => {
-        if (!(await stat(to).catch(() => null)) || routed !== undefined) return;
-        // It's answered at once, without waiting for the move. A routing error opens it on the CLI
-        // login, as the session_open hook does (index.server.ts): null here.
-        routed = ((await open(service, paseo).catch(() => undefined))?.env as Record<string, unknown> | undefined) ?? null;
+        routed ??= open(service, paseo);
       };
       await service.placeHomes();
       pi.onScan = null;
-
-      // Its folder's settings can't be read just then, so it either has the account's proxy or doesn't
-      // open on the account at all (it opens on the CLI login): never the account without its proxy.
-      expect(routed).not.toBeUndefined();
-      if (routed?.PI_CODING_AGENT_DIR !== undefined) expect(routed.HTTPS_PROXY).toBe(proxy);
-      expect((await store.read()).sessions["agent-1"]?.accountId).not.toBe(id);
+      const env = (await routed)?.env as Record<string, unknown>;
+      expect(env.PI_CODING_AGENT_DIR).toBe(from);
+      expect(env.HTTPS_PROXY).toBe(proxy);
       expect(findAccount(await store.read(), id)?.home).toBe(from);
-      expect((await stat(join(from, "zerosub.json"))).isFile()).toBe(true);
       await expect(stat(to)).rejects.toThrow();
       expect(await store.read()).toMatchObject({ moves: {} });
       const card = (await service.view(paseo as never)).accounts.find((account) => account.id === id);
       expect(card?.moving?.waiting).toMatch(/just started/);
-    } finally {
-      vi.useRealTimers();
-      await service.stop();
-    }
-  });
-
-  it("keeps the account on the folder with its key when Pi makes the old folder again during the check", async () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    const store = new StateStore(join(root, "state.json"));
-    const pi = new InstalledPi();
-    const service = piService(pi, store);
-    const paseo = { agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false } }) } };
-    service.attach(paseo as never);
-    try {
-      await service.start();
-      pi.inUse.add("held");
-      const scan = pi.homesInUse.bind(pi);
-      pi.homesInUse = async (homes) => (pi.inUse.has("held") ? new Set(homes) : scan(homes));
-      const id = await service.addApiAccount({ label: "Work key", key: KEY });
-      const from = join(root, "paseo", "zerosub", "homes", id);
-      const to = join(root, "pi-config", "pi-work-key");
-      pi.inUse.clear();
-      vi.setSystemTime(Date.now() + 31_000);
-
-      // While the folder is at its new place, Pi starts on the old one (a terminal with its old
-      // script, say) and makes it again: the move gives way, and the folder can't go back.
-      pi.onScan = async () => {
-        if (!(await stat(to).catch(() => null)) || pi.inUse.has(from)) return;
-        await mkdir(join(from, "sessions"), { recursive: true });
-        await writeFile(join(from, "settings.json"), "{}\n");
-        pi.inUse.add(from);
-      };
-      await service.placeHomes();
-      pi.onScan = null;
-      expect((await stat(join(to, "zerosub.json"))).isFile()).toBe(true);
-      await expect(stat(join(from, "zerosub.json"))).rejects.toThrow();
-      // Whatever the card says, it never tells you to delete the folder with the key.
-      const said = (await service.view(paseo as never)).accounts.find((account) => account.id === id)?.moving;
-      expect(`${said?.error ?? ""} ${said?.waiting ?? ""}`).not.toMatch(new RegExp(`delete [^.]*${to.split("/").pop()}`));
-
-      // The next pass finishes the move to the folder with the key, and leaves the one Pi made alone.
-      pi.inUse.clear();
-      await service.placeHomes();
-      const state = await store.read();
-      expect(findAccount(state, id)?.home).toBe(to);
-      expect(state.moves).toEqual({});
-      expect(JSON.parse(await readFile(join(to, "auth.json"), "utf8")).anthropic).toEqual({ type: "api_key", key: KEY });
-      expect((await stat(join(from, "settings.json"))).isFile()).toBe(true);
-      await service.setDefault(paseo as never, id);
-      expect((await open(service, paseo))?.env.PI_CODING_AGENT_DIR).toBe(to);
     } finally {
       vi.useRealTimers();
       await service.stop();
@@ -950,7 +895,7 @@ describe("Pi accounts in the service", () => {
     }
   });
 
-  it("sets no new proxy on the CLI login while a follower's folder is being moved, and says to try again", async () => {
+  it("checks a follower whose folder is being moved once the move is done, before a new proxy on the CLI login", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const store = new StateStore(join(root, "state.json"));
     const pi = new InstalledPi();
@@ -962,24 +907,22 @@ describe("Pi accounts in the service", () => {
       pi.inUse.add("held");
       const scan = pi.homesInUse.bind(pi);
       pi.homesInUse = async (homes) => (pi.inUse.has("held") ? new Set(homes) : scan(homes));
-      await service.addApiAccount({ label: "Gateway", key: KEY, baseUrl: "http://gw.example.com" });
+      const id = await service.addApiAccount({ label: "Gateway", key: KEY, baseUrl: "http://gw.example.com" });
       const to = join(root, "pi-config", "pi-gateway");
       pi.inUse.clear();
       vi.setSystemTime(Date.now() + 31_000);
       const before = await readFile(join(main, "settings.json"), "utf8");
 
-      // While its folder is away for the check, its settings can't be read: it isn't taken for safe.
-      let refused: unknown;
+      // Asked for during the move: it isn't read halfway there and taken for an account with no key.
+      let refused: Promise<unknown> | undefined;
       pi.onScan = async () => {
-        if (!(await stat(to).catch(() => null)) || refused !== undefined) return;
-        refused = await service.setProxy(MAIN_ACCOUNT_ID.pi, "http://127.0.0.1:7890").then(() => null, (error: unknown) => error);
+        refused ??= service.setProxy(MAIN_ACCOUNT_ID.pi, "http://127.0.0.1:7890").then(() => null, (error: unknown) => error);
       };
       await service.placeHomes();
       pi.onScan = null;
-      expect(String(refused)).toMatch(/try again/i);
+      expect(String(await refused)).toMatch(/Gateway has no proxy of its own/);
+      expect(findAccount(await store.read(), id)?.home).toBe(to);
       expect(await readFile(join(main, "settings.json"), "utf8")).toBe(before);
-      // Once it's where it'll stay, it's checked as ever.
-      await expect(service.setProxy(MAIN_ACCOUNT_ID.pi, "http://127.0.0.1:7890")).rejects.toThrow(/Gateway has no proxy of its own/);
     } finally {
       vi.useRealTimers();
       await service.stop();

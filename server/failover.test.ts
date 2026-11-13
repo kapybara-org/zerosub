@@ -21,10 +21,13 @@ let root: string;
 let previousHome: string | undefined;
 /** The services the current test made, stopped once it ends. */
 const services: Service[] = [];
+let previousLaunchers: string | undefined;
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "zerosub-failover-"));
   previousHome = process.env.PASEO_HOME;
+  previousLaunchers = process.env.ZEROSUB_LAUNCHER_DIR;
+  process.env.ZEROSUB_LAUNCHER_DIR = join(root, "launchers");
   process.env.PASEO_HOME = root; // saved usage lands here, never in the real ~/.paseo
 });
 
@@ -34,6 +37,9 @@ afterEach(async () => {
   await Promise.all(services.splice(0).map((service) => service.stop()));
   if (previousHome === undefined) delete process.env.PASEO_HOME;
   else process.env.PASEO_HOME = previousHome;
+  if (previousLaunchers === undefined) delete process.env.ZEROSUB_LAUNCHER_DIR;
+  else process.env.ZEROSUB_LAUNCHER_DIR = previousLaunchers;
+  // Retried: a write the test set off in the background can still be landing in it.
   await rm(root, { recursive: true, force: true, maxRetries: 5 });
 });
 
@@ -123,6 +129,9 @@ interface SetUpOptions {
   detectSignOut?: FamilyAdapter["detectSignOut"];
 }
 
+/** Automatic switching is off by default; the tests of what it does turn it on. */
+const SWITCHING = preferences.schema.parse({ autoSwitch: true });
+
 async function setUp(state: Partial<StoredState>, hit: () => LimitHit, options: SetUpOptions = {}) {
   const store = new StateStore(join(root, "state.json"));
   await store.update((draft) => Object.assign(draft, state));
@@ -167,6 +176,7 @@ async function setUp(state: Partial<StoredState>, hit: () => LimitHit, options: 
     reopener as unknown as Reopener,
   );
   services.push(service);
+  service.setPreferences(SWITCHING);
   const limitTurn = () =>
     service.onTurnEnded(
       { agent: { id: AGENT, provider: "claude" }, turnId: "t", outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never,
@@ -397,6 +407,24 @@ describe("when the CLI login changes hands", () => {
 });
 
 describe("failover", () => {
+  it("leaves the agent on its account at a limit unless automatic switching is turned on", async () => {
+    const { service, store, reopened, sent, limitTurn } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+        sessions: {},
+      },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your session limit" }),
+    );
+    service.setPreferences(preferences.schema.parse({ autoSwitch: false }));
+    await limitTurn();
+    const state = await store.read();
+    expect(state.accounts.find((a) => a.id === MAIN)?.limitedUntil).not.toBeNull(); // still recorded
+    expect(state.bindings[AGENT]).toBeUndefined();
+    expect(reopened).toEqual([]);
+    expect(sent).toHaveLength(0);
+  });
+
   it("blames the CLI login for a session ZeroSub never routed, even when the agent is bound elsewhere", async () => {
     // Today's incident: the agent's session predates zerosub, and a switch to "hello" was waiting.
     const { store, reopened, sent, notes, limitTurn } = await setUp(
@@ -722,6 +750,48 @@ describe("failover", () => {
   });
 });
 
+describe("an API account's refused key", () => {
+  const API = "claude-api";
+
+  it("marks the account and moves the agent to a subscription account", async () => {
+    const refused = () => "Invalid API key · Fix external API key";
+    const { store, reopened, notes, limitTurn } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), { ...account(API, "gateway", "managed"), auth: "api" }] as never,
+        defaults: { claude: API, codex: null, pi: null },
+        sessions: { [AGENT]: { accountId: API, family: "claude", openedAt: new Date().toISOString() } },
+      },
+      () => {
+        throw new Error("unused: no limit in this turn");
+      },
+      { detectLimit: () => null, detectSignOut: refused },
+    );
+    await limitTurn();
+    const state = await store.read();
+    // `claude auth status` would still say "logged in" for any key, so the refusal is what counts.
+    expect(state.accounts.find((a) => a.id === API)?.signedIn).toBe(false);
+    expect(reopened).toEqual([AGENT]);
+    expect(notes.at(-1)).toMatchObject({ from: "gateway", to: "marketing", outcome: "switched" });
+  });
+
+  it("leaves a subscription account alone when its login still checks out", async () => {
+    const { store, reopened, limitTurn } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: HELLO, codex: null, pi: null },
+        sessions: { [AGENT]: { accountId: HELLO, family: "claude", openedAt: new Date().toISOString() } },
+      },
+      () => {
+        throw new Error("unused: no limit in this turn");
+      },
+      { detectLimit: () => null, detectSignOut: () => "Not logged in · Please run /login" },
+    );
+    await limitTurn();
+    expect((await store.read()).accounts.find((a) => a.id === HELLO)?.signedIn).toBe(true);
+    expect(reopened).toEqual([]);
+  });
+});
+
 describe("forking to the other provider", () => {
   const CODEX_MAIN = MAIN_ACCOUNT_ID.codex;
   const MODES: Record<string, Array<{ id: string; label: string; colorTier: string }>> = {
@@ -899,8 +969,9 @@ describe("disabling an account", () => {
   });
 
   it("won't disable an account whose agents routing would leave on it", async () => {
-    // Routing never moves agents onto an account at its limit, so they'd stay put.
+    // Routing never moves agents onto an API account or one at its limit, so they'd stay put.
     const others = {
+      "an API key": { ...account(HELLO, "hello", "managed"), auth: "api" },
       "a limit": { ...account(HELLO, "hello", "managed"), limitedUntil: inFuture(), limitKind: "window" },
     };
     for (const [why, other] of Object.entries(others)) {
@@ -2379,6 +2450,36 @@ describe("answering before Paseo gives up", () => {
     expect(spent).toBe(1);
   });
 
+  it.each([
+    [true, "Still using the reset on marketing. Its limits show here once it's done, and the agent carries on; don't use another."],
+    [false, "Still using the reset on marketing. Its limits show here once it's done; don't use another."],
+  ])("says the agent carries on after a slow reset only when Keep going is on (%s)", async (autoContinue, message) => {
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const { service, paseo, sent } = await setUp(onMarketing(), hit, {
+      claude: {
+        redeemReset: async () => {
+          await gate;
+          return { outcome: "reset", message: "Limits reset.", left: 0 };
+        },
+      },
+      // The agent's last turn did stop at the limit.
+      recent: inTurn("t", { type: "assistant_message", text: "You've hit your session limit · resets 3pm" }),
+      detectLimit: detectClaudeLimit,
+    });
+    service.setPreferences(preferences.schema.parse({ autoSwitch: true, autoContinue }));
+    const asked = service.redeem(paseo as never, MAIN, AGENT);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(await asked).toEqual({ outcome: "pending", message, left: null, continued: false });
+
+    release();
+    if (autoContinue) await vi.waitFor(() => expect(sent).toHaveLength(1));
+    else {
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(sent).toEqual([]);
+    }
+  });
+
   it("answers a usage refresh that has to renew a sign-in", async () => {
     let release = () => {};
     const gate = new Promise<void>((resolve) => (release = resolve));
@@ -2394,6 +2495,62 @@ describe("answering before Paseo gives up", () => {
     await vi.advanceTimersByTimeAsync(15_000);
     expect((await viewing).accounts).toHaveLength(2);
     release();
+  });
+
+  it("reads only the account asked for, when one is", async () => {
+    const read: Array<string | null> = [];
+    const { service, paseo } = await setUp(onMarketing(), hit, {
+      claude: {
+        usage: async (home: string | null) => {
+          read.push(home);
+          return { fetchedAt: new Date().toISOString(), windows: [], error: null, cached: false, resets: null };
+        },
+      },
+    });
+    read.length = 0;
+    await service.view(paseo as never, true, HELLO);
+    expect(read).toEqual([join(tmpdir(), HELLO)]);
+  });
+});
+
+describe("forking to the other provider by hand", () => {
+  /** A ChatGPT agent out of room, and Claude accounts as given; the fork never gets as far as starting an agent. */
+  async function refusal(claude: Array<Record<string, unknown>>) {
+    const CODEX_MAIN = MAIN_ACCOUNT_ID.codex;
+    const store = new StateStore(join(root, "state.json"));
+    await store.update((draft) =>
+      Object.assign(draft, {
+        accounts: [{ ...account(CODEX_MAIN, "hello", "main"), family: "codex", limitedUntil: inFuture(), limitKind: "window" }, ...claude],
+        defaults: { claude: MAIN, codex: CODEX_MAIN, pi: null },
+      }),
+    );
+    const agent = { id: AGENT, provider: "codex", status: "idle", title: "Fix the build", archivedAt: null, labels: {} };
+    const paseo = {
+      config: { get: async () => ({ config: { providers: {} } }) },
+      providers: { listAvailable: async () => ({ providers: [{ provider: "claude", available: true }, { provider: "codex", available: true }] }) },
+      agents: {
+        list: async () => ({ entries: [{ agent }], pageInfo: { hasMore: false, nextCursor: null } }),
+        ref: () => ({ refresh: async () => ({ agent }) }),
+      },
+    };
+    const service = new Service(
+      {
+        claude: claudeAdapter(() => ({ kind: "window", resetsAt: inFuture(), message: "" })),
+        codex: { ...claudeAdapter(() => ({ kind: "window", resetsAt: null, message: "" })), family: "codex", portable: false } as FamilyAdapter,
+        pi: absentPi(),
+      },
+      store,
+      { resolve: async () => ({ claude: "claude" as const, codex: "codex" as const }) } as unknown as FamilyResolver,
+      { locate: async () => "/usr/local/bin/paseo", reopen: async () => ({ ok: true as const }) } as unknown as Reopener,
+    );
+    return service.forkAgent(paseo as never, AGENT);
+  }
+
+  it("says an API account won't take the work over, rather than that every account is at its limit", async () => {
+    const limited = { ...account(MAIN, "marketing", "main"), limitedUntil: inFuture(), limitKind: "window" };
+    const api = { ...account("claude-api", "gateway", "managed"), auth: "api" };
+    await expect(refusal([limited, api])).rejects.toThrow(/only Claude accounts with room use an API key/);
+    await expect(refusal([limited])).rejects.toThrow("Every Claude account is at its limit too.");
   });
 });
 

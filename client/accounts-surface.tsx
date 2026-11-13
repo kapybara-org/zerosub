@@ -1,24 +1,28 @@
 import { useHosts, useSettings, type PluginSurfaceProps } from "@getpaseo/plugin/client";
-import { Icon, Modal, TextInput, useToast } from "@getpaseo/plugin/client/react-native";
+import { copyText, Icon, Modal, TextInput, useToast } from "@getpaseo/plugin/client/react-native";
 import { SettingsCard, SettingsSwitch } from "@getpaseo/plugin/client/ui";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ScrollView, Text, View } from "react-native";
-import { accountSubtitle, describeReopen, formatAge, formatCredits, formatPlan, staleNotice, usageSummary } from "../shared/format";
-import { FAMILIES, FAMILY_LABEL, type AccountView, type Family, type StateView } from "../shared/model";
+import { accountSubtitle, describeReopen, formatAge, formatCredits, formatPlan, isDisabled, staleNotice, usageSummary } from "../shared/format";
+import { FAMILIES, FAMILY_LABEL, HIDDEN, type AccountView, type Family, type StateView } from "../shared/model";
 import { preferences } from "../shared/preferences";
 import {
   clearAccountLimit,
   removeAccount,
   renameAccount,
   setAccountEnabled,
+  setAccountProxy,
+  setClaudeHomesDir,
   setDefaultAccount,
   setNextAgentAccount,
 } from "../shared/rpc";
 import { AddAccountModal } from "./add-account";
-import { AddPiAccountModal, ApiKeyModal, PiSectionNotes, ProxyModal, piCardDetails } from "./pi-accounts";
+import { ApiAccountModal } from "./api-account";
 import { ResetConfirm, redeemToast, resetBadge } from "./reset-confirm";
 import { describe, stoppedWaiting, useStore, VISIBLE_POLL_MS, type ZeroSubStore } from "./store";
-import { Badge, Button, Card, IconButton, UsageBar, useText } from "./ui";
+import { Badge, Button, Card, IconButton, UsageBar, useText, type TooltipAlign } from "./ui";
+import { cardActions, type CardActionKey } from "./card-actions";
+import { AddPiAccountModal, ApiKeyModal as PiApiKeyModal, PiSectionNotes, ProxyModal as PiProxyModal, piCardDetails } from "./pi-accounts";
 
 type Theme = PluginSurfaceProps["theme"];
 
@@ -76,8 +80,12 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
             ) : null}
           </View>
           <Text style={text.muted}>
-            Keep several Claude and ChatGPT accounts signed in, and run Pi on several Anthropic API keys. Each
-            agent uses one; when an account hits its limit, agents move to another and keep going.
+            Keep several Claude and ChatGPT accounts signed in, and Pi on several Anthropic API keys. Each agent uses one;{" "}
+            {state?.autoSwitch
+              ? state.autoContinue
+                ? "when an account hits its limit, agents move to another and keep going."
+                : "when an account hits its limit, agents move to another and wait for you there."
+              : "when an account hits its limit, move its agents to another from their account button, or turn on automatic switching below."}
           </Text>
         </View>
 
@@ -123,6 +131,8 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
                 family={family}
                 accounts={state.accounts.filter((account) => account.family === family)}
                 state={state}
+                launchers={family === "claude" ? state.launchers : null}
+                homes={family === "claude" ? state.claudeHomes : null}
                 theme={theme}
                 compact={layout.compact}
                 store={store}
@@ -222,16 +232,22 @@ const SECTION_TITLE: Record<Family, string> = { claude: "Claude", codex: "ChatGP
 function FamilySection({
   family,
   accounts,
-  state,
+  launchers,
+  homes,
   theme,
   compact,
   store,
+  state,
   onAdd,
   onSignIn,
 }: {
   family: Family;
-  accounts: AccountView[];
   state: StateView;
+  accounts: AccountView[];
+  /** Directory with each added Claude account's command, if any account has one. */
+  launchers: string | null;
+  /** Where added accounts' folders are kept; null for Codex, and from older servers. */
+  homes: StateView["claudeHomes"];
   theme: Theme;
   compact: boolean;
   store: ZeroSubStore;
@@ -267,35 +283,202 @@ function FamilySection({
               account={account}
               theme={theme}
               store={store}
+              compact={compact}
               onSignIn={() => onSignIn(account)}
             />
           ))}
           {!compact && row.length === 1 ? <View style={{ flex: 1 }} /> : null}
         </View>
       ))}
+      {launchers ? <ShellHint theme={theme} directory={launchers} accounts={accounts} /> : null}
+      {homes ? <HomesHint theme={theme} homes={homes} store={store} /> : null}
     </View>
   );
+}
+
+/** Where added Claude accounts' folders are kept, and the way to keep them somewhere else. */
+function HomesHint({ theme, homes, store }: { theme: Theme; homes: NonNullable<StateView["claudeHomes"]>; store: ZeroSubStore }) {
+  const text = useText(theme);
+  const [editing, setEditing] = useState(false);
+  return (
+    <View style={{ flexDirection: "row", alignItems: "flex-start", gap: 10, paddingHorizontal: 2 }}>
+      <Icon name="FolderOpen" size={16} color={theme.colors.foregroundMuted} />
+      <View style={{ flex: 1, gap: 4 }}>
+        <Text style={text.small}>Each added account keeps its sign-in and settings in a folder of its own in</Text>
+        <Text selectable style={[text.small, { color: theme.colors.foreground }]}>
+          {homes.dir}
+        </Text>
+      </View>
+      <IconButton
+        theme={theme}
+        icon="FolderPen"
+        label="Change where accounts are kept"
+        tooltip="Keep the accounts' folders somewhere else; they move there"
+        tooltipAlign="end"
+        onPress={() => setEditing(true)}
+      />
+      {editing ? <HomesModal theme={theme} homes={homes} store={store} onClose={() => setEditing(false)} /> : null}
+    </View>
+  );
+}
+
+function HomesModal({
+  theme,
+  homes,
+  store,
+  onClose,
+}: {
+  theme: Theme;
+  homes: NonNullable<StateView["claudeHomes"]>;
+  store: ZeroSubStore;
+  onClose(): void;
+}) {
+  const text = useText(theme);
+  const toast = useToast();
+  const [dir, setDir] = useState(homes.isDefault ? "" : homes.dir);
+  const typed = dir.trim();
+  const changed = typed === "" ? !homes.isDefault : typed !== homes.dir;
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const save = useCallback(async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      const result = await store.rpc(setClaudeHomesDir, { dir: typed });
+      const moving = result.moving > 0 ? ` · ${result.moving} account${result.moving === 1 ? "" : "s"} move there once nothing runs on ${result.moving === 1 ? "it" : "them"}` : "";
+      toast.show(`Accounts are kept in ${result.dir} now${moving}`, { variant: "success", durationMs: 5_000 });
+      await store.refresh();
+      onClose();
+    } catch (failure) {
+      setError(describe(failure));
+    } finally {
+      setSaving(false);
+    }
+  }, [typed, store, toast, onClose]);
+  const inputStyle = useMemo(
+    () => ({
+      color: theme.colors.foreground,
+      backgroundColor: theme.colors.surface2,
+      borderColor: theme.colors.border,
+      borderWidth: 1,
+      borderRadius: 8,
+      paddingHorizontal: 12,
+      paddingVertical: 10,
+      fontSize: 15,
+    }),
+    [theme],
+  );
+  return (
+    <Modal title="Where Claude accounts are kept" open onOpenChange={(open) => (open ? undefined : onClose())}>
+      <Modal.Content>
+        <Text style={text.muted}>
+          {`Now: ${homes.dir}${homes.isDefault ? ", beside the terminal scripts" : ""}. Each added account has a folder of its own there, named after it like its terminal script, with its sign-in and settings; new ones are signed in inside ZeroSub's own folder, then moved there.`}
+        </Text>
+        <Text style={text.muted}>
+          {"Saving another folder moves every account kept here, and any still in ZeroSub's own folder, to it. Each moves once nothing runs on it: an agent or a terminal using it holds it back until it stops. Its Keychain entry moves with it. Removing an account later only takes it out of ZeroSub; its folder stays."}
+        </Text>
+        <TextInput
+          value={dir}
+          onChangeText={setDir}
+          autoFocus
+          maxLength={1024}
+          placeholder={homes.isDefault ? homes.dir : "Default, beside the terminal scripts"}
+          placeholderTextColor={theme.colors.foregroundMuted}
+          autoCapitalize="none"
+          autoCorrect={false}
+          onSubmitEditing={() => (changed ? void save() : undefined)}
+          style={inputStyle}
+          accessibilityLabel="Folder for Claude accounts"
+        />
+        <Text style={text.small}>A full path on this host; ~ is your home folder. Leave it empty for the default.</Text>
+        {error ? <Text style={text.danger}>{error}</Text> : null}
+        <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, justifyContent: "flex-end" }}>
+          <Button theme={theme} label="Cancel" tooltip="Keep the accounts where they are" tooltipAlign="end" onPress={onClose} />
+          <Button
+            theme={theme}
+            tone="primary"
+            label="Save"
+            tooltip="Keep the accounts in this folder; they move there"
+            tooltipAlign="end"
+            busy={saving}
+            disabled={!changed}
+            onPress={() => void save()}
+          />
+        </View>
+      </Modal.Content>
+    </Modal>
+  );
+}
+
+/** How to start the CLI on an added account from a terminal. */
+function ShellHint({ theme, directory, accounts }: { theme: Theme; directory: string; accounts: AccountView[] }) {
+  const text = useText(theme);
+  const toast = useToast();
+  // Readable when the path needs no quoting, which is nearly always.
+  const line = /^[\w./~+@%-]+$/.test(directory)
+    ? `export PATH="${directory}:$PATH"`
+    : `export PATH='${directory.replace(/'/g, "'\\''")}':"$PATH"`;
+  const commands = accounts.flatMap((account) => (account.launcher ? [account.launcher] : []));
+  const copy = useCallback(async () => {
+    try {
+      await copyText(line);
+      toast.show("Copied", { variant: "success" });
+    } catch {
+      toast.error("Couldn't copy. Select the text and copy it yourself.");
+    }
+  }, [line, toast]);
+  return (
+    <View style={{ flexDirection: "row", alignItems: "flex-start", gap: 10, paddingHorizontal: 2 }}>
+      <Icon name="SquareTerminal" size={16} color={theme.colors.foregroundMuted} />
+      <View style={{ flex: 1, gap: 4 }}>
+        <Text style={text.small}>
+          From a terminal on this host: add this line to your shell profile once, then run{" "}
+          {commands.length > 0 ? commands.join(", ") : "claude-<account>"}. Accounts added later work without changing it.
+        </Text>
+        <Text selectable style={[text.small, { color: theme.colors.foreground }]}>
+          {line}
+        </Text>
+      </View>
+      <IconButton theme={theme} icon="Copy" label="Copy" tooltip="Copy the line for your shell profile" onPress={() => void copy()} />
+    </View>
+  );
+}
+
+/** One of the icon buttons in a card's header. */
+interface CardAction {
+  key: string;
+  icon: string;
+  label: string;
+  tooltip: string;
+  tone?: "danger";
+  busy?: boolean;
+  onPress(): void;
 }
 
 function AccountCard({
   account,
   theme,
   store,
+  compact,
   onSignIn,
 }: {
   account: AccountView;
   theme: Theme;
   store: ZeroSubStore;
+  /** A phone-sized screen: the header's buttons get a row of their own, so the name keeps its room. */
+  compact: boolean;
   onSignIn(): void;
 }) {
   const text = useText(theme);
   const toast = useToast();
-  const [busy, setBusy] = useState<"default" | "remove" | "clear" | "toggle" | "next" | null>(null);
+  const [busy, setBusy] = useState<"default" | "remove" | "clear" | "toggle" | "usage" | "next" | null>(null);
   const [renaming, setRenaming] = useState(false);
-  const [editingApi, setEditingApi] = useState(false);
   const [editingProxy, setEditingProxy] = useState(false);
-  const api = account.auth === "api";
-  const details = piCardDetails(account);
+  const [editingApi, setEditingApi] = useState(false);
+  // Pi's CLI login shows the Anthropic key it keeps, too.
+  const api = account.auth === "api" || account.apiEditable ? account.api : null;
+  // An API account "signs in again" by getting a working key, not through the sign-in page.
+  const signIn = account.auth === "api" ? () => setEditingApi(true) : onSignIn;
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const resets = account.usage?.resets ?? null;
@@ -304,7 +487,8 @@ function AccountCard({
   const summary = usageSummary(account);
   const subtitle = accountSubtitle(account);
   const signedOut = account.status === "signed_out";
-  const disabled = account.status === "disabled";
+  // A signed-out account reports only that as its status, but may be disabled too.
+  const disabled = isDisabled(account);
   const faded = disabled ? { opacity: 0.55 } : null;
   const windows = account.usage?.windows ?? [];
   const agents = account.agentCount === 0 ? "No agents" : `${account.agentCount} agent${account.agentCount === 1 ? "" : "s"}`;
@@ -312,7 +496,7 @@ function AccountCard({
 
   // Sets the account aside for a while, or brings it back; its agents move off it and back.
   const toggle = useCallback(async () => {
-    const enabling = account.status === "disabled";
+    const enabling = isDisabled(account);
     setBusy("toggle");
     try {
       const result = await store.rpc(setAccountEnabled, { accountId: account.id, enabled: enabling });
@@ -359,6 +543,17 @@ function AccountCard({
   }, [account, store, toast]);
 
   // For when the user knows better, e.g. after upgrading the plan or buying credits.
+  // Read the way this account's Claude Code reaches Anthropic: through its own proxy, if it has one.
+  // What comes back, a reading or why there's none, shows on the card.
+  const refreshUsage = useCallback(async () => {
+    setBusy("usage");
+    try {
+      await store.refresh({ refreshUsage: true, accountId: account.id });
+    } finally {
+      setBusy(null);
+    }
+  }, [account.id, store]);
+
   const markAvailable = useCallback(async () => {
     setBusy("clear");
     try {
@@ -375,7 +570,7 @@ function AccountCard({
     setBusy("remove");
     try {
       const result = await store.rpc(removeAccount, { accountId: account.id });
-      const removed = `Removed ${account.label}`;
+      const removed = account.externalHome ? `Removed ${account.label} from ZeroSub; its sign-in and files are kept` : `Removed ${account.label}`;
       // An older server only says how many agents ran on it, not how moving them went.
       const message = result.moves
         ? describeReopen(removed, result.moves)
@@ -400,111 +595,143 @@ function AccountCard({
     }
   }, [account, store, toast]);
 
+  const offered: Record<CardActionKey, CardAction> = {
+    clear: {
+      key: "clear",
+      icon: "CircleCheck",
+      label: "Mark as available again (it has room)",
+      tooltip: "Mark as available: use it again before its limit resets, e.g. after upgrading",
+      busy: busy === "clear",
+      onPress: () => void markAvailable(),
+    },
+    next: {
+      key: "next",
+      icon: account.nextAgentUntil ? "CircleX" : "SquarePlus",
+      label: account.nextAgentUntil ? "Cancel: next new agent goes back to the default" : "Use for the next new agent",
+      tooltip: account.nextAgentUntil
+        ? "Your next new agent starts here. Click to cancel"
+        : "Next new agent: the next agent you start (new workspace or tab) uses this account, once",
+      busy: busy === "next",
+      onPress: () => void nextAgent(),
+    },
+    default: {
+      key: "default",
+      icon: "Star",
+      label: "Make default",
+      tooltip: "Make default: new agents start on this account",
+      busy: busy === "default",
+      onPress: () => void makeDefault(),
+    },
+    toggle: {
+      key: "toggle",
+      icon: disabled ? "CirclePlay" : "CirclePause",
+      label: disabled ? "Enable account" : "Disable for now (agents won't use it)",
+      tooltip: disabled ? "Enable: agents can use this account again" : "Disable for now: agents stop using it and move to your other accounts",
+      busy: busy === "toggle",
+      onPress: () => void toggle(),
+    },
+    usage: {
+      key: "usage",
+      icon: "RefreshCw",
+      label: "Refresh usage",
+      tooltip: account.proxy ? `Refresh usage: read this account's now, through ${account.proxy}` : "Refresh usage: read this account's now",
+      busy: busy === "usage",
+      onPress: () => void refreshUsage(),
+    },
+    api: {
+      key: "api",
+      icon: "KeyRound",
+      label: "API settings",
+      tooltip: account.family === "pi" ? "API settings: key and base URL" : "API settings: key, base URL and traffic switches",
+      onPress: () => setEditingApi(true),
+    },
+    proxy: { key: "proxy", icon: "Globe", label: "Proxy", tooltip: "Proxy: the network this account uses", onPress: () => setEditingProxy(true) },
+    rename: { key: "rename", icon: "Pencil", label: "Rename", tooltip: "Rename this account", onPress: () => setRenaming(true) },
+    remove: {
+      key: "remove",
+      icon: "Trash2",
+      label: "Remove",
+      tooltip: account.externalHome ? "Remove from ZeroSub only: its sign-in, files and launcher stay" : account.family === "pi"
+          ? "Remove: delete its saved key"
+          : "Remove: sign it out and delete its saved login",
+      tone: "danger",
+      busy: busy === "remove",
+      onPress: () => setConfirmRemove(true),
+    },
+  };
+  const actions = cardActions(account).map((key) => offered[key]);
+  const details =
+    piCardDetails(account) ??
+    ([
+      api ? `${api.keyKind === "api_key" ? "Key" : "Token"}${api.keyHint ? ` …${api.keyHint}` : ""} · ${api.baseUrl ?? "Anthropic API"}` : null,
+      account.proxy ? `Via ${account.proxy}` : null,
+      account.launcher ? `Terminal: ${account.launcher}` : null,
+    ]
+      .filter(Boolean)
+      .join(" · ") ||
+      null);
+  // Beside the name, up to eight 30 pt buttons leave a 375 pt phone's card no room for it. There they go
+  // on a row under the name instead (261 pt wide there; eight take 254). That row starts 75 pt from the
+  // screen's left, so a 240 pt tip opens rightwards from the first two, centred over the next three and
+  // leftwards from the rest, and stays on screen.
+  const actionRow = (
+    <View
+      style={[
+        { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 2 },
+        compact ? { marginLeft: -6 } : { marginTop: -4, marginRight: -6 },
+      ]}
+    >
+      {actions.map((action, index) => {
+        const align: TooltipAlign = !compact ? "end" : index < 2 ? "start" : index < 5 ? "center" : "end";
+        return (
+          <IconButton
+            key={action.key}
+            theme={theme}
+            icon={action.icon}
+            label={action.label}
+            tooltip={action.tooltip}
+            tooltipAlign={align}
+            tone={action.tone}
+            busy={action.busy}
+            onPress={action.onPress}
+          />
+        );
+      })}
+    </View>
+  );
+
   return (
     <Card theme={theme} fill>
       <View style={{ flexDirection: "row", alignItems: "flex-start", gap: 12 }}>
         <View style={faded}>
           <Avatar theme={theme} label={account.label} />
         </View>
-        <View style={[{ flex: 1, minWidth: 0, gap: 3 }, faded]}>
-          <Text style={text.strong} numberOfLines={1}>
-            {account.label}
-          </Text>
-          {subtitle ? (
-            <Text style={text.small} numberOfLines={1}>
-              {subtitle}
+        <View style={{ flex: 1, minWidth: 0, gap: 6 }}>
+          <View style={[{ gap: 3 }, faded]}>
+            <Text style={text.strong} numberOfLines={1}>
+              {account.label}
             </Text>
-          ) : null}
+            {subtitle ? (
+              <Text style={text.small} numberOfLines={1}>
+                {subtitle}
+              </Text>
+            ) : null}
+          </View>
+          {compact ? actionRow : null}
         </View>
-        <View style={{ flexDirection: "row", alignItems: "center", gap: 2, marginTop: -4, marginRight: -6 }}>
-          {account.status === "limited" ? (
-            <IconButton
-              theme={theme}
-              icon="CircleCheck"
-              label="Mark as available again (it has room)"
-              tooltip="Mark as available: use it again before its limit resets, e.g. after upgrading"
-              busy={busy === "clear"}
-              onPress={() => void markAvailable()}
-            />
-          ) : null}
-          {/* A pick waiting here can always be canceled, whatever has become of the account since. */}
-          {account.nextAgentUntil || (!signedOut && !disabled) ? (
-            <IconButton
-              theme={theme}
-              icon={account.nextAgentUntil ? "CircleX" : "SquarePlus"}
-              label={account.nextAgentUntil ? "Cancel: next new agent goes back to the default" : "Use for the next new agent"}
-              tooltip={
-                account.nextAgentUntil
-                  ? "Your next new agent starts here. Click to cancel"
-                  : "Next new agent: the next agent you start (new workspace or tab) uses this account, once"
-              }
-              busy={busy === "next"}
-              onPress={() => void nextAgent()}
-            />
-          ) : null}
-          {!account.isDefault && !signedOut && !disabled ? (
-            <IconButton
-              theme={theme}
-              icon="Star"
-              label="Make default"
-              tooltip="Make default: new agents start on this account"
-              busy={busy === "default"}
-              onPress={() => void makeDefault()}
-            />
-          ) : null}
-          {/* No Pi account stands in for another, so one can't be disabled (see setAccountEnabled). */}
-          {account.family === "pi" && !disabled ? null : (
-            <IconButton
-              theme={theme}
-              icon={disabled ? "CirclePlay" : "CirclePause"}
-              label={disabled ? "Enable account" : "Disable for now (agents won't use it)"}
-              tooltip={
-                disabled
-                  ? "Enable: agents can use this account again"
-                  : "Disable for now: agents stop using it and move to your other accounts"
-              }
-              busy={busy === "toggle"}
-              onPress={() => void toggle()}
-            />
-          )}
-          {account.apiEditable ? (
-            <IconButton theme={theme} icon="KeyRound" label="API settings" tooltip="API settings: key and base URL" onPress={() => setEditingApi(true)} />
-          ) : null}
-          {account.proxyEditable ? (
-            <IconButton theme={theme} icon="Globe" label="Proxy" tooltip="Proxy: the network this account uses" onPress={() => setEditingProxy(true)} />
-          ) : null}
-          <IconButton theme={theme} icon="Pencil" label="Rename" tooltip="Rename this account" onPress={() => setRenaming(true)} />
-          {account.kind !== "main" ? (
-            <IconButton
-              theme={theme}
-              icon="Trash2"
-              label="Remove"
-              tooltip={
-                account.externalHome
-                  ? "Remove from ZeroSub only: its folder, key and script stay"
-                  : api
-                    ? "Remove: delete its saved key"
-                    : "Remove: sign it out and delete its saved login"
-              }
-              tone="danger"
-              busy={busy === "remove"}
-              onPress={() => setConfirmRemove(true)}
-            />
-          ) : null}
-        </View>
+        {compact ? null : actionRow}
       </View>
 
       <View style={[{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 }, faded]}>
         {account.isDefault ? <Badge theme={theme} label="Default" tone="accent" /> : null}
         {disabled ? <Badge theme={theme} label="Disabled" /> : null}
         {plan ? <Badge theme={theme} label={plan} /> : null}
-        {api ? <Badge theme={theme} label="API" /> : null}
+        {account.auth === "api" ? <Badge theme={theme} label="API" /> : null}
         {account.kind === "main" ? <Badge theme={theme} label="CLI login" /> : null}
         {account.status === "limited" ? <Badge theme={theme} label="Limit reached" tone="danger" /> : null}
         {account.status === "signed_out" ? <Badge theme={theme} label="Signed out" tone="warning" /> : null}
         {resets && !signedOut ? <Badge theme={theme} label={resetBadge(resets)} tone="accent" /> : null}
       </View>
-
       {details ? (
         <Text selectable style={[text.small, faded]} numberOfLines={3}>
           {details}
@@ -520,9 +747,18 @@ function AccountCard({
 
       <View style={[{ gap: 10 }, faded]}>
         {signedOut ? (
-          <Text style={text.small}>{api ? "The key was refused. Enter a working one to use this account." : "Sign in again to use this account."}</Text>
-        ) : api ? (
-          <Text style={text.small}>Billed per use · used only as the default or when picked for an agent</Text>
+          <Text style={text.small}>{account.auth === "api" ? "The key was refused. Enter a working one to use this account." : "Sign in again to use this account."}</Text>
+        ) : account.auth === "api" ? (
+          <Text style={text.small}>
+            {[
+              "Billed per use · used only as the default or when picked for an agent",
+              api?.disableNonessentialTraffic
+                ? "nonessential traffic off"
+                : [api?.disableTelemetry ? "telemetry off" : null, api?.disableErrorReporting ? "error reporting off" : null].filter(Boolean).join(", ") || null,
+            ]
+              .filter(Boolean)
+              .join(" · ")}
+          </Text>
         ) : windows.length > 0 ? (
           windows.map((limit) => <UsageBar key={limit.id} theme={theme} limit={limit} />)
         ) : (
@@ -553,16 +789,30 @@ function AccountCard({
           {disabled ? "Disabled · agents won't use it" : freshness ? `${agents} · ${freshness}` : agents}
         </Text>
         {signedOut ? (
-          <Button
-            theme={theme}
-            size="small"
-            tone="primary"
-            icon={api ? "KeyRound" : "LogIn"}
-            label={api ? "Fix key" : "Sign in"}
-            tooltip={api ? "Enter a working key for this account" : "Sign this account in again"}
-            tooltipAlign="end"
-            onPress={api ? () => setEditingApi(true) : onSignIn}
-          />
+          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+            {disabled ? (
+              <Button
+                theme={theme}
+                size="small"
+                icon="CirclePlay"
+                label="Enable"
+                tooltip="Use this account again once it's signed in"
+                tooltipAlign="end"
+                busy={busy === "toggle"}
+                onPress={() => void toggle()}
+              />
+            ) : null}
+            <Button
+              theme={theme}
+              size="small"
+              tone="primary"
+              icon={account.auth === "api" ? "KeyRound" : "LogIn"}
+              label={account.auth === "api" ? "Fix key" : "Sign in"}
+              tooltip={account.auth === "api" ? "Enter a working key for this account" : "Sign this account in again"}
+              tooltipAlign="end"
+              onPress={signIn}
+            />
+          </View>
         ) : disabled ? (
           <Button
             theme={theme}
@@ -610,18 +860,35 @@ function AccountCard({
       {renaming ? (
         <RenameModal theme={theme} account={account} store={store} onClose={() => setRenaming(false)} />
       ) : null}
-      {editingApi ? <ApiKeyModal theme={theme} store={store} account={account} onClose={() => setEditingApi(false)} /> : null}
-      {editingProxy ? <ProxyModal theme={theme} store={store} account={account} onClose={() => setEditingProxy(false)} /> : null}
+      {editingApi ? (
+        account.family === "pi" ? (
+          <PiApiKeyModal theme={theme} store={store} account={account} onClose={() => setEditingApi(false)} />
+        ) : (
+          <ApiAccountModal theme={theme} store={store} account={account} onClose={() => setEditingApi(false)} />
+        )
+      ) : null}
+      {editingProxy ? (
+        account.family === "pi" ? (
+          <PiProxyModal theme={theme} account={account} store={store} onClose={() => setEditingProxy(false)} />
+        ) : (
+          <ProxyModal theme={theme} account={account} store={store} onClose={() => setEditingProxy(false)} />
+        )
+      ) : null}
       <Modal title={`Remove ${account.label}?`} open={confirmRemove} onOpenChange={setConfirmRemove}>
         <Modal.Content>
           <Text style={text.body}>
-            {account.externalHome
-              ? `This only removes the account from ZeroSub. Its folder${account.home ? ` (${account.home})` : ""}, its key${account.launcher ? ` and its terminal script ${account.launcher}` : ""} stay as they are, and you can add it back from Add account. Agents using it move to the default account; their conversations are kept.`
-              : account.family === "pi"
-                ? "This deletes the account's folder and saved key on this machine. Agents using it move to the default account; their conversations are kept."
-                : account.family === "claude"
-                  ? "This signs the account out on this machine and deletes its saved login. Agents using it move to the default account; their conversations are kept."
-                  : "This signs the account out on this machine and deletes its saved login. New agents use the default account. Existing ChatGPT conversations on it can't move, so start new agents for them."}
+            {[
+              account.externalHome
+                ? `This only removes the account from ZeroSub. Its folder${account.home ? ` (${account.home})` : ""} is outside ZeroSub's own, so its sign-in${
+                    account.launcher ? `, its files and its terminal script ${account.launcher}` : " and its files"
+                  } stay as they are, and you can add it back by hand.`
+                : account.family === "pi"
+                  ? "This deletes the account's folder and saved key on this machine."
+                  : "This signs the account out on this machine and deletes its saved login.",
+              account.family !== "codex"
+                ? "Agents using it move to the default account; their conversations are kept."
+                : "New agents use the default account. Existing ChatGPT conversations on it can't move, so start new agents for them.",
+            ].join(" ")}
           </Text>
           <View style={{ flexDirection: "row", gap: 8, justifyContent: "flex-end" }}>
             <Button theme={theme} label="Cancel" tooltip="Keep this account" tooltipAlign="end" onPress={() => setConfirmRemove(false)} />
@@ -633,7 +900,7 @@ function AccountCard({
               tooltip={
                 account.externalHome
                   ? "Remove it from ZeroSub only; its agents move to the default"
-                  : api
+                  : account.family === "pi"
                     ? "Delete its saved key; its agents move to the default"
                     : "Sign it out and delete its saved login; its agents move to the default"
               }
@@ -723,6 +990,146 @@ function RenameModal({
   );
 }
 
+function ProxyModal({
+  theme,
+  account,
+  store,
+  onClose,
+}: {
+  theme: Theme;
+  account: AccountView;
+  store: ZeroSubStore;
+  onClose(): void;
+}) {
+  const text = useText(theme);
+  const toast = useToast();
+  // The box starts with the current proxy, its password hidden: a change is only saved with the
+  // password typed in full.
+  const current = account.proxy ?? "";
+  const [proxy, setProxy] = useState(current);
+  const typed = proxy.trim();
+  const hidden = typed.includes(HIDDEN);
+  // Main's settings can outrank a proxy set here for the CLI login: it's set there instead.
+  const blocked = account.proxyBlocked;
+  const changed = typed !== "" && typed !== current && !hidden && !blocked;
+  const inherited = account.inheritedProxy;
+  // Kept in the user's file (the CLI login's in ~/.claude/settings.json): saving changes it there,
+  // for whatever else reads it too.
+  const file = account.proxyFile;
+  const followers = account.proxyFollowers.length > 0 ? `, and so do ${account.proxyFollowers.join(", ")}, which have no proxy of their own` : "";
+  const afterRemoval = inherited ? `they then go through ${inherited.proxy}, set in ${inherited.from}` : "they then use the network the CLI already has";
+  const [saving, setSaving] = useState<"save" | "clear" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const save = useCallback(
+    async (value: string) => {
+      setSaving(value ? "save" : "clear");
+      setError(null);
+      try {
+        const result = await store.rpc(setAccountProxy, { accountId: account.id, proxy: value });
+        toast.show(result.proxy ? `${account.label} now uses ${result.proxy}` : `${account.label} no longer uses a proxy`, {
+          variant: "success",
+        });
+        await store.refresh();
+        onClose();
+      } catch (failure) {
+        setError(describe(failure));
+      } finally {
+        setSaving(null);
+      }
+    },
+    [account, store, toast, onClose],
+  );
+  const inputStyle = useMemo(
+    () => ({
+      color: theme.colors.foreground,
+      backgroundColor: theme.colors.surface2,
+      borderColor: theme.colors.border,
+      borderWidth: 1,
+      borderRadius: 8,
+      paddingHorizontal: 12,
+      paddingVertical: 10,
+      fontSize: 15,
+    }),
+    [theme],
+  );
+  return (
+    <Modal title={`Proxy for ${account.label}`} open onOpenChange={(open) => (open ? undefined : onClose())}>
+      <Modal.Content>
+        <Text style={text.muted}>
+          {account.proxy
+            ? `Now: ${account.proxy}${file ? `, set in ${file}` : ""}.`
+            : inherited
+              ? `Now: no proxy of its own; it goes through ${inherited.proxy}, set in ${inherited.from}.`
+              : "Now: no proxy of its own; it uses the network the CLI already has."}
+          {blocked
+            ? null
+            : file
+              ? ` Saving changes it there, so plain claude in a terminal uses it too${followers}. Removing it takes it out of there, and ${afterRemoval}. Agents started afterwards use the new setting; running ones keep theirs until they reopen.`
+              : account.kind === "main"
+              ? " Agents started after saving use the new setting; running ones keep theirs until they reopen. Plain claude in a terminal doesn't: it goes the way ~/.claude/settings.json and your shell say."
+              : " Agents and terminal sessions started after saving use the new setting; running ones keep theirs until they reopen."}
+        </Text>
+        {blocked ? <Text style={text.danger}>{blocked}</Text> : null}
+        {blocked ? null : (
+          <>
+            <TextInput
+              value={proxy}
+              onChangeText={setProxy}
+              autoFocus
+              maxLength={2048}
+              // Empty keeps the proxy it goes through without one of its own, so that's what it shows.
+              placeholder={inherited?.proxy ?? "http://host:port"}
+              placeholderTextColor={theme.colors.foregroundMuted}
+              autoCapitalize="none"
+              autoCorrect={false}
+              onSubmitEditing={() => (changed ? void save(typed) : undefined)}
+              style={inputStyle}
+              accessibilityLabel="Proxy URL"
+            />
+            <Text style={text.small}>
+              {hidden
+                ? `${HIDDEN} hides the proxy's password: type it in full to save a change.`
+                : "http:// or https://, with user:password@ if the proxy needs it."}
+            </Text>
+          </>
+        )}
+        {error ? <Text style={text.danger}>{error}</Text> : null}
+        <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, justifyContent: "flex-end" }}>
+          <Button
+            theme={theme}
+            label={blocked ? "Close" : "Cancel"}
+            tooltip={blocked ? "Close" : "Keep the current proxy"}
+            tooltipAlign="end"
+            onPress={onClose}
+          />
+          {account.proxy ? (
+            <Button
+              theme={theme}
+              label="Remove proxy"
+              tooltip={file ? `Take the proxy out of ${file}` : "Stop using a proxy of its own"}
+              tooltipAlign="end"
+              busy={saving === "clear"}
+              onPress={() => void save("")}
+            />
+          ) : null}
+          {blocked ? null : (
+            <Button
+              theme={theme}
+              tone="primary"
+              label="Save"
+              tooltip="Use this proxy for the account"
+              tooltipAlign="end"
+              busy={saving === "save"}
+              disabled={!changed}
+              onPress={() => void save(typed)}
+            />
+          )}
+        </View>
+      </Modal.Content>
+    </Modal>
+  );
+}
+
 function Avatar({ theme, label }: { theme: Theme; label: string }) {
   const initial = label.trim().charAt(0).toUpperCase() || "?";
   return (
@@ -767,9 +1174,9 @@ function AutomationSettings({ theme }: { theme: Theme }) {
         />
         <SettingsSwitch
           label="Keep going after a switch"
-          hint="Sends a short follow-up so the interrupted task continues."
+          hint="Sends a short follow-up so the interrupted task continues, also after you use a banked reset. Off, a ChatGPT task that hits its limit stays where it stopped."
           value={settings.values.autoContinue}
-          disabled={settings.saving || !settings.values.autoSwitch}
+          disabled={settings.saving}
           onValueChange={(autoContinue) => save({ autoContinue })}
         />
         <SettingsSwitch

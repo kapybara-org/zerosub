@@ -1,15 +1,21 @@
 import { describe, expect, it } from "vitest";
 import {
   accountSubtitle,
+  canStandIn,
   describeReopen,
+  egressText,
   formatAge,
   formatCredits,
+  formatCountdown,
   formatPlan,
+  formatResetAt,
   formatResetIn,
+  isDisabled,
   moveProblem,
   peakUsage,
   pillText,
   shortLabel,
+  shortWindowLabel,
   staleNotice,
   usageSummary,
 } from "./format";
@@ -26,6 +32,80 @@ describe("formatResetIn", () => {
     expect(formatResetIn("2026-09-23T11:00:00Z", NOW)).toBe("now");
     expect(formatResetIn(null, NOW)).toBeNull();
     expect(formatResetIn("not a date", NOW)).toBeNull();
+  });
+});
+
+describe("formatResetAt", () => {
+  // Local times, so it reads the same in every time zone. 28 October 2026 is a Wednesday.
+  const now = new Date(2026, 9, 28, 15, 20).getTime();
+  const at = (...parts: [number, number, number, number, number, number?, number?]) => new Date(...parts).toISOString();
+
+  it("gives the time today, the weekday within the week, and the date a week on", () => {
+    expect(formatResetAt(at(2026, 9, 28, 18, 0), now)).toBe("18:00");
+    expect(formatResetAt(at(2026, 9, 29, 2, 5), now)).toBe("Thu 02:05");
+    expect(formatResetAt(at(2026, 10, 3, 9, 0), now)).toBe("Tue 09:00");
+    // Today's weekday again: the date says it isn't today.
+    expect(formatResetAt(at(2026, 10, 4, 9, 0), now)).toBe("Nov 4 09:00");
+  });
+
+  it("rounds to the minute, so readings a moment apart read the same", () => {
+    expect(formatResetAt(at(2026, 9, 28, 17, 59, 59, 600), now)).toBe("18:00");
+  });
+
+  it("has nothing to say once the time has passed, or when there's none", () => {
+    expect(formatResetAt(at(2026, 9, 28, 15, 0), now)).toBeNull();
+    expect(formatResetAt(null, now)).toBeNull();
+    expect(formatResetAt("not a date", now)).toBeNull();
+  });
+});
+
+describe("formatCountdown", () => {
+  const now = Date.parse("2026-10-28T12:00:00Z");
+  it("counts hours and minutes, days and hours from a day on, as the status line does", () => {
+    expect(formatCountdown("2026-10-28T15:26:40Z", now)).toBe("3h26m");
+    expect(formatCountdown("2026-10-29T05:26:00Z", now)).toBe("17h26m");
+    expect(formatCountdown("2026-10-30T05:40:00Z", now)).toBe("1d17h");
+    expect(formatCountdown("2026-10-28T12:26:00Z", now)).toBe("26m");
+    // Each unit is written even when it's nothing, so every entry reads alike.
+    expect(formatCountdown("2026-10-28T15:00:00Z", now)).toBe("3h0m");
+    expect(formatCountdown("2026-10-30T12:20:00Z", now)).toBe("2d0h");
+    expect(formatCountdown("2026-10-28T12:00:30Z", now)).toBe("0m");
+  });
+
+  it("has nothing to say once the time has passed, or when there's none", () => {
+    expect(formatCountdown("2026-10-28T11:59:00Z", now)).toBeNull();
+    expect(formatCountdown(null, now)).toBeNull();
+    expect(formatCountdown("not a date", now)).toBeNull();
+  });
+});
+
+describe("egressText", () => {
+  const now = Date.parse("2026-10-28T12:00:00Z");
+  const egress = (checkedAt: string | null, ip: string | null = "203.0.113.7", error: string | null = null) => ({ ip, country: "US", checkedAt, error });
+
+  it("gives the address Anthropic sees and its country", () => {
+    expect(egressText(egress("2026-10-28T11:55:00Z"), now)).toBe("IP: 203.0.113.7 (US)");
+    expect(egressText({ ...egress("2026-10-28T11:55:00Z"), country: null }, now)).toBe("IP: 203.0.113.7");
+  });
+
+  it("says how old the address is once it's been an hour, as when checks fail since", () => {
+    expect(egressText(egress("2026-10-28T11:20:00Z", "203.0.113.7", "timed out"), now)).toBe("IP: 203.0.113.7 (US)");
+    expect(egressText(egress("2026-10-28T10:50:00Z", "203.0.113.7", "timed out"), now)).toBe("IP: 203.0.113.7 (US, 1h ago)");
+  });
+
+  it("says it couldn't check when it never could, and nothing before the first check", () => {
+    expect(egressText(egress(null, null, "Client network socket disconnected"), now)).toBe("IP: couldn't check");
+    expect(egressText(null, now)).toBeNull();
+  });
+});
+
+describe("shortWindowLabel", () => {
+  it("shortens the window names Claude and Codex readings use", () => {
+    expect(shortWindowLabel("5-hour")).toBe("5h");
+    expect(shortWindowLabel("Weekly")).toBe("7d");
+    expect(shortWindowLabel("3-day")).toBe("3d");
+    expect(shortWindowLabel("90-minute")).toBe("90m");
+    expect(shortWindowLabel("Usage")).toBe("Usage");
   });
 });
 
@@ -60,10 +140,14 @@ describe("account presentation", () => {
     family: "claude",
     label: "work",
     kind: "managed",
+    auth: "subscription",
+    api: null,
+    apiEditable: false,
     email: "work@example.com",
     plan: "max",
     organization: null,
     status: "ready",
+    disabled: false,
     isDefault: false,
     limitedUntil: null,
     usage: {
@@ -79,17 +163,15 @@ describe("account presentation", () => {
     },
     agentCount: 2,
     home: "/homes/claude-a",
-    auth: "subscription",
-    api: null,
-    apiEditable: false,
+    externalHome: false,
     proxy: null,
-    proxyEditable: false,
+    proxyEditable: true,
     inheritedProxy: null,
+    proxyBlocked: null,
     proxyFile: null,
     proxyFollowers: [],
-    launcher: null,
+    launcher: "claude-work.sh",
     egress: null,
-    externalHome: false,
     moving: null,
   };
 
@@ -174,5 +256,37 @@ describe("move outcomes", () => {
     expect(moveProblem({ ...nothing, failed: [{ agentId: "a", error: "Timed out closing previous session during refresh" }] }, "work")).toBe(
       "Couldn't reload this agent onto work (Timed out closing previous session during refresh), so it moves when its session next starts.",
     );
+  });
+});
+
+describe("account state for the app", () => {
+  const base = { status: "ready" as const, disabled: false, auth: "subscription" as const };
+
+  it("knows an account is disabled even when it's signed out too", () => {
+    expect(isDisabled(base)).toBe(false);
+    expect(isDisabled({ ...base, status: "signed_out", disabled: true })).toBe(true);
+    // Older servers only said so through the status.
+    expect(isDisabled({ ...base, status: "disabled", disabled: false })).toBe(true);
+  });
+
+  it("only lets ready subscription accounts take work over, as the server does", () => {
+    const ready = { ...base, family: "claude" as const };
+    expect(canStandIn(ready)).toBe(true);
+    expect(canStandIn({ ...ready, auth: "api" })).toBe(false);
+    expect(canStandIn({ ...ready, status: "limited" })).toBe(false);
+    expect(canStandIn({ ...ready, status: "disabled" })).toBe(false);
+    expect(canStandIn({ ...ready, status: "signed_out" })).toBe(false);
+    // Pi's own login may be an API key too.
+    expect(canStandIn({ ...ready, family: "pi" })).toBe(false);
+  });
+});
+
+describe("staleNotice", () => {
+  it("says how old the data shown is and why it isn't newer", () => {
+    expect(staleNotice(NOW - 3 * 60_000, "Plugin is not available", NOW)).toBe(
+      "Showing data from 3m ago · couldn't refresh: Plugin is not available",
+    );
+    expect(staleNotice(NOW - 5_000, "Plugin RPC timed out", NOW)).toBe("Showing data from a moment ago · couldn't refresh: Plugin RPC timed out");
+    expect(staleNotice(null, "Plugin is not available", NOW)).toBe("Couldn't refresh: Plugin is not available");
   });
 });

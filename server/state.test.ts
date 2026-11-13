@@ -14,6 +14,7 @@ afterEach(async () => {
   vi.useRealTimers();
   vi.restoreAllMocks();
   await chmod(join(dir, "state.json"), 0o600).catch(() => undefined);
+  // Retried: a write the test set off in the background can still be landing in it.
   await rm(dir, { recursive: true, force: true, maxRetries: 5 });
 });
 

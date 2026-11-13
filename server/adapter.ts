@@ -1,6 +1,9 @@
 import type { PluginLifecycleEvents, PluginTurnOutcome } from "@getpaseo/plugin/server";
-import type { ApiSummary, Family, LoginMethod, LoginStep, Usage } from "../shared/model";
+import type { ApiSummary } from "../shared/model";
+import type { ApiConfig } from "./homes";
+import type { Family, LoginMethod, LoginStep, Usage } from "../shared/model";
 import type { RedeemOutcome } from "../shared/rpc";
+import { providerEnv } from "./provider-env";
 
 /**
  * One timeline entry. Taken from the SDK rather than `@getpaseo/protocol`: Paseo only supplies
@@ -74,10 +77,15 @@ export interface LoginHandle {
 export interface ProxyState {
   /** Its own proxy, or null when it uses whatever it inherits. */
   own: string | null;
-  /** The user's file its own proxy is kept in, where setting one changes it; null when that's ZeroSub's own. */
+  /**
+   * The user's file its own proxy is kept in, where setting one changes it (`~/.claude/settings.json`
+   * for the CLI login, say); null when that's ZeroSub's own.
+   */
   file: string | null;
   /** The proxy it goes through without one of its own, and where that's set; null when that's direct. */
   inherited: { proxy: string; from: string } | null;
+  /** Why one can't be set here just now; null when it can. */
+  blocked?: string | null;
 }
 
 /**
@@ -117,41 +125,69 @@ export interface FamilyAdapter {
    * resets on the same limit.
    */
   redeemReset(home: string | null, options?: { onlyAtLimit?: boolean }): Promise<RedeemReply>;
-  login(home: string | null, method: LoginMethod): Promise<LoginHandle>;
-  logout(home: string): Promise<void>;
   /**
-   * The rest is only there for providers whose added accounts are API keys with a proxy each (Pi's).
-   * An account's key (reduced to a hint) and base URL; `home === null` (the CLI login) only where
-   * `mainApi` says so.
+   * A managed account's API key settings (key reduced to a hint), or null for a subscription login.
+   * `home === null` (the CLI login) only where `mainApi` says so.
    */
   api?(home: string | null): Promise<ApiSummary | null>;
-  /** The CLI login's Anthropic key and base URL can be set here too. */
+  /** The CLI login's Anthropic key and base URL can be set here too (Pi's, kept in its own files). */
   readonly mainApi?: boolean;
   /**
-   * Stores an account's key (`null` keeps the current one) and base URL. `wanted`, if given, is asked
-   * once nothing else works on the home; false throws and writes nothing.
+   * Stores an API account's key, base URL and traffic switches. `wanted`, if given, is asked once
+   * nothing else works on the home; false throws and writes nothing.
    */
-  setApi?(home: string | null, config: { key: string | null; baseUrl: string | null }, wanted?: () => Promise<boolean>): Promise<void>;
-  /** Where an account's CLI (`home === null`: the CLI's own login) gets its proxy. */
+  setApi?(home: string | null, config: ApiConfig, wanted?: () => Promise<boolean>): Promise<void>;
+  /**
+   * Where an account's CLI (`home === null`: the CLI's own login) gets its proxy, when the provider
+   * lets ZeroSub set one per account.
+   */
   proxyState?(home: string | null): Promise<ProxyState>;
-  /** Sets (or clears, with `null`) an account's proxy, for processes started afterwards. `wanted` as for `setApi`. */
-  setProxy?(home: string | null, proxy: string | null, wanted?: () => Promise<boolean>): Promise<void>;
-  /** The address Anthropic sees the account's requests come from; null when they go somewhere else first. */
+  /**
+   * The address the provider sees the account's requests come from, the way its CLI reaches it;
+   * null when its requests go somewhere else first. Only Claude says.
+   */
   egress?(home: string | null): Promise<{ ip: string; country: string | null } | null>;
   /**
-   * Which of `homes` a process of the provider's CLI runs on right now, so a home isn't moved under
-   * it (see `Service.placeHomes`). Providers that have it keep added accounts' homes outside `homes/`.
+   * Sets (or clears, with `null`) an account's proxy (`home === null`: the CLI's own login); takes
+   * effect for processes started afterwards. `wanted` as for `setApi`.
+   */
+  setProxy?(home: string | null, proxy: string | null, wanted?: () => Promise<boolean>): Promise<void>;
+  /**
+   * Which of `homes` a process of the provider's CLI runs on right now: one started with that home,
+   * by Paseo, ZeroSub or a terminal script. With `copyCredentials` and `dropOldCredentials`, what
+   * lets ZeroSub move the provider's homes (only Claude's); see `Service.placeHomes`.
    */
   homesInUse?(homes: readonly string[]): Promise<Set<string>>;
+  /**
+   * Before a home's folder moves from `from` to `to`: copies what the CLI keeps for it outside the
+   * folder (Claude's Keychain entry on macOS) to where it looks for `to`'s, and checks the copy.
+   * Nothing to do where the sign-in lives in the folder. Repeating it after it worked does nothing.
+   */
+  copyCredentials?(from: string, to: string): Promise<void>;
+  /**
+   * Undoes `copyCredentials` for a move that didn't happen: removes `to`'s copy, but only while it's
+   * the same as `from`'s, so an entry that was there before is never touched.
+   */
+  dropCopiedCredentials?(from: string, to: string): Promise<void>;
+  /**
+   * Once the account's home is saved as `to`: removes `from`'s copy, but only while `to` holds a
+   * sign-in of its own, so the account's login is never left nowhere. False when it left `from`'s.
+   */
+  dropOldCredentials?(from: string, to: string): Promise<boolean>;
+  login(home: string | null, method: LoginMethod): Promise<LoginHandle>;
+  logout(home: string): Promise<void>;
   /** Looks for a subscription usage-limit failure in a finished turn. */
   detectLimit(event: TurnEvent): LimitHit | null;
   /** Looks for a turn that failed because the account's login is no longer valid. */
   detectSignOut(event: TurnEvent): string | null;
 }
 
-/** The environment for a process ZeroSub spawns against `patch`. */
-export function spawnEnv(patch: EnvPatch): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env };
+/**
+ * The environment for a process ZeroSub spawns against `patch`: what Paseo gives a session of the
+ * family's provider, the daemon's environment with the provider's configured `env` over it.
+ */
+export function spawnEnv(patch: EnvPatch, family: Family): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, ...providerEnv(family) };
   for (const [key, value] of Object.entries(patch)) if (value !== null) env[key] = value;
   return env;
 }
