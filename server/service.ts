@@ -41,7 +41,7 @@ import { turnRows } from "./limits";
 import { canSignInWithBrowser } from "./machine";
 import { equivalentMode } from "./modes";
 import { homesDir } from "./paths";
-import { Reopener } from "./reopen";
+import { Reopener, hostCanReload } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
 import { chooseAccount, isLimited, isUsable, mostAvailable, type RouteDecision } from "./routing";
@@ -1748,7 +1748,7 @@ export class Service {
     this.reloads.set(agentId, reload);
     let result: Awaited<ReturnType<Reopener["reopen"]>>;
     try {
-      result = await this.reopener.reopen(agentId);
+      result = await this.reopener.reopen(agentId, paseo);
     } finally {
       this.reloads.delete(agentId);
     }
@@ -1905,8 +1905,8 @@ export class Service {
     if (this.aligning || this.stopped || this.pinning > 0) return emptySummary();
     this.aligning = true;
     try {
-      // Without the CLI nothing can be reopened; agents move when their sessions next start.
-      if ((await this.reopener.locate()) === null) return emptySummary();
+      // Without the host's own reopen or the CLI nothing can be reopened; agents move when their sessions next start.
+      if (!(await this.canReopen(paseo))) return emptySummary();
       const state = await this.store.read();
       const families = await this.families.resolve(paseo);
       const routing = new Set(this.routing.values());
@@ -2120,7 +2120,7 @@ export class Service {
     const state = await this.store.read();
     const families = await this.families.resolve(paseo);
     const agents = await this.cachedAgents(paseo);
-    const canReopen = (await this.reopener.locate()) !== null;
+    const canReopen = await this.canReopen(paseo);
     const now = Date.now();
 
     const routes: AgentRoute[] = [];
@@ -2183,6 +2183,11 @@ export class Service {
     };
   }
 
+  /** Whether running agents can change accounts right away: through the host's own reopen, or the CLI. */
+  private async canReopen(paseo: PaseoApi | null): Promise<boolean> {
+    return hostCanReload(paseo) || (await this.reopener.locate()) !== null;
+  }
+
   /** Agents with a live session: the given ones (looked up fresh), or every one. */
   private async liveAgents(paseo: PaseoApi, agentIds?: readonly string[]): Promise<AgentInfo[]> {
     const agents = agentIds
@@ -2219,7 +2224,7 @@ export class Service {
     if (process.env.CODEX_ACCESS_TOKEN) {
       warnings.push("The daemon's environment sets CODEX_ACCESS_TOKEN. Codex agents on your CLI login use it instead of a ChatGPT sign-in.");
     }
-    if ((await this.reopener.locate()) === null) {
+    if (!(await this.canReopen(this.paseo))) {
       warnings.push(
         "Paseo's command-line tool wasn't found, so running agents change accounts the next time their session starts instead of right away.",
       );
