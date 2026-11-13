@@ -7,6 +7,7 @@ import {
   findAccount,
   mainAccount,
   type Binding,
+  type NextAgentPick,
   type StoredAccount,
   type StoredState,
 } from "./state";
@@ -155,6 +156,11 @@ export interface RouteInput {
    * first at the moment, which would move it again each time two accounts swap places.
    */
   current?: string;
+  /**
+   * Whether this session may take the one-time "next new agent" pick: one the user's own agents
+   * open, not Paseo's helpers (see `takesNextPick` in service.ts). Only a new agent takes it.
+   */
+  allowNextPick?: boolean;
 }
 
 export interface RouteDecision {
@@ -163,6 +169,11 @@ export interface RouteDecision {
   bind: Binding | null;
   /** Why the preferred account was skipped, if it was. */
   skipped: { account: StoredAccount; why: "limited" | "signed_out" | "disabled" } | null;
+  /**
+   * The "next new agent" pick routing looked at, to be cleared: it's spent whether the agent starts
+   * on its account or that account couldn't take it.
+   */
+  nextPick?: NextAgentPick;
 }
 
 /**
@@ -185,6 +196,17 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   let account = bound && bound.family === input.family ? bound : undefined;
   let bind: Binding | null = null;
 
+  // A pick whose account can't take the agent (at its limit, signed out, disabled, removed) is spent
+  // all the same, and the agent routes as usual: kept, it would send every new agent to whichever
+  // account stands in for its own until it expires.
+  const nextPick = !account && fresh && input.allowNextPick ? (state.nextAgent?.[input.family] ?? undefined) : undefined;
+  if (nextPick && Date.parse(nextPick.until) > input.now) {
+    const picked = findAccount(state, nextPick.accountId);
+    if (picked?.family === input.family && picked.signedIn && !picked.disabled && !(input.autoSwitch && isLimited(picked, input.now))) {
+      account = picked;
+      bind = { accountId: picked.id, source: "user", at };
+    }
+  }
   if (!account && fresh && input.balanceNewAgents && accounts.length > 1) {
     const nearReset = input.family === "codex" ? soonestWeeklyReset(state, input.family, input.usageOf, input.now) : undefined;
     account = nearReset ?? mostAvailable(state, input.family, input.usageOf, input.now);
@@ -223,7 +245,7 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
             : { accountId: alternative.id, source: "auto", at };
     }
   }
-  return { account, bind, skipped };
+  return { account, bind, skipped, nextPick };
 }
 
 /** The account an agent is routed to right now, without side effects (for display). */

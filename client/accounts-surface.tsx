@@ -12,6 +12,7 @@ import {
   renameAccount,
   setAccountEnabled,
   setDefaultAccount,
+  setNextAgentAccount,
 } from "../shared/rpc";
 import { AddAccountModal } from "./add-account";
 import { AddPiAccountModal, ApiKeyModal, PiSectionNotes, ProxyModal, piCardDetails } from "./pi-accounts";
@@ -289,7 +290,7 @@ function AccountCard({
 }) {
   const text = useText(theme);
   const toast = useToast();
-  const [busy, setBusy] = useState<"default" | "remove" | "clear" | "toggle" | null>(null);
+  const [busy, setBusy] = useState<"default" | "remove" | "clear" | "toggle" | "next" | null>(null);
   const [renaming, setRenaming] = useState(false);
   const [editingApi, setEditingApi] = useState(false);
   const [editingProxy, setEditingProxy] = useState(false);
@@ -338,6 +339,20 @@ function AccountCard({
     } catch (error) {
       if (stoppedWaiting(error)) toast.show(stillMoving(account.label), { variant: "info", durationMs: 5_000 });
       else toast.error(describe(error));
+    } finally {
+      setBusy(null);
+    }
+  }, [account, store, toast]);
+
+  const nextAgent = useCallback(async () => {
+    setBusy("next");
+    const enabled = !account.nextAgentUntil;
+    try {
+      await store.rpc(setNextAgentAccount, { accountId: account.id, enabled });
+      toast.show(enabled ? `Your next new agent starts on ${account.label} (for the next 10 minutes)` : "Next new agent: back to the default", { variant: "success" });
+      await store.refresh();
+    } catch (error) {
+      toast.error(describe(error));
     } finally {
       setBusy(null);
     }
@@ -410,6 +425,21 @@ function AccountCard({
               tooltip="Mark as available: use it again before its limit resets, e.g. after upgrading"
               busy={busy === "clear"}
               onPress={() => void markAvailable()}
+            />
+          ) : null}
+          {/* A pick waiting here can always be canceled, whatever has become of the account since. */}
+          {account.nextAgentUntil || (!signedOut && !disabled) ? (
+            <IconButton
+              theme={theme}
+              icon={account.nextAgentUntil ? "CircleX" : "SquarePlus"}
+              label={account.nextAgentUntil ? "Cancel: next new agent goes back to the default" : "Use for the next new agent"}
+              tooltip={
+                account.nextAgentUntil
+                  ? "Your next new agent starts here. Click to cancel"
+                  : "Next new agent: the next agent you start (new workspace or tab) uses this account, once"
+              }
+              busy={busy === "next"}
+              onPress={() => void nextAgent()}
             />
           ) : null}
           {!account.isDefault && !signedOut && !disabled ? (
