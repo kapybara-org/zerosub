@@ -108,6 +108,8 @@ export type OpenCodeFork = z.infer<typeof OpenCodeForkSchema>;
  * Set when recovery lost a source's OpenCode fork record (key: the source agent ID), or every
  * source's (key `*`, when the registry couldn't be read at all). Until that source has a record
  * again, nothing is sent or forked for it automatically; a manual fork asks once (`told`) first.
+ * The next OpenCode fork settles `*`: each source with an OpenCode continuation gets its own hold,
+ * and `*` goes.
  */
 export const OpenCodeHoldSchema = z.object({ at: z.string(), told: z.boolean().optional() });
 export const ALL_SOURCES = "*";

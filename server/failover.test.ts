@@ -1257,7 +1257,9 @@ describe("forking to the other provider", () => {
       "absent": [] as Array<Record<string, unknown>>,
       "archived": [opencodeAgent(RESERVED.targetId, { archivedAt: "2026-09-23T08:00:00.000Z" })],
     };
-    describe.each(Object.entries(damage))("after a restart where %s", (_, broken) => {
+    describe.each(Object.entries(damage))("after a restart where %s", (name, broken) => {
+      // An unreadable registry holds only the sources Paseo still lists an OpenCode continuation for.
+      const held = name === "the registry is not JSON" ? { archived: targets.archived } : targets;
       /** A reservation is unconfirmed when the registry breaks; the restarted service can't see it. */
       const restart = async (target: Array<Record<string, unknown>>) => {
         vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -1269,7 +1271,7 @@ describe("forking to the other provider", () => {
         return setUpFork("bypassPermissions", [], {}, target, { prefs: PREFS });
       };
 
-      it.each(Object.entries(targets))("never forks again on its own when the reserved target is %s", async (_, target) => {
+      it.each(Object.entries(held))("never forks again on its own when the reserved target is %s", async (_, target) => {
         const second = await restart(target);
         await second.limitTurn();
         expect(second.created).toHaveLength(0);
@@ -1278,7 +1280,7 @@ describe("forking to the other provider", () => {
         expect(second.notes.at(-1)?.detail).toMatch(/record of what it sent to OpenCode/);
       });
 
-      it.each(Object.entries(targets))("asks before a manual fork when the reserved target is %s, then starts one", async (_, target) => {
+      it.each(Object.entries(held))("asks before a manual fork when the reserved target is %s, then starts one", async (_, target) => {
         const second = await restart(target);
         await expect(second.service.forkAgent(second.paseo, AGENT, "opencode")).rejects.toThrow(/choose Continue on OpenCode again/);
         expect(second.created).toHaveLength(0);
@@ -1287,6 +1289,21 @@ describe("forking to the other provider", () => {
         expect(second.created).toHaveLength(1);
         expect(second.sends).toHaveLength(1);
       });
+    });
+
+    it("settles a recovered registry's global hold, so an agent with no OpenCode continuation forks automatically", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await writeFile(join(root, "state.json"), "{ not json");
+      // Another agent's OpenCode continuation, whose record went with the damaged registry.
+      const older = opencodeAgent("oc-older", { labels: { "zerosub.continued-from": "agent-older" } });
+      const second = await setUpFork("bypassPermissions", [], {}, [older], { prefs: PREFS });
+      expect(Object.keys((await second.store.read()).opencodeHolds)).toEqual(["*"]);
+      await second.limitTurn();
+      expect(second.created).toHaveLength(1);
+      expect(second.sends).toHaveLength(1);
+      // Only the agent whose continuation is listed keeps a hold; the global one is gone.
+      expect(Object.keys((await second.store.read()).opencodeHolds)).toEqual(["agent-older"]);
     });
 
     /** Runs `change` when `continueInNewAgent` itself refreshes the source, after every earlier check. */

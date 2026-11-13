@@ -1821,6 +1821,7 @@ export class Service {
     const original = source === "auto" ? await waitForSource(paseo, first, "auto").catch(() => undefined) : first;
     if (!original || !ready(original)) return { skipped: SOURCE_BUSY_REFUSAL };
 
+    await this.settleGlobalHold(paseo);
     const recordRead = await this.store.read();
     let record = recordRead.opencodeForks[agentId];
     // Recovery lost what was sent for this source. A missing, archived or unlisted fork proves
@@ -1896,6 +1897,27 @@ export class Service {
    * ahead; a person is told once, and the next manual request may start a new fork. The hold is
    * cleared when that fork's reservation is written.
    */
+  /**
+   * Settles the hold recovery put on every source when it couldn't read the fork records at all.
+   * Only a source with an OpenCode continuation (archived ones included) can have lost a record, so
+   * each such source gets a hold of its own and the global hold goes: agents without one, and agents
+   * created later, fork as before. It stays while Paseo's agent list can't be read whole.
+   */
+  private async settleGlobalHold(paseo: PaseoApi): Promise<void> {
+    if (!(await this.store.read()).opencodeHolds[ALL_SOURCES]) return;
+    const { agents, complete } = await listAgents(paseo, true);
+    if (!complete) return;
+    await this.store.update((draft) => {
+      const hold = draft.opencodeHolds[ALL_SOURCES];
+      if (!hold) return;
+      for (const agent of agents) {
+        const source = agent.continuedFrom;
+        if (source && agent.provider === OPENCODE_PROVIDER && !draft.opencodeForks[source]) draft.opencodeHolds[source] ??= { at: hold.at };
+      }
+      delete draft.opencodeHolds[ALL_SOURCES];
+    });
+  }
+
   private async askBeforeUnproven(agentId: string, source: "auto" | "user"): Promise<ForkOutcome | undefined> {
     if (source === "user" && (await this.store.read()).opencodeHolds[agentId]?.told) return undefined;
     const at = new Date().toISOString();
