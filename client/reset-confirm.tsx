@@ -4,7 +4,7 @@ import { useCallback, useState, type ComponentType } from "react";
 import { Text, View } from "react-native";
 import type { AccountView, ResetOffer } from "../shared/model";
 import { redeemReset, type RedeemResult } from "../shared/rpc";
-import { describe, stoppedWaiting, type ZeroSubStore } from "./store";
+import { describe, stoppedWaiting, useStore, type ZeroSubStore } from "./store";
 import { Button, useText } from "./ui";
 
 type Theme = PluginHostProps["theme"];
@@ -47,15 +47,18 @@ export function ResetConfirm({
   theme: Theme;
   store: ZeroSubStore;
   account: AccountView;
-  /** The agent stopped by this account's limit; it carries on after the reset. */
+  /** The agent stopped by this account's limit; it carries on after the reset when the follow-up is on. */
   agentId?: string;
   onFinished(result: RedeemResult): void;
   onCancel(): void;
 }) {
   const text = useText(theme);
+  const { state } = useStore(store);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const resets = account.usage?.resets ?? null;
+  // The agent only gets the follow-up with "Keep going after a switch" on.
+  const carriesOn = agentId !== undefined && (state?.autoContinue ?? true);
 
   const confirm = useCallback(async () => {
     setBusy(true);
@@ -89,7 +92,7 @@ export function ResetConfirm({
   return (
     <View style={{ gap: 12 }}>
       <Text style={text.body}>
-        Refills {refills} on {account.label} now{agentId ? ", then this agent carries on" : ""}. A reset can't be undone.
+        Refills {refills} on {account.label} now{carriesOn ? ", then this agent carries on" : ""}. A reset can't be undone.
       </Text>
       <Text style={text.muted}>{resetDetail(resets)}</Text>
       {resets.blockedReason ? <Text style={text.warning}>{resets.blockedReason}</Text> : null}
@@ -112,27 +115,44 @@ export function ResetConfirm({
   );
 }
 
-/** The confirmation as popover content for an agent's account button. */
-export function resetPopover(store: ZeroSubStore, account: AccountView, agentId: string): ComponentType<PluginButtonContentProps> {
+/**
+ * The confirmation as popover content for an agent's account button. It reads the account from the
+ * store as it renders, so what it says and whether it lets the reset go ahead stay current while it's
+ * open.
+ */
+export function resetPopover(
+  store: ZeroSubStore,
+  accountId: string,
+  agentId: string,
+): ComponentType<PluginButtonContentProps> {
   return function ResetPopover({ theme, close }: PluginButtonContentProps) {
     const toast = useToast();
     const text = useText(theme);
+    const { state } = useStore(store);
+    const account = state?.accounts.find((entry) => entry.id === accountId) ?? null;
     return (
       <View style={{ gap: 12, maxWidth: 360 }}>
         <Text style={text.heading}>Use a banked reset?</Text>
-        <ResetConfirm
-          theme={theme}
-          store={store}
-          account={account}
-          agentId={agentId}
-          onCancel={close}
-          onFinished={(result) => {
-            close();
-            const { message, variant } = redeemToast(account.label, result);
-            if (variant === "error") toast.error(message);
-            else toast.show(message, { variant, durationMs: 5_000 });
-          }}
-        />
+        {account ? (
+          <ResetConfirm
+            theme={theme}
+            store={store}
+            account={account}
+            agentId={agentId}
+            onCancel={close}
+            onFinished={(result) => {
+              close();
+              const { message, variant } = redeemToast(account.label, result);
+              if (variant === "error") toast.error(message);
+              else toast.show(message, { variant, durationMs: 5_000 });
+            }}
+          />
+        ) : (
+          <>
+            <Text style={text.body}>That account is no longer in ZeroSub.</Text>
+            <Button theme={theme} label="Close" tooltip="Close this window" tooltipAlign="end" onPress={close} />
+          </>
+        )}
       </View>
     );
   };

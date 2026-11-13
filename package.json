@@ -37,7 +37,7 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.server.json",
-    "test": "vitest run",
+    "test": "env -u CLAUDE_SECURESTORAGE_CONFIG_DIR PASEO_HOME=\"${TMPDIR:-/tmp}/zerosub-tests/paseo\" ZEROSUB_LAUNCHER_DIR=\"${TMPDIR:-/tmp}/zerosub-tests/claude-config\" ZEROSUB_PI_DIR=\"${TMPDIR:-/tmp}/zerosub-tests/pi-config\" CLAUDE_CONFIG_DIR=\"${TMPDIR:-/tmp}/zerosub-tests/claude\" CODEX_HOME=\"${TMPDIR:-/tmp}/zerosub-tests/codex\" vitest run",
     "audit:mobile": "! grep -rnE \"\\\\b(document|window|localStorage|navigator)\\\\.|<(div|span|p|a|button|input|img|ul|ol|li|section|header|footer|main|nav|form|label|h[1-6]|table|tr|td|svg|path|br|hr)[ >/]|className=|onClick=\" client/"
   },
   "devDependencies": {

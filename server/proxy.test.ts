@@ -1,7 +1,7 @@
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { createConnection, createServer, type AddressInfo, type Server } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
-import { bypassesProxy, maskProxy, noProxyFromEnv, normalizeProxy, openTunnel, proxiedFetch, withRequiredNoProxy, withoutDomains } from "./proxy";
+import { bypassesProxy, maskProxy, noProxyFromEnv, normalizeProxy, openTunnel, proxiedFetch, proxyFromEnv, withClaudeNoProxy, withRequiredNoProxy, withoutClaudeDomains, withoutDomains } from "./proxy";
 
 const servers: (Server | HttpServer)[] = [];
 
@@ -45,6 +45,14 @@ function firstReply(socket: import("node:net").Socket): Promise<string> {
   return new Promise((resolve) => socket.once("data", (chunk) => resolve(String(chunk))));
 }
 
+describe("proxyFromEnv", () => {
+  it("follows Claude Code's order and skips empty values", () => {
+    expect(proxyFromEnv({ HTTPS_PROXY: "http://upper:1", https_proxy: "http://lower:2" })).toBe("http://lower:2");
+    expect(proxyFromEnv({ https_proxy: "", HTTPS_PROXY: "http://upper:1", HTTP_PROXY: "http://plain:3" })).toBe("http://upper:1");
+    expect(proxyFromEnv({ http_proxy: "http://plain-lower:4", HTTP_PROXY: "http://plain:3" })).toBe("http://plain-lower:4");
+    expect(proxyFromEnv({})).toBeNull();
+  });
+});
 
 describe("normalizeProxy", () => {
   it("accepts http(s) proxies with optional credentials, in canonical form", () => {
@@ -53,7 +61,7 @@ describe("normalizeProxy", () => {
     expect(normalizeProxy("HTTP://Proxy.Example")).toBe("http://proxy.example");
   });
 
-  it("refuses anything Pi and ZeroSub can't both use", () => {
+  it("refuses anything Claude Code and ZeroSub can't both use", () => {
     expect(() => normalizeProxy("socks5://127.0.0.1:1080")).toThrow("socks5 proxies aren't supported");
     expect(() => normalizeProxy("127.0.0.1:7890")).toThrow();
     expect(() => normalizeProxy("http://127.0.0.1:7890/path")).toThrow("scheme, host and port");
@@ -130,7 +138,7 @@ describe("maskProxy, for proxies not typed in the app", () => {
 });
 
 describe("no-proxy lists", () => {
-  it("are read from both variables", () => {
+  it("are read the way Claude Code reads them", () => {
     expect(noProxyFromEnv({ no_proxy: "a", NO_PROXY: "b" })).toBe("a,b");
     expect(noProxyFromEnv({ no_proxy: "a", NO_PROXY: "a" })).toBe("a");
     expect(noProxyFromEnv({ no_proxy: "", NO_PROXY: "b" })).toBe("b");
@@ -138,7 +146,7 @@ describe("no-proxy lists", () => {
     expect(noProxyFromEnv({})).toBeNull();
   });
 
-  it("send a host past the proxy by exact host, suffix or host:port", () => {
+  it("send a host past the proxy the way Claude Code does", () => {
     const usage = "https://api.anthropic.com/api/oauth/usage";
     expect(bypassesProxy("*", usage)).toBe(true);
     expect(bypassesProxy(".anthropic.com", usage)).toBe(true);
@@ -150,23 +158,23 @@ describe("no-proxy lists", () => {
     expect(bypassesProxy(null, usage)).toBe(false);
   });
 
-  it("lose only the entries that could send the given domains' traffic past the proxy", () => {
-    const anthropic = ["anthropic.com", "claude.ai", "claude.com"];
+  it("lose only the entries that could send Anthropic or Claude traffic past the proxy", () => {
     expect(
-      withoutDomains("localhost, 127.0.0.1,.anthropic.com,anthropic.com,api.anthropic.com:443,*.claude.ai,claude.com,.com,10.0.0.0/8,corp.example,notanthropic.com", anthropic),
+      withoutClaudeDomains("localhost, 127.0.0.1,.anthropic.com,anthropic.com,api.anthropic.com:443,*.claude.ai,claude.com,.com,10.0.0.0/8,corp.example,notanthropic.com"),
     ).toBe("localhost,127.0.0.1,10.0.0.0/8,corp.example,notanthropic.com");
-    expect(withoutDomains("gw.example.com,other.example", [...anthropic, "gw.example.com"])).toBe("other.example");
-    expect(withoutDomains("*", anthropic)).toBe("");
-    expect(withoutDomains(null, anthropic)).toBe("");
+    expect(withoutClaudeDomains("*")).toBe("");
+    expect(withoutClaudeDomains(null)).toBe("");
     // undici from 8.12 (Pi 1.5.0 on) takes `*` with a port for every host on that port, anywhere in
     // the list; a trailing dot names the same host to every version.
-    expect(withoutDomains("corp.example,*:443,*:8443", anthropic)).toBe("corp.example");
-    expect(withoutDomains("anthropic.com.,api.anthropic.com.:443,.claude.ai.,corp.example.", anthropic)).toBe("corp.example.");
+    expect(withoutClaudeDomains("corp.example,*:443,*:8443")).toBe("corp.example");
+    expect(withoutClaudeDomains("anthropic.com.,api.anthropic.com.:443,.claude.ai.,corp.example.")).toBe("corp.example.");
     // Nor any entry that's `*` once a port, a leading `*.` or `.` and a trailing dot are dropped.
-    for (const entry of [".*", "*.*", ".*.", "*.*:443"]) expect(withoutDomains(`corp.example,${entry}`, anthropic), entry).toBe("corp.example");
+    for (const entry of [".*", "*.*", ".*.", "*.*:443"]) expect(withoutClaudeDomains(`corp.example,${entry}`), entry).toBe("corp.example");
+    expect(withoutDomains("gw.example.com.,other.example", ["gw.example.com"])).toBe("other.example");
   });
 
-  it("keep this machine direct when a proxy is installed", () => {
+  it("keeps local callbacks and Claude downloads direct when a proxy is installed", () => {
+    expect(withClaudeNoProxy("corp.example,localhost,::1,DOWNLOADS.CLAUDE.AI")).toBe("localhost,127.0.0.1,::1,downloads.claude.ai,corp.example");
     expect(withRequiredNoProxy("corp.example,localhost,::1")).toBe("localhost,127.0.0.1,::1,corp.example");
   });
 });

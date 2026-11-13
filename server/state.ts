@@ -12,9 +12,9 @@ export const StoredAccountSchema = z.object({
   /** The label was generated from the email and may be replaced when the identity is learned. */
   autoLabel: z.boolean().default(true),
   kind: AccountKindSchema,
-  /** How it signs in. `api` accounts (added Pi accounts) are only used when chosen, never by automatic routing. */
+  /** How it signs in. `api` accounts are only used when chosen, never by automatic routing. */
   auth: AuthKindSchema.default("subscription"),
-  /** Credential home (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`). `null` for the CLI's own login. */
+  /** Credential home (`CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `PI_CODING_AGENT_DIR`). `null` for the CLI's own login. */
   home: z.string().nullable(),
   email: z.string().nullable().default(null),
   plan: z.string().nullable().default(null),
@@ -90,25 +90,32 @@ export type ContinuationChain = z.infer<typeof ContinuationChainSchema>;
 export const NextAgentPickSchema = z.object({ accountId: z.string(), until: z.string() });
 export type NextAgentPick = z.infer<typeof NextAgentPickSchema>;
 
-/** A home to sign out and delete once nothing runs on it any more. */
+/** A home to sign out, and delete when it's in `homesDir()`, once nothing runs on it any more. */
 export const CleanupSchema = z.object({
   family: FamilySchema,
   /** The account it was (or was going to be) the home of; its agents' sessions name this ID. */
   accountId: z.string(),
-  /** `removed`: the user removed the account. `unfinished`: a new account whose sign-in hasn't been saved yet. */
+  /** `removed`: the user removed the account. `unfinished`: a new account whose sign-in or setup hasn't been saved yet. */
   why: z.enum(["removed", "unfinished"]),
   at: z.string(),
 });
 export type Cleanup = z.infer<typeof CleanupSchema>;
 
-export const PiHomesSchema = z.object({
+/**
+ * Where added Claude accounts' homes are kept: `dir` (null for the launcher directory,
+ * `~/.claude-config`), and folders chosen before whose accounts still move to it.
+ */
+export const ClaudeHomesSchema = z.object({
   dir: z.string().nullable().default(null),
   from: z.array(z.string()).default([]),
 });
-export type PiHomes = z.infer<typeof PiHomesSchema>;
+export type ClaudeHomes = z.infer<typeof ClaudeHomesSchema>;
 
-/** A home being moved, written before anything moves, so a move cut short is finished from here. */
-export const MoveSchema = z.object({ from: z.string(), to: z.string(), at: z.string() });
+/**
+ * A home being moved, written before anything moves, so a move cut short is finished from here.
+ * `family`: whose home it is (missing in records of earlier versions, which only moved Claude's).
+ */
+export const MoveSchema = z.object({ from: z.string(), to: z.string(), at: z.string(), family: FamilySchema.optional() });
 export type Move = z.infer<typeof MoveSchema>;
 
 export const StoredStateSchema = z.object({
@@ -131,6 +138,11 @@ export const StoredStateSchema = z.object({
    * `accounts` may just be missing from a damaged or hand-edited registry.
    */
   cleanup: z.record(z.string(), CleanupSchema).default({}),
+  claudeHomes: ClaudeHomesSchema.default({ dir: null, from: [] }),
+  /** Where added Pi accounts' homes are kept, as for Claude's (`dir` null: `~/.pi-config`). */
+  piHomes: ClaudeHomesSchema.default({ dir: null, from: [] }),
+  /** Homes being moved, by account (see `Service.placeHomes`). */
+  moves: z.record(z.string(), MoveSchema).default({}),
   nextAgent: z
     .object({
       claude: NextAgentPickSchema.nullable().default(null),
@@ -138,10 +150,6 @@ export const StoredStateSchema = z.object({
       pi: NextAgentPickSchema.nullable().default(null),
     })
     .default({ claude: null, codex: null, pi: null }),
-  /** Where added Pi accounts' homes are kept: `dir` (null: `~/.pi-config`), and folders picked before whose accounts still move to it. */
-  piHomes: PiHomesSchema.default({ dir: null, from: [] }),
-  /** Homes being moved, by account (see `Service.placeHomes`). */
-  moves: z.record(z.string(), MoveSchema).default({}),
 });
 export type StoredState = z.infer<typeof StoredStateSchema>;
 
@@ -187,9 +195,10 @@ export function salvageState(raw: unknown): { state: StoredState; dropped: boole
       sessions: records(LiveSessionSchema, source.sessions),
       continuations: records(ContinuationChainSchema, source.continuations),
       cleanup: records(CleanupSchema, source.cleanup),
-      nextAgent: { claude: null, codex: null, pi: null },
-      piHomes: keep(PiHomesSchema, source.piHomes ?? {}) ?? { dir: null, from: [] },
+      claudeHomes: keep(ClaudeHomesSchema, source.claudeHomes ?? {}) ?? { dir: null, from: [] },
+      piHomes: keep(ClaudeHomesSchema, source.piHomes ?? {}) ?? { dir: null, from: [] },
       moves: records(MoveSchema, source.moves),
+      nextAgent: { claude: null, codex: null, pi: null },
     },
     dropped: true,
   };

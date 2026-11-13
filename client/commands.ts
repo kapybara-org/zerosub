@@ -1,5 +1,5 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
-import { describeReopen, limitedPick, moveProblem } from "../shared/format";
+import { describeReopen, isDisabled, limitedPick, moveProblem } from "../shared/format";
 import { FAMILY_LABEL, type AccountView, type StateView } from "../shared/model";
 import { setAgentAccount, setDefaultAccount, setNextAgentAccount, type ReopenSummary } from "../shared/rpc";
 import { stoppedWaiting, type ZeroSubStore } from "./store";
@@ -51,8 +51,14 @@ export function contributeCommands(client: PluginClientContext, store: ZeroSubSt
           const names = accounts.map((account) => account.label).join(", ");
           throw new Error(`No ${FAMILY_LABEL[family]} account matches "${query}". Accounts: ${names || "none"}.`);
         }
-        if (match.status === "signed_out") throw new Error(`${match.label} is signed out. Sign it in from Accounts first.`);
-        if (match.status === "disabled") throw new Error(`${match.label} is disabled. Enable it in Accounts first.`);
+        if (match.status === "signed_out") {
+          throw new Error(
+            isDisabled(match)
+              ? `${match.label} is disabled and signed out. Enable it and sign it in from Accounts first.`
+              : `${match.label} is signed out. Sign it in from Accounts first.`,
+          );
+        }
+        if (isDisabled(match)) throw new Error(`${match.label} is disabled. Enable it in Accounts first.`);
         if (match.status === "limited" && state.autoSwitch) throw new Error(limitedPick(match.label));
         await move(match.id, match.label);
       },
@@ -64,7 +70,7 @@ export function contributeCommands(client: PluginClientContext, store: ZeroSubSt
   let signature = "";
   const syncDynamic = () => {
     const state = store.current.state;
-    const next = state ? JSON.stringify(state.accounts.map((a) => [a.id, a.label, a.isDefault, a.status, a.nextAgentUntil])) : "";
+    const next = state ? JSON.stringify(state.accounts.map((a) => [a.id, a.label, a.isDefault, a.status, isDisabled(a), a.nextAgentUntil])) : "";
     if (next === signature) return;
     signature = next;
     for (const remove of dynamic) remove();
@@ -73,7 +79,7 @@ export function contributeCommands(client: PluginClientContext, store: ZeroSubSt
     state.accounts.forEach((account, index) => {
       const pending = Boolean(account.nextAgentUntil);
       // A waiting pick can always be canceled, whatever has become of its account since.
-      if (pending || (account.status !== "signed_out" && account.status !== "disabled")) {
+      if (pending || (account.status !== "signed_out" && !isDisabled(account))) {
         dynamic.push(
           client.addCommandCenterItem({
             id: `next-agent-${index}`,
@@ -90,7 +96,7 @@ export function contributeCommands(client: PluginClientContext, store: ZeroSubSt
           }),
         );
       }
-      if (account.isDefault || account.status === "signed_out" || account.status === "disabled") return;
+      if (account.isDefault || account.status === "signed_out" || isDisabled(account)) return;
       dynamic.push(
         client.addCommandCenterItem({
           id: `default-${index}`,

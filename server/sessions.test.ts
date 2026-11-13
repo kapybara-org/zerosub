@@ -3,12 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { FamilyAdapter } from "./adapter";
-import { absentPi } from "./fakes.test-support";
 import type { FamilyResolver } from "./families";
 import type { Reopener } from "./reopen";
 import { Service } from "./service";
 import { MAIN_ACCOUNT_ID, StateStore, type StoredState } from "./state";
 import { preferences } from "../shared/preferences";
+import { absentPi } from "./fakes.test-support";
 
 // Where ZeroSub records an agent's session must be where it really runs: the account button, the
 // 30-second check and failover all go by that record.
@@ -22,10 +22,13 @@ const EARLIER = "2026-09-23T07:00:00.000Z";
 
 let root: string;
 let previousHome: string | undefined;
+let previousLaunchers: string | undefined;
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "zerosub-sessions-"));
   previousHome = process.env.PASEO_HOME;
+  previousLaunchers = process.env.ZEROSUB_LAUNCHER_DIR;
+  process.env.ZEROSUB_LAUNCHER_DIR = join(root, "launchers");
   process.env.PASEO_HOME = root;
 });
 
@@ -36,6 +39,8 @@ afterEach(async () => {
   await Promise.all(services.splice(0).map((service) => service.stop()));
   if (previousHome === undefined) delete process.env.PASEO_HOME;
   else process.env.PASEO_HOME = previousHome;
+  if (previousLaunchers === undefined) delete process.env.ZEROSUB_LAUNCHER_DIR;
+  else process.env.ZEROSUB_LAUNCHER_DIR = previousLaunchers;
   await rm(root, { recursive: true, force: true });
 });
 

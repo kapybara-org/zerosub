@@ -33,8 +33,8 @@ export interface ZeroSubStore {
   getSnapshot(): StoreSnapshot;
   watch(intervalMs: number): () => void;
   watchClosely(): () => void;
-  /** `refreshUsage` reads every account's usage first. */
-  refresh(options?: { refreshUsage?: boolean; fresh?: boolean }): Promise<void>;
+  /** `refreshUsage` reads usage first: only `accountId`'s, or every account's. */
+  refresh(options?: { refreshUsage?: boolean; fresh?: boolean; accountId?: string }): Promise<void>;
 }
 
 /**
@@ -48,10 +48,11 @@ export function createZeroSubStore(client: PluginClientContext): ZeroSubStore {
   /** The plain state query under way; polls and the refresh after an action share it. */
   let inFlight: Promise<void> | null = null;
   /**
-   * An explicit usage refresh under way. The daemon can take a while over one (it may renew sign-ins),
-   * so it runs beside the plain queries instead of holding them (and every action waiting on one) up.
+   * Explicit usage refreshes under way, by account ("" for every account). The daemon takes up to
+   * ~15 s over one, so they run beside the plain queries instead of holding them (and every action
+   * waiting on one) up.
    */
-  let usageInFlight: Promise<void> | null = null;
+  const usageInFlight = new Map<string, Promise<void>>();
   let issued = 0;
   let published = 0;
   let stopped = false;
@@ -107,8 +108,8 @@ export function createZeroSubStore(client: PluginClientContext): ZeroSubStore {
     return watch(ACTIVE_POLL_MS);
   }
 
-  function refresh(options: { refreshUsage?: boolean; fresh?: boolean } = {}): Promise<void> {
-    if (options.refreshUsage) return refreshUsage();
+  function refresh(options: { refreshUsage?: boolean; fresh?: boolean; accountId?: string } = {}): Promise<void> {
+    if (options.refreshUsage) return refreshUsage(options.accountId);
     if (inFlight) {
       if (!options.fresh) return inFlight;
       return inFlight.then(() => refresh());
@@ -121,27 +122,29 @@ export function createZeroSubStore(client: PluginClientContext): ZeroSubStore {
     return run;
   }
 
-  /** Asks the daemon to read every account's usage now, then shows the result. */
-  function refreshUsage(): Promise<void> {
-    if (usageInFlight) return usageInFlight;
-    const run = query(true).then((shown) => {
+  /** Asks the daemon to read usage now, `accountId`'s or every account's, then shows the result. */
+  function refreshUsage(accountId?: string): Promise<void> {
+    const key = accountId ?? "";
+    const pending = usageInFlight.get(key);
+    if (pending) return pending;
+    const run = query(true, accountId).then((shown) => {
       // A poll that started while usage was being read answered first, maybe with older readings.
       // The daemon has the new ones now, so ask once more rather than leave them unshown.
       if (!shown) return refresh({ fresh: true });
       return undefined;
     });
-    usageInFlight = run;
+    usageInFlight.set(key, run);
     void run.finally(() => {
-      if (usageInFlight === run) usageInFlight = null;
+      if (usageInFlight.get(key) === run) usageInFlight.delete(key);
     });
     return run;
   }
 
   /** One state query. Resolves to whether its answer was shown: an older, slower answer never replaces a newer one. */
-  function query(withUsage: boolean): Promise<boolean> {
+  function query(withUsage: boolean, accountId?: string): Promise<boolean> {
     const sequence = ++issued;
     return client
-      .rpc(getState, { refreshUsage: withUsage ? true : undefined })
+      .rpc(getState, { refreshUsage: withUsage ? true : undefined, accountId })
       .then((state) => {
         if (sequence < published) return false;
         published = sequence;

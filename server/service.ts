@@ -11,13 +11,16 @@ import {
   FAMILY_LABEL,
   OTHER_FAMILY,
   type AccountView,
-  type ApiSummary,
   type AgentRoute,
+  type ApiKeyKind,
+  ApiSummarySchema,
+  type ApiSummary,
   type Egress,
   type Family,
   type LoginMethod,
   type LoginView,
   type StateView,
+  type TrafficSwitches,
   type Usage,
 } from "../shared/model";
 import { capsAccount, limitedPick } from "../shared/format";
@@ -40,14 +43,14 @@ import { FamilyResolver } from "./families";
 import { sameAccountIdentity, withoutWorkspace } from "./account-identity";
 import { CodexContinuations } from "./continuations";
 import { CONTINUED_FROM_LABEL, continueInNewAgent, type Continuation } from "./handoff";
-import { PI_ACCOUNT_FILE, crossesInheritedProxy, isAccountHome, moveHome, normalizeBaseUrl, plainHttp, readPiAccount, readPiAccountForAgents, removeHome } from "./homes";
-import { launcherNames, piLauncherDir, writeLaunchers, type LauncherAccount } from "./launchers";
+import { crossesInheritedProxy, moveHome, normalizeBaseUrl, plainHttp, readPiAccount, removeHome } from "./homes";
+import { launcherDir, launcherNames, piLauncherDir, writeLaunchers, type LauncherAccount, type LauncherKind } from "./launchers";
 import { Mutex } from "./json-file";
 import { turnRows } from "./limits";
 import { canSignInWithBrowser } from "./machine";
 import { equivalentMode } from "./modes";
 import { homesDir, inHomesDir, isOwnHome, shownPath } from "./paths";
-import { chooseImportedPiHome, choosePiHomesDir, piHomesDir, placeFor } from "./placement";
+import { chooseHomesDir, chooseImportedHome, chooseImportedPiHome, homesDirFor, placeFor, type PlacedFamily } from "./placement";
 import { maskProxy, normalizeProxy } from "./proxy";
 import { Reopener, hostCanReload } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
@@ -62,15 +65,21 @@ import {
   mainAccount,
   type Binding,
   type Cleanup,
-  type Move,
   type ContinuationChain,
   type LiveSession,
+  type Move,
   type NextAgentPick,
   type StoredAccount,
   type StoredState,
 } from "./state";
 
 type PaseoApi = PluginHookContext["paseo"];
+
+/** The families whose added accounts' homes are kept outside ZeroSub's own folder, each with a script. */
+const PLACED: readonly PlacedFamily[] = ["claude", "pi"];
+const LAUNCHER_DIR: Record<LauncherKind, () => string> = { claude: launcherDir, pi: piLauncherDir };
+/** Where the registry keeps the folder each placed family's homes are kept in. */
+const HOMES_KEY: Record<PlacedFamily, "claudeHomes" | "piHomes"> = { claude: "claudeHomes", pi: "piHomes" };
 type TurnEnded = PluginLifecycleEvents["agent.turn_ended"];
 
 const PROVIDER_NAME: Record<Family, string> = { claude: "Claude Code", codex: "Codex", pi: "Pi" };
@@ -84,6 +93,12 @@ const RENEW_LOGIN_MS = 30 * 60_000;
 const ACTIVE_WINDOW_MS = 15 * 60_000;
 const UPKEEP_MS = 30_000;
 const IDENTITY_MS = 30 * 60_000;
+/**
+ * How often to check the address each Claude account's requests come from, as Claude Code's status
+ * line can, besides once the daemon starts and when an account's proxy changes. Each check is a
+ * request Anthropic's edge sees without a token, so no more often than that says a change.
+ */
+const EGRESS_MS = 30 * 60_000;
 const AVAILABILITY_MS = 10 * 60_000;
 /** Assumed length of a window limit whose reset time couldn't be read. */
 const WINDOW_LIMIT_MS = 60 * 60_000;
@@ -93,9 +108,12 @@ const BUDGET_LIMIT_MS = 3 * 60 * 60_000;
 const LIMIT_TRUST_MS = 15 * 60_000;
 const LOGIN_TTL_MS = 15 * 60_000;
 const LOGIN_GRACE_MS = 3_000;
-const PRUNE_MS = 10 * 60_000;
 /** Cleanup passes a home's sign-out (or sign-in check) may fail in before it's given up on. */
 const CLEANUP_TRIES = 3;
+/** A home an agent was routed to this recently isn't moved yet: its session may only now be starting. */
+const ROUTED_SETTLE_MS = 30_000;
+const REMOVED_WHILE_SIGNING_IN = "That account was removed while you were signing in, so it wasn't added back.";
+const PRUNE_MS = 10 * 60_000;
 /** After a reset, limit notices from turns that were already running are stale. */
 const RESET_GRACE_MS = 5 * 60_000;
 const AGENT_LIST_MS = 3_000;
@@ -117,16 +135,9 @@ const TURN_SETTLE_MS = 60_000;
 const REPLY_WAIT_MS = 20_000;
 /** How long a usage refresh asked for by hand waits for readings; renewing a sign-in can take a minute. */
 const USAGE_REPLY_MS = 15_000;
-/**
- * How often to check the address each added Pi account's requests come from, besides once the
- * daemon starts and when its proxy changes. Each check is a request Anthropic's edge sees without a key.
- */
-const EGRESS_MS = 30 * 60_000;
-/** A home an agent was routed to this recently isn't moved yet: its session may only now be starting. */
-const ROUTED_SETTLE_MS = 30_000;
 
 const DEFAULT_PREFERENCES: Preferences = {
-  autoSwitch: true,
+  autoSwitch: false,
   autoContinue: true,
   continuePrompt: DEFAULT_CONTINUE_PROMPT,
   moveAgentsOnDefaultChange: true,
@@ -150,16 +161,6 @@ interface LoginSession {
   /** The account is being written to the registry: its home is in use for as long as that takes. */
   saving: boolean;
 }
-
-/** A move of an account's home under way; once `committed`, the account uses `to`. */
-interface HomeMove {
-  from: string;
-  to: string;
-  committed: boolean;
-}
-
-/** A move that gave way to something started on the home meanwhile (see `moveAccountHome`). */
-class MoveGaveWay extends Error {}
 
 interface AgentInfo {
   id: string;
@@ -204,7 +205,7 @@ interface Opening {
 type Problem = { kind: "limit"; hit: LimitHit } | { kind: "signed_out" };
 
 /**
- * Whether the agent has a session open. One whose last turn failed ("error": an API key out of
+ * Whether the agent has a session open. One whose last turn failed ("error": an API account out of
  * credit, say) still does, and its next message goes to that session as it is, so it's moved like an
  * idle one: by a reload.
  */
@@ -275,11 +276,11 @@ export class Service {
   private readonly usageAttemptAt = new Map<string, number>();
   private readonly usageInFlight = new Map<string, Promise<void>>();
   private readonly identityCheckedAt = new Map<string, number>();
+  private readonly egress = new Map<string, Egress>();
+  private readonly egressCheckedAt = new Map<string, number>();
   private readonly availability = new Map<Family, { ok: boolean; detail: string | null; at: number }>();
   private readonly logins = new Map<string, LoginSession>();
   private readonly loginLocks: Record<Family, Mutex> = { claude: new Mutex(), codex: new Mutex(), pi: new Mutex() };
-  /** Homes of API accounts being set up, which cleanup must leave alone. */
-  private readonly creatingHomes = new Set<string>();
   /**
    * Agents whose account changed mid-turn (or while starting); reopened when the turn ends, or by
    * alignment once they're idle without one.
@@ -309,23 +310,6 @@ export class Service {
    * default looks due to move, so moves nobody asked for (alignment, waiting switches) hold off.
    */
   private pinning = 0;
-  /** Where each added Pi account's requests were last seen coming from (see `checkEgress`). */
-  private readonly egress = new Map<string, Egress>();
-  private readonly egressCheckedAt = new Map<string, number>();
-  /** A pass moving homes to where they're kept (see `placeHomes`); a call during one gets that one. */
-  private placing: Promise<void> | null = null;
-  /** The move of each account's home under way now (see `moveAccountHome`). */
-  private readonly moving = new Map<string, HomeMove>();
-  /** Each account's last finished move, for a session routed from a registry read before it. */
-  private readonly moved = new Map<string, { from: string; to: string }>();
-  /** ZeroSub's own calls running on each home (see `onAccount`), which a move of it gives way to. */
-  private readonly homeCalls = new Map<string, number>();
-  /** When routing last opened a session on each account. */
-  private readonly routedAt = new Map<string, number>();
-  /** Why each account whose home is due to move hasn't moved yet: what it waits for, or what went wrong. */
-  private readonly moveNotes = new Map<string, { waiting: string | null; error: string | null }>();
-  /** Each account's script, as the launchers were last written. */
-  private launcherFiles: Map<string, string> | null = null;
   /** Interactive sessions being routed right now, and their agents. Where each opens isn't recorded yet. */
   private readonly routing = new Map<Promise<unknown>, string>();
   /** One failover at a time per exhausted account. */
@@ -352,6 +336,24 @@ export class Service {
   private cleaning: Promise<void> | null = null;
   /** Failed cleanup attempts this run, by home. */
   private readonly cleanupFailures = new Map<string, number>();
+  /** Homes of API accounts being set up, which cleanup must leave alone. */
+  private readonly creatingHomes = new Set<string>();
+  /** A pass moving homes to where they're kept (see `placeHomes`); a call during one gets that one. */
+  private placing: Promise<void> | null = null;
+  /** Set while a home moves: routing, and ZeroSub's own calls on an account, wait for it. */
+  private moveGate: Promise<void> | null = null;
+  /** How many homes have moved this run, so a call that looked an account up during one looks again. */
+  private homesMoved = 0;
+  /** Sessions being routed right now, which a move waits for. */
+  private readonly routesUnderWay = new Set<object>();
+  /** ZeroSub's own calls running on each home (see `onAccount`), which a move of it waits for. */
+  private readonly homeCalls = new Map<string, number>();
+  /** When routing last opened a session on each account. */
+  private readonly routedAt = new Map<string, number>();
+  /** Why each account whose home is due to move hasn't moved yet: what it waits for, or what went wrong. */
+  private readonly moveNotes = new Map<string, { waiting: string | null; error: string | null }>();
+  /** Each account's script, as the launchers were last written. */
+  private launcherFiles: Map<string, string> | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
   private stopped = false;
   /** Startup's steps have all worked; until they have, each upkeep tries them again. See `startUp`. */
@@ -392,7 +394,7 @@ export class Service {
     void this.tick().catch(() => undefined);
   }
 
-  /** Shows the last readings and registers the CLIs' own logins, once it all works. */
+  /** Shows the last readings, registers the CLIs' own logins and reports stray homes, once it all works. */
   private startUp(): Promise<void> {
     if (this.started) return Promise.resolve();
     this.starting ??= (async () => {
@@ -401,6 +403,7 @@ export class Service {
       await Promise.all(FAMILIES.map((family) => this.ensureFamily(family)));
       this.started = true;
       await this.reportStrayHomes().catch(() => undefined);
+      await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
     })().finally(() => {
       this.starting = null;
     });
@@ -465,23 +468,24 @@ export class Service {
       if (now - (this.identityCheckedAt.get(account.id) ?? 0) > IDENTITY_MS) {
         void this.refreshIdentity(account.id).catch(() => undefined);
       }
-      if (now - (this.egressCheckedAt.get(account.id) ?? 0) >= EGRESS_MS) void this.checkEgress(account);
+      if (account.signedIn && now - (this.egressCheckedAt.get(account.id) ?? 0) >= EGRESS_MS) void this.checkEgress(account);
     }
     for (const [id, login] of this.logins) {
       if (login.finishedAt && now - login.finishedAt > LOGIN_TTL_MS) this.logins.delete(id);
       else if (!login.finishedAt && now - Date.parse(login.view.startedAt) > LOGIN_TTL_MS) void this.cancelLogin(id);
     }
-    // Keep added Pi homes in step with Pi's own directory (shared entries, sign-ins, settings) even
-    // when they're only used from a terminal, which ZeroSub never sees start.
+    // Keep added homes in step with main (shared entries, generated settings) even when they're
+    // only used from a shell, which ZeroSub never sees start. A Pi home's sign-ins are made from
+    // main's too, so a key added there reaches the accounts.
     for (const account of state.accounts) {
-      if (account.family === "pi" && account.kind === "managed" && account.home && !this.moving.has(account.id)) {
-        await this.adapters.pi
+      if ((account.family === "claude" || account.family === "pi") && account.kind === "managed" && account.home) {
+        await this.adapters[account.family]
           .prepareHome(account.home, this.stillHas(account))
           .catch((error: unknown) => log(`could not refresh the home of ${account.label}`, error));
       }
     }
     await this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
-    await this.refreshLaunchers().catch((error: unknown) => log("could not write the Pi scripts", error));
+    await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
     if (this.paseo) {
       await this.forgetEndedSessions(this.paseo).catch((error: unknown) => log("could not check which agents closed while ZeroSub was off", error));
       void this.alignSessions(this.paseo).catch((error: unknown) => log("aligning agents failed", error));
@@ -489,15 +493,39 @@ export class Service {
     }
   }
 
+  /** Added Claude (or Pi) accounts, which each get a `claude-<account>` (`pi-<account>`) script. */
+  private launcherAccounts(state: StoredState, kind: LauncherKind = "claude"): LauncherAccount[] {
+    return state.accounts.flatMap((account) =>
+      account.family === kind && account.kind === "managed" && account.home ? [{ id: account.id, label: account.label, home: account.home }] : [],
+    );
+  }
+
+  /**
+   * Rewrites the account scripts when the accounts or their names changed. Only a removed account's
+   * script goes (its home is listed for cleanup): one the registry merely lost is kept.
+   */
+  private async refreshLaunchers(): Promise<void> {
+    const state = await this.store.read();
+    // A home that's moving keeps its account's script, rewritten for where it's gone.
+    const moved = new Map(Object.values(state.moves).map((move) => [resolve(move.from), move.to]));
+    const files = new Map<string, string>();
+    for (const kind of PLACED) {
+      const written = await writeLaunchers(this.launcherAccounts(state, kind), LAUNCHER_DIR[kind](), Object.keys(state.cleanup), moved, kind);
+      for (const [accountId, name] of written) files.set(accountId, name);
+    }
+    this.launcherFiles = files;
+  }
+
   private async refreshIdentity(accountId: string): Promise<void> {
     this.identityCheckedAt.set(accountId, Date.now());
-    const account = findAccount(await this.store.read(), accountId);
-    // A Pi API account's key is only known to work from a turn: a refused one is learned from a failed turn.
-    if (!account || account.auth === "api") return;
-    // A check that can't tell (Claude's keychain unreadable just now, say) changes nothing; the next one may.
-    const identity = await this.adapters[account.family].identity(account.home).catch((error: unknown) => {
-      log(`could not check whether ${account.label} is signed in`, error);
-      return null;
+    const identity = await this.onAccount(accountId, async (account) => {
+      // `claude auth status` only tells whether an API account has a key, not whether it works: a
+      // refused key is learned from a failed turn and cleared by saving the key again.
+      if (!account || account.auth === "api") return null;
+      return this.adapters[account.family].identity(account.home).catch((error: unknown) => {
+        log(`could not check whether ${account.label} is signed in`, error);
+        return null;
+      });
     });
     if (!identity) return;
     let handedOver = false;
@@ -590,10 +618,13 @@ export class Service {
   }
 
   /**
-   * Signs out and deletes the homes listed for cleanup (see `StoredState.cleanup`): a removed
-   * account's, and a new account's whose sign-in never finished, once no live agent session runs on
-   * it any more. A home that isn't listed is never touched, whatever the registry says about it: a
-   * damaged or hand-edited registry may simply be missing its account. One pass at a time.
+   * Works through the registry's cleanup list: homes of removed accounts, and of new accounts whose
+   * sign-in or setup never finished. Each is signed out and deleted once no live agent session runs
+   * on it. Only ZeroSub's own homes (see `isOwnHome`) are: an entry for any other home, which an
+   * older version or a snapshot it wrote may hold, is dropped untouched. Nothing else is ever signed
+   * out or deleted, however few accounts the registry lists, since a registry that was damaged,
+   * restored or edited by hand may simply be missing them. One pass runs at a time, and a call during
+   * a pass gets that pass.
    */
   cleanUpHomes(paseo: PaseoApi): Promise<void> {
     this.cleaning ??= this.cleanUpPass(paseo).finally(() => {
@@ -605,28 +636,24 @@ export class Service {
   private async cleanUpPass(paseo: PaseoApi): Promise<void> {
     const state = await this.store.read();
     const owned = new Set(state.accounts.map((account) => account.home));
-    const busy = new Set<string>();
+    const busy = new Set(this.creatingHomes);
     for (const login of this.logins.values()) {
       const active = !login.finishedAt || login.saving || Date.now() - login.finishedAt < LOGIN_GRACE_MS;
       if (active && login.home) busy.add(login.home);
     }
-    for (const home of this.creatingHomes) busy.add(home);
     for (const [home, entry] of Object.entries(state.cleanup)) {
       if (busy.has(home)) continue;
-      if (!isAccountHome(home, entry.family)) {
-        // Only a folder ZeroSub made in homes/ is ever signed out or deleted. An entry naming anything
-        // else (a hand edit, say) could otherwise sign out the CLI's own login, keychain entry and all.
-        await this.store.update((draft) => {
-          delete draft.cleanup[home];
-        });
-        console.error(`[ZeroSub] left ${home} alone: it isn't an account home in ${homesDir()}`);
-        continue;
-      }
       if (owned.has(home)) {
         // An account uses it again (put back by hand, say), so it's never signed out from under it.
         await this.store.update((draft) => {
           if (draft.accounts.some((account) => account.home === home)) delete draft.cleanup[home];
         });
+        continue;
+      }
+      if (!(await isOwnHome(home))) {
+        // Kept elsewhere, so its sign-in, files and launcher are the user's, whatever the entry says.
+        await this.store.update((draft) => void delete draft.cleanup[home]);
+        console.log(`[ZeroSub] dropped ${home} from the cleanup list without signing it out or deleting anything: it isn't in ${homesDir()}`);
         continue;
       }
       await this.cleanUpHome(paseo, home, entry, state).catch((error: unknown) => log(`cleaning up ${home} failed`, error));
@@ -638,11 +665,14 @@ export class Service {
       .filter(([, session]) => session.accountId === entry.accountId)
       .map(([agentId]) => agentId);
     for (const agentId of users) {
-      const info = await agentInfo(paseo, agentId);
+      // Paseo answers null for an agent it no longer knows. A lookup that fails throws instead, and
+      // the whole pass waits for a later one: an agent it couldn't see may still run on the home.
+      const agent = (await paseo.agents.ref(agentId).refresh())?.agent;
+      const info = agent ? toAgentInfo(agent) : null;
       if (info && !info.archived && info.status !== "closed") return; // Still in use: a later pass.
     }
     // A sign-in this run saw end without an account is its own to undo. One left by an earlier run
-    // only goes if it isn't signed in: a registry restored from an older copy can still list a
+    // only goes if it isn't signed in: a registry restored from an older backup can still list a
     // sign-in that has since become an account the registry no longer knows.
     // A Pi account is saved, and its entry dropped, in one write (see `addApiAccount`): an entry left
     // means it never became an account, so its home goes, key and all.
@@ -657,8 +687,8 @@ export class Service {
           ? `left ${home} alone: no account uses it, but it's signed in, so it may be an account missing from the registry`
           : `deleted ${home}, left by a sign-in that never finished`;
       } else {
-        await this.adapters[entry.family].logout(home);
-        outcome = entry.why === "unfinished" && entry.family === "pi" ? `deleted ${home}, left by a Pi account that was never saved` : `signed out and deleted ${home}`;
+        if (!(await this.signOut(entry.family, home))) return; // No longer ZeroSub's: the next pass drops it.
+        outcome = `signed out and deleted ${home}`;
       }
     } catch (error) {
       const failures = (this.cleanupFailures.get(home) ?? 0) + 1;
@@ -678,6 +708,28 @@ export class Service {
       for (const agentId of users) if (draft.sessions[agentId]?.accountId === entry.accountId) delete draft.sessions[agentId];
     });
     console.log(`[ZeroSub] ${outcome}`);
+  }
+
+  /**
+   * Whether the registry still lists `account` with its home, asked as a sync of that home starts: the
+   * home of an account removed meanwhile is never synced again, whoever it belongs to.
+   */
+  private stillHas(account: StoredAccount): () => Promise<boolean> {
+    return async () => (await this.store.read()).accounts.some((entry) => entry.id === account.id && entry.home === account.home);
+  }
+
+  /**
+   * The only way ZeroSub signs a home out, and only one of its own (see `isOwnHome`). Any other
+   * home's sign-in is the user's: the CLI's logout would delete its keychain entry on macOS.
+   * Returns whether it signed out.
+   */
+  private async signOut(family: Family, home: string): Promise<boolean> {
+    if (!(await isOwnHome(home))) {
+      console.log(`[ZeroSub] didn't sign out ${home}: it isn't in ${homesDir()}, so its sign-in is yours to keep or remove`);
+      return false;
+    }
+    await this.adapters[family].logout(home);
+    return true;
   }
 
   /** Whether a sign-in into `home` ran in this process and has ended. */
@@ -701,7 +753,7 @@ export class Service {
     if (stray.length === 0) return;
     console.error(
       `[ZeroSub] no account uses ${stray.join(", ")} in ${homesDir()}, so ${stray.length === 1 ? "it is" : "they are"} left alone. ` +
-        "If accounts are missing, restore state.json; otherwise sign them out and delete them yourself.",
+        "If accounts are missing, restore state.json from a backup; otherwise sign them out and delete them yourself.",
     );
   }
 
@@ -712,6 +764,307 @@ export class Service {
       () => void this.cleanUpHomes(paseo).catch((error: unknown) => log("cleanup failed", error)),
       LOGIN_GRACE_MS + 500,
     ).unref?.();
+  }
+
+  // ------------------------------------------------------------------ where homes are kept
+
+  /**
+   * Runs `work` with the account as the registry has it once no home is moving, and holds off a
+   * move of its home until `work` is done: a CLI ZeroSub runs on the account mustn't start in a
+   * folder about to go, or renew its sign-in into the Keychain entry being moved.
+   */
+  private onAccount<T>(accountId: string, work: (account: StoredAccount | undefined) => Promise<T>): Promise<T> {
+    return this.onHomes(
+      (state) => {
+        const home = findAccount(state, accountId)?.home;
+        return home ? [home] : [];
+      },
+      (state) => work(findAccount(state, accountId)),
+    );
+  }
+
+  /**
+   * Runs `work` with the registry as it is once no home is moving, and holds off a move of each home
+   * `homesOf` picks from it until `work` is done (see `moveBlocker`), so `work` finds them where the
+   * registry says.
+   */
+  private async onHomes<T>(homesOf: (state: StoredState) => string[], work: (state: StoredState) => Promise<T>): Promise<T> {
+    let state: StoredState;
+    for (;;) {
+      if (this.moveGate) {
+        await this.moveGate;
+        continue;
+      }
+      const moved = this.homesMoved;
+      state = await this.store.read();
+      // A move started or finished while the registry was read: read it again after.
+      if (!this.moveGate && moved === this.homesMoved) break;
+    }
+    const homes = homesOf(state);
+    for (const home of homes) this.homeCalls.set(home, (this.homeCalls.get(home) ?? 0) + 1);
+    try {
+      return await work(state);
+    } finally {
+      for (const home of homes) {
+        const left = (this.homeCalls.get(home) ?? 1) - 1;
+        if (left > 0) this.homeCalls.set(home, left);
+        else this.homeCalls.delete(home);
+      }
+    }
+  }
+
+  /**
+   * Changes the folder added Claude accounts' homes are kept in (empty: the default,
+   * `~/.claude-config`). New accounts go there, and the accounts in the folder it replaces, or still
+   * in ZeroSub's `homes/`, move there one at a time as nothing runs on them (see `placeHomes`).
+   * Returns the folder as shown, and how many accounts are due to move.
+   */
+  setPiHomesDir(input: string): Promise<{ dir: string; moving: number }> {
+    return this.setClaudeHomesDir(input, "pi");
+  }
+
+  async setClaudeHomesDir(input: string, family: PlacedFamily = "claude"): Promise<{ dir: string; moving: number }> {
+    const state = await this.store.read();
+    const key = HOMES_KEY[family];
+    const chosen = await chooseHomesDir(input, state.accounts, family);
+    const previous = resolve(homesDirFor(family, state[key]));
+    const updated = await this.store.update((draft) => {
+      const from = new Set(draft[key].from.map((folder) => resolve(folder)));
+      from.add(previous);
+      const next = resolve(homesDirFor(family, { dir: chosen, from: [] }));
+      from.delete(next);
+      draft[key] = { dir: chosen, from: [...from] };
+    });
+    this.moveNotes.clear();
+    const dir = homesDirFor(family, updated[key]);
+    console.log(`[ZeroSub] added ${FAMILY_LABEL[family]} accounts' homes are kept in ${dir} now`);
+    void this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
+    return { dir: shownPath(dir), moving: (await this.dueMoves(updated)).filter((account) => account.family === family).length };
+  }
+
+  /**
+   * Moves added Claude accounts' homes to the folder they're kept in (see `claudeHomesDir`): a new
+   * account's from ZeroSub's own `homes/`, where it was signed in, and every account's from a
+   * folder picked before. Moves cut short (the plugin stopped halfway) are finished first. Each home
+   * moves only while nothing runs on it (see `moveAccountHome`); one in use waits for a later pass,
+   * and the app says why. Only providers whose adapter can move homes take part (Claude's). One pass
+   * at a time; a call during one gets that one.
+   */
+  placeHomes(): Promise<void> {
+    this.placing ??= this.placePass().finally(() => {
+      this.placing = null;
+    });
+    return this.placing;
+  }
+
+  /** Whether `family`'s adapter can move its homes (Claude's and Pi's). */
+  private movable(family: Family): family is PlacedFamily {
+    const adapter = this.adapters[family];
+    return (
+      (PLACED as readonly Family[]).includes(family) &&
+      Boolean(adapter.homesInUse)
+    );
+  }
+
+  private async placePass(): Promise<void> {
+    for (const [accountId, move] of Object.entries((await this.store.read()).moves)) {
+      await this.finishMove(accountId, move).catch((error: unknown) => {
+        this.moveNotes.set(accountId, { waiting: null, error: describe(error) });
+        log(`could not finish moving ${move.from} to ${move.to}`, error);
+      });
+    }
+    const state = await this.store.read();
+    const due = await this.dueMoves(state);
+    for (const accountId of this.moveNotes.keys()) {
+      if (!due.some((account) => account.id === accountId) && !state.moves[accountId]) this.moveNotes.delete(accountId);
+    }
+    if (due.length === 0) return this.forgetEmptiedFolders(state);
+    const inUse = new Set<string>();
+    const unknown = new Set<string>();
+    for (const family of PLACED) {
+      const homes = due.filter((account) => account.family === family).map((account) => account.home);
+      if (homes.length === 0) continue;
+      try {
+        for (const home of await this.adapters[family].homesInUse!(homes)) inUse.add(home);
+      } catch (error) {
+        for (const account of due.filter((entry) => entry.family === family)) {
+          unknown.add(account.id);
+          this.moveNotes.set(account.id, { waiting: null, error: `ZeroSub couldn't tell whether anything runs on it: ${describe(error)}` });
+        }
+      }
+    }
+    const taken = new Set(state.accounts.flatMap((account) => (account.home ? [resolve(account.home)] : [])));
+    let moved = false;
+    for (const account of due) {
+      if (unknown.has(account.id)) continue;
+      const dir = homesDirFor(account.family as PlacedFamily, state[HOMES_KEY[account.family as PlacedFamily]]);
+      const waiting = this.moveBlocker(account, inUse);
+      if (waiting) {
+        this.moveNotes.set(account.id, { waiting, error: null });
+        continue;
+      }
+      const to = await placeFor(account, dir, taken);
+      taken.add(resolve(to));
+      try {
+        if (await this.moveAccountHome(account, to)) moved = true;
+      } catch (error) {
+        this.moveNotes.set(account.id, { waiting: null, error: describe(error) });
+        log(`could not move the home of ${account.label} to ${to}`, error);
+      }
+    }
+    if (moved) await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
+  }
+
+  /**
+   * Added Claude and Pi accounts whose homes are due to move: a folder of their own (a link stays
+   * where it points) in ZeroSub's `homes/` or a folder picked before, and no move of theirs under way.
+   */
+  private async dueMoves(state: StoredState): Promise<Array<StoredAccount & { home: string }>> {
+    const due: Array<StoredAccount & { home: string }> = [];
+    for (const family of PLACED) {
+      if (!this.movable(family)) continue;
+      const homes = state[HOMES_KEY[family]];
+      const dir = resolve(homesDirFor(family, homes));
+      const sources = new Set([homesDir(), ...homes.from].map((folder) => resolve(folder)));
+      for (const account of accountsOf(state, family)) {
+        const home = account.home;
+        if (account.kind !== "managed" || !home || state.moves[account.id]) continue;
+        const folder = dirname(resolve(home));
+        if (folder === dir || !sources.has(folder)) continue;
+        if ((await lstat(home).catch(() => null))?.isDirectory()) due.push({ ...account, home });
+      }
+    }
+    return due;
+  }
+
+  /** What keeps an account's home from moving right now, said for the app; null when nothing does. */
+  private moveBlocker(account: StoredAccount & { home: string }, inUse: ReadonlySet<string>): string | null {
+    const { home } = account;
+    if ([...this.logins.values()].some((login) => login.home === home && (!login.finishedAt || login.saving))) return "it's being signed in";
+    if (this.creatingHomes.has(home)) return "it's being set up";
+    if (inUse.has(home)) return `${PROVIDER_NAME[account.family]} runs on it (an agent or a terminal); it moves once that stops`;
+    if ((this.homeCalls.get(home) ?? 0) > 0) return "ZeroSub is checking it";
+    if (Date.now() - (this.routedAt.get(account.id) ?? 0) < ROUTED_SETTLE_MS) return "an agent has just started on it";
+    return null;
+  }
+
+  /**
+   * Moves one account's home to `to`, with routing and ZeroSub's own calls on accounts held off
+   * meanwhile (see `onAccount`). Sessions already being routed go first, then the home is checked
+   * again for anything running on it. The move is recorded before anything moves; the account's
+   * Keychain entry is copied (see `FamilyAdapter.copyCredentials`); the folder moves and the
+   * account's new home is saved together (see `moveHome`); then `finishMove` removes the old entry.
+   * If the folder didn't move, the copy goes again. False when it waits for a later pass.
+   */
+  private async moveAccountHome(account: StoredAccount & { home: string }, to: string): Promise<boolean> {
+    const adapter = this.adapters[account.family];
+    const from = account.home;
+    const move: Move = { from, to, at: new Date().toISOString(), family: account.family };
+    let open: () => void = () => undefined;
+    this.moveGate = new Promise((resolve) => (open = resolve));
+    try {
+      for (const until = Date.now() + ROUTING_WAIT_MS; this.routesUnderWay.size > 0; await delay(50)) {
+        if (Date.now() > until) {
+          this.moveNotes.set(account.id, { waiting: "agents are starting; it moves at the next check", error: null });
+          return false;
+        }
+      }
+      const waiting = this.moveBlocker(account, await adapter.homesInUse!([from]));
+      if (waiting) {
+        this.moveNotes.set(account.id, { waiting, error: null });
+        return false;
+      }
+      await this.store.update((draft) => void (draft.moves[account.id] = move));
+      let copied = false;
+      try {
+        await adapter.copyCredentials?.(from, to);
+        copied = true;
+        await moveHome(from, to, async () => {
+          await this.store.update((draft) => {
+            const target = findAccount(draft, account.id);
+            if (target?.home !== from) throw new Error(`${account.label} was removed or changed while its home was moving`);
+            target.home = to;
+          });
+          this.homesMoved += 1;
+        });
+      } catch (error) {
+        // Still where it was: the copy of its sign-in goes, and so does the record. Otherwise the
+        // record stays, for `finishMove` to sort out.
+        const back = (await lstat(from).catch(() => null))?.isDirectory() && !(await lstat(to).catch(() => null));
+        if (back) {
+          if (copied) await adapter.dropCopiedCredentials?.(from, to).catch(() => undefined);
+          await this.store.update((draft) => void delete draft.moves[account.id]).catch(() => undefined);
+        }
+        throw error;
+      }
+    } finally {
+      this.moveGate = null;
+      open();
+    }
+    await this.finishMove(account.id, move);
+    return true;
+  }
+
+  /**
+   * Finishes a recorded move of an account's home. Cut short before the folder moved: the copy of
+   * its sign-in goes, and the move is tried again. After the folder moved but before the account's
+   * new home was saved: the sign-in is copied (again) and the new home saved. Once it's saved: the
+   * old Keychain entry goes, provided the new one holds the sign-in. Both folders there, or neither,
+   * before it's saved is left as it is for the user, and the app says so; the old folder still there
+   * after (stopped before a copy onto another disk was cleaned up) is left alone, and logged. The
+   * account's terminal script is rewritten for the new home before the record goes.
+   */
+  private async finishMove(accountId: string, move: Move): Promise<void> {
+    const adapter = this.adapters[move.family ?? "claude"];
+    const forget = () => this.store.update((draft) => void delete draft.moves[accountId]);
+    let account = findAccount(await this.store.read(), accountId);
+    const folder = async (path: string) => (await lstat(path).catch(() => null))?.isDirectory() === true;
+    const [atFrom, atTo] = [await folder(move.from), await folder(move.to)];
+    if (account?.home === move.from) {
+      if (atFrom && !atTo) {
+        await adapter.dropCopiedCredentials?.(move.from, move.to);
+        await forget();
+        return;
+      }
+      if (atFrom || !atTo) {
+        throw new Error(
+          atFrom
+            ? `ZeroSub stopped while copying ${shownPath(move.from)} to ${shownPath(move.to)} on another disk, and both are there now. The account still uses ${shownPath(move.from)}: delete ${shownPath(move.to)}, and the move starts again at ZeroSub's next check.`
+            : `ZeroSub stopped while moving ${shownPath(move.from)} to ${shownPath(move.to)}, and neither is there now.`,
+        );
+      }
+      await adapter.copyCredentials?.(move.from, move.to);
+      await this.store.update((draft) => {
+        const target = findAccount(draft, accountId);
+        if (target?.home === move.from) target.home = move.to;
+      });
+      this.homesMoved += 1;
+      account = findAccount(await this.store.read(), accountId);
+    }
+    if (account?.home === move.to || (!account && atTo && !atFrom)) {
+      if (adapter.dropOldCredentials && !(await adapter.dropOldCredentials(move.from, move.to))) {
+        console.log(`[ZeroSub] kept the sign-in saved for ${move.from}: ${move.to} has none of its own`);
+      }
+    }
+    // While the move is still on record, so the account's script is rewritten, not released.
+    if (account?.home === move.to) await this.refreshLaunchers();
+    await forget();
+    this.moveNotes.delete(accountId);
+    if (account?.home === move.to && atFrom) {
+      console.log(`[ZeroSub] ${move.from} is still there after ${account.label} moved to ${move.to}; it's an old copy, left alone (delete it yourself)`);
+    }
+    if (account?.home === move.to) console.log(`[ZeroSub] moved the home of ${account.label} from ${move.from} to ${move.to}`);
+  }
+
+  /** Stops moving accounts out of folders picked before once none of theirs is left there. */
+  private async forgetEmptiedFolders(state: StoredState): Promise<void> {
+    const used = (folder: string) =>
+      state.accounts.some((account) => account.home && dirname(resolve(account.home)) === resolve(folder)) ||
+      Object.values(state.moves).some((move) => dirname(resolve(move.from)) === resolve(folder));
+    if (PLACED.every((family) => state[HOMES_KEY[family]].from.every(used))) return;
+    await this.store.update((draft) => {
+      for (const family of PLACED) draft[HOMES_KEY[family]].from = draft[HOMES_KEY[family]].from.filter(used);
+    });
   }
 
   // ------------------------------------------------------------------ hooks
@@ -787,7 +1140,27 @@ export class Service {
     });
   }
 
+  /**
+   * Waits while a home moves, then holds off the next move until this session is routed: one routed
+   * to a home just before it moved would open on a folder that's gone (see `moveAccountHome`).
+   */
   private async route(
+    request: PluginSessionOpenRequest,
+    context: PluginHookContext,
+    opening?: Opening,
+    abandoned?: AbortSignal,
+  ): Promise<PluginSessionOpenRequest | undefined> {
+    while (this.moveGate) await this.moveGate;
+    const routing = {};
+    this.routesUnderWay.add(routing);
+    try {
+      return await this.routeNow(request, context, opening, abandoned);
+    } finally {
+      this.routesUnderWay.delete(routing);
+    }
+  }
+
+  private async routeNow(
     request: PluginSessionOpenRequest,
     context: PluginHookContext,
     opening?: Opening,
@@ -821,12 +1194,8 @@ export class Service {
     if (!first) return undefined;
     let decision = first;
     const prepare = async (account: StoredAccount) => {
-      // Taken before anything else waits, so a move of this home that hasn't finished gives way (see
-      // `moveAccountHome`); one that has is followed. Routing itself never waits for a move.
-      const home = this.homeNow(account);
-      this.routedAt.set(account.id, Date.now());
-      if (account.kind === "managed" && home && home === account.home && !this.moving.has(account.id)) {
-        await adapter.prepareHome(home, this.stillHas(account)).catch((error: unknown) => log(`could not refresh the home of ${account.label}`, error));
+      if (account.kind === "managed" && account.home) {
+        await adapter.prepareHome(account.home, this.stillHas(account)).catch((error: unknown) => log(`could not refresh the home of ${account.label}`, error));
       }
     };
 
@@ -863,14 +1232,14 @@ export class Service {
       console.log(`[ZeroSub] next-agent pick ${decision.bind?.source === "user" ? "used" : "dropped, as its account can't take agents now"}: ${request.agentId}`);
     }
     this.activeAt.set(account.id, now);
+    this.routedAt.set(account.id, now);
     console.log(
       `[ZeroSub] ${request.provider} agent ${request.agentId} → ${account.label} (${request.reason}${
         decision.skipped ? `; skipped ${decision.skipped.account.label}: ${decision.skipped.why}` : ""
       })`,
     );
-    const home = this.homeNow(account);
     const session = typeof request.cwd === "string" && request.cwd ? { cwd: request.cwd } : undefined;
-    return { ...request, env: applyEnv(await adapter.env(home, session), request.env) };
+    return { ...request, env: applyEnv(await adapter.env(account.home, session), request.env) };
   }
 
   /**
@@ -1384,9 +1753,9 @@ export class Service {
       }
       this.redeeming.add(account.id);
       try {
-        const reply = await this.adapters[account.family]
-          .redeemReset(account.home, { onlyAtLimit: automatic })
-          .catch((error: unknown): RedeemReply => ({ outcome: "error", message: describe(error), left: null }));
+        const reply = await this.onAccount(account.id, (current) => this.adapters[account.family].redeemReset((current ?? account).home, { onlyAtLimit: automatic })).catch(
+          (error: unknown): RedeemReply => ({ outcome: "error", message: describe(error), left: null }),
+        );
         console.log(`[ZeroSub] banked reset on ${account.label}: ${reply.outcome}`);
         if (reply.outcome === "reset") {
           const at = Date.now();
@@ -1439,6 +1808,7 @@ export class Service {
     this.attach(paseo);
     const account = findAccount(await this.store.read(), accountId);
     if (!account) throw new Error("That account no longer exists.");
+    if (account.auth === "api") throw new Error(`${account.label} uses an API key, which has no banked resets.`);
     if (!account.signedIn) throw new Error(`${account.label} is signed out. Sign it in first.`);
     const pending = (message: string): RedeemResult => ({ outcome: "pending", message, left: null, continued: false });
     if (this.redeeming.has(account.id)) {
@@ -1455,7 +1825,7 @@ export class Service {
     task.catch((error: unknown) => log(`using a reset on ${account.label} failed`, error));
     if (await settles(task, replyBy - Date.now())) return task;
     return pending(
-      `Still using the reset on ${account.label}. Its limits show here once it's done${agentId ? ", and the agent carries on" : ""}; don't use another.`,
+      `Still using the reset on ${account.label}. Its limits show here once it's done${agentId && this.prefs.autoContinue ? ", and the agent carries on" : ""}; don't use another.`,
     );
   }
 
@@ -1512,8 +1882,7 @@ export class Service {
     const usage = this.usage.get(accountId);
     if (!usage || usage.cached) return null;
     const full = usage.windows.filter((window) => window.usedPercent >= 99 && window.resetsAt);
-    // A full window of one model's only is what the turn hit when none of the account's own is full,
-    // so a later-resetting model window doesn't stretch a 5-hour limit to days.
+    // A full window of one model's only is what the turn hit when none of the account's own is full.
     const hit = full.some(capsAccount) ? full.filter(capsAccount) : full;
     hit.sort((a, b) => Date.parse(b.resetsAt ?? "") - Date.parse(a.resetsAt ?? ""));
     return hit[0]?.resetsAt ?? null;
@@ -1667,8 +2036,17 @@ export class Service {
       ? (await paseo.providers.listAvailable()).providers?.some((entry) => entry.provider === provider && entry.available)
       : false;
     if (!provider || !available) return { skipped: `${name} isn't available in Paseo on this host.` };
-    const account = mostAvailable(state, other, (id) => this.usage.get(id), Date.now(), new Set());
-    if (!account) return { skipped: `Every ${name} account is at its limit too.` };
+    const now = Date.now();
+    const account = mostAvailable(state, other, (id) => this.usage.get(id), now, new Set());
+    if (!account) {
+      // API accounts are billed per use, so they never take work over by themselves; say so rather than "at its limit".
+      const apiOnly = accountsOf(state, other).some((entry) => entry.auth === "api" && isUsable(entry, now));
+      return {
+        skipped: apiOnly
+          ? `The only ${name} accounts with room use an API key, which ZeroSub never moves work onto by itself. To use one, start a ${name} agent and pick it from the agent's account button.`
+          : `Every ${name} account is at its limit too.`,
+      };
+    }
 
     const original = (await paseo.agents.ref(agentId).refresh())?.agent;
     if (!original) throw new Error("That agent is no longer available.");
@@ -2176,19 +2554,24 @@ export class Service {
     if (now < (this.usageRetryAt.get(accountId) ?? 0)) return Promise.resolve();
     const since = now - (this.usageAttemptAt.get(accountId) ?? 0);
     const task = (async () => {
-      const account = findAccount(await this.store.read(), accountId);
-      // An API account (an added Pi account) has no subscription windows to read.
-      if (!account || account.auth === "api") return;
-      const spacing = this.adapters[account.family].usageSpacingMs;
-      if (since < (force ? spacing : Math.max(spacing, 60_000))) return;
-      this.usageAttemptAt.set(accountId, Date.now());
-      const renew = renewLogin || this.renewsInBackground(account, Date.now());
-      if (renew) this.renewAttemptAt.set(accountId, Date.now());
-      const { retryAt, ...read } = await this.adapters[account.family]
-        .usage(account.home, { renewLogin: renew })
-        .catch(
-          (error: unknown): UsageRead => ({ fetchedAt: new Date().toISOString(), windows: [], error: describe(error), cached: false, resets: null }),
-        );
+      const result = await this.onAccount(accountId, async (account) => {
+        // An API account has no subscription windows to read.
+        if (!account || account.auth === "api") return null;
+        const spacing = this.adapters[account.family].usageSpacingMs;
+        if (since < (force ? spacing : Math.max(spacing, 60_000))) return null;
+        this.usageAttemptAt.set(accountId, Date.now());
+        const renew = renewLogin || this.renewsInBackground(account, Date.now());
+        if (renew) this.renewAttemptAt.set(accountId, Date.now());
+        const reading = await this.adapters[account.family]
+          .usage(account.home, { renewLogin: renew })
+          .catch(
+            (error: unknown): UsageRead => ({ fetchedAt: new Date().toISOString(), windows: [], error: describe(error), cached: false, resets: null }),
+          );
+        return { account, reading };
+      });
+      if (!result) return;
+      const { account } = result;
+      const { retryAt, ...read } = result.reading;
       if (retryAt) this.usageRetryAt.set(accountId, retryAt);
       else this.usageRetryAt.delete(accountId);
       const usage: Usage = { ...read, credits: read.credits ?? null };
@@ -2256,12 +2639,14 @@ export class Service {
 
   // ------------------------------------------------------------------ RPC: state
 
-  async view(paseo: PaseoApi, refreshUsage = false): Promise<StateView> {
+  /** With `refreshUsage`, reads usage now first: `accountId`'s only, or every account's. */
+  async view(paseo: PaseoApi, refreshUsage = false, accountId?: string): Promise<StateView> {
     this.attach(paseo);
     if (refreshUsage) {
       const state = await this.store.read();
+      const accounts = accountId ? state.accounts.filter((account) => account.id === accountId) : state.accounts;
       // Renewing a sign-in can take longer than Paseo waits for an answer; later readings show at the next poll.
-      await settles(Promise.allSettled(state.accounts.map((account) => this.refreshUsage(account.id, true, true))), USAGE_REPLY_MS);
+      await settles(Promise.allSettled(accounts.map((account) => this.refreshUsage(account.id, true, true))), USAGE_REPLY_MS);
     }
     void this.prune(paseo).catch(() => undefined);
     const state = await this.store.read();
@@ -2298,65 +2683,71 @@ export class Service {
       });
     }
 
-    const piScripts = this.launcherAccounts(state);
-    const launcherOf = this.launcherFiles ?? launcherNames(piScripts);
+    const launchers = this.launcherAccounts(state);
+    const piLaunchers = this.launcherAccounts(state, "pi");
+    const launcherOf = this.launcherFiles ?? new Map([...launcherNames(launchers), ...launcherNames(piLaunchers, new Map(), "pi")]);
     const proxies = new Map<string, ProxyState>();
     const apis = new Map<string, ApiSummary | null>();
     const external = new Set<string>();
     await Promise.all(
       state.accounts.map(async (account) => {
         const adapter = this.adapters[account.family];
-        // A home of null is the CLI's own login; its files are only read here.
+        // A home of null is the CLI's own login.
         if (adapter.proxyState && (account.kind === "main" || account.home)) {
-          proxies.set(account.id, await adapter.proxyState(account.home).catch((): ProxyState => ({ own: null, file: null, inherited: null })));
+          const unknown = (error: unknown): ProxyState => ({ own: null, file: null, inherited: null, blocked: describe(error) });
+          proxies.set(account.id, await adapter.proxyState(account.home).catch(unknown));
         }
         if (account.kind === "main" && adapter.mainApi && adapter.api) apis.set(account.id, await adapter.api(null).catch(() => null));
         if (account.kind !== "managed" || !account.home) return;
-        if (adapter.homesInUse && !(await isOwnHome(account.home))) external.add(account.id);
+        if (!(await isOwnHome(account.home))) external.add(account.id);
         if (account.auth === "api" && adapter.api) apis.set(account.id, await adapter.api(account.home).catch(() => null));
       }),
     );
-    // A proxy kept in the user's file (Pi's own login's in its settings) is also the one every added
-    // account without its own goes through.
+    // A proxy kept in the user's file (the CLI login's in main's settings) is also the one every
+    // added account without its own goes through.
     const followers = (family: Family) =>
       state.accounts.filter((other) => other.family === family && other.kind === "managed" && proxies.get(other.id)?.own === null).map((other) => other.label);
-    const piHomesNow = piHomesDir(state.piHomes);
+    const homesDirNow = (family: PlacedFamily) => homesDirFor(family, state[HOMES_KEY[family]]);
     const due = new Set((await this.dueMoves(state)).map((account) => account.id));
     const moving = (account: StoredAccount): AccountView["moving"] => {
       const move = state.moves[account.id];
       if (!move && !due.has(account.id)) return null;
       const note = this.moveNotes.get(account.id);
-      return { to: shownPath(move?.to ?? piHomesNow), waiting: note?.waiting ?? null, error: note?.error ?? null };
+      const to = move?.to ?? homesDirNow(account.family === "pi" ? "pi" : "claude");
+      return { to: shownPath(to), waiting: note?.waiting ?? null, error: note?.error ?? null };
     };
     const accounts: AccountView[] = state.accounts.map((account) => {
       const limited = isLimited(account, now);
       const proxy = proxies.get(account.id);
+      const api = apis.get(account.id);
       return {
         id: account.id,
         family: account.family,
         label: account.label,
         kind: account.kind,
+        auth: account.auth,
+        api: api ? ApiSummarySchema.parse(api) : null,
+        apiEditable: account.auth === "api" || (account.kind === "main" && this.adapters[account.family].mainApi === true),
         email: account.email,
         plan: account.plan,
         organization: account.organization,
         status: !account.signedIn ? "signed_out" : account.disabled ? "disabled" : limited ? "limited" : "ready",
+        disabled: account.disabled,
         isDefault: defaultAccount(state, account.family)?.id === account.id,
         nextAgentUntil: nextPickUntil(state, account.id, account.family, now),
         limitedUntil: limited ? account.limitedUntil : null,
         usage: this.usage.get(account.id) ?? null,
         agentCount: counts.get(account.id) ?? 0,
         home: account.home,
-        auth: account.auth,
-        api: apis.get(account.id) ?? null,
-        apiEditable: account.auth === "api" || (account.kind === "main" && this.adapters[account.family].mainApi === true),
+        externalHome: external.has(account.id),
         proxy: proxy?.own ? maskProxy(proxy.own) : null,
         proxyEditable: proxy !== undefined,
         inheritedProxy: proxy?.inherited ? { ...proxy.inherited, proxy: maskProxy(proxy.inherited.proxy) } : null,
+        proxyBlocked: proxy?.blocked ?? null,
         proxyFile: proxy?.file ?? null,
         proxyFollowers: proxy?.file ? followers(account.family) : [],
         launcher: launcherOf.get(account.id) ?? null,
         egress: this.egress.get(account.id) ?? null,
-        externalHome: external.has(account.id),
         moving: moving(account),
       };
     });
@@ -2368,11 +2759,14 @@ export class Service {
       providers: families,
       canReopen,
       browserSignIn: this.browserSignIn,
+      launchers: launchers.length > 0 ? launcherDir() : null,
+      piLaunchers: piLaunchers.length > 0 ? piLauncherDir() : null,
+      claudeHomes: this.movable("claude") ? { dir: shownPath(homesDirNow("claude")), isDefault: state.claudeHomes.dir === null } : null,
+      piHomes: this.movable("pi") ? { dir: shownPath(homesDirNow("pi")), isDefault: state.piHomes.dir === null } : null,
       showComposerPill: this.prefs.showComposerPill,
       autoSwitch: this.prefs.autoSwitch,
+      autoContinue: this.prefs.autoContinue,
       warnings: await this.warnings(),
-      piLaunchers: piScripts.length > 0 ? piLauncherDir() : null,
-      piHomes: this.adapters.pi.homesInUse ? { dir: shownPath(piHomesNow), isDefault: state.piHomes.dir === null } : null,
     };
   }
 
@@ -2504,12 +2898,12 @@ export class Service {
       throw new Error("Pi accounts can't be disabled. Make another one the default, or pick another for its agents, or remove it.");
     }
     if (!enabled && !mostAvailable(state, account.family, (id) => this.usage.get(id), Date.now(), new Set([account.id]))) {
-      // Routing only stands in a usable account for a disabled one. Without one, its
+      // Routing only stands in a usable subscription account for a disabled one. Without one, its
       // agents and new ones would stay on it, or quietly fall back to the CLI login.
       const others = accountsOf(state, account.family).some((other) => other.id !== account.id && other.signedIn && !other.disabled);
       throw new Error(
         others
-          ? `${account.label}'s agents would have nowhere to go: your other ${FAMILY_LABEL[account.family]} accounts are at their limit. Wait for one to reset, or add or enable another account first.`
+          ? `${account.label}'s agents would have nowhere to go: your other ${FAMILY_LABEL[account.family]} accounts are at their limit or use an API key, which ZeroSub never moves agents onto by itself. Wait for one to reset, or add or enable another account first.`
           : `${account.label} is the only ${FAMILY_LABEL[account.family]} account in use. Add or enable another one first.`,
       );
     }
@@ -2712,14 +3106,189 @@ export class Service {
       account.autoLabel = false;
     });
     if (!findAccount(state, accountId)) throw new Error("That account no longer exists.");
-    // A Pi account's script is named after it.
-    await this.refreshLaunchers().catch((error: unknown) => log("could not write the Pi scripts", error));
+    await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
+  }
+
+  /** Sets an added account's proxy; an empty value clears it. Processes started afterwards use it. */
+  async setProxy(accountId: string, input: string): Promise<string | null> {
+    // Set where the account's home is once any move of it is done.
+    const { account, proxy, kept } = await this.onAccount(accountId, async (account) => {
+      if (!account) throw new Error("That account no longer exists.");
+      const adapter = this.adapters[account.family];
+      if (!adapter.setProxy || (account.kind === "managed" && !account.home)) throw new Error("A proxy can only be set for Claude and Pi accounts.");
+      const proxy = input.trim() ? normalizeProxy(input) : null;
+      // A proxy kept in the user's file (the CLI login's in main's settings) is changed there.
+      const kept = account.home ? null : await adapter.proxyState?.(null).catch(() => null);
+      if (account.family === "pi" && !account.home && proxy && proxy !== kept?.own) await this.refuseClearTextFollowers(account.family);
+      await adapter.setProxy(account.home, proxy, this.stillHas(account));
+      return { account, proxy, kept };
+    });
+    void this.checkEgress(account);
+    if (kept?.file) void this.followMainSettings(account.family);
+    return proxy ? maskProxy(proxy) : null;
+  }
+
+  /**
+   * A new proxy on Pi's CLI login is also every added Pi account's without one of its own, so it's
+   * refused while one of those sends its key over plain http:// through it: to this machine too,
+   * unless the no-proxy list keeps it direct, since Pi adds nothing to that list for the login's
+   * proxy (see `crossesInheritedProxy`). Their homes don't move while they're read: one read halfway
+   * through a move would look like an account with no key.
+   */
+  private refuseClearTextFollowers(family: Family): Promise<void> {
+    const added = (state: StoredState) =>
+      accountsOf(state, family).filter((account): account is StoredAccount & { home: string } => account.kind === "managed" && Boolean(account.home));
+    return this.onHomes(
+      (state) => added(state).map((account) => account.home),
+      async (state) => {
+        for (const account of added(state)) {
+          const { key, baseUrl, proxy } = await readPiAccount(account.home);
+          if (proxy) continue;
+          if (key && crossesInheritedProxy(baseUrl)) {
+            throw new Error(
+              `${account.label} has no proxy of its own and sends its key over plain http:// to ${baseUrl}, so this proxy could read it. Give ${account.label} its key again with an https:// base URL, or a proxy of its own, first.`,
+            );
+          }
+        }
+      },
+    );
+  }
+
+  /**
+   * Remakes the added homes' settings from main's, which just changed, and checks where the
+   * requests of those without a proxy of their own, which go through main's, now come from.
+   */
+  private async followMainSettings(family: Family): Promise<void> {
+    const adapter = this.adapters[family];
+    for (const account of accountsOf(await this.store.read(), family)) {
+      if (account.kind !== "managed" || !account.home) continue;
+      await adapter.prepareHome(account.home, this.stillHas(account)).catch((error: unknown) => log(`could not refresh the home of ${account.label}`, error));
+      const proxy = await adapter.proxyState?.(account.home).catch(() => null);
+      if (account.signedIn && proxy?.own === null) void this.checkEgress(account);
+    }
+  }
+
+  /** Checks where the account's requests come from; a failed check keeps the last address it saw. */
+  private async checkEgress(account: StoredAccount): Promise<void> {
+    const adapter = this.adapters[account.family];
+    if (!adapter.egress) return;
+    // Pi's own login is never checked: only an added account's requests are ZeroSub's to place.
+    if (account.family === "pi" && (account.kind !== "managed" || !account.home)) return;
+    this.egressCheckedAt.set(account.id, Date.now());
+    const checkedAt = new Date().toISOString();
+    try {
+      const seen = await this.onAccount(account.id, (current) => adapter.egress!((current ?? account).home));
+      if (seen) this.egress.set(account.id, { ...seen, checkedAt, error: null });
+      else this.egress.delete(account.id);
+    } catch (error) {
+      const last = this.egress.get(account.id);
+      this.egress.set(account.id, {
+        ip: last?.ip ?? null,
+        country: last?.country ?? null,
+        checkedAt: last?.checkedAt ?? null,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Adds an account that uses an API key or token, optionally against another base URL: a Claude
+   * account, or a Pi one (an Anthropic key in an agent directory of its own).
+   */
+  async addApiAccount(input: ApiAccountInput & { label: string; key: string; proxy?: string; family?: "claude" | "pi" }): Promise<string> {
+    // Pi's are an API key and nothing else, so its form sends no kind; Claude's always says which.
+    const family = input.family ?? (input.keyKind ? "claude" : "pi");
+    const keyKind = input.keyKind ?? "api_key";
+    const adapter = this.adapters[family];
+    if (!adapter.setApi) throw new Error("API accounts aren't supported here.");
+    if (family === "pi" && keyKind !== "api_key") throw new Error("Pi accounts use an API key (x-api-key), not an auth token.");
+    const baseUrl = input.baseUrl?.trim() ? normalizeBaseUrl(input.baseUrl) : null;
+    const proxy = input.proxy?.trim() ? normalizeProxy(input.proxy) : null;
+    const key = input.key.trim();
+    if (!key) throw new Error("Enter the API key or token.");
+    const identity = apiIdentity(baseUrl, keyDigest(key));
+    const duplicate = accountsOf(await this.store.read(), family).find((account) => account.identity === identity);
+    if (duplicate) throw new Error(`That key is already added as "${duplicate.label}".`);
+
+    // A managed account's ID matches its home's folder name.
+    const id = `${family}-${randomBytes(6).toString("hex")}`;
+    const home = join(homesDir(), id);
+    this.creatingHomes.add(home);
+    try {
+      // On the cleanup list until the account is saved, in case the plugin stops halfway.
+      await this.store.update((draft) => {
+        draft.cleanup[home] = { family, accountId: id, why: "unfinished", at: new Date().toISOString() };
+      });
+      if (proxy) await adapter.setProxy?.(home, proxy);
+      await adapter.setApi(home, { ...trafficSwitches(input), keyKind, key, baseUrl });
+      await adapter.prepareHome(home);
+      await this.store.update((draft) => {
+        // Checked again in the write that saves it, so two adds of one key at once can't both land.
+        const twin = accountsOf(draft, family).find((account) => account.identity === identity);
+        if (twin) throw new Error(`That key is already added as "${twin.label}".`);
+        const account = newAccount({ id, family, kind: "managed", home, auth: "api" });
+        account.label = input.label.trim();
+        account.autoLabel = false;
+        account.identity = identity;
+        draft.accounts.push(account);
+        delete draft.cleanup[home];
+      });
+    } catch (error) {
+      await removeHome(home).catch(() => undefined);
+      await this.store.update((draft) => void delete draft.cleanup[home]).catch(() => undefined);
+      throw error;
+    } finally {
+      this.creatingHomes.delete(home);
+    }
+    // Set up in `homes/`, then moved to where accounts are kept.
+    await this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
+    await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
+    const added = findAccount(await this.store.read(), id);
+    if (added) void this.checkEgress(added);
+    return id;
+  }
+
+  /** Changes an API account's key (empty keeps it), base URL or traffic switches. */
+  async updateApiAccount(accountId: string, input: ApiAccountInput & { key?: string }): Promise<void> {
+    // Written where the account's home is once any move of it is done.
+    await this.onAccount(accountId, (account) => this.updateApi(accountId, account, input));
+  }
+
+  private async updateApi(accountId: string, account: StoredAccount | undefined, input: ApiAccountInput & { key?: string }): Promise<void> {
+    if (!account) throw new Error("That account no longer exists.");
+    const adapter = this.adapters[account.family];
+    // Pi's CLI login keeps its key in Pi's own files, which the adapter changes in place.
+    if (account.kind === "main" && adapter.mainApi && adapter.setApi) {
+      await adapter.setApi(null, { ...trafficSwitches(input), keyKind: input.keyKind ?? "api_key", key: input.key?.trim() || null, baseUrl: input.baseUrl?.trim() || null });
+      void this.checkEgress(account);
+      return;
+    }
+    if (account.auth !== "api" || !account.home || !adapter.setApi) throw new Error(`${account.label} signs in with a subscription, not an API key.`);
+    const baseUrl = input.baseUrl?.trim() ? normalizeBaseUrl(input.baseUrl) : null;
+    const key = input.key?.trim() || null;
+    // A kept key stays on its base URL (writeAccountApi refuses to move it), so its identity holds.
+    const identity = key ? apiIdentity(baseUrl, keyDigest(key)) : null;
+    if (identity) {
+      const duplicate = accountsOf(await this.store.read(), account.family).find((entry) => entry.id !== account.id && entry.identity === identity);
+      if (duplicate) throw new Error(`That key is already added as "${duplicate.label}".`);
+    }
+    await adapter.setApi(account.home, { ...trafficSwitches(input), keyKind: input.keyKind ?? "api_key", key, baseUrl }, this.stillHas(account));
+    await this.store.update((draft) => {
+      const target = findAccount(draft, accountId);
+      if (!target) return;
+      if (identity) target.identity = identity;
+      // A new key is worth trying again even if the old one had been refused. A Pi account's key is
+      // only marked refused by Anthropic, so a new base URL alone doesn't clear that.
+      if (key || account.family !== "pi") target.signedIn = true;
+    });
   }
 
   /** Removes an account. Moving its agents can outlast the RPC: see `answerBy`. */
   async remove(paseo: PaseoApi, accountId: string): Promise<{ affected: number; moves: ReopenSummary }> {
     const replyBy = Date.now() + REPLY_WAIT_MS;
     this.attach(paseo);
+    // Where its home is decides what removing it does, so a move of it finishes first.
+    while (this.moveGate) await this.moveGate;
     const state = await this.store.read();
     const account = findAccount(state, accountId);
     if (!account) throw new Error("That account no longer exists.");
@@ -2747,278 +3316,95 @@ export class Service {
     const affected = Object.entries(state.sessions)
       .filter(([, session]) => session.accountId === accountId)
       .map(([agentId]) => agentId);
-    // A home kept outside ZeroSub's own `homes/` (where added Pi accounts are kept) is the user's:
-    // removing its account only takes it out of ZeroSub, and its folder, key and script stay.
-    const kept = account.home !== null && account.family === "pi" && !(await isOwnHome(account.home));
+    // Only a home of ZeroSub's own is signed out and deleted. One kept elsewhere is only unregistered:
+    // its sign-in, files and launcher stay, so it still works from a terminal and can be added back.
+    const own = account.home !== null && (await isOwnHome(account.home));
     await this.store.update((draft) => {
       draft.accounts = draft.accounts.filter((entry) => entry.id !== accountId);
-      if (account.home && !kept) draft.cleanup[account.home] = { family: account.family, accountId, why: "removed", at: new Date().toISOString() };
+      if (account.home && own) draft.cleanup[account.home] = { family: account.family, accountId, why: "removed", at: new Date().toISOString() };
       for (const [agentId, binding] of Object.entries(draft.bindings)) {
         if (binding.accountId === accountId) delete draft.bindings[agentId];
       }
       if (draft.defaults[account.family] === accountId) draft.defaults[account.family] = null;
       dropNextPick(draft, account);
     });
+    // A sign-in into it that's still going would otherwise add it back when it finishes.
+    for (const login of this.logins.values()) {
+      if (login.accountId === accountId && !login.finishedAt) await this.cancelLogin(login.id);
+    }
     this.setUsage(accountId, null);
-    this.egress.delete(accountId);
-    if (account.home && kept) console.log(`[ZeroSub] removed ${account.label} from ZeroSub only: ${account.home} isn't in ${homesDir()}, so its files and script stay`);
-    // Its script is released rather than deleted when its home stays (see writeLaunchers).
-    await this.refreshLaunchers(account.home && !kept ? [account.home] : []).catch((error: unknown) => log("could not write the Pi scripts", error));
-    // Idle agents move now and busy ones after their turn. The home is signed out and deleted by the
-    // cleanup pass only once nothing runs on it any more.
+    if (account.home && !own) {
+      console.log(`[ZeroSub] removed ${account.label} from ZeroSub only: ${account.home} isn't in ${homesDir()}, so its sign-in, files and launcher stay`);
+    }
+    // A kept home's launcher is released here rather than deleted (see writeLaunchers).
+    await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
+    // Idle agents move now and busy ones after their turn. A home of ZeroSub's own is signed out and
+    // deleted by the cleanup pass only once nothing runs on it any more.
     const summary = emptySummary();
     const moves = await this.answerBy(replyBy, this.reconcile(paseo, "removed", affected, new Map([[account.id, account.label]]), { summary }), summary);
     void this.cleanUpHomes(paseo).catch((error: unknown) => log("cleanup failed", error));
     return { affected: affected.length, moves };
   }
 
-  // ------------------------------------------------------------------ Pi accounts
+  // ------------------------------------------------------------------ RPC: a folder signed in already
 
   /**
-   * Whether `account` is still registered, asked with its home's lock held before anything is
-   * written to it: a home whose account was removed meanwhile is never written to (or made again).
+   * Adds a Claude account from a folder Claude Code is signed in with already (its
+   * `CLAUDE_CONFIG_DIR`, set up by hand or kept when its account was removed here), as it is: no
+   * sign-in, and syncing only adds what's missing (see `prepareClaudeHome`). The folder stays where
+   * it is, unless it's in ZeroSub's `homes/` or a folder picked before, which it moves out of like
+   * any account's (see `placeHomes`); removing the account later only takes it out of ZeroSub, as
+   * for any folder outside `homes/`. Refused, saying why, for a folder `chooseImportedHome` turns
+   * down, one not signed in with a Claude subscription, or one signed in as an account here already.
+   * Returns the new account's ID.
    */
-  private stillHas(account: StoredAccount): () => Promise<boolean> {
-    return async () => {
-      const current = findAccount(await this.store.read(), account.id);
-      return current !== undefined && current.home === account.home;
-    };
-  }
-
-  /**
-   * Where an account's home is right now. A move of it that's saved is followed (the registry read
-   * may be from before it); one that isn't yet is left to give way to whatever asked.
-   */
-  private homeNow(account: StoredAccount): string | null {
-    const run = this.moving.get(account.id);
-    if (run?.committed && account.home === run.from) return run.to;
-    const done = this.moved.get(account.id);
-    if (done && account.home === done.from) return done.to;
-    return account.home;
-  }
-
-  /**
-   * Runs `work` on an account as it is now (see `homeNow`), counting it as a call on that home so
-   * no move of it is saved under it (see `moveAccountHome`). Never waits for a move.
-   */
-  private async onAccount<T>(accountId: string, work: (account: StoredAccount | undefined) => Promise<T>): Promise<T> {
-    const stored = findAccount(await this.store.read(), accountId);
-    const home = stored ? this.homeNow(stored) : null;
-    const account = stored && home !== stored.home ? { ...stored, home } : stored;
-    if (home) this.homeCalls.set(home, (this.homeCalls.get(home) ?? 0) + 1);
-    try {
-      return await work(account);
-    } finally {
-      if (home) {
-        const left = (this.homeCalls.get(home) ?? 1) - 1;
-        if (left > 0) this.homeCalls.set(home, left);
-        else this.homeCalls.delete(home);
-      }
-    }
-  }
-
-  /** Added Pi accounts, which each get a `pi-<account>.sh` script. */
-  private launcherAccounts(state: StoredState): LauncherAccount[] {
-    return state.accounts.flatMap((account) =>
-      account.family === "pi" && account.kind === "managed" && account.home ? [{ id: account.id, label: account.label, home: account.home }] : [],
-    );
-  }
-
-  /**
-   * Rewrites the account scripts when the accounts or their names changed. A removed account's
-   * script goes when its home does (`leaving`, or gone); one whose home stays is released to the user.
-   * Nothing is written while no Pi account is added.
-   */
-  private async refreshLaunchers(leaving: readonly string[] = []): Promise<void> {
-    // Only where Pi accounts are kept outside `homes/` (the real adapter; not test doubles).
-    if (!this.adapters.pi.homesInUse) return;
-    const state = await this.store.read();
-    // A home that's moving keeps its account's script, rewritten for where it's gone.
-    const moved = new Map(Object.values(state.moves).map((move) => [resolve(move.from), move.to]));
-    this.launcherFiles = await writeLaunchers(this.launcherAccounts(state), piLauncherDir(), leaving, moved);
-  }
-
-  /**
-   * Sets an account's proxy; an empty value clears it. Processes started afterwards use it. Pi's own
-   * login's is kept in Pi's own settings, changed there only when asked to here.
-   */
-  async setProxy(accountId: string, input: string): Promise<string | null> {
-    const { account, proxy } = await this.onAccount(accountId, async (account) => {
-      if (!account) throw new Error("That account no longer exists.");
-      const adapter = this.adapters[account.family];
-      const main = account.kind === "main" && adapter.mainApi === true;
-      if (!adapter.setProxy || !(main || (account.kind === "managed" && account.home))) throw new Error("A proxy can only be set for Pi accounts.");
-      const proxy = input.trim() ? normalizeProxy(input) : null;
-      if (main && proxy && proxy !== (await adapter.proxyState?.(null))?.own) await this.refuseClearTextFollowers(account.family);
-      await adapter.setProxy(main ? null : account.home, proxy, this.stillHas(account));
-      return { account, proxy };
+  async importAccount(input: string): Promise<string> {
+    const home = await chooseImportedHome(input, (await this.store.read()).accounts);
+    const shown = shownPath(home);
+    if ([...this.logins.values()].some((login) => login.home === home && !login.finishedAt)) throw new Error(`${shown} is being signed in right now.`);
+    const identity = await this.adapters.claude.identity(home).catch((error: unknown) => {
+      throw new Error(`ZeroSub couldn't tell whether ${shown} is signed in: ${describe(error)}`);
     });
-    if (account.kind === "main") await this.followMainSettings(account.family);
-    else void this.checkEgress(account);
-    return proxy ? maskProxy(proxy) : null;
-  }
-
-  /**
-   * A new proxy on the CLI login is also every added account's without one of its own, so it's
-   * refused while one of those sends its key over plain http:// through it: to this machine too,
-   * unless the no-proxy list keeps it direct, since Pi adds nothing to that list for the login's
-   * proxy (see `crossesInheritedProxy`).
-   */
-  private async refuseClearTextFollowers(family: Family): Promise<void> {
-    const adapter = this.adapters[family];
-    for (const account of accountsOf(await this.store.read(), family)) {
-      const home = this.homeNow(account);
-      if (account.kind !== "managed" || !home) continue;
-      // Read as for an agent: while its folder is being moved its settings can't be read, and an
-      // account read as having no key or proxy would pass unchecked.
-      const settings = await readPiAccountForAgents(home).catch(() => null);
-      if (!settings) throw new Error(`${account.label}'s folder is being moved just now. Try again in a moment.`);
-      const { key, baseUrl, proxy } = settings;
-      if (proxy) continue;
-      if (key && crossesInheritedProxy(baseUrl)) {
-        throw new Error(
-          `${account.label} has no proxy of its own and sends its key over plain http:// to ${baseUrl}, so this proxy could read it. Give ${account.label} its key again with an https:// base URL, or a proxy of its own, first.`,
-        );
-      }
-    }
-  }
-
-  /**
-   * Remakes the added homes' files from the CLI login's, which just changed (its proxy goes to every
-   * added account without one of its own), and checks where those accounts' requests come from now.
-   */
-  private async followMainSettings(family: Family): Promise<void> {
-    const adapter = this.adapters[family];
-    for (const account of accountsOf(await this.store.read(), family)) {
-      if (account.kind !== "managed" || !account.home || this.moving.has(account.id)) continue;
-      await adapter.prepareHome(account.home, this.stillHas(account)).catch((error: unknown) => log(`could not refresh the home of ${account.label}`, error));
-      const proxy = await adapter.proxyState?.(account.home).catch(() => null);
-      if (proxy?.own === null) void this.checkEgress(account);
-    }
-  }
-
-  /**
-   * Checks where an added account's requests come from; a failed check keeps the last address it
-   * saw. The CLI login is never checked, so nothing is sent while no account is added.
-   */
-  private async checkEgress(account: StoredAccount): Promise<void> {
-    const adapter = this.adapters[account.family];
-    if (!adapter.egress || account.kind !== "managed" || !account.home || !account.signedIn) return;
-    this.egressCheckedAt.set(account.id, Date.now());
-    const checkedAt = new Date().toISOString();
-    try {
-      const seen = await this.onAccount(account.id, async (current) => (current?.home ? adapter.egress!(current.home) : null));
-      if (seen) this.egress.set(account.id, { ...seen, checkedAt, error: null });
-      else this.egress.delete(account.id);
-    } catch (error) {
-      const last = this.egress.get(account.id);
-      this.egress.set(account.id, {
-        ip: last?.ip ?? null,
-        country: last?.country ?? null,
-        checkedAt: last?.checkedAt ?? null,
-        error: describe(error),
-      });
-    }
-  }
-
-  /**
-   * Adds a Pi account: an Anthropic API key, optionally sent to another base URL, with an optional
-   * proxy. Set up in `homes/`, then moved to where Pi accounts are kept (see `placeHomes`).
-   */
-  async addApiAccount(input: { label: string; key: string; baseUrl?: string; proxy?: string }): Promise<string> {
-    const adapter = this.adapters.pi;
-    if (!adapter.setApi) throw new Error("API accounts aren't supported here.");
-    const baseUrl = input.baseUrl?.trim() ? normalizeBaseUrl(input.baseUrl) : null;
-    const proxy = input.proxy?.trim() ? normalizeProxy(input.proxy) : null;
-    const key = input.key.trim();
-    if (!key) throw new Error("Enter the API key.");
-    const identity = apiIdentity(baseUrl, keyDigest(key));
-    const duplicate = accountsOf(await this.store.read(), "pi").find((account) => account.identity === identity);
-    if (duplicate) throw new Error(`That key is already added as "${duplicate.label}".`);
-
-    // A managed account's ID matches its home's folder name, as its cleanup entry does.
-    const id = `pi-${randomBytes(6).toString("hex")}`;
-    const home = join(homesDir(), id);
-    this.creatingHomes.add(home);
-    try {
-      // On the cleanup list until the account is saved, so a home left half made is cleaned up even
-      // after a restart. While it's being made, cleanup leaves it alone.
-      await this.store.update((draft) => {
-        draft.cleanup[home] = { family: "pi", accountId: id, why: "unfinished", at: new Date().toISOString() };
-      });
-      if (proxy) await adapter.setProxy?.(home, proxy);
-      await adapter.setApi(home, { key, baseUrl });
-      await adapter.prepareHome(home);
-      await this.store.update((draft) => {
-        // Checked again here too: another add of the same key may have finished meanwhile.
-        const twin = accountsOf(draft, "pi").find((entry) => entry.identity === identity);
-        if (twin) throw new Error(`That key is already added as "${twin.label}".`);
-        const account = newAccount({ id, family: "pi", kind: "managed", home, auth: "api" });
-        account.label = input.label.trim();
-        account.autoLabel = false;
-        account.identity = identity;
-        draft.accounts.push(account);
-        delete draft.cleanup[home];
-      });
-    } catch (error) {
-      // Gone now, or left on the cleanup list for a later pass.
-      const removed = await removeHome(home).then(
-        () => true,
-        () => false,
+    if (!identity.signedIn) {
+      throw new Error(
+        `Claude Code isn't signed in with ${shown}. Sign in there first (CLAUDE_CONFIG_DIR=${shown} claude, then /login), using the same path, or add the account with a Claude subscription sign-in instead.`,
       );
-      if (removed) await this.store.update((draft) => void delete draft.cleanup[home]).catch(() => undefined);
-      throw error;
-    } finally {
-      this.creatingHomes.delete(home);
     }
-    await this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
-    await this.refreshLaunchers().catch((error: unknown) => log("could not write the Pi scripts", error));
-    const added = findAccount(await this.store.read(), id);
-    if (added) void this.checkEgress(added);
-    return id;
-  }
-
-  /** Changes a Pi account's key (empty keeps it) or base URL; Pi's own login's too, when asked to here. */
-  async updateApiAccount(accountId: string, input: { key?: string; baseUrl?: string }): Promise<void> {
-    await this.onAccount(accountId, async (account) => {
-      if (!account) throw new Error("That account no longer exists.");
-      const adapter = this.adapters[account.family];
-      const key = input.key?.trim() || null;
-      const baseUrl = input.baseUrl?.trim() ? normalizeBaseUrl(input.baseUrl) : null;
-      // Pi's own login keeps its key in Pi's own files, which the adapter changes in place.
-      if (account.kind === "main" && adapter.mainApi && adapter.setApi) {
-        await adapter.setApi(null, { key, baseUrl });
-        await this.followMainSettings(account.family);
-        return;
-      }
-      if (account.auth !== "api" || !account.home || !adapter.setApi) throw new Error(`${account.label} signs in with a subscription, not an API key.`);
-      // A kept key stays on its base URL (the adapter refuses to move it), so its identity holds.
-      const identity = key ? apiIdentity(baseUrl, keyDigest(key)) : null;
-      if (identity) {
-        const duplicate = accountsOf(await this.store.read(), account.family).find((entry) => entry.id !== account.id && entry.identity === identity);
-        if (duplicate) throw new Error(`That key is already added as "${duplicate.label}".`);
-      }
-      await adapter.setApi(account.home, { key, baseUrl }, this.stillHas(account));
-      await this.store.update((draft) => {
-        const target = findAccount(draft, accountId);
-        if (!target) return;
-        if (!identity) return;
-        target.identity = identity;
-        // A new key is worth trying again even if the old one had been refused.
-        target.signedIn = true;
-      });
+    if (!identity.identity) throw new Error(`${shown} uses an API key or token, not a Claude subscription. Add it with "API key or token" instead.`);
+    let account: StoredAccount | undefined;
+    await this.store.update((draft) => {
+      if (draft.accounts.some((entry) => entry.home && resolve(entry.home) === home)) throw new Error(`${shown} is already added.`);
+      // The CLI's own login counts too: an added account must be one of its own.
+      const duplicate = accountsOf(draft, "claude").find((entry) => entry.identity === identity.identity);
+      if (duplicate) throw new Error(`${identity.email ?? shown} is already added as "${duplicate.label}".`);
+      // A folder of ZeroSub's own gets its ID back: a managed account's ID matches its folder's name there.
+      const name = basename(home);
+      const id = inHomesDir(home) && /^claude-[0-9a-f]{12}$/.test(name) && !findAccount(draft, name) ? name : `claude-${randomBytes(6).toString("hex")}`;
+      account = newAccount({ id, family: "claude", kind: "managed", home });
+      draft.accounts.push(account);
+      applyIdentity(account, identity, draft);
+      // A removed account's folder that's back isn't cleaned up after all.
+      for (const folder of Object.keys(draft.cleanup)) if (resolve(folder) === home) delete draft.cleanup[folder];
     });
-    const account = findAccount(await this.store.read(), accountId);
-    if (account) void this.checkEgress(account);
+    const added = account!;
+    this.identityCheckedAt.set(added.id, Date.now());
+    console.log(`[ZeroSub] added ${home}, signed in already, as ${added.label}`);
+    await this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
+    await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
+    void this.refreshUsage(added.id, true).catch(() => undefined);
+    return added.id;
   }
 
   /**
-   * Adds back a Pi account from its folder, which ZeroSub set up and kept when the account was
-   * removed (outside `homes/`, removing one only unregisters it): its key, base URL and proxy are
+   * Adds back a Pi account from its folder, which ZeroSub set up before and kept when the account
+   * was removed (outside `homes/`, removing one only unregisters it): its key, base URL and proxy are
    * still in its `zerosub.json`. The folder stays where it is, unless it's in `homes/` or a folder
-   * picked before, which it moves out of like any account's. Its name is the folder's.
+   * picked before, which it moves out of like any account's (see `placeHomes`). Refused, saying why,
+   * for a folder `chooseImportedPiHome` turns down, one without a key, or one whose key is added
+   * already. Its name is the folder's. Returns the new account's ID.
    */
   async importPiAccount(input: string): Promise<string> {
+    const adapter = this.adapters.pi;
     const home = await chooseImportedPiHome(input, (await this.store.read()).accounts);
     const shown = shownPath(home);
     const { key, baseUrl, proxy } = await readPiAccount(home);
@@ -3027,7 +3413,7 @@ export class Service {
     // would go through the one it inherits, which could read a key sent over plain http://, to this
     // machine too (`inherited` is null where the no-proxy list keeps the base URL direct).
     if (!proxy && plainHttp(baseUrl)) {
-      const inherited = (await this.adapters.pi.proxyState?.(home))?.inherited;
+      const inherited = (await adapter.proxyState?.(home))?.inherited;
       if (inherited) {
         throw new Error(
           `${shown} sends its key over plain http:// to ${baseUrl} and has no proxy of its own, so it would go through ${maskProxy(inherited.proxy)} (${inherited.from}), which could read it. Add it as a new account with its key instead.`,
@@ -3047,265 +3433,24 @@ export class Service {
       account.autoLabel = false;
       account.identity = identity;
       draft.accounts.push(account);
-      // A folder in `homes/` waiting to be cleaned up is an account's again.
-      delete draft.cleanup[home];
+      for (const folder of Object.keys(draft.cleanup)) if (resolve(folder) === home) delete draft.cleanup[folder];
     });
     const added = account!;
-    await this.adapters.pi.prepareHome(home, this.stillHas(added)).catch((error: unknown) => log(`could not refresh the home of ${added.label}`, error));
+    await adapter.prepareHome(home, this.stillHas(added)).catch((error: unknown) => log(`could not refresh the home of ${added.label}`, error));
     console.log(`[ZeroSub] added the Pi account in ${home} back as ${added.label}`);
     await this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
-    await this.refreshLaunchers().catch((error: unknown) => log("could not write the Pi scripts", error));
-    void this.checkEgress(added);
+    await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
     return added.id;
-  }
-
-  /**
-   * Changes the folder added Pi accounts' homes are kept in (empty: the default, `~/.pi-config`).
-   * New accounts go there, and the accounts in the folder it replaces, or still in ZeroSub's
-   * `homes/`, move there one at a time as nothing runs on them (see `placeHomes`). Returns the
-   * folder as shown, and how many accounts are due to move.
-   */
-  async setPiHomesDir(input: string): Promise<{ dir: string; moving: number }> {
-    const state = await this.store.read();
-    const chosen = await choosePiHomesDir(input, state.accounts);
-    const previous = resolve(piHomesDir(state.piHomes));
-    const updated = await this.store.update((draft) => {
-      const from = new Set(draft.piHomes.from.map((folder) => resolve(folder)));
-      from.add(previous);
-      from.delete(resolve(piHomesDir({ dir: chosen, from: [] })));
-      draft.piHomes = { dir: chosen, from: [...from] };
-    });
-    this.moveNotes.clear();
-    const dir = piHomesDir(updated.piHomes);
-    console.log(`[ZeroSub] added Pi accounts' homes are kept in ${dir} now`);
-    void this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
-    return { dir: shownPath(dir), moving: (await this.dueMoves(updated)).length };
-  }
-
-  /**
-   * Moves added Pi accounts' homes to the folder they're kept in (see `piHomesDir`): a new account's
-   * from ZeroSub's own `homes/`, where it was set up, and every account's from a folder picked
-   * before. Moves cut short (the plugin stopped halfway) are finished first. Each home moves only
-   * while nothing runs on it (see `moveAccountHome`); one in use waits for a later pass, and the app
-   * says why. One pass at a time; a call during one gets that one.
-   */
-
-  /**
-   * Moves added Pi accounts' homes to the folder they're kept in (see `piHomesDir`): a new account's
-   * from ZeroSub's own `homes/`, where it was set up, and every account's from a folder picked
-   * before. Moves cut short (the plugin stopped halfway) are finished first. Each home moves only
-   * while nothing runs on it (see `moveAccountHome`); one in use waits for a later pass, and the app
-   * says why. One pass at a time; a call during one gets that one.
-   */
-  placeHomes(): Promise<void> {
-    this.placing ??= this.placePass().finally(() => {
-      this.placing = null;
-    });
-    return this.placing;
-  }
-
-  private async placePass(): Promise<void> {
-    const adapter = this.adapters.pi;
-    if (!adapter.homesInUse) return;
-    for (const [accountId, move] of Object.entries((await this.store.read()).moves)) {
-      await this.finishMove(accountId, move).catch((error: unknown) => {
-        this.moveNotes.set(accountId, { waiting: null, error: describe(error) });
-        log(`could not finish moving ${move.from} to ${move.to}`, error);
-      });
-    }
-    const state = await this.store.read();
-    const due = await this.dueMoves(state);
-    for (const accountId of this.moveNotes.keys()) {
-      if (!due.some((account) => account.id === accountId) && !state.moves[accountId]) this.moveNotes.delete(accountId);
-    }
-    if (due.length === 0) return this.forgetEmptiedFolders(state);
-    let inUse: Set<string>;
-    try {
-      inUse = await adapter.homesInUse(due.map((account) => account.home));
-    } catch (error) {
-      for (const account of due) this.moveNotes.set(account.id, { waiting: null, error: `ZeroSub couldn't tell whether anything runs on it: ${describe(error)}` });
-      return;
-    }
-    const dir = piHomesDir(state.piHomes);
-    const taken = new Set(state.accounts.flatMap((account) => (account.home ? [resolve(account.home)] : [])));
-    let moved = false;
-    for (const account of due) {
-      const waiting = this.moveBlocker(account, inUse);
-      if (waiting) {
-        this.moveNotes.set(account.id, { waiting, error: null });
-        continue;
-      }
-      const to = await placeFor(account, dir, taken);
-      taken.add(resolve(to));
-      try {
-        if (await this.moveAccountHome(account, to)) moved = true;
-      } catch (error) {
-        this.moveNotes.set(account.id, { waiting: null, error: describe(error) });
-        log(`could not move the home of ${account.label} to ${to}`, error);
-      }
-    }
-    if (moved) await this.refreshLaunchers().catch((error: unknown) => log("could not write the Pi scripts", error));
-  }
-
-  /**
-   * Added Pi accounts whose homes are due to move: a folder of their own (a link stays where it
-   * points) in ZeroSub's `homes/` or a folder picked before, and no move of theirs under way.
-   */
-  private async dueMoves(state: StoredState): Promise<Array<StoredAccount & { home: string }>> {
-    if (!this.adapters.pi.homesInUse) return [];
-    const dir = resolve(piHomesDir(state.piHomes));
-    const sources = new Set([homesDir(), ...state.piHomes.from].map((folder) => resolve(folder)));
-    const due: Array<StoredAccount & { home: string }> = [];
-    for (const account of accountsOf(state, "pi")) {
-      const home = account.home;
-      if (account.kind !== "managed" || !home || state.moves[account.id]) continue;
-      const folder = dirname(resolve(home));
-      if (folder === dir || !sources.has(folder)) continue;
-      if ((await lstat(home).catch(() => null))?.isDirectory()) due.push({ ...account, home });
-    }
-    return due;
-  }
-
-  /** Why an account's home can't move just now, or null when it can. */
-  private moveBlocker(account: StoredAccount & { home: string }, inUse: ReadonlySet<string>): string | null {
-    const { home } = account;
-    if (this.creatingHomes.has(home)) return "it's being set up";
-    if (inUse.has(home)) return "Pi runs on it (an agent or a terminal); it moves once that stops";
-    if ((this.homeCalls.get(home) ?? 0) > 0) return "ZeroSub is working on it";
-    if (Date.now() - (this.routedAt.get(account.id) ?? 0) < ROUTED_SETTLE_MS) return "an agent has just started on it";
-    return null;
-  }
-
-  /**
-   * Moves an account's home to `to`, once nothing runs on it. Nothing waits for the move: a session
-   * routed to the home, or a call of ZeroSub's on it, while the folder is being moved makes the move
-   * give way (the folder goes back, and it's tried at a later pass), and once the move is saved
-   * they're given the new folder (see `homeNow`). The move is written down first (`moves`), so one
-   * cut short is finished or undone at the next pass (see `finishMove`). Everything a Pi account has
-   * is in its folder, so the folder is all that moves. False when it had to wait after all.
-   */
-  private async moveAccountHome(account: StoredAccount & { home: string }, to: string): Promise<boolean> {
-    const from = account.home;
-    const homesInUse = (homes: readonly string[]) => this.adapters.pi.homesInUse!(homes);
-    const waiting = this.moveBlocker(account, await homesInUse([from]));
-    if (waiting) {
-      this.moveNotes.set(account.id, { waiting, error: null });
-      return false;
-    }
-    const startedAt = Date.now();
-    const move: Move = { from, to, at: new Date(startedAt).toISOString() };
-    const run: HomeMove = { from, to, committed: false };
-    this.moving.set(account.id, run);
-    try {
-      await this.store.update((draft) => void (draft.moves[account.id] = move));
-      try {
-        await moveHome(from, to, async () => {
-          // Checked again once the folder is there: anything that started on it meanwhile keeps it.
-          const started = (await homesInUse([from])).has(from)
-            ? "Pi started on it (an agent or a terminal); it moves once that stops"
-            : (this.homeCalls.get(from) ?? 0) > 0
-              ? "ZeroSub is working on it"
-              : (this.routedAt.get(account.id) ?? 0) >= startedAt
-                ? "an agent has just started on it"
-                : null;
-          if (started) throw new MoveGaveWay(started);
-          run.committed = true;
-          try {
-            await this.store.update((draft) => {
-              const target = findAccount(draft, account.id);
-              if (target?.home !== from) throw new Error(`${account.label} was removed or changed while its home was moving`);
-              target.home = to;
-            });
-          } catch (error) {
-            run.committed = false;
-            throw error;
-          }
-        });
-      } catch (error) {
-        // Still where it was: the record goes. Otherwise it stays, for `finishMove` to sort out.
-        const back = (await lstat(from).catch(() => null))?.isDirectory() && !(await lstat(to).catch(() => null));
-        if (back) await this.store.update((draft) => void delete draft.moves[account.id]).catch(() => undefined);
-        if (!(error instanceof MoveGaveWay)) throw error;
-        this.moveNotes.set(account.id, { waiting: error.message, error: null });
-        return false;
-      }
-      this.moved.set(account.id, { from, to });
-    } finally {
-      this.moving.delete(account.id);
-    }
-    await this.finishMove(account.id, move);
-    return true;
-  }
-
-  /**
-   * Finishes a recorded move of an account's home. Cut short before the folder moved: the move is
-   * tried again. After the folder moved but before the account's new home was saved: it's saved now.
-   * Both folders there before it's saved: the account goes with the one that has its key
-   * (`zerosub.json`). Only the new one has it when Pi made the old folder again while the move was
-   * checking for Pi (a terminal with the old script, say), so the folder couldn't go back: the move is
-   * finished, and the old folder left alone. Otherwise, and when neither folder is there, it's left as
-   * it is for the user, and the app says so, never asking to delete the folder with the key. The old
-   * folder still there after (a copy onto another disk not cleaned up) is left alone, and logged. The
-   * account's script is rewritten for the new home before the record goes.
-   */
-  private async finishMove(accountId: string, move: Move): Promise<void> {
-    const forget = () => this.store.update((draft) => void delete draft.moves[accountId]);
-    let account = findAccount(await this.store.read(), accountId);
-    const folder = async (path: string) => (await lstat(path).catch(() => null))?.isDirectory() === true;
-    const [atFrom, atTo] = [await folder(move.from), await folder(move.to)];
-    if (account?.home === move.from) {
-      if (atFrom && !atTo) {
-        await forget();
-        return;
-      }
-      const keyed = async (path: string) => (await lstat(join(path, PI_ACCOUNT_FILE)).catch(() => null))?.isFile() === true;
-      const [keyFrom, keyTo] = atFrom && atTo ? [await keyed(move.from), await keyed(move.to)] : [false, false];
-      if (atFrom && atTo && keyTo && !keyFrom) {
-        console.log(`[ZeroSub] ${move.from} was made again while ${account.label} moved to ${move.to}, which has its key; finishing the move and leaving ${move.from} alone (delete it yourself)`);
-      } else if (atFrom || !atTo) {
-        throw new Error(
-          !atFrom
-            ? `ZeroSub stopped while moving ${shownPath(move.from)} to ${shownPath(move.to)}, and neither is there now.`
-            : keyFrom
-              ? `ZeroSub stopped while copying ${shownPath(move.from)} to ${shownPath(move.to)} on another disk, and both are there now. The account still uses ${shownPath(move.from)}: delete ${shownPath(move.to)}, and the move starts again at ZeroSub's next check.`
-              : `Both ${shownPath(move.from)} and ${shownPath(move.to)} are there, and neither has the account's key (${PI_ACCOUNT_FILE}). Enter its key again from its card.`,
-        );
-      }
-      await this.store.update((draft) => {
-        const target = findAccount(draft, accountId);
-        if (target?.home === move.from) target.home = move.to;
-      });
-      account = findAccount(await this.store.read(), accountId);
-    }
-    // While the move is still on record, so the account's script is rewritten, not released.
-    if (account?.home === move.to) await this.refreshLaunchers();
-    await forget();
-    this.moveNotes.delete(accountId);
-    if (account?.home === move.to && atFrom) {
-      console.log(`[ZeroSub] ${move.from} is still there after ${account.label} moved to ${move.to}; it's an old copy, left alone (delete it yourself)`);
-    }
-    if (account?.home === move.to) console.log(`[ZeroSub] moved the home of ${account.label} from ${move.from} to ${move.to}`);
-  }
-
-  /** Stops moving accounts out of folders picked before once none of theirs is left there. */
-  private async forgetEmptiedFolders(state: StoredState): Promise<void> {
-    const used = (folder: string) =>
-      state.accounts.some((account) => account.home && dirname(resolve(account.home)) === resolve(folder)) ||
-      Object.values(state.moves).some((move) => dirname(resolve(move.from)) === resolve(folder));
-    if (state.piHomes.from.every(used)) return;
-    await this.store.update((draft) => {
-      draft.piHomes.from = draft.piHomes.from.filter(used);
-    });
   }
 
   // ------------------------------------------------------------------ RPC: sign-in
 
-  startLogin(family: Family, method: LoginMethod, accountId?: string): Promise<LoginView> {
-    return this.loginLocks[family].run(() => this.beginLogin(family, method, accountId));
+  startLogin(family: Family, method: LoginMethod, accountId?: string, proxy?: string): Promise<LoginView> {
+    return this.loginLocks[family].run(() => this.beginLogin(family, method, accountId, proxy));
   }
 
-  private async beginLogin(family: Family, method: LoginMethod, accountId?: string): Promise<LoginView> {
-    // Pi's added accounts are API keys, and its own login signs in inside Pi.
+  private async beginLogin(family: Family, method: LoginMethod, accountId?: string, proxyInput?: string): Promise<LoginView> {
+    // Pi's added accounts are API keys, and its CLI login signs in inside Pi.
     if (family === "pi") throw new Error("Pi accounts use an Anthropic API key: add one with Add account, or change its key from its card. Sign Pi's own login in with /login inside Pi.");
     let availability = this.availability.get(family);
     if (!availability?.ok) {
@@ -3320,6 +3465,10 @@ export class Service {
     const state = await this.store.read();
     const existing = accountId ? findAccount(state, accountId) : undefined;
     if (accountId && (!existing || existing.family !== family)) throw new Error("That account no longer exists.");
+    if (existing?.auth === "api") throw new Error(`${existing.label} uses an API key. Change the key from its card instead.`);
+    // A new account's proxy is in place before the CLI starts, so the sign-in itself goes through it.
+    const proxy = !existing && proxyInput?.trim() ? normalizeProxy(proxyInput) : null;
+    if (proxy && !this.adapters[family].setProxy) throw new Error(`A proxy can't be set for ${FAMILY_LABEL[family]} accounts yet.`);
 
     const id = randomBytes(6).toString("hex");
     const home = existing ? existing.home : join(homesDir(), `${family}-${id}`);
@@ -3353,6 +3502,7 @@ export class Service {
           draft.cleanup[home] = { family, accountId: `${family}-${id}`, why: "unfinished", at: new Date().toISOString() };
         });
       }
+      if (home && proxy) await this.adapters[family].setProxy?.(home, proxy);
       if (home) await this.adapters[family].prepareHome(home);
       const handle = await this.adapters[family].login(home, method);
       if (session.finishedAt) {
@@ -3404,16 +3554,22 @@ export class Service {
 
     const state = await this.store.read();
     const existing = findAccount(state, session.accountId);
+    if (session.accountId && !existing) return this.failLogin(session, REMOVED_WHILE_SIGNING_IN);
     if (existing?.kind === "managed" && existing.identity && identity.identity && !sameAccountIdentity(session.family, existing, identity)) {
-      // Signing an account back in must not quietly turn it into a different login.
-      if (session.home) await adapter.logout(session.home).catch(() => undefined);
+      // Signing an account back in must not quietly turn it into a different login. A home kept
+      // outside homes/ isn't signed out, though: it keeps what the CLI wrote until the user signs in again.
+      const kept = session.home !== null && !(await isOwnHome(session.home));
+      if (session.home) await this.signOut(session.family, session.home).catch(() => undefined);
+      const keptNote = kept
+        ? ` Its folder is outside ZeroSub's own, so ZeroSub didn't sign it out: until then it's signed in as ${identity.email ?? "that login"}.`
+        : "";
       const expected = existing.email ?? existing.label;
       // Only a Codex key can come without the email, and then it doesn't say which member signed in.
       return this.failLogin(
         session,
         identity.email
-          ? `You signed in as ${identity.email}, but this is ${expected}. Sign in as ${expected}, or use Add account for the other one.`
-          : `Couldn't tell which workspace member signed in, because Codex didn't return an email. Sign in again as ${expected}.`,
+          ? `You signed in as ${identity.email}, but this is ${expected}. Sign in as ${expected}, or use Add account for the other one.${keptNote}`
+          : `Couldn't tell which workspace member signed in, because Codex didn't return an email. Sign in again as ${expected}.${keptNote}`,
       );
     }
     // The CLI's own login is whatever the user signs it into; only added accounts must be distinct.
@@ -3424,7 +3580,7 @@ export class Service {
           )
         : undefined;
     if (duplicate) {
-      if (!existing && session.home) await adapter.logout(session.home).catch(() => undefined);
+      if (!existing && session.home) await this.signOut(session.family, session.home).catch(() => undefined);
       return this.failLogin(
         session,
         `${identity.email ?? "That account"} is already added as "${duplicate.label}". Sign in with a different account.`,
@@ -3434,13 +3590,19 @@ export class Service {
     session.finishedAt = Date.now(); // Claim completion before writing, so a late cancel can't race it.
 
     let accountId = session.accountId;
+    let removed = false;
     let handedOver = false;
     session.saving = true;
     try {
       await this.store.update((draft) => {
         let account = findAccount(draft, accountId);
+        if (!account && accountId) {
+          // Removed while signing back in: it stays removed (see `remove`).
+          removed = true;
+          return;
+        }
         if (!account) {
-          // A managed account's ID matches its home's folder name, as its cleanup entry does.
+          // A managed account's ID matches its home's folder name.
           accountId = `${session.family}-${session.id}`;
           account = newAccount({ id: accountId, family: session.family, kind: "managed", home: session.home });
           draft.accounts.push(account);
@@ -3454,16 +3616,18 @@ export class Service {
     } catch (error) {
       // A new account's home is then cleaned up as an unfinished sign-in, like any that failed.
       log("could not save the account just signed in", error);
-      session.view = { ...session.view, step: "failed", message: `Signed in, but ZeroSub couldn't save the account: ${describe(error)}` };
-      this.scheduleCleanup();
-      return;
+      return this.endLogin(session, `Signed in, but ZeroSub couldn't save the account: ${describe(error)}`);
     } finally {
       session.saving = false;
     }
+    if (removed) return this.endLogin(session, REMOVED_WHILE_SIGNING_IN);
     if (accountId) this.identityCheckedAt.set(accountId, Date.now());
     if (accountId && handedOver) this.forgetReading(accountId);
     session.accountId = accountId;
     session.view = { ...session.view, step: "done", accountId, message: null };
+    // Signed in in `homes/`, then moved to where accounts are kept.
+    await this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
+    await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
     if (accountId) void this.refreshUsage(accountId, true).catch(() => undefined);
   }
 
@@ -3471,6 +3635,11 @@ export class Service {
     if (session.finishedAt) return;
     session.finishedAt = Date.now();
     session.handle?.cancel();
+    this.endLogin(session, message);
+  }
+
+  /** Shows a sign-in as failed, after `finishLogin` has claimed its completion. */
+  private endLogin(session: LoginSession, message: string): void {
     session.view = { ...session.view, step: "failed", message };
     this.scheduleCleanup();
   }
@@ -3478,7 +3647,21 @@ export class Service {
 
 // -------------------------------------------------------------------- helpers
 
-/** What tells an API key's account from another: where the key goes, and a short hash of the key. */
+interface ApiAccountInput extends Partial<TrafficSwitches> {
+  /** Left out for Pi accounts, which only take an API key. */
+  keyKind?: ApiKeyKind;
+  baseUrl?: string;
+}
+
+function trafficSwitches(input: Partial<TrafficSwitches>): TrafficSwitches {
+  return {
+    disableTelemetry: input.disableTelemetry === true,
+    disableErrorReporting: input.disableErrorReporting === true,
+    disableNonessentialTraffic: input.disableNonessentialTraffic === true,
+  };
+}
+
+/** Spots the same key being added twice without keeping the key: a short hash, scoped to its endpoint. */
 function apiIdentity(baseUrl: string | null, digest: string): string {
   return `api|${baseUrl ?? "anthropic"}|${digest}`;
 }
@@ -3543,7 +3726,7 @@ function applyIdentityFields(account: StoredAccount, identity: Identity, state: 
   account.plan = identity.plan ?? account.plan;
   account.organization = identity.organization ?? account.organization;
   if (!vaguer) account.identity = identity.identity ?? account.identity;
-  // An identity without an email (Pi's) has nothing better to call an account that has a name.
+  // An identity without an email (Pi's, say) has nothing better to call an account that has a name.
   if ((account.autoLabel && (identity.email || !account.label)) || !account.label) {
     account.label = suggestLabel(account, state);
     account.autoLabel = true;

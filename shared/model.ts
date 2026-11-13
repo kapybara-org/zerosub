@@ -35,6 +35,19 @@ export const UsageWindowSchema = z.object({
 });
 export type UsageWindow = z.infer<typeof UsageWindowSchema>;
 
+/** The address an account's requests come from, as the provider's edge sees it. */
+export const EgressSchema = z.object({
+  /** From the last check that worked. */
+  ip: z.string().nullable(),
+  /** The country the edge places it in, like "US". */
+  country: z.string().nullable(),
+  /** When that check was. */
+  checkedAt: z.string().nullable(),
+  /** Why the latest check failed, when it did. */
+  error: z.string().nullable(),
+});
+export type Egress = z.infer<typeof EgressSchema>;
+
 /** Banked limit resets the provider has granted this account (Claude "limit reset", Codex reset credits). */
 export const ResetOfferSchema = z.object({
   /** Resets left to use. */
@@ -83,34 +96,43 @@ export const AccountKindSchema = z.enum([
 export type AccountKind = z.infer<typeof AccountKindSchema>;
 
 export const AuthKindSchema = z.enum([
-  /** Signed in with a Claude or ChatGPT subscription (or, for Pi's own login, whatever Pi is signed in to). */
+  /** Signed in with a Claude or ChatGPT subscription. */
   "subscription",
-  /** An added Pi account: an Anthropic API key, billed per use, so never picked automatically. */
+  /** An API key or token, optionally against another base URL. Billed per use, so never picked automatically. */
   "api",
 ]);
 export type AuthKind = z.infer<typeof AuthKindSchema>;
 
-/** An API key's settings as shown in the app; the key itself never leaves the host. */
-export const ApiSummarySchema = z.object({
+export const ApiKeyKindSchema = z.enum([
+  /** `ANTHROPIC_API_KEY`, sent as `x-api-key`. */
+  "api_key",
+  /** `ANTHROPIC_AUTH_TOKEN`, sent as `Authorization: Bearer`. */
+  "auth_token",
+]);
+export type ApiKeyKind = z.infer<typeof ApiKeyKindSchema>;
+
+/** Claude Code's own switches; each is off unless the user turns it on. */
+export const TrafficSwitchesSchema = z.object({
+  /** `DISABLE_TELEMETRY`. */
+  disableTelemetry: z.boolean().default(false),
+  /** `DISABLE_ERROR_REPORTING`. */
+  disableErrorReporting: z.boolean().default(false),
+  /** `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`: everything not needed to talk to the model. */
+  disableNonessentialTraffic: z.boolean().default(false),
+});
+export type TrafficSwitches = z.infer<typeof TrafficSwitchesSchema>;
+
+/** An API account's settings as shown in the app; the key itself never leaves the host. */
+export const ApiSummarySchema = TrafficSwitchesSchema.extend({
+  /** Left out by providers whose accounts only take an API key (Pi's). */
+  keyKind: ApiKeyKindSchema.default("api_key"),
   /** The key's last four characters, or empty for a key too short to show any of it. */
   keyHint: z.string(),
-  /** Where Anthropic's requests go, or null for Anthropic's own API. */
+  /** `ANTHROPIC_BASE_URL`, or null for Anthropic's own API. */
   baseUrl: z.string().nullable(),
 });
-export type ApiSummary = z.infer<typeof ApiSummarySchema>;
-
-/** The address an account's requests come from, as the provider's edge sees it. */
-export const EgressSchema = z.object({
-  /** From the last check that worked. */
-  ip: z.string().nullable(),
-  /** The country the edge places it in, like "US". */
-  country: z.string().nullable(),
-  /** When that check was. */
-  checkedAt: z.string().nullable(),
-  /** Why the latest check failed, when it did. */
-  error: z.string().nullable(),
-});
-export type Egress = z.infer<typeof EgressSchema>;
+/** As an adapter gives it: the kind and switches may be left out, and are filled in for the client. */
+export type ApiSummary = z.input<typeof ApiSummarySchema>;
 
 /** `disabled`: the user set it aside for a while; it stays signed in but nothing is routed to it. */
 export const AccountStatusSchema = z.enum(["ready", "signed_out", "limited", "checking", "disabled"]);
@@ -121,10 +143,24 @@ export const AccountViewSchema = z.object({
   family: FamilySchema,
   label: z.string(),
   kind: AccountKindSchema,
+  auth: AuthKindSchema.default("subscription"),
+  /** Set for `api` accounts, and for Pi's CLI login while it keeps an Anthropic API key. */
+  api: ApiSummarySchema.nullable().default(null),
+  /**
+   * Its Anthropic key and base URL can be changed from its card: `api` accounts, and Pi's CLI login
+   * (in Pi's own `auth.json` and `models.json`). False from older servers.
+   */
+  apiEditable: z.boolean().default(false),
   email: z.string().nullable(),
   plan: z.string().nullable(),
   organization: z.string().nullable(),
   status: AccountStatusSchema,
+  /**
+   * Set aside by the user. `status` names only one state, and a signed-out account says
+   * `signed_out` even when it's also disabled, so this tells whether it needs enabling.
+   * False from older servers, which only said so through `status`.
+   */
+  disabled: z.boolean().default(false),
   isDefault: z.boolean(),
   /** Set while the next new agent of this family will start on this account (one-time pick). */
   nextAgentUntil: z.string().nullable().optional(),
@@ -132,31 +168,41 @@ export const AccountViewSchema = z.object({
   usage: UsageSchema.nullable(),
   agentCount: z.number(),
   home: z.string().nullable(),
-  auth: AuthKindSchema.default("subscription"),
-  /** An added Pi account's key (reduced to a hint) and base URL, and Pi's own login's while it keeps an Anthropic key. */
-  api: ApiSummarySchema.nullable().default(null),
-  /** Its Anthropic key and base URL can be changed from its card (Pi accounts, Pi's own login included). */
-  apiEditable: z.boolean().default(false),
-  /** The account's own proxy, password hidden (as `HIDDEN`). Null when it uses whatever it inherits. */
+  /**
+   * The home is outside ZeroSub's own `homes/` folder: where added Claude accounts are kept
+   * (`StateView.claudeHomes`), or somewhere the user moved it. Removing the account then only takes
+   * it out of ZeroSub: its sign-in, files and launcher stay. False from older servers.
+   */
+  externalHome: z.boolean().default(false),
+  /** The account's own proxy, password hidden (as `HIDDEN`). Null when it uses whatever the CLI inherits. */
   proxy: z.string().nullable().default(null),
-  /** A proxy can be set for this account here (Pi accounts, Pi's own login included). */
+  /** ZeroSub can set a proxy for this account (Claude accounts, the CLI login included). */
   proxyEditable: z.boolean().default(false),
-  /** The proxy it goes through without one of its own, password hidden, and where that's set. */
+  /**
+   * The proxy the account goes through when it has none of its own, password hidden, and where
+   * that's set (`~/.claude/settings.json`, say). Null when that's direct, and from older servers.
+   */
   inheritedProxy: z.object({ proxy: z.string(), from: z.string() }).nullable().default(null),
-  /** The user's file its own proxy is kept in (Pi's own login: `httpProxy` in `~/.pi/agent/settings.json`). */
+  /** Why a proxy can't be set here for this account just now; null when it can. */
+  proxyBlocked: z.string().nullable().default(null),
+  /**
+   * The user's file the account's own proxy is kept in, where setting one changes it: the CLI
+   * login's, while `~/.claude/settings.json` sets one. Null when ZeroSub keeps it.
+   */
   proxyFile: z.string().nullable().default(null),
   /** Added accounts that go through the same proxy, having none of their own, while it's kept in `proxyFile`. */
   proxyFollowers: z.array(z.string()).default([]),
-  /** Command (a script in `StateView.piLaunchers`) that starts the CLI on this account. */
+  /** Command (a script in `StateView.launchers`) that starts the CLI on this account. */
   launcher: z.string().nullable().default(null),
-  /** Where the account's requests come from, as Anthropic sees them; null when unknown or not Anthropic. */
+  /**
+   * Where the account's requests come from, as Anthropic sees them. Null before the first check,
+   * for providers that don't say, and when the account's requests go to another base URL first.
+   */
   egress: EgressSchema.nullable().default(null),
   /**
-   * The home is outside ZeroSub's own `homes/` folder (where added Pi accounts are kept): removing the
-   * account only takes it out of ZeroSub, and its folder, key and script stay.
+   * The account's home is due to move to `to`, where added Claude accounts are kept, and hasn't yet:
+   * what it waits for (Claude Code running on it, say), or what went wrong. Null when it stays.
    */
-  externalHome: z.boolean().default(false),
-  /** The account's home is due to move to `to`, and hasn't yet: what it waits for, or what went wrong. */
   moving: z.object({ to: z.string(), waiting: z.string().nullable(), error: z.string().nullable() }).nullable().default(null),
 });
 export type AccountView = z.infer<typeof AccountViewSchema>;
@@ -238,13 +284,22 @@ export const StateViewSchema = z.object({
    * and daemons started over SSH, where only the code sign-in works.
    */
   browserSignIn: z.boolean().default(true),
-  /** Directory with a `pi-<account>.sh` script per added Pi account, to put on `PATH`. */
+  /** Directory with a `claude-<account>` script per added Claude account, to put on `PATH`. */
+  launchers: z.string().nullable().default(null),
+  /**
+   * The folder added Claude accounts' homes are kept in (`~/.claude-config`, say), and whether it's
+   * the default. Null from older servers, which keep them in ZeroSub's own folder.
+   */
+  claudeHomes: z.object({ dir: z.string(), isDefault: z.boolean() }).nullable().default(null),
+  /** Directory with a `pi-<account>` script per added Pi account, to put on `PATH`. */
   piLaunchers: z.string().nullable().default(null),
   /** The folder added Pi accounts' homes are kept in (`~/.pi-config`, say), and whether it's the default. */
   piHomes: z.object({ dir: z.string(), isDefault: z.boolean() }).nullable().default(null),
   showComposerPill: z.boolean(),
   /** Accounts at their limit are skipped, so agents can't be moved onto one by hand either. */
-  autoSwitch: z.boolean().default(true),
+  autoSwitch: z.boolean().default(false),
+  /** "Keep going after a switch": the follow-up goes out after a switch or a banked reset. */
+  autoContinue: z.boolean().default(true),
   warnings: z.array(z.string()),
 });
 export type StateView = z.infer<typeof StateViewSchema>;

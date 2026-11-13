@@ -71,7 +71,6 @@ export class FamilyResolver {
       const { config } = await paseo.config.get();
       const providers = asRecord(config.providers);
       value = familiesFromConfig(providers);
-      // Pi's provider `env` (a proxy there, say) is what its agents inherit; see server/pi.ts.
       rememberProviderEnvs(value, providers);
     } catch (error) {
       console.warn("[ZeroSub] could not read provider config; using built-in providers only", describe(error));

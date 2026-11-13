@@ -3,8 +3,9 @@ import { copyText, Modal, TextInput, useToast } from "@getpaseo/plugin/client/re
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ActivityIndicator, Pressable, Text, View } from "react-native";
 import { formatPlan } from "../shared/format";
-import { FAMILY_LABEL, type Family, type LoginMethod, type LoginView } from "../shared/model";
-import { cancelLogin, startLogin, submitLoginCode } from "../shared/rpc";
+import { FAMILY_LABEL, type AccountView, type Family, type LoginMethod, type LoginView } from "../shared/model";
+import { cancelLogin, importAccount, startLogin, submitLoginCode } from "../shared/rpc";
+import { ApiAccountForm } from "./api-account";
 import { describe, useStore, type ZeroSubStore } from "./store";
 import { Button, useText } from "./ui";
 
@@ -38,6 +39,14 @@ export function AddAccountModal({
   const mobile = layout.platform === "ios" || layout.platform === "android";
   const hostBrowser = state?.browserSignIn !== false;
   const [method, setMethod] = useState<LoginMethod>(hostBrowser && !mobile ? "browser" : "code");
+  // A new Claude account gets its proxy before the sign-in starts, so the sign-in goes through it.
+  const askProxy = family === "claude" && !accountId;
+  // A new Claude account can sign in with a subscription, use an API key instead, or come from a
+  // folder that's signed in already.
+  const [stage, setStage] = useState<"mode" | "proxy" | "api" | "import" | "signin">(askProxy ? "mode" : "signin");
+  const [apiAdded, setApiAdded] = useState<string | null>(null);
+  const [imported, setImported] = useState<string | null>(null);
+  const [proxy, setProxy] = useState("");
   const [loginId, setLoginId] = useState<string | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
   // Each start gets a number; only the newest one's answer counts.
@@ -50,7 +59,12 @@ export function AddAccountModal({
       setStartError(null);
       setLoginId(null);
       try {
-        const login = await store.rpc(startLogin, { family, accountId, method: next });
+        const login = await store.rpc(startLogin, {
+          family,
+          accountId,
+          method: next,
+          proxy: askProxy && proxy.trim() ? proxy.trim() : undefined,
+        });
         // The modal closed (or a newer start replaced this one) before the daemon answered.
         if (closed.current || mine !== attempt.current) {
           void store.rpc(cancelLogin, { loginId: login.id }).catch(() => undefined);
@@ -61,16 +75,22 @@ export function AddAccountModal({
         if (!closed.current && mine === attempt.current) setStartError(describe(error));
       }
     },
-    [store, family, accountId],
+    [store, family, accountId, askProxy, proxy],
   );
 
   useEffect(() => {
-    if (attempt.current === 0) void begin(method);
+    if (!askProxy && attempt.current === 0) void begin(method);
+  }, [askProxy, begin, method]);
+
+  const continueToSignIn = useCallback(() => {
+    setStage("signin");
+    void begin(method);
   }, [begin, method]);
 
   useEffect(() => store.watchClosely(), [store]);
 
   const login = state?.logins.find((entry) => entry.id === loginId) ?? null;
+  const current = accountId ? state?.accounts.find((entry) => entry.id === accountId) : undefined;
   const account = login?.accountId ? state?.accounts.find((entry) => entry.id === login.accountId) : undefined;
   const finished = login ? login.step === "done" || login.step === "failed" || login.step === "canceled" : false;
 
@@ -89,14 +109,76 @@ export function AddAccountModal({
     [family, begin],
   );
 
-  const title = accountId ? "Sign in again" : `Add ${FAMILY_LABEL[family]} account`;
+  const title = accountId
+    ? "Sign in again"
+    : stage === "api"
+      ? "Add Claude API account"
+      : stage === "import"
+        ? "Add a signed-in folder"
+        : `Add ${FAMILY_LABEL[family]} account`;
   let body: ReactNode;
-  if (startError) {
+  if (stage === "mode") {
+    body = (
+      <ModeStep
+        theme={theme}
+        autoSwitch={state?.autoSwitch ?? false}
+        onSubscription={() => setStage("proxy")}
+        onApi={() => setStage("api")}
+        onImport={() => setStage("import")}
+        onCancel={close}
+      />
+    );
+  } else if (stage === "import") {
+    const added = imported ? state?.accounts.find((entry) => entry.id === imported) : undefined;
+    body = imported ? (
+      <>
+        <Text style={text.heading}>Account added</Text>
+        <Text style={text.body}>
+          {added ? describeAccount(added) : "The account"} is ready, signed in as it was. New Claude agents
+          {multiHost ? ` on ${host.label}` : ""} can use it, and you can move an agent to it from the account button in the
+          message box.
+        </Text>
+        <Row>
+          <Button theme={theme} tone="primary" label="Done" tooltip="Close this window" tooltipAlign="end" onPress={onClose} />
+        </Row>
+      </>
+    ) : (
+      <ImportStep theme={theme} store={store} onDone={setImported} onCancel={close} />
+    );
+  } else if (stage === "api") {
+    const added = apiAdded ? state?.accounts.find((entry) => entry.id === apiAdded) : undefined;
+    body = apiAdded ? (
+      <>
+        <Text style={text.heading}>Account added</Text>
+        <Text style={text.body}>
+          {added?.label ?? "The account"} is ready. Make it the default, or pick it for an agent from the account button in
+          the message box; ZeroSub never moves agents onto it by itself.
+        </Text>
+        <Row>
+          <Button theme={theme} tone="primary" label="Done" tooltip="Close this window" tooltipAlign="end" onPress={onClose} />
+        </Row>
+      </>
+    ) : (
+      <ApiAccountForm theme={theme} store={store} onDone={setApiAdded} onCancel={close} />
+    );
+  } else if (stage === "proxy") {
+    body = <ProxyStep theme={theme} proxy={proxy} onChange={setProxy} onCancel={close} onContinue={continueToSignIn} />;
+  } else if (startError) {
     body = (
       <>
         <Text style={text.danger}>{startError}</Text>
         <Row>
           <Button theme={theme} label="Close" tooltip="Close without adding an account" tooltipAlign="end" onPress={close} />
+          {askProxy ? (
+            <Button
+              theme={theme}
+              icon="Globe"
+              label="Change proxy"
+              tooltip="Go back and change the proxy for this account"
+              tooltipAlign="end"
+              onPress={() => setStage("proxy")}
+            />
+          ) : null}
           <Button
             theme={theme}
             tone="primary"
@@ -126,11 +208,7 @@ export function AddAccountModal({
   } else if (login.step === "verifying") {
     body = <Waiting theme={theme} label="Checking your account…" />;
   } else if (login.step === "done") {
-    const who = account
-      ? `${account.label}${account.email && account.email !== account.label ? ` (${account.email})` : ""}${
-          account.plan ? ` · ${formatPlan(account.plan)}` : ""
-        }`
-      : "The account";
+    const who = account ? describeAccount(account) : "The account";
     body = (
       <>
         <Text style={text.heading}>You're signed in</Text>
@@ -151,6 +229,16 @@ export function AddAccountModal({
         </Text>
         <Row>
           <Button theme={theme} label="Close" tooltip="Close without adding an account" tooltipAlign="end" onPress={close} />
+          {askProxy ? (
+            <Button
+              theme={theme}
+              icon="Globe"
+              label="Change proxy"
+              tooltip="Go back and change the proxy for this account"
+              tooltipAlign="end"
+              onPress={() => setStage("proxy")}
+            />
+          ) : null}
           <Button
             theme={theme}
             tone="primary"
@@ -172,6 +260,9 @@ export function AddAccountModal({
           <Text style={text.small}>Adds the account on {host.label} only. Other hosts sign in separately.</Text>
         ) : null}
         {body}
+        {stage === "signin" && !startError && login && login.step !== "done" && login.step !== "failed" ? (
+          <ProxyNote theme={theme} proxy={askProxy ? (proxy.trim() ? "the proxy you entered" : null) : (current?.proxy ?? null)} />
+        ) : null}
       </Modal.Content>
     </Modal>
   );
@@ -349,6 +440,233 @@ function SignInSteps({
       ) : null}
     </View>
   );
+}
+
+/** "work (work@acme.com) · Max": an account as the finished steps name it. */
+function describeAccount(account: AccountView): string {
+  return `${account.label}${account.email && account.email !== account.label ? ` (${account.email})` : ""}${
+    account.plan ? ` · ${formatPlan(account.plan)}` : ""
+  }`;
+}
+
+function ModeStep({
+  theme,
+  autoSwitch,
+  onSubscription,
+  onApi,
+  onImport,
+  onCancel,
+}: {
+  theme: Theme;
+  /** Agents move off an account at its limit by themselves only with automatic switching on. */
+  autoSwitch: boolean;
+  onSubscription(): void;
+  onApi(): void;
+  onImport(): void;
+  onCancel(): void;
+}) {
+  const text = useText(theme);
+  return (
+    <View style={{ gap: 12 }}>
+      <Text style={text.strong}>How does this account connect?</Text>
+      <Choice
+        theme={theme}
+        title="Claude subscription"
+        detail={`Sign in with a Claude Pro or Max account. Usage limits are tracked${
+          autoSwitch
+            ? " and agents move between accounts automatically."
+            : "; turn on automatic switching to have agents move between accounts by themselves."
+        }`}
+        onPress={onSubscription}
+      />
+      <Choice
+        theme={theme}
+        title="API key or token"
+        detail="An Anthropic API key, or a key for another endpoint via its base URL. Billed per use; used only when you choose it."
+        onPress={onApi}
+      />
+      <Choice
+        theme={theme}
+        title="A folder that's signed in already"
+        detail="A Claude Code folder (its CLAUDE_CONFIG_DIR) signed in with a subscription: one you set up yourself, or one kept when you removed its account here. No sign-in; it stays where it is."
+        onPress={onImport}
+      />
+      <Row>
+        <Button theme={theme} label="Cancel" tooltip="Close without adding an account" tooltipAlign="end" onPress={onCancel} />
+      </Row>
+    </View>
+  );
+}
+
+function Choice({ theme, title, detail, onPress }: { theme: Theme; title: string; detail: string; onPress(): void }) {
+  const text = useText(theme);
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={title}
+      onPress={onPress}
+      style={{ gap: 4, padding: 12, borderRadius: 10, borderWidth: 1, borderColor: theme.colors.border, backgroundColor: theme.colors.surface1 }}
+    >
+      <Text style={text.strong}>{title}</Text>
+      <Text style={text.small}>{detail}</Text>
+    </Pressable>
+  );
+}
+
+function ImportStep({
+  theme,
+  store,
+  onDone,
+  onCancel,
+}: {
+  theme: Theme;
+  store: ZeroSubStore;
+  onDone(accountId: string): void;
+  onCancel(): void;
+}) {
+  const text = useText(theme);
+  const [path, setPath] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const add = useCallback(async () => {
+    if (!path.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await store.rpc(importAccount, { path: path.trim() });
+      await store.refresh();
+      onDone(result.accountId);
+    } catch (failure) {
+      setError(describe(failure));
+    } finally {
+      setBusy(false);
+    }
+  }, [path, store, onDone]);
+  const inputStyle = useMemo(
+    () => ({
+      color: theme.colors.foreground,
+      backgroundColor: theme.colors.surface2,
+      borderColor: theme.colors.border,
+      borderWidth: 1,
+      borderRadius: 8,
+      paddingHorizontal: 12,
+      paddingVertical: 10,
+      fontSize: 14,
+    }),
+    [theme],
+  );
+  return (
+    <View style={{ gap: 12 }}>
+      <Text style={text.strong}>Folder on this host</Text>
+      <Text style={text.muted}>
+        The folder Claude Code was started with as CLAUDE_CONFIG_DIR, written the same way: its sign-in is saved under that
+        exact path. ZeroSub checks who it's signed in as, and adds it unless that account is here already.
+      </Text>
+      <TextInput
+        value={path}
+        onChangeText={setPath}
+        maxLength={1024}
+        placeholder="~/.claude-config/claude-work"
+        placeholderTextColor={theme.colors.foregroundMuted}
+        autoCapitalize="none"
+        autoCorrect={false}
+        autoFocus
+        onSubmitEditing={() => void add()}
+        style={inputStyle}
+        accessibilityLabel="Folder to add"
+      />
+      <Text style={text.small}>
+        A full path; ~ is your home folder. Its files are kept as they are; ZeroSub only adds what it shares with your
+        other accounts. Removing the account here later only takes it out of ZeroSub again.
+      </Text>
+      {error ? <Text style={text.danger}>{error}</Text> : null}
+      <Row>
+        <Button theme={theme} label="Cancel" tooltip="Close without adding an account" tooltipAlign="end" onPress={onCancel} />
+        <Button
+          theme={theme}
+          tone="primary"
+          label="Add account"
+          tooltip="Check the folder's sign-in and add it"
+          tooltipAlign="end"
+          busy={busy}
+          disabled={!path.trim()}
+          onPress={() => void add()}
+        />
+      </Row>
+    </View>
+  );
+}
+
+function ProxyStep({
+  theme,
+  proxy,
+  onChange,
+  onCancel,
+  onContinue,
+}: {
+  theme: Theme;
+  proxy: string;
+  onChange(value: string): void;
+  onCancel(): void;
+  onContinue(): void;
+}) {
+  const text = useText(theme);
+  const inputStyle = useMemo(
+    () => ({
+      color: theme.colors.foreground,
+      backgroundColor: theme.colors.surface2,
+      borderColor: theme.colors.border,
+      borderWidth: 1,
+      borderRadius: 8,
+      paddingHorizontal: 12,
+      paddingVertical: 10,
+      fontSize: 14,
+    }),
+    [theme],
+  );
+  return (
+    <View style={{ gap: 12 }}>
+      <Text style={text.strong}>Proxy for this account (optional)</Text>
+      <Text style={text.muted}>
+        Everything this account's Claude Code sends goes through it, starting with the sign-in. Leave it empty to use
+        the network the CLI already has.
+      </Text>
+      <TextInput
+        value={proxy}
+        onChangeText={onChange}
+        maxLength={2048}
+        placeholder="http://127.0.0.1:7890"
+        placeholderTextColor={theme.colors.foregroundMuted}
+        autoCapitalize="none"
+        autoCorrect={false}
+        autoFocus
+        onSubmitEditing={onContinue}
+        style={inputStyle}
+        accessibilityLabel="Proxy URL"
+      />
+      <Text style={text.small}>
+        http:// or https://, with user:password@ if the proxy needs it. The sign-in page itself opens in your browser,
+        which uses the browser's own network settings.
+      </Text>
+      <Row>
+        <Button theme={theme} label="Cancel" tooltip="Close without adding an account" tooltipAlign="end" onPress={onCancel} />
+        <Button
+          theme={theme}
+          tone="primary"
+          label={proxy.trim() ? "Continue" : "Continue without a proxy"}
+          tooltip="Start the sign-in"
+          tooltipAlign="end"
+          onPress={onContinue}
+        />
+      </Row>
+    </View>
+  );
+}
+
+function ProxyNote({ theme, proxy }: { theme: Theme; proxy: string | null }) {
+  const text = useText(theme);
+  if (!proxy) return null;
+  return <Text style={text.small}>The CLI signs in through {proxy}.</Text>;
 }
 
 function Step({ theme, number, title, children }: { theme: Theme; number: number; title: string; children: ReactNode }) {

@@ -225,6 +225,35 @@ describe("chooseAccount", () => {
     expect(decision?.account.id).toBe("claude-main");
   });
 
+  it("uses an API account only when it's chosen, and moves off it rather than onto it", () => {
+    const api = account({ id: "claude-api", auth: "api" });
+    const limited = account({ id: "claude-work", limitedUntil: "2026-09-23T14:00:00Z" });
+    // Balancing and failover skip it…
+    const balanced = chooseAccount(stateWith([main, api]), {
+      ...base,
+      balanceNewAgents: true,
+      reason: "create",
+      usageOf: (id) => (id === "claude-api" ? usage(0) : usage(90)),
+    });
+    expect(balanced?.account.id).toBe("claude-main");
+    const failover = chooseAccount(stateWith([limited, api], { defaults: { claude: "claude-work", codex: null, pi: null } }), {
+      ...base,
+      reason: "resume",
+      usageOf: () => null,
+    });
+    expect(failover?.account.id).toBe("claude-work");
+    // …but the default and an agent's own pick still use it.
+    const chosen = stateWith([main, api], { defaults: { claude: "claude-api", codex: null, pi: null } });
+    expect(chooseAccount(chosen, { ...base, reason: "resume", usageOf: () => null })?.account.id).toBe("claude-api");
+    const picked = stateWith([main, api], { bindings: { "agent-1": { accountId: "claude-api", source: "user", at: "x" } } });
+    expect(chooseAccount(picked, { ...base, reason: "resume", usageOf: () => null })?.account.id).toBe("claude-api");
+    // A refused key moves the agent to a subscription account.
+    const refused = stateWith([main, account({ id: "claude-api", auth: "api", signedIn: false })], {
+      defaults: { claude: "claude-api", codex: null, pi: null },
+    });
+    expect(chooseAccount(refused, { ...base, reason: "resume", usageOf: () => null })?.account.id).toBe("claude-main");
+  });
+
   it("returns null when the family has no accounts", () => {
     expect(chooseAccount(emptyState(), { ...base, reason: "create", usageOf: () => null })).toBeNull();
   });
@@ -236,6 +265,14 @@ describe("mostAvailable", () => {
     const work = account({ id: "claude-work" });
     const state = stateWith([main, work], { defaults: { claude: "claude-work", codex: null, pi: null } });
     expect(mostAvailable(state, "claude", () => usage(20), NOW)?.id).toBe("claude-work");
+  });
+
+  it("never picks an API account, even the roomiest default", () => {
+    const main = account({ id: "claude-main", kind: "main", home: null });
+    const api = account({ id: "claude-api", auth: "api" });
+    const state = stateWith([main, api], { defaults: { claude: "claude-api", codex: null, pi: null } });
+    expect(mostAvailable(state, "claude", (id) => (id === "claude-api" ? usage(0) : usage(90)), NOW)?.id).toBe("claude-main");
+    expect(mostAvailable(stateWith([api]), "claude", () => usage(0), NOW)).toBeUndefined();
   });
 
   it("ranks accounts by the room they have for any model, not by one model's full window", () => {
@@ -377,8 +414,9 @@ describe("disabled accounts", () => {
     expect(route([personal])?.account.id).toBe("claude-main");
     expect(route([personal], "claude-personal")?.account.id).toBe("claude-personal");
     expect(route([personal], "claude-personal")?.bind).toBeNull(); // so it still returns once work is enabled
-    // Only an account routing could have picked by itself stands in: not the disabled one or a full one.
+    // Only an account routing could have picked by itself stands in: not the disabled one, an API account or a full one.
     expect(route([personal], "claude-work")?.account.id).toBe("claude-main");
+    expect(route([account({ id: "claude-api", auth: "api" })], "claude-api")?.account.id).toBe("claude-main");
     expect(route([account({ id: "claude-personal", limitedUntil: "2026-09-23T14:00:00Z" })], "claude-personal")?.account.id).toBe(
       "claude-main",
     );

@@ -13,6 +13,7 @@ function account(status: AccountView["status"], nextAgentUntil: string | null): 
     plan: null,
     organization: null,
     status,
+    disabled: status === "disabled",
     isDefault: false,
     nextAgentUntil,
     limitedUntil: null,
@@ -25,6 +26,7 @@ function account(status: AccountView["status"], nextAgentUntil: string | null): 
     proxy: null,
     proxyEditable: false,
     inheritedProxy: null,
+    proxyBlocked: null,
     proxyFile: null,
     proxyFollowers: [],
     launcher: null,
@@ -51,11 +53,14 @@ function commandCenter(accounts: AccountView[]) {
     providers: {},
     canReopen: false,
     browserSignIn: true,
-    showComposerPill: false,
-    autoSwitch: true,
-    warnings: [],
+    launchers: null,
+    claudeHomes: null,
     piLaunchers: null,
     piHomes: null,
+    showComposerPill: false,
+    autoSwitch: true,
+    autoContinue: true,
+    warnings: [],
   };
   const rpc = vi.fn(async () => ({ until: null }));
   const store = { current: { state, error: null, updatedAt: 0 }, subscribe: () => () => undefined, rpc, refresh: async () => undefined };

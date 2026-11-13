@@ -3,10 +3,9 @@ import { connect as netConnect, type Socket } from "node:net";
 import { connect as tlsConnect } from "node:tls";
 import { HIDDEN } from "../shared/model";
 
-/** The order Node clients read them in (undici's `EnvHttpProxyAgent`, as Pi uses): the first one set wins. */
+/** Claude Code's own order: the first one set (non-empty) wins. */
 export const PROXY_KEYS = ["https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"] as const;
 
-/** The proxy an environment names, in the order Node clients read the variables in; null without one. */
 export function proxyFromEnv(env: Record<string, string | undefined>): string | null {
   for (const key of PROXY_KEYS) {
     const value = env[key]?.trim();
@@ -20,7 +19,10 @@ export const NO_PROXY_KEYS = ["no_proxy", "NO_PROXY"] as const;
 /** Hosts that stay direct when ZeroSub gives a process a proxy: this machine, where a local gateway may be. */
 export const REQUIRED_NO_PROXY = ["localhost", "127.0.0.1", "::1"] as const;
 
-/** The no-proxy list in an environment: `*` if either variable is, else both when they differ. */
+/** For Claude Code, its updater's host as well. */
+export const CLAUDE_REQUIRED_NO_PROXY = [...REQUIRED_NO_PROXY, "downloads.claude.ai"] as const;
+
+/** The no-proxy list Claude Code reads (2.1.312): `*` if either variable is, else both when they differ. */
 export function noProxyFromEnv(env: Record<string, string | undefined>): string | null {
   const { no_proxy: lower, NO_PROXY: upper } = env;
   if (lower === "*" || upper === "*") return "*";
@@ -29,8 +31,9 @@ export function noProxyFromEnv(env: Record<string, string | undefined>): string 
 }
 
 /**
- * Whether a request to `target` goes direct under the no-proxy list `noProxy`: `*` for everything,
- * `host:port`, `.suffix` (the domain itself or any below it), otherwise the exact host.
+ * Whether Claude Code goes to `target` directly under the no-proxy list `noProxy`, matching the way
+ * it does (2.1.312): `*` for everything, `host:port`, `.suffix` (the domain itself or any below it),
+ * otherwise the exact host.
  */
 export function bypassesProxy(noProxy: string | null, target: string): boolean {
   if (!noProxy) return false;
@@ -49,11 +52,22 @@ export function bypassesProxy(noProxy: string | null, target: string): boolean {
     });
 }
 
+/** Where Claude Code signs in, reads usage and sends an account's requests. */
+const CLAUDE_DOMAINS = ["anthropic.com", "claude.ai", "claude.com"];
+
 /**
- * `noProxy` without anything that could send a request to one of `domains` past the proxy, in any of
- * the forms HTTP clients accept: `*`, `*.domain`, `.domain`, `domain`, with or without a port, for
- * those domains, one below them (`api.anthropic.com`) or above them (`.com`). The rest (`localhost`,
- * an intranet's domain, address ranges) stays as it was.
+ * `noProxy` without anything that could send a request to Anthropic or Claude past the proxy, in
+ * any of the forms HTTP clients accept: `*`, `*.domain`, `.domain`, `domain`, with or without a
+ * port, for those domains, one below them (`api.anthropic.com`) or above them (`.com`). The rest
+ * (`localhost`, an intranet's domain, address ranges) stays as it was.
+ */
+export function withoutClaudeDomains(noProxy: string | null): string {
+  return withoutDomains(noProxy, CLAUDE_DOMAINS);
+}
+
+/**
+ * `noProxy` without anything that could send a request to one of `domains` past the proxy, the way
+ * `withoutClaudeDomains` does for Anthropic's and Claude's (Pi accounts add their base URL's host).
  */
 export function withoutDomains(noProxy: string | null, domains: readonly string[]): string {
   const wanted = domains.map((domain) => domain.toLowerCase()).filter(Boolean);
@@ -76,11 +90,11 @@ export function withoutDomains(noProxy: string | null, domains: readonly string[
 }
 
 /** Adds this machine's addresses, without duplicating entries. */
-export function withRequiredNoProxy(noProxy: string | null): string {
+export function withRequiredNoProxy(noProxy: string | null, required: readonly string[] = REQUIRED_NO_PROXY): string {
   const entries = (noProxy ?? "").split(/[\s,]+/).filter(Boolean);
   const seen = new Set<string>();
   const result: string[] = [];
-  for (const entry of [...REQUIRED_NO_PROXY, ...entries]) {
+  for (const entry of [...required, ...entries]) {
     const key = entry.toLowerCase();
     if (!seen.has(key)) {
       seen.add(key);
@@ -90,9 +104,14 @@ export function withRequiredNoProxy(noProxy: string | null): string {
   return result.join(",");
 }
 
+/** Adds this machine's addresses and Claude's updater host, as Claude Code's processes need. */
+export function withClaudeNoProxy(noProxy: string | null): string {
+  return withRequiredNoProxy(noProxy, CLAUDE_REQUIRED_NO_PROXY);
+}
+
 /**
  * Checks a proxy typed by the user and returns it in canonical form. Only http:// and https://
- * proxies are accepted: they're what Pi and ZeroSub's own requests can both use. One
+ * proxies are accepted: they're what Claude Code and ZeroSub's own requests can both use. One
  * still holding the hidden password it was shown with (see `maskProxy`) isn't a proxy to save.
  */
 export function normalizeProxy(input: string): string {
@@ -117,7 +136,7 @@ export function normalizeProxy(input: string): string {
 
 /**
  * The proxy for display: the password, if any, is hidden, and so is a user name with no password
- * (often a token). A proxy written without a scheme is read as http://,
+ * (often a token). A proxy written without a scheme is read as http://, as Claude Code reads it,
  * and one that can't be read at all shows only what follows its last `@`.
  */
 export function maskProxy(proxy: string): string {
@@ -213,7 +232,7 @@ interface ProxiedInit {
 }
 
 /**
- * `fetch`, but through `proxy` when one is set, the way the account's CLI would reach the same
+ * `fetch`, but through `proxy` when one is set, the way Claude Code itself would reach the same
  * host for that account. Only https:// targets are supported; that's all ZeroSub calls.
  */
 export async function proxiedFetch(proxy: string | null, target: string, init: ProxiedInit = {}): Promise<Response> {

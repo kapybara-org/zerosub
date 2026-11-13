@@ -19,9 +19,17 @@ type Entry = { item: AgentTimelineItem; timestamp: string; seqStart: number; seq
 let dir: string;
 /** The services the current test made, stopped once it ends. */
 const services: Service[] = [];
-beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "zerosub-continuations-")); });
+let previousLaunchers: string | undefined;
+beforeEach(async () => {
+  dir = await mkdtemp(join(tmpdir(), "zerosub-continuations-"));
+  previousLaunchers = process.env.ZEROSUB_LAUNCHER_DIR;
+  process.env.ZEROSUB_LAUNCHER_DIR = join(dir, "launchers");
+});
 afterEach(async () => {
   await Promise.all(services.splice(0).map((service) => service.stop()));
+  if (previousLaunchers === undefined) delete process.env.ZEROSUB_LAUNCHER_DIR;
+  else process.env.ZEROSUB_LAUNCHER_DIR = previousLaunchers;
+  // Retried: a write the test set off in the background can still be landing in it.
   await rm(dir, { recursive: true, force: true, maxRetries: 5 });
 });
 
@@ -114,6 +122,8 @@ async function setup() {
   } as unknown as FamilyAdapter;
   const service = () => {
     const made = new Service({ codex: adapter, claude: adapter, pi: absentPi() }, store, { resolve: async () => ({ codex: "codex" }) } as unknown as FamilyResolver);
+    // Automatic switching is off by default; these tests are about what it does.
+    made.setPreferences(preferences.schema.parse({ autoSwitch: true }));
     services.push(made);
     return made;
   };
@@ -274,7 +284,7 @@ describe("Codex account continuations", () => {
     const event = { agent: t.agents.get("root"), turnId: "turn-1", outcome: { kind: "canceled" }, timeline: [] };
     await service.onTurnEnded(event as never, { paseo: t.paseo } as never);
     expect(t.created).toHaveLength(0);
-    service.setPreferences(preferences.schema.parse({ autoContinue: false }));
+    service.setPreferences(preferences.schema.parse({ autoSwitch: true, autoContinue: false }));
     await service.onTurnEnded({ ...event, outcome: { kind: "failed" } } as never, { paseo: t.paseo } as never);
     expect(t.created).toHaveLength(0);
   });
