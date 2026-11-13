@@ -32,7 +32,7 @@ import {
   type UsageRead,
 } from "./adapter";
 import { FamilyResolver } from "./families";
-import { sameAccountIdentity } from "./account-identity";
+import { sameAccountIdentity, withoutWorkspace } from "./account-identity";
 import { CodexContinuations } from "./continuations";
 import { CONTINUED_FROM_LABEL, continueInNewAgent, type Continuation } from "./handoff";
 import { isAccountHome, removeHome } from "./homes";
@@ -421,13 +421,14 @@ export class Service {
     if (handedOver) this.forgetReading(accountId);
   }
 
-  /** The CLI login now belongs to someone else, so the last reading and its refresh timing were the previous person's. */
+  /** The CLI login now belongs to someone else, so the last reading, its refresh timing and a reset just spent were the previous person's. */
   private forgetReading(accountId: string): void {
     console.log(`[ZeroSub] the CLI login for ${accountId} changed hands; dropping its old usage and limit`);
     this.setUsage(accountId, null);
     this.usageLive.delete(accountId);
     this.usageRetryAt.delete(accountId);
     this.usageAttemptAt.delete(accountId);
+    this.lastRedeemAt.delete(accountId);
     void this.refreshUsage(accountId, true).catch(() => undefined);
   }
 
@@ -1262,7 +1263,10 @@ export class Service {
           .catch((error: unknown): RedeemReply => ({ outcome: "error", message: describe(error), left: null }));
         console.log(`[ZeroSub] banked reset on ${account.label}: ${reply.outcome}`);
         if (reply.outcome === "reset") {
-          this.lastRedeemAt.set(account.id, Date.now());
+          const at = Date.now();
+          this.lastRedeemAt.set(account.id, at);
+          // The reset refilled the subscription, so stale notices from its other slots are past too.
+          for (const twin of sameSubscription(await this.store.read(), account)) this.lastRedeemAt.set(twin.id, at);
           await this.afterReset(account.id, reply.left);
         } else if (reply.left !== null) {
           this.updateResetCount(account.id, reply.left);
@@ -2701,9 +2705,10 @@ export class Service {
           draft.accounts.push(account);
           if (session.home) delete draft.cleanup[session.home];
         }
-        handedOver = applyIdentity(account, identity, draft);
+        // Cleared first, so a limit the account brings from another slot (see applyIdentity) stands.
         account.limitedUntil = null;
         account.limitKind = null;
+        handedOver = applyIdentity(account, identity, draft);
       });
     } catch (error) {
       // A new account's home is then cleaned up as an unfinished sign-in, like any that failed.
@@ -2778,10 +2783,12 @@ function applyIdentity(account: StoredAccount, identity: Identity, state: Stored
 function applyIdentityFields(account: StoredAccount, identity: Identity, state: StoredState): void {
   account.signedIn = identity.signedIn;
   if (!identity.signedIn) return;
+  // A key read without its workspace says less than the one stored for the same person, which stays.
+  const vaguer = withoutWorkspace(identity.identity) && !withoutWorkspace(account.identity) && sameAccountIdentity(account.family, account, identity);
   account.email = identity.email ?? account.email;
   account.plan = identity.plan ?? account.plan;
   account.organization = identity.organization ?? account.organization;
-  account.identity = identity.identity ?? account.identity;
+  if (!vaguer) account.identity = identity.identity ?? account.identity;
   if (account.autoLabel || !account.label) {
     account.label = suggestLabel(account, state);
     account.autoLabel = true;

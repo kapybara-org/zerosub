@@ -9,6 +9,7 @@ import type { Reopener } from "./reopen";
 import type { SwitchGuard } from "./switch-guard";
 import { Service } from "./service";
 import { MAIN_ACCOUNT_ID, StateStore, type StoredAccount, type StoredState } from "./state";
+import { saveReadings } from "./usage";
 import { preferences } from "../shared/preferences";
 
 const MAIN = MAIN_ACCOUNT_ID.claude;
@@ -233,6 +234,33 @@ describe("one subscription, one limit", () => {
     const state = await store.read();
     expect(state.accounts.map((a) => a.limitedUntil)).toEqual([null, null]);
   });
+
+  const reset = { redeemReset: async () => ({ outcome: "reset" as const, message: "Limits reset.", left: 0 }) };
+
+  it("lifts the twin's limit along with a banked reset", async () => {
+    const { service, store, paseo, limitTurn } = await setUp(
+      { accounts: [twinOfMain(), twin()], defaults: { claude: MAIN, codex: null }, sessions: {} },
+      window,
+      { claude: reset },
+    );
+    await limitTurn();
+    expect((await redeemNow(service, paseo, TWIN)).outcome).toBe("reset");
+    expect((await store.read()).accounts.map((a) => a.limitedUntil)).toEqual([null, null]);
+  });
+
+  it("doesn't let a stale notice from the twin limit the subscription a reset just refilled", async () => {
+    const { service, store, paseo, sent, limitTurn } = await setUp(
+      { accounts: [twinOfMain(), twin()], defaults: { claude: MAIN, codex: null }, sessions: {} },
+      window,
+      { claude: reset },
+    );
+    await limitTurn();
+    expect((await redeemNow(service, paseo, TWIN)).outcome).toBe("reset");
+    // A turn on the CLI login ran into the limit before the reset on the twin, and ends just after it.
+    await limitTurn();
+    expect((await store.read()).accounts.map((a) => a.limitedUntil)).toEqual([null, null]);
+    expect(sent).toHaveLength(1); // It carries on where it is.
+  });
 });
 
 describe("when the CLI login changes hands", () => {
@@ -274,6 +302,96 @@ describe("when the CLI login changes hands", () => {
     const until = new Date(Date.now() + 3 * 3_600_000).toISOString();
     const { main } = await handOver([{ ...signedInAs("new"), limitedUntil: until, limitKind: "window", limitedAt: inPast(), limitSource: "reading" } as never]);
     expect(main).toMatchObject({ identity: "new", limitedUntil: until, limitKind: "window", limitSource: "reading" });
+  });
+
+  const hit = () => ({ kind: "window" as const, resetsAt: inFuture(), message: "" });
+  const checkIdentity = (service: Service) => (service as unknown as { refreshIdentity(id: string): Promise<void> }).refreshIdentity(MAIN);
+  const card = async (service: Service, paseo: unknown) => (await service.view(paseo as never)).accounts.find((a) => a.id === MAIN);
+  /** The new person's reading, which lands once `land` is called. */
+  function slowReading(percent: number) {
+    let land = () => {};
+    const landed = new Promise<void>((resolve) => (land = resolve));
+    return { land, read: () => landed.then(reading(percent)) };
+  }
+  /** Another slot, signed into the new person's account and at its limit. */
+  const newAtLimit = (until: string) =>
+    ({ ...signedInAs("new"), limitedUntil: until, limitKind: "window", limitedAt: inPast(), limitSource: "reading" }) as never;
+
+  it("shows the new person on the card at once, without the previous person's limit or reading", async () => {
+    let who = "old";
+    const next = slowReading(40);
+    const { service, paseo } = await setUp(
+      { accounts: [stale as never], defaults: { claude: MAIN, codex: null }, sessions: {} },
+      hit,
+      { identity: () => as(who), claude: { usage: async () => (who === "old" ? reading(97)() : next.read()) } },
+    );
+    await service.refreshUsage(MAIN, true);
+    expect(await card(service, paseo)).toMatchObject({ status: "limited", usage: { windows: [{ usedPercent: 97 }] } });
+    who = "new";
+    await checkIdentity(service);
+    // Nobody asked for a refresh: until the new person's reading lands, the card shows none.
+    expect(await card(service, paseo)).toMatchObject({ email: "new@example.com", status: "ready", limitedUntil: null, usage: null });
+    next.land();
+    await vi.waitFor(async () => expect((await card(service, paseo))?.usage?.windows.map((w) => w.usedPercent)).toEqual([40]));
+  });
+
+  it("finds a change of hands at startup, and drops the previous person's saved reading and limit", async () => {
+    await saveReadings(new Map([[MAIN, { ...reading(97)(), credits: null }]]));
+    const next = slowReading(40);
+    const { service, store, paseo } = await setUp(
+      { accounts: [stale as never], defaults: { claude: MAIN, codex: null }, sessions: {} },
+      hit,
+      { identity: () => as("new"), claude: { usage: next.read } },
+    );
+    await service.start();
+    expect((await store.read()).accounts.find((a) => a.id === MAIN)).toMatchObject({ identity: "new", limitedUntil: null, limitedAt: null });
+    expect(await card(service, paseo)).toMatchObject({ status: "ready", usage: null });
+    next.land();
+    await vi.waitFor(async () => expect((await card(service, paseo))?.usage?.windows.map((w) => w.usedPercent)).toEqual([40]));
+  });
+
+  it("takes over another slot's limit when the CLI login is signed in here as that slot's account", async () => {
+    const until = new Date(Date.now() + 3 * 3_600_000).toISOString();
+    let who = "old";
+    const { service, store } = await setUp(
+      { accounts: [stale as never, newAtLimit(until)], defaults: { claude: MAIN, codex: null }, sessions: {} },
+      hit,
+      {
+        identity: () => as(who),
+        claude: {
+          login: async () => {
+            who = "new";
+            return {
+              progress: { step: "starting", url: null, codeUrl: null, userCode: null, message: null },
+              onProgress: () => undefined,
+              submitCode: async () => undefined,
+              cancel: () => undefined,
+              finished: Promise.resolve({ ok: true, message: null }),
+            };
+          },
+        },
+      },
+    );
+    const { id } = await service.startLogin("claude", "browser", MAIN);
+    await vi.waitFor(async () => expect((await service.submitCode(id, "")).step).toBe("done"));
+    const main = (await store.read()).accounts.find((a) => a.id === MAIN);
+    expect(main).toMatchObject({ identity: "new", limitedUntil: until, limitKind: "window", limitSource: "reading" });
+  });
+
+  it("spends a reset for the new person at once, though one was just spent for the previous person", async () => {
+    const until = new Date(Date.now() + 3 * 3_600_000).toISOString();
+    let who = "old";
+    const { service, store, paseo } = await setUp(
+      { accounts: [stale as never, newAtLimit(until)], defaults: { claude: MAIN, codex: null }, sessions: {} },
+      hit,
+      { identity: () => as(who), claude: { redeemReset: async () => ({ outcome: "reset", message: "Limits reset.", left: 0 }) } },
+    );
+    expect((await redeemNow(service, paseo, MAIN)).outcome).toBe("reset");
+    who = "new";
+    await checkIdentity(service);
+    expect((await store.read()).accounts.find((a) => a.id === MAIN)?.limitedUntil).toBe(until);
+    expect((await redeemNow(service, paseo, MAIN)).outcome).toBe("reset");
+    expect((await store.read()).accounts.map((a) => a.limitedUntil)).toEqual([null, null]);
   });
 });
 
