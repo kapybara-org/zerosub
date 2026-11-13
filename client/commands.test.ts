@@ -25,6 +25,12 @@ function account(status: AccountView["status"], nextAgentUntil: string | null): 
     proxy: null,
     proxyEditable: false,
     inheritedProxy: null,
+    proxyFile: null,
+    proxyFollowers: [],
+    launcher: null,
+    egress: null,
+    externalHome: false,
+    moving: null,
   };
 }
 
@@ -48,6 +54,8 @@ function commandCenter(accounts: AccountView[]) {
     showComposerPill: false,
     autoSwitch: true,
     warnings: [],
+    piLaunchers: null,
+    piHomes: null,
   };
   const rpc = vi.fn(async () => ({ until: null }));
   const store = { current: { state, error: null, updatedAt: 0 }, subscribe: () => () => undefined, rpc, refresh: async () => undefined };

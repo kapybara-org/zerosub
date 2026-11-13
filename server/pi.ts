@@ -459,7 +459,7 @@ export class PiAdapter implements FamilyAdapter {
 
   async setProxy(home: string | null, proxy: string | null, wanted?: () => Promise<boolean>): Promise<void> {
     if (!home) return writePiMainProxy(proxy);
-    await writePiAccountProxy(home, proxy, wanted);
+    await writePiAccountProxy(home, proxy, wanted, (baseUrl) => inheritedPiProxy(baseUrl ?? ANTHROPIC_API));
     await this.writeLaunchEnv(home);
   }
 

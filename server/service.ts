@@ -40,7 +40,7 @@ import { FamilyResolver } from "./families";
 import { sameAccountIdentity, withoutWorkspace } from "./account-identity";
 import { CodexContinuations } from "./continuations";
 import { CONTINUED_FROM_LABEL, continueInNewAgent, type Continuation } from "./handoff";
-import { PI_ACCOUNT_FILE, isAccountHome, moveHome, normalizeBaseUrl, readPiAccount, removeHome, sentInTheClear } from "./homes";
+import { PI_ACCOUNT_FILE, isAccountHome, moveHome, normalizeBaseUrl, readPiAccount, readPiAccountForAgents, removeHome, sentInTheClear } from "./homes";
 import { launcherNames, piLauncherDir, writeLaunchers, type LauncherAccount } from "./launchers";
 import { Mutex } from "./json-file";
 import { turnRows } from "./limits";
@@ -2866,9 +2866,14 @@ export class Service {
   private async refuseClearTextFollowers(family: Family): Promise<void> {
     const adapter = this.adapters[family];
     for (const account of accountsOf(await this.store.read(), family)) {
-      if (account.kind !== "managed" || !account.home) continue;
-      if ((await adapter.proxyState?.(account.home))?.own) continue;
-      const { key, baseUrl } = await readPiAccount(account.home);
+      const home = this.homeNow(account);
+      if (account.kind !== "managed" || !home) continue;
+      // Read as for an agent: while its folder is being moved its settings can't be read, and an
+      // account read as having no key or proxy would pass unchecked.
+      const settings = await readPiAccountForAgents(home).catch(() => null);
+      if (!settings) throw new Error(`${account.label}'s folder is being moved just now. Try again in a moment.`);
+      const { key, baseUrl, proxy } = settings;
+      if (proxy) continue;
       if (key && sentInTheClear(baseUrl)) {
         throw new Error(
           `${account.label} has no proxy of its own and sends its key over plain http:// to ${baseUrl}, so this proxy could read it. Give ${account.label} its key again with an https:// base URL, or a proxy of its own, first.`,

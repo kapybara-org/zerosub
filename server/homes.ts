@@ -731,12 +731,28 @@ export function writePiAccountApi(home: string, config: { key: string | null; ba
 
 /**
  * Sets (or clears, with `null`) a Pi account's proxy, for its sessions started afterwards (see
- * `PiAdapter.env`). `wanted` as for `stillWanted`.
+ * `PiAdapter.env`). `wanted` as for `stillWanted`. `inherited` says which proxy the account would go
+ * through without one of its own, for a key that clearing it would send there in the clear.
  */
-export function writePiAccountProxy(home: string, proxy: string | null, wanted?: () => Promise<boolean>): Promise<void> {
+export function writePiAccountProxy(
+  home: string,
+  proxy: string | null,
+  wanted?: () => Promise<boolean>,
+  inherited?: (baseUrl: string | null) => Promise<{ proxy: string; from: string } | null>,
+): Promise<void> {
   return withHome(home, async () => {
     await stillWanted(wanted);
     const previous = await readPiAccount(home);
+    // Without its own, the account goes through the proxy it inherits: a plain-http:// key would then
+    // cross that one in the clear, as through a new one of its own.
+    if (!proxy && previous.proxy && previous.key && sentInTheClear(previous.baseUrl)) {
+      const next = await inherited?.(previous.baseUrl);
+      if (next) {
+        throw new Error(
+          `This account sends its key over plain http://, and without its own proxy it would go through ${next.proxy} (${next.from}), which could read it. Switch to an https:// base URL first, or keep this proxy.`,
+        );
+      }
+    }
     // As with a new base URL, a key is never sent somewhere new: over plain http:// a proxy reads it.
     if (proxy && proxy !== previous.proxy) {
       if (previous.key && sentInTheClear(previous.baseUrl)) {

@@ -687,6 +687,64 @@ describe("Pi accounts in the service", () => {
     }
   });
 
+  it("keeps an account's own proxy while clearing it would send its plain-http:// key through the CLI login's", async () => {
+    const store = new StateStore(join(root, "state.json"));
+    const service = piService(new InstalledPi(), store);
+    const paseo = { agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false } }) } };
+    service.attach(paseo as never);
+    await service.start();
+    try {
+      const id = await service.addApiAccount({ label: "Gateway", key: KEY, baseUrl: "http://gw.example.com", proxy: "http://127.0.0.1:7890" });
+      const home = findAccount(await store.read(), id)!.home!;
+      // The CLI login has a proxy of its own, which an account without one goes through.
+      await writeFile(join(main, "settings.json"), JSON.stringify({ defaultProvider: "anthropic", httpProxy: "http://10.0.0.1:3128" }));
+      await expect(service.setProxy(id, "")).rejects.toThrow(/plain http:\/\//);
+      expect(JSON.parse(await readFile(join(home, "zerosub.json"), "utf8")).proxy).toBe("http://127.0.0.1:7890");
+      // Without one there, the key goes straight to the gateway, as it would without ZeroSub.
+      await writeFile(join(main, "settings.json"), JSON.stringify({ defaultProvider: "anthropic" }));
+      await service.setProxy(id, "");
+      expect(JSON.parse(await readFile(join(home, "zerosub.json"), "utf8")).proxy).toBeUndefined();
+    } finally {
+      await service.stop();
+    }
+  });
+
+  it("sets no new proxy on the CLI login while a follower's folder is being moved, and says to try again", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const store = new StateStore(join(root, "state.json"));
+    const pi = new InstalledPi();
+    const service = piService(pi, store);
+    const paseo = { agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false } }) } };
+    service.attach(paseo as never);
+    try {
+      await service.start();
+      pi.inUse.add("held");
+      const scan = pi.homesInUse.bind(pi);
+      pi.homesInUse = async (homes) => (pi.inUse.has("held") ? new Set(homes) : scan(homes));
+      await service.addApiAccount({ label: "Gateway", key: KEY, baseUrl: "http://gw.example.com" });
+      const to = join(root, "pi-config", "pi-gateway");
+      pi.inUse.clear();
+      vi.setSystemTime(Date.now() + 31_000);
+      const before = await readFile(join(main, "settings.json"), "utf8");
+
+      // While its folder is away for the check, its settings can't be read: it isn't taken for safe.
+      let refused: unknown;
+      pi.onScan = async () => {
+        if (!(await stat(to).catch(() => null)) || refused !== undefined) return;
+        refused = await service.setProxy(MAIN_ACCOUNT_ID.pi, "http://127.0.0.1:7890").then(() => null, (error: unknown) => error);
+      };
+      await service.placeHomes();
+      pi.onScan = null;
+      expect(String(refused)).toMatch(/try again/i);
+      expect(await readFile(join(main, "settings.json"), "utf8")).toBe(before);
+      // Once it's where it'll stay, it's checked as ever.
+      await expect(service.setProxy(MAIN_ACCOUNT_ID.pi, "http://127.0.0.1:7890")).rejects.toThrow(/Gateway has no proxy of its own/);
+    } finally {
+      vi.useRealTimers();
+      await service.stop();
+    }
+  });
+
   it("finishes a move a restart cut short after the folder moved, and undoes one cut short before", async () => {
     const store = new StateStore(join(root, "state.json"));
     const pi = new InstalledPi();
