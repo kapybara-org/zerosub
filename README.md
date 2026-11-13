@@ -6,7 +6,7 @@ Use several Claude and ChatGPT (Codex) subscriptions side by side in [Paseo](htt
 - **Your existing CLI logins show up automatically.** Nothing changes until you add a second account.
 - **Pick an account per agent.** An account button in the message box shows which account each Claude or Codex agent uses. Tap it to switch.
 - **Automatic failover.** When an account hits its 5-hour or weekly limit, the agent moves to the account with the most room left and carries on. New agents skip exhausted accounts.
-- **Live usage.** Each account shows its own 5-hour and weekly usage and when they reset, plus any ChatGPT credits. Accounts in use refresh about every minute and after each turn, and a limit shows up the moment it hits.
+- **Live usage.** Each account shows its own 5-hour and weekly usage and when they reset, plus any ChatGPT credits or Claude extra usage. Accounts in use refresh about every minute and after each turn, and a limit shows up the moment it hits.
 - **Banked resets.** If a provider has banked limit resets on an account, you can use one from the account card or the agent's account button.
 - **Set an account aside.** Disable an account for a while and its agents move to your other accounts, then come back when you enable it again.
 - **Several hosts.** Each Paseo host keeps its own accounts, and the Accounts screen says which host you're looking at.
@@ -91,6 +91,10 @@ A ChatGPT account can also have prepaid ChatGPT credits, which Codex spends once
 - **Use ChatGPT credits when a limit is reached** (off by default; in Accounts, or **Settings → Plugins → zerosub → ZeroSub preferences**) keeps an account with credits in use at its limit. New agents may then spend paid credits even while another account still has room.
 - Even with it on, a limit an agent actually ran into stays until it resets: Codex stopped that agent, so the credits didn't cover it.
 
+### Claude extra usage
+
+When a Claude account has extra usage turned on (pay-as-you-go past the plan's limits), its card says so under the usage bars, with this month's spend and cap when Anthropic reports them, for example "Extra usage on · $12.34 of $50.00 this month". This is for information: ZeroSub still treats a full window as a limit and switches the same way.
+
 ### When every account of a provider is out
 
 ZeroSub tries these in order, and a timeline note says which one happened:
@@ -166,7 +170,7 @@ ZeroSub never implements OAuth itself and never copies credentials between accou
 
 - Credentials stay in the CLIs' own stores. ZeroSub's registry (`$PASEO_HOME/zerosub/state.json`) holds account names, emails, plans, which agent uses which account, and continuation links with timeline positions. Handoff text stays in the agents' conversation histories; it isn't copied into the registry.
 - Every write of the registry also leaves a snapshot in `$PASEO_HOME/zerosub/backups/`, readable only by you: the last 5 writes, then the last one of each of 12 recent hours and 7 recent days, 24 files at most. If the registry is missing, empty, not JSON, or has entries that don't validate (a hand edit gone wrong, say), ZeroSub restores the newest snapshot, keeps the damaged file as `state.json.bad-<time>`, and says so in its log.
-- To show Claude usage, ZeroSub reads each account's current access token and calls Anthropic's usage endpoint, the same way Paseo's built-in usage display and `/usage` do. It never logs or stores tokens and never refreshes them itself. When you refresh usage (the ↻ button beside the title) or use a reset and a token has expired, it runs `claude -p /usage` so Claude Code renews its own sign-in. In the background it does the same at most every 30 minutes per account, and only for a reading that has passed its reset time or an account at its 5-hour or weekly limit. Codex usage comes from `codex app-server`.
+- To show Claude usage, ZeroSub reads each account's current access token and calls Anthropic's usage endpoint, the same way Paseo's built-in usage display and `/usage` do. That read includes extra-usage spend; if Anthropic fails to answer it, ZeroSub reads once more without spend, so the usage bars never go missing for it. It never logs or stores tokens and never refreshes them itself. When you refresh usage (the ↻ button beside the title) or use a reset and a token has expired, it runs `claude -p /usage` so Claude Code renews its own sign-in. In the background it does the same at most every 30 minutes per account, and only for a reading that has passed its reset time or an account at its 5-hour or weekly limit. Codex usage comes from `codex app-server`.
 - Using a banked reset calls the provider's own reset endpoint with that account's sign-in, and only after you confirm (or turn on automatic use).
 - Removing an account moves its agents to the default account, then signs it out (`claude auth logout` / `codex` logout) and deletes its home. This happens once no agent is mid-turn on it. Abandoned sign-ins are cleaned up the same way; one a restart interrupted is deleted only if it isn't signed in.
 - ZeroSub only signs out or deletes homes it recorded for cleanup when you removed the account or started the sign-in, never a home just because the registry doesn't list it: a damaged or hand-edited registry may simply be missing accounts. Folders in `homes/` that no account uses are left alone and named in the log at startup.

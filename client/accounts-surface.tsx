@@ -3,7 +3,7 @@ import { Icon, Modal, TextInput, useToast } from "@getpaseo/plugin/client/react-
 import { SettingsCard, SettingsSwitch } from "@getpaseo/plugin/client/ui";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ScrollView, Text, View } from "react-native";
-import { accountSubtitle, describeReopen, formatAge, formatCredits, formatPlan, staleNotice, usageSummary } from "../shared/format";
+import { accountSubtitle, describeReopen, formatAge, formatCredits, formatExtraUsage, formatPlan, staleNotice, usageSummary } from "../shared/format";
 import { FAMILIES, FAMILY_LABEL, type AccountView, type Family, type StateView } from "../shared/model";
 import { preferences } from "../shared/preferences";
 import {
@@ -300,6 +300,7 @@ function AccountCard({
   const [confirmReset, setConfirmReset] = useState(false);
   const resets = account.usage?.resets ?? null;
   const credits = account.usage?.credits ?? null;
+  const extraUsage = account.usage?.extraUsage ? formatExtraUsage(account.usage.extraUsage) : null;
   const plan = formatPlan(account.plan);
   const summary = usageSummary(account);
   const subtitle = accountSubtitle(account);
@@ -529,6 +530,7 @@ function AccountCard({
           <Text style={text.small}>{account.usage?.error ?? summary ?? "Checking usage…"}</Text>
         )}
         {!signedOut && credits ? <Text style={text.small}>{formatCredits(credits)}</Text> : null}
+        {!signedOut && extraUsage ? <Text style={text.small}>{extraUsage}</Text> : null}
         {!signedOut && windows.length > 0 && account.usage?.error ? <Text style={text.small}>{account.usage.error}</Text> : null}
         {!signedOut && resets?.blockedReason ? <Text style={text.small}>{resets.blockedReason}</Text> : null}
       </View>

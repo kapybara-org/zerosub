@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { Usage } from "../shared/model";
+import { UsageSchema, type Usage } from "../shared/model";
 import { SwitchGuard } from "./switch-guard";
 import { mergeUsage, retryDelayMs, showLimit } from "./usage";
 
@@ -31,6 +31,26 @@ describe("showLimit", () => {
   it("leaves the reading alone when no window matches or the time is unknown", () => {
     expect(showLimit(reading(), "2026-09-25T00:00:00.000Z")).toEqual(reading());
     expect(showLimit(reading(), null)).toEqual(reading());
+  });
+});
+
+describe("extra usage in usage.json", () => {
+  const extra = { enabled: true, spend: 12, limit: null, currency: "USD" };
+
+  it("is kept from a live read when Claude Code's cached copy comes in after it", () => {
+    const live = reading({ extraUsage: extra });
+    const cachedNewer = reading({ fetchedAt: "2026-09-23T08:05:00.000Z", cached: true });
+    expect(mergeUsage(live, cachedNewer).extraUsage).toEqual(extra);
+    const off = { ...extra, enabled: false };
+    expect(mergeUsage(live, reading({ fetchedAt: "2026-09-23T08:05:00.000Z", extraUsage: off })).extraUsage).toEqual(off);
+  });
+
+  it("round-trips through the saved shape, and readings saved before it still load", () => {
+    expect(UsageSchema.parse(JSON.parse(JSON.stringify(reading({ extraUsage: extra })))).extraUsage).toEqual(extra);
+    expect(UsageSchema.parse(JSON.parse(JSON.stringify(reading()))).extraUsage).toBeUndefined();
+    expect(UsageSchema.parse({ ...reading(), extraUsage: { enabled: false } }).extraUsage).toEqual({
+      enabled: false, spend: null, limit: null, currency: null,
+    });
   });
 });
 
