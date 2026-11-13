@@ -98,6 +98,9 @@ export async function inheritedPiProxy(target = ANTHROPIC_API): Promise<{ proxy:
  * opens them, so a conversation moves between accounts and stays where Paseo looks for it after an
  * account is removed.
  */
+/** The variables Pi reads Anthropic's key or token from (`getApiKeyEnvVars` in pi-ai). */
+const PI_ANTHROPIC_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN"];
+
 export class PiAdapter implements FamilyAdapter {
   readonly family = "pi" as const;
   /** Pi reopens a session from its file, whichever account it runs on. */
@@ -110,6 +113,9 @@ export class PiAdapter implements FamilyAdapter {
     if (!home) return {};
     const account = await readPiAccount(home);
     const patch: EnvPatch = { PI_CODING_AGENT_DIR: home };
+    // Pi takes Anthropic's key from these when the stored one comes out empty, and would send it to
+    // the account's base URL: an added account's agents only ever use its own key.
+    for (const key of PI_ANTHROPIC_ENV) if (process.env[key]) patch[key] = "";
     // Pi writes a new session in its agent directory's `sessions`, which is the CLI login's linked in,
     // so the file would be named through the account's home: Paseo resumes it by that name, which
     // goes when the account does. Pi is told the folder it would use for the CLI login instead.

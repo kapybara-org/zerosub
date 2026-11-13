@@ -459,7 +459,8 @@ async function writePiAccount(home: string, account: PiAccount): Promise<void> {
  * say), which are safe to copy, and the account's own Anthropic key in place of any the CLI login
  * has. Subscription sign-ins (OAuth) aren't copied: each copy would refresh its token on its own,
  * and the first refresh would leave the other with a spent one. Pi uses a stored key before any in
- * the environment, so the daemon's `ANTHROPIC_API_KEY` can't take this one's place.
+ * the environment, so the daemon's `ANTHROPIC_API_KEY` can't take this one's place; the key is
+ * stored escaped (see `piLiteral`) so Pi reads it as it was typed.
  */
 export function piAuth(main: unknown, key: string | null): Json {
   const auth: Json = {};
@@ -468,8 +469,19 @@ export function piAuth(main: unknown, key: string | null): Json {
       if (provider !== "anthropic" && isObject(entry) && entry.type === "api_key") auth[provider] = entry;
     }
   }
-  if (key) auth.anthropic = { type: "api_key", key };
+  if (key) auth.anthropic = { type: "api_key", key: piLiteral(key) };
   return auth;
+}
+
+/**
+ * `value` written so Pi reads it back unchanged. Pi resolves a stored key as config: one starting
+ * with `!` is run as a shell command, and `$NAME` or `${NAME}` is filled in from the environment, so
+ * a key containing either would be run or changed (and one that came out empty would fall back to
+ * the environment's key). In Pi's syntax `$$` stands for `$`, and `$!` for `!`.
+ */
+export function piLiteral(value: string): string {
+  const escaped = value.split("$").join("$$");
+  return escaped.startsWith("!") ? `$${escaped}` : escaped;
 }
 
 /**

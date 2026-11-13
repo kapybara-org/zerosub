@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { FamilyAdapter, TurnEvent } from "./adapter";
 import { absentPi } from "./fakes.test-support";
 import { familiesFromConfig, type FamilyResolver } from "./families";
-import { piAuth, piModels, preparePiHome, readPiAccount, readPiAccountApi, sentInTheClear, writePiAccountApi, writePiAccountProxy } from "./homes";
+import { piAuth, piLiteral, piModels, preparePiHome, readPiAccount, readPiAccountApi, sentInTheClear, writePiAccountApi, writePiAccountProxy } from "./homes";
 import { detectPiSignOut } from "./limits";
 import { PiAdapter, piSessionDir } from "./pi";
 import type { Reopener } from "./reopen";
@@ -13,7 +13,7 @@ import { Service } from "./service";
 import { MAIN_ACCOUNT_ID, StateStore } from "./state";
 
 const KEY = "sk-ant-api03-pppppppppppppppppppppppp-4242";
-const SAVED = ["PASEO_HOME", "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "NO_PROXY", "no_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] as const;
+const SAVED = ["PASEO_HOME", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "NO_PROXY", "no_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] as const;
 
 let root: string;
 let main: string;
@@ -60,6 +60,17 @@ describe("a Pi account's generated files", () => {
       ),
     ).toEqual({ openrouter: { type: "api_key", key: "or" }, anthropic: { type: "api_key", key: KEY } });
     expect(piAuth(undefined, null)).toEqual({});
+  });
+
+  it("stores a key so Pi reads it as typed, never running or filling it in", () => {
+    // Pi runs a value starting with `!` and fills in `$NAME`; `$$` is a `$` and `$!` a `!` (Pi 1.4.0's resolveConfigValue).
+    expect(piLiteral("sk-ant-plain")).toBe("sk-ant-plain");
+    expect(piLiteral("!echo leaked")).toBe("$!echo leaked");
+    expect(piLiteral("sk$HOME")).toBe("sk$$HOME");
+    expect(piLiteral("${X}")).toBe("$${X}");
+    expect(piLiteral("$!")).toBe("$$!");
+    expect(piLiteral("a!b")).toBe("a!b");
+    expect(piAuth(undefined, "!echo$X")).toEqual({ anthropic: { type: "api_key", key: "$!echo$$X" } });
   });
 
   it("sends Anthropic's requests to the account's base URL, and drops anything else that would send another key", () => {
@@ -203,6 +214,16 @@ describe("PiAdapter", () => {
   it("leaves the CLI login as Paseo runs it without ZeroSub", async () => {
     await writeFile(join(main, "settings.json"), JSON.stringify({ defaultProvider: "anthropic", httpProxy: "http://10.0.0.1:3128" }));
     expect(await new PiAdapter().env(null, { cwd: "/work" })).toEqual({});
+  });
+
+  it("keeps the daemon's Anthropic key and tokens from an added account's agents, and leaves them to the CLI login's", async () => {
+    process.env.ANTHROPIC_API_KEY = "sk-daemon";
+    process.env.ANTHROPIC_AUTH_TOKEN = "token-daemon";
+    const home = join(root, "home");
+    await writePiAccountApi(home, { key: KEY, baseUrl: "https://gw.example.com" });
+    const adapter = new PiAdapter();
+    expect(await adapter.env(home)).toEqual({ PI_CODING_AGENT_DIR: home, ANTHROPIC_API_KEY: "", ANTHROPIC_AUTH_TOKEN: "" });
+    expect(await adapter.env(null)).toEqual({});
   });
 
   it("keeps an added account's proxy in its own zerosub.json, and its settings linked to the CLI login's", async () => {
