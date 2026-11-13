@@ -1,6 +1,7 @@
 import { lstat, mkdir, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
-import { join, sep } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+import type { Family } from "../shared/model";
 import { homesDir, mainClaudeDir, mainClaudeGlobalConfig, mainCodexHome } from "./paths";
 
 /**
@@ -64,11 +65,21 @@ async function syncOverlay(home: string, spec: OverlaySpec): Promise<void> {
 }
 
 /**
+ * Whether `home` is a folder ZeroSub made for an account (of `family`, when given): a direct child
+ * of `homesDir()`, named `<family>-<id>`, written out in full. A path with `..` in it, or one
+ * elsewhere, is not, even if it starts with `homesDir()`.
+ */
+export function isAccountHome(home: string, family?: Family): boolean {
+  if (resolve(home) !== home || dirname(home) !== homesDir()) return false;
+  return !family || basename(home).startsWith(`${family}-`);
+}
+
+/**
  * Deletes a managed home. Its top level holds symlinks into the user's real CLI home, so those are
  * unlinked first; nothing outside ZeroSub's own directory is ever followed or removed.
  */
 export async function removeHome(home: string): Promise<void> {
-  if (!home.startsWith(homesDir() + sep)) return;
+  if (!isAccountHome(home)) return;
   for (const name of await readdir(home).catch(() => [] as string[])) {
     const path = join(home, name);
     const entry = await lstat(path).catch(() => null);

@@ -61,7 +61,7 @@ export function describeRow(row: SwitchRow): string {
     case "stayed":
       return `${lead}This conversation stays on ${row.from ?? "its account"}.${row.detail ? ` ${row.detail}` : ""}`;
     case "pending":
-      return `${lead}Moves to ${row.to} when its session next starts.`;
+      return `${lead}Moves to ${row.to} when its session next starts.${row.detail ? ` ${row.detail}` : ""}`;
     default: {
       const from =
         row.from && row.reason !== "limit" && row.reason !== "signed_out" && row.reason !== "disabled" ? `from ${row.from} ` : "";

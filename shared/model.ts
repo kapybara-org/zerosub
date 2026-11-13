@@ -99,6 +99,13 @@ export const AgentRouteSchema = z.object({
   /** The live session still runs on a different account and is waiting to be reopened. */
   pendingAccountId: z.string().nullable(),
   /**
+   * While `pendingAccountId` is set, when the session moves: `idle` once the agent is idle (within
+   * half a minute), `turn` when its current turn ends, `background` once background work it left
+   * running stops, `restart` when its session next starts (it isn't moved unattended, reloading it
+   * didn't work, or Paseo's CLI isn't there to do it).
+   */
+  waiting: z.enum(["idle", "turn", "background", "restart"]).nullable().default(null),
+  /**
    * The conversation can move to another account in place. False for Codex agents that already
    * have history: ChatGPT accounts can't read each other's encrypted reasoning, so switching
    * continues the work in a new agent instead.
@@ -160,6 +167,8 @@ export const StateViewSchema = z.object({
    */
   browserSignIn: z.boolean().default(true),
   showComposerPill: z.boolean(),
+  /** Accounts at their limit are skipped, so agents can't be moved onto one by hand either. */
+  autoSwitch: z.boolean().default(true),
   warnings: z.array(z.string()),
 });
 export type StateView = z.infer<typeof StateViewSchema>;
