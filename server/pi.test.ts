@@ -25,7 +25,7 @@ const BLANK_ANTHROPIC = {
   ANTHROPIC_SERVICE_ACCOUNT_ID: "",
   ANTHROPIC_WORKSPACE_ID: "",
 };
-const SAVED = ["PASEO_HOME", "ZEROSUB_PI_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID", "ANTHROPIC_IDENTITY_TOKEN_FILE", "ANTHROPIC_SERVICE_ACCOUNT_ID", "ANTHROPIC_WORKSPACE_ID", "OPENROUTER_API_KEY", "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "NO_PROXY", "no_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] as const;
+const SAVED = ["PASEO_HOME", "ZEROSUB_PI_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID", "ANTHROPIC_IDENTITY_TOKEN_FILE", "ANTHROPIC_SERVICE_ACCOUNT_ID", "ANTHROPIC_WORKSPACE_ID", "OPENROUTER_API_KEY", "QWEN_TOKEN_PLAN_API_KEY", "QWEN_TOKEN_PLAN_TEAM_API_KEY", "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "NO_PROXY", "no_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] as const;
 
 let root: string;
 let main: string;
@@ -195,6 +195,13 @@ describe("a Pi account's home", () => {
     process.env.OPENROUTER_API_KEY = "sk-or-env";
     await expect(writePiAccountProxy(home, "http://10.0.0.4:3128")).rejects.toThrow(/openrouter/);
     delete process.env.OPENROUTER_API_KEY;
+    // A provider Pi takes its key from more than one variable for (from 1.6: the per-plan one, then the shared one).
+    await writeFile(join(main, "models.json"), JSON.stringify({ providers: { "qwen-token-plan": { baseUrl: remote } } }));
+    for (const name of ["QWEN_TOKEN_PLAN_API_KEY", "QWEN_TOKEN_PLAN_TEAM_API_KEY"] as const) {
+      process.env[name] = "sk-qwen";
+      await expect(writePiAccountProxy(home, "http://10.0.0.4:3128"), name).rejects.toThrow(/qwen-token-plan/);
+      delete process.env[name];
+    }
 
     // Pi reads models.json past a byte order mark, `//` comments and trailing commas, so they hide nothing.
     await writeFile(join(main, "models.json"), `\uFEFF{\n  // my gateway\n  "providers": { "ollama": { "baseUrl": "${remote}", "apiKey": "k", }, },\n}\n`);

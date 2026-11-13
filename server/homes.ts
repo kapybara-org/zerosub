@@ -813,16 +813,19 @@ export function writePiAccountProxy(
 }
 
 /**
- * The variable Pi takes each of its own providers' key from when it has none stored
- * (`getApiKeyEnvVars` in pi-ai, 1.4.0 to 1.5.2). Anthropic's are in `PI_ANTHROPIC_CREDENTIAL_ENV`.
+ * The variables Pi takes each of its own providers' key from when it has none stored
+ * (`getApiKeyEnvVars` in pi-ai): every name any version from 1.4.0 on reads, as a name an older or
+ * newer Pi doesn't read only refuses a proxy it could have allowed. 1.5.1 added
+ * `qwen-token-plan-individual-cn`; the per-plan Qwen variables come after 1.5.2 (on Pi's main
+ * branch, not released yet). Anthropic's are in `PI_ANTHROPIC_CREDENTIAL_ENV`.
  */
-const PI_KEY_ENV: Readonly<Record<string, string>> = {
+const PI_KEY_ENV: Readonly<Record<string, string | readonly string[]>> = {
   "github-copilot": "COPILOT_GITHUB_TOKEN",
   "ant-ling": "ANT_LING_API_KEY",
-  "qwen-token-plan": "QWEN_TOKEN_PLAN_API_KEY",
-  "qwen-token-plan-cn": "QWEN_TOKEN_PLAN_CN_API_KEY",
-  "qwen-token-plan-individual": "QWEN_TOKEN_PLAN_API_KEY",
-  "qwen-token-plan-individual-cn": "QWEN_TOKEN_PLAN_CN_API_KEY",
+  "qwen-token-plan": ["QWEN_TOKEN_PLAN_TEAM_API_KEY", "QWEN_TOKEN_PLAN_API_KEY"],
+  "qwen-token-plan-cn": ["QWEN_TOKEN_PLAN_TEAM_CN_API_KEY", "QWEN_TOKEN_PLAN_CN_API_KEY"],
+  "qwen-token-plan-individual": ["QWEN_TOKEN_PLAN_INDIVIDUAL_API_KEY", "QWEN_TOKEN_PLAN_API_KEY"],
+  "qwen-token-plan-individual-cn": ["QWEN_TOKEN_PLAN_INDIVIDUAL_CN_API_KEY", "QWEN_TOKEN_PLAN_CN_API_KEY"],
   openai: "OPENAI_API_KEY",
   azure: "AZURE_OPENAI_API_KEY",
   nvidia: "NVIDIA_API_KEY",
@@ -889,7 +892,7 @@ export async function clearTextProviders(login: boolean): Promise<string[]> {
   }
   const providers = isObject(models) && isObject(models.providers) ? models.providers : {};
   const env: Record<string, string | undefined> = { ...process.env, ...providerEnv("pi") };
-  const inEnv = (name: string) => (name === "anthropic" ? PI_ANTHROPIC_CREDENTIAL_ENV : PI_KEY_ENV[name] ? [PI_KEY_ENV[name]] : []).some((key) => env[key]?.trim());
+  const inEnv = (name: string) => (name === "anthropic" ? PI_ANTHROPIC_CREDENTIAL_ENV : [PI_KEY_ENV[name] ?? []].flat()).some((key) => env[key]?.trim());
   const clear = (value: unknown) => typeof value === "string" && sentInTheClear(value);
   // Set to something: an empty key or header list, or `authHeader: false`, sends nothing.
   const set = (value: unknown) => (isObject(value) ? Object.keys(value).length > 0 : value !== undefined && value !== null && value !== false && value !== "");

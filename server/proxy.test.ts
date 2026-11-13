@@ -158,6 +158,10 @@ describe("no-proxy lists", () => {
     expect(withoutDomains("gw.example.com,other.example", [...anthropic, "gw.example.com"])).toBe("other.example");
     expect(withoutDomains("*", anthropic)).toBe("");
     expect(withoutDomains(null, anthropic)).toBe("");
+    // undici from 8.12 (Pi 1.5.0 on) takes `*` with a port for every host on that port, anywhere in
+    // the list; a trailing dot names the same host to every version.
+    expect(withoutDomains("corp.example,*:443,*:8443", anthropic)).toBe("corp.example");
+    expect(withoutDomains("anthropic.com.,api.anthropic.com.:443,.claude.ai.,corp.example.", anthropic)).toBe("corp.example.");
   });
 
   it("keep this machine direct when a proxy is installed", () => {

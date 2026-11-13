@@ -61,11 +61,15 @@ export function withoutDomains(noProxy: string | null, domains: readonly string[
     .split(/[,\s]+/)
     .filter((entry) => {
       if (!entry) return false;
-      if (entry === "*") return false;
+      // Read the way the loosest client reads it. undici (Pi's) drops a port, a leading `*.` or `.`
+      // and a trailing dot, and from 8.12 (Pi 1.5.0 on) takes `*`, alone or with a port (`*:443`),
+      // for every host wherever it stands in the list.
       const host = entry
         .toLowerCase()
         .replace(/:\d*$/, "")
-        .replace(/^\*?\.?/, "");
+        .replace(/^\*?\.?/, "")
+        .replace(/\.$/, "");
+      if (!host) return false;
       return !wanted.some((domain) => host === domain || domain.endsWith(`.${host}`) || host.endsWith(`.${domain}`));
     })
     .join(",");
