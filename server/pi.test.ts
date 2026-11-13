@@ -462,6 +462,8 @@ describe("Pi accounts in the service", () => {
       const launchEnv = await readFile(join(home, "zerosub.env"), "utf8");
       expect(launchEnv).toContain("export https_proxy='http://127.0.0.1:7890'");
       expect(launchEnv).toContain("export NO_PROXY='localhost,127.0.0.1,::1'");
+      // A shell's own Anthropic key never stands in for the account's, from a terminal either.
+      for (const key of Object.keys(BLANK_ANTHROPIC)) expect(launchEnv).toContain(`export ${key}=''`);
       expect((await stat(join(home, "zerosub.env"))).mode & 0o777).toBe(0o600);
       expect(JSON.stringify(await store.read())).not.toContain(KEY);
       expect(await store.read()).toMatchObject({ cleanup: {}, moves: {} });
@@ -501,7 +503,9 @@ describe("Pi accounts in the service", () => {
       await service.setProxy(id, "");
       const plain = await open(service, paseo, "refresh");
       expect(plain?.env.HTTPS_PROXY).toBeUndefined();
-      expect(await readFile(join(home, "zerosub.env"), "utf8")).not.toContain("export");
+      const plainEnv = await readFile(join(home, "zerosub.env"), "utf8");
+      expect(plainEnv).not.toMatch(/^export \w*proxy/im);
+      expect(plainEnv).toContain("export ANTHROPIC_API_KEY=''");
 
       // Kept outside homes/, removing it only unregisters it: its folder, key and script stay.
       await service.remove(paseo as never, id);

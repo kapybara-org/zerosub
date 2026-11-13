@@ -305,7 +305,7 @@ function shellQuote(value: string): string {
  * it changes.
  */
 async function writeLaunchEnv(home: string, variables: Record<string, string>): Promise<void> {
-  const lines = ["# Written by ZeroSub: the proxy this account's Pi agents use in Paseo. Don't edit: it's rewritten when that changes."];
+  const lines = ["# Written by ZeroSub: the proxy and environment this account's Pi agents get in Paseo. Don't edit: it's rewritten when that changes."];
   for (const [key, value] of Object.entries(variables)) lines.push(`export ${key}=${shellQuote(value)}`);
   const content = `${lines.join("\n")}\n`;
   const path = join(home, PI_LAUNCH_ENV);
@@ -392,11 +392,14 @@ export class PiAdapter implements FamilyAdapter {
     await this.writeLaunchEnv(home);
   }
 
-  /** Brings the account's `zerosub.env` in step with the proxy its agents get (see `writeLaunchEnv`). */
+  /**
+   * Brings the account's `zerosub.env` in step with the proxy its agents get, and the Anthropic
+   * variables they get blanked, so a shell's key never stands in for the account's (see `writeLaunchEnv`).
+   */
   private async writeLaunchEnv(home: string): Promise<void> {
     const patch = await this.env(home);
     const variables: Record<string, string> = {};
-    for (const key of [...PROXY_KEYS, ...NO_PROXY_KEYS]) {
+    for (const key of [...PI_ANTHROPIC_ENV, ...PROXY_KEYS, ...NO_PROXY_KEYS]) {
       const value = patch[key];
       if (typeof value === "string") variables[key] = value;
     }
