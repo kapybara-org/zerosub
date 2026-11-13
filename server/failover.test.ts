@@ -1637,16 +1637,26 @@ describe("forking to the other provider", () => {
       expect(setup.notes.at(-1)?.detail).toMatch(/couldn't be confirmed \(transfer zerosub-handoff-m1\)/);
     });
 
-    it("keeps the pending reservation when the target is archived, instead of starting another fork", async () => {
+    it.each([
+      ["archived", true],
+      ["gone", false],
+    ])("continues on OpenCode again once the fork of an unconfirmed send is %s", async (_, archived) => {
       const sent = "The reserved initial handoff.\nzerosub transfer zerosub-handoff-m1";
       const setup = await setUpReuse(
-        { archivedAt: "2026-09-23T08:00:00.000Z" },
+        {},
         seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: digestOf(sent) }),
       );
+      expect((await setup.service.forkAgent(setup.paseo, AGENT, "opencode")).delivery).toBe("uncertain");
+      if (archived) setup.byId.get(RESERVED.targetId)!.archivedAt = "2026-09-23T08:00:00.000Z";
+      else setup.byId.delete(RESERVED.targetId);
       const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
-      expect(done.delivery).toBe("uncertain");
-      expect(setup.created).toHaveLength(0);
-      expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.messageId).toBe("zerosub-handoff-m1");
+      expect(done.delivery).toBe("sent");
+      expect(done.agentId).not.toBe(RESERVED.targetId);
+      expect(setup.created).toHaveLength(1);
+      expect(setup.sends).toHaveLength(1);
+      const record = (await setup.store.read()).opencodeForks[AGENT]!;
+      expect(record.forkAgentId).toBe(done.agentId);
+      expect(record.pending).toBeUndefined();
     });
 
     it("reuses the same message ID when an update's acknowledgement was lost", async () => {

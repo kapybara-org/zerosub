@@ -213,7 +213,7 @@ const FOUND_DETAIL =
 const HISTORY_GAP_DETAIL =
   "ZeroSub couldn't read this agent's handoff history, so it can't prove what the continuation has. Nothing was sent; check both chats.";
 const uncertainDetail = (title: string, messageId: string): string =>
-  `The last handoff to “${title}” couldn't be confirmed (transfer ${messageId}). Open that chat before retrying; ZeroSub won't send a second copy.`;
+  `The last handoff to “${title}” couldn't be confirmed (transfer ${messageId}). Open that chat before retrying; ZeroSub won't send it a second copy. To continue in a new chat instead, archive that one.`;
 const alreadyContinued = (title: string): string =>
   `This agent was already continued in “${title}”. Nothing was started; carry on in that chat.`;
 const MOVED_REFUSAL = "The existing OpenCode continuation moved, is working or is waiting for permission. Check that chat before retrying.";
@@ -1859,9 +1859,12 @@ export class Service {
         };
       }
       if (!fork || fork.archivedAt) {
-        // An unresolved send is never dropped because its target is archived or gone: archival is not
-        // proof nothing was delivered. Keep the reservation and say so.
-        return this.openCodeUncertain(forkId, fork?.title, pending.messageId);
+        // The fork of an unconfirmed send was archived or is gone: whatever it received stays there,
+        // and nothing more can reach it, so the reservation goes and the work continues in a new fork.
+        await this.store.update((draft) => {
+          if (draft.opencodeForks[agentId]?.pending?.messageId === pending.messageId) delete draft.opencodeForks[agentId];
+        });
+        return this.createOpenCodeFork(paseo, agentId, original, source);
       }
       if (pending.sentDigest !== undefined && (await this.hasReceipt(paseo, forkId, pending.messageId, pending.sentDigest))) {
         await this.settleOpenCode(agentId, pending.messageId);
