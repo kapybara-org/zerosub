@@ -98,8 +98,26 @@ export async function inheritedPiProxy(target = ANTHROPIC_API): Promise<{ proxy:
  * opens them, so a conversation moves between accounts and stays where Paseo looks for it after an
  * account is removed.
  */
-/** The variables Pi reads Anthropic's key or token from (`getApiKeyEnvVars` in pi-ai). */
-const PI_ANTHROPIC_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN"];
+/**
+ * The variables that would have an added account's agents send something other than its own key:
+ * - the ones Pi reads Anthropic's key or token from (`getApiKeyEnvVars` in pi-ai);
+ * - `ANTHROPIC_CUSTOM_HEADERS`, which the Anthropic SDK adds to every request after the key, so an
+ *   `x-api-key` or `authorization` line there replaces it;
+ * - the workload identity federation ones, which Pi uses for Anthropic when no key comes out
+ *   (`getAnthropicFederation` in pi-ai) and would send the token it gets for them.
+ * Blank is unset to both Pi and the SDK.
+ */
+const PI_ANTHROPIC_ENV = [
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_OAUTH_TOKEN",
+  "ANTHROPIC_CUSTOM_HEADERS",
+  "ANTHROPIC_FEDERATION_RULE_ID",
+  "ANTHROPIC_ORGANIZATION_ID",
+  "ANTHROPIC_IDENTITY_TOKEN_FILE",
+  "ANTHROPIC_SERVICE_ACCOUNT_ID",
+  "ANTHROPIC_WORKSPACE_ID",
+];
 
 export class PiAdapter implements FamilyAdapter {
   readonly family = "pi" as const;
@@ -113,8 +131,8 @@ export class PiAdapter implements FamilyAdapter {
     if (!home) return {};
     const account = await readPiAccount(home);
     const patch: EnvPatch = { PI_CODING_AGENT_DIR: home };
-    // Pi takes Anthropic's key from these when the stored one comes out empty, and would send it to
-    // the account's base URL: an added account's agents only ever use its own key. Always blanked,
+    // Pi would send what these give to the account's base URL, in place of or on top of the account's
+    // key: an added account's agents only ever use its own key. Always blanked,
     // since they can come from the Pi provider's `env` in Paseo's config as well as the daemon's.
     for (const key of PI_ANTHROPIC_ENV) patch[key] = "";
     // Pi writes a new session in its agent directory's `sessions`, which is the CLI login's linked in,
