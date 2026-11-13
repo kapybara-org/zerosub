@@ -226,8 +226,9 @@ const mainWrites = new Mutex();
  * Pi applies wherever it runs on that login while its environment names no proxy, and which added
  * accounts without a proxy of their own share. ZeroSub gives Pi agents nothing for it: Pi reads it
  * itself. Like an added account's, a new proxy is refused while a key or sign-in it would carry goes
- * over plain http:// to another machine, wherever Pi takes it from (see `clearTextProviders`). The
- * file is backed up first and written under Pi's own lock.
+ * over plain http://, wherever Pi takes it from (see `clearTextProviders`): to this machine too,
+ * unless the no-proxy list keeps it direct, since Pi adds nothing to that list. The file is backed
+ * up first and written under Pi's own lock.
  */
 async function writePiMainProxy(proxy: string | null): Promise<void> {
   await mainWrites.run(async () => {
@@ -235,11 +236,13 @@ async function writePiMainProxy(proxy: string | null): Promise<void> {
       const exposed = await clearTextProviders(true);
       if (exposed.includes("anthropic")) {
         throw new Error(
-          "Pi's own login sends its Anthropic key or sign-in over plain http://, which a proxy can read. Use an https:// base URL for Anthropic and its models (in Pi's models.json), or a gateway on this machine, before setting a proxy.",
+          "Pi's own login sends its Anthropic key or sign-in over plain http://, which a proxy can read (Pi sends even this machine's addresses through it unless NO_PROXY lists them). Use an https:// base URL for Anthropic and its models (in Pi's models.json), or list that host in NO_PROXY, before setting a proxy.",
         );
       }
       if (exposed.length > 0) {
-        throw new Error(`Pi's own models.json sends the key or sign-in for ${exposed.join(", ")} over plain http://, so a proxy could read it. Use https:// there, or a gateway on this machine, before setting a proxy.`);
+        throw new Error(
+          `Pi's own models.json sends the key or sign-in for ${exposed.join(", ")} over plain http://, so a proxy could read it (Pi sends even this machine's addresses through it unless NO_PROXY lists them). Use https:// there, or list those hosts in NO_PROXY, before setting a proxy.`,
+        );
       }
     }
     await withPiLock(mainSettingsPath(), async () => {

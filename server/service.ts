@@ -40,7 +40,7 @@ import { FamilyResolver } from "./families";
 import { sameAccountIdentity, withoutWorkspace } from "./account-identity";
 import { CodexContinuations } from "./continuations";
 import { CONTINUED_FROM_LABEL, continueInNewAgent, type Continuation } from "./handoff";
-import { PI_ACCOUNT_FILE, isAccountHome, moveHome, normalizeBaseUrl, readPiAccount, readPiAccountForAgents, removeHome, sentInTheClear } from "./homes";
+import { PI_ACCOUNT_FILE, crossesInheritedProxy, isAccountHome, moveHome, normalizeBaseUrl, plainHttp, readPiAccount, readPiAccountForAgents, removeHome } from "./homes";
 import { launcherNames, piLauncherDir, writeLaunchers, type LauncherAccount } from "./launchers";
 import { Mutex } from "./json-file";
 import { turnRows } from "./limits";
@@ -2860,8 +2860,9 @@ export class Service {
 
   /**
    * A new proxy on the CLI login is also every added account's without one of its own, so it's
-   * refused while one of those sends its key over plain http:// to another machine, as a new proxy
-   * on that account itself would be.
+   * refused while one of those sends its key over plain http:// through it: to this machine too,
+   * unless the no-proxy list keeps it direct, since Pi adds nothing to that list for the login's
+   * proxy (see `crossesInheritedProxy`).
    */
   private async refuseClearTextFollowers(family: Family): Promise<void> {
     const adapter = this.adapters[family];
@@ -2874,7 +2875,7 @@ export class Service {
       if (!settings) throw new Error(`${account.label}'s folder is being moved just now. Try again in a moment.`);
       const { key, baseUrl, proxy } = settings;
       if (proxy) continue;
-      if (key && sentInTheClear(baseUrl)) {
+      if (key && crossesInheritedProxy(baseUrl)) {
         throw new Error(
           `${account.label} has no proxy of its own and sends its key over plain http:// to ${baseUrl}, so this proxy could read it. Give ${account.label} its key again with an https:// base URL, or a proxy of its own, first.`,
         );
@@ -3023,8 +3024,9 @@ export class Service {
     const { key, baseUrl, proxy } = await readPiAccount(home);
     if (!key) throw new Error(`${shown} has no API key in its zerosub.json. Add a new account with its API key instead.`);
     // As for a new proxy on the CLI login (see `refuseClearTextFollowers`): without a proxy of its own it
-    // would go through the one it inherits, which could read a key sent over plain http://.
-    if (!proxy && sentInTheClear(baseUrl)) {
+    // would go through the one it inherits, which could read a key sent over plain http://, to this
+    // machine too (`inherited` is null where the no-proxy list keeps the base URL direct).
+    if (!proxy && plainHttp(baseUrl)) {
       const inherited = (await this.adapters.pi.proxyState?.(home))?.inherited;
       if (inherited) {
         throw new Error(

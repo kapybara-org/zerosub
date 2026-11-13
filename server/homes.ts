@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { ApiSummary, Family } from "../shared/model";
 import { Mutex, readJson } from "./json-file";
-import { REQUIRED_NO_PROXY, maskProxy } from "./proxy";
+import { REQUIRED_NO_PROXY, bypassesProxy, maskProxy } from "./proxy";
 import { providerEnv } from "./provider-env";
 import { homesDir, isOwnHome, mainClaudeDir, mainClaudeGlobalConfig, mainCodexHome, mainPiDir } from "./paths";
 
@@ -784,8 +784,9 @@ export function writePiAccountProxy(
     await stillWanted(wanted);
     const previous = await readPiAccount(home);
     // Without its own, the account goes through the proxy it inherits: a plain-http:// key would then
-    // cross that one in the clear, as through a new one of its own.
-    if (!proxy && previous.proxy && previous.key && sentInTheClear(previous.baseUrl)) {
+    // cross that one in the clear, as through a new one of its own, to this machine too (`inherited`
+    // is null where the no-proxy list keeps the base URL direct; see `crossesInheritedProxy`).
+    if (!proxy && previous.proxy && previous.key && plainHttp(previous.baseUrl)) {
       const next = await inherited?.(previous.baseUrl);
       if (next) {
         throw new Error(
@@ -869,11 +870,12 @@ const PI_KEY_ENV: Readonly<Record<string, string | readonly string[]>> = {
 const PI_ANTHROPIC_CREDENTIAL_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_FEDERATION_RULE_ID"];
 
 /**
- * Providers that Pi's own `models.json` sends over plain http:// to another machine (see
- * `sentInTheClear`), for the provider or any of its models, along with a credential a proxy could
- * then read: an entry in the CLI login's `auth.json`, an `apiKey`, `headers` or `authHeader` in its
- * `models.json` (for the provider, a model or an override), or a key in the environment Pi starts
- * with (the daemon's, under the Pi provider's `env` in Paseo's config).
+ * Providers that Pi's own `models.json` sends over plain http:// through the proxy (to another
+ * machine for an added account's, see `sentInTheClear`; for the login's, anywhere the no-proxy list
+ * doesn't keep direct, see `crossesInheritedProxy`), for the provider or any of its models, along
+ * with a credential a proxy could then read: an entry in the CLI login's `auth.json`, an `apiKey`,
+ * `headers` or `authHeader` in its `models.json` (for the provider, a model or an override), or a key
+ * in the environment Pi starts with (the daemon's, under the Pi provider's `env` in Paseo's config).
  *
  * For an added account's proxy these are the credentials every account gets from the CLI login: its
  * `auth.json` API keys (see `piAuth`; its sign-ins aren't copied) and everything but Anthropic's, which
@@ -893,7 +895,7 @@ export async function clearTextProviders(login: boolean): Promise<string[]> {
   const providers = isObject(models) && isObject(models.providers) ? models.providers : {};
   const env: Record<string, string | undefined> = { ...process.env, ...providerEnv("pi") };
   const inEnv = (name: string) => (name === "anthropic" ? PI_ANTHROPIC_CREDENTIAL_ENV : [PI_KEY_ENV[name] ?? []].flat()).some((key) => env[key]?.trim());
-  const clear = (value: unknown) => typeof value === "string" && sentInTheClear(value);
+  const clear = (value: unknown) => typeof value === "string" && (login ? crossesInheritedProxy(value, env) : sentInTheClear(value));
   // Set to something: an empty key or header list, or `authHeader: false`, sends nothing.
   const set = (value: unknown) => (isObject(value) ? Object.keys(value).length > 0 : value !== undefined && value !== null && value !== false && value !== "");
   const carries = (entry: unknown) => isObject(entry) && ["apiKey", "headers", "authHeader"].some((key) => set(entry[key]));
@@ -912,8 +914,10 @@ export async function clearTextProviders(login: boolean): Promise<string[]> {
 }
 
 /**
- * Whether requests to `baseUrl` would cross a proxy unencrypted: plain http:// to anywhere but the
- * hosts that always stay direct (`REQUIRED_NO_PROXY`).
+ * Whether requests to `baseUrl` would cross a proxy ZeroSub gives an added account unencrypted:
+ * plain http:// to anywhere but the hosts that always stay direct (`REQUIRED_NO_PROXY`, which
+ * ZeroSub puts in that account's no-proxy list; see `proxyVariables`). For a proxy Pi takes itself,
+ * see `crossesInheritedProxy`.
  */
 export function sentInTheClear(baseUrl: string | null): boolean {
   if (!baseUrl) return false;
@@ -924,4 +928,25 @@ export function sentInTheClear(baseUrl: string | null): boolean {
   } catch {
     return false;
   }
+}
+
+/** Whether `baseUrl` is plain http://, which any proxy it goes through can read. */
+export function plainHttp(baseUrl: string | null): boolean {
+  if (!baseUrl) return false;
+  try {
+    return new URL(baseUrl).protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether requests to `baseUrl` would cross a proxy Pi takes from `httpProxy` or the environment
+ * (`env`, the one Pi starts with) unencrypted: plain http:// that the no-proxy list doesn't keep
+ * direct. Pi adds nothing to that list, and undici, which Pi sends its requests with, keeps no host
+ * direct without it, this machine included. The list is read as undici reads it: `no_proxy` wherever
+ * it's set, even empty, else `NO_PROXY`.
+ */
+export function crossesInheritedProxy(baseUrl: string | null, env: Record<string, string | undefined> = { ...process.env, ...providerEnv("pi") }): boolean {
+  return baseUrl !== null && plainHttp(baseUrl) && !bypassesProxy(env.no_proxy ?? env.NO_PROXY ?? null, baseUrl);
 }
