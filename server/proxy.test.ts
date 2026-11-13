@@ -1,5 +1,50 @@
-import { describe, expect, it } from "vitest";
-import { bypassesProxy, maskProxy, noProxyFromEnv, normalizeProxy, withRequiredNoProxy, withoutDomains } from "./proxy";
+import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
+import { createConnection, createServer, type AddressInfo, type Server } from "node:net";
+import { afterEach, describe, expect, it } from "vitest";
+import { bypassesProxy, maskProxy, noProxyFromEnv, normalizeProxy, openTunnel, proxiedFetch, withRequiredNoProxy, withoutDomains } from "./proxy";
+
+const servers: (Server | HttpServer)[] = [];
+
+afterEach(async () => {
+  await Promise.all(servers.splice(0).map((server) => new Promise((resolve) => server.close(resolve))));
+});
+
+function listen<T extends Server | HttpServer>(server: T): Promise<number> {
+  servers.push(server);
+  return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve((server.address() as AddressInfo).port)));
+}
+
+/** A TCP server that answers every line with "echo:" + line. */
+async function echoServer(): Promise<number> {
+  return listen(createServer((socket) => socket.on("data", (chunk) => socket.write(`echo:${chunk}`))));
+}
+
+/** A minimal CONNECT proxy that records what it was asked and can refuse, or send every tunnel `to` one local port. */
+async function connectProxy(options: { refuse?: number; to?: number } = {}): Promise<{ port: number; seen: { url?: string; auth?: string }[] }> {
+  const seen: { url?: string; auth?: string }[] = [];
+  const server = createHttpServer();
+  server.on("connect", (req, client, head) => {
+    seen.push({ url: req.url, auth: req.headers["proxy-authorization"] });
+    if (options.refuse) {
+      client.end(`HTTP/1.1 ${options.refuse} Nope\r\n\r\n`);
+      return;
+    }
+    const [host, port] = (req.url ?? "").split(":");
+    const upstream = createConnection(options.to ? { host: "127.0.0.1", port: options.to } : { host, port: Number(port) }, () => {
+      client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      if (head.length) upstream.write(head);
+      upstream.pipe(client);
+      client.pipe(upstream);
+    });
+    upstream.on("error", () => client.destroy());
+  });
+  return { port: await listen(server), seen };
+}
+
+function firstReply(socket: import("node:net").Socket): Promise<string> {
+  return new Promise((resolve) => socket.once("data", (chunk) => resolve(String(chunk))));
+}
+
 
 describe("normalizeProxy", () => {
   it("accepts http(s) proxies with optional credentials, in canonical form", () => {
@@ -25,6 +70,51 @@ describe("maskProxy", () => {
   it("hides only the password", () => {
     expect(maskProxy("http://user:secret@127.0.0.1:7890")).toBe("http://user:•••@127.0.0.1:7890");
     expect(maskProxy("http://127.0.0.1:7890")).toBe("http://127.0.0.1:7890");
+  });
+});
+
+describe("openTunnel", () => {
+  it("tunnels to the target through the proxy and sends proxy credentials", async () => {
+    const target = await echoServer();
+    const proxy = await connectProxy();
+    const socket = await openTunnel(`http://user:p%40ss@127.0.0.1:${proxy.port}`, "127.0.0.1", target);
+    socket.write("hi");
+    expect(await firstReply(socket)).toBe("echo:hi");
+    socket.destroy();
+    expect(proxy.seen).toEqual([{ url: `127.0.0.1:${target}`, auth: `Basic ${Buffer.from("user:p@ss").toString("base64")}` }]);
+  });
+
+  it("fails when the proxy refuses the tunnel", async () => {
+    const proxy = await connectProxy({ refuse: 407 });
+    await expect(openTunnel(`http://127.0.0.1:${proxy.port}`, "example.com", 443)).rejects.toThrow("HTTP 407");
+  });
+
+  it("fails rather than going direct when the proxy is unreachable", async () => {
+    const closed = await listen(createServer());
+    await new Promise((resolve) => servers.pop()!.close(resolve));
+    await expect(openTunnel(`http://127.0.0.1:${closed}`, "example.com", 443)).rejects.toThrow("Proxy connection failed");
+  });
+
+  it("refuses proxy schemes it can't speak", async () => {
+    await expect(openTunnel("socks5://127.0.0.1:1080", "example.com", 443)).rejects.toThrow("socks5:");
+    await expect(openTunnel("not a url", "example.com", 443)).rejects.toThrow("valid URL");
+  });
+});
+
+describe("proxiedFetch", () => {
+  it("sends an https request through the proxy's tunnel, never straight to the host", async () => {
+    // A host only the proxy reaches: it doesn't resolve, so going straight there gets nowhere.
+    let hello = "";
+    const target = await listen(createServer((socket) => socket.once("data", (chunk: Buffer) => ((hello = chunk.toString("latin1")), socket.destroy()))));
+    const proxy = await connectProxy({ to: target });
+    await expect(proxiedFetch(`http://127.0.0.1:${proxy.port}`, "https://usage.zerosub.test/api", { signal: AbortSignal.timeout(5_000) })).rejects.toThrow();
+    expect(proxy.seen.map((entry) => entry.url)).toEqual(["usage.zerosub.test:443"]);
+    // The TLS handshake with the host went through the tunnel: the host's name is in its hello.
+    expect(hello).toContain("usage.zerosub.test");
+  });
+
+  it("never sends a plain-http request through the tunnel path", async () => {
+    await expect(proxiedFetch("http://127.0.0.1:1", "http://example.com/")).rejects.toThrow("https://");
   });
 });
 
@@ -68,6 +158,12 @@ describe("no-proxy lists", () => {
     expect(withoutDomains("gw.example.com,other.example", [...anthropic, "gw.example.com"])).toBe("other.example");
     expect(withoutDomains("*", anthropic)).toBe("");
     expect(withoutDomains(null, anthropic)).toBe("");
+    // undici from 8.12 (Pi 1.5.0 on) takes `*` with a port for every host on that port, anywhere in
+    // the list; a trailing dot names the same host to every version.
+    expect(withoutDomains("corp.example,*:443,*:8443", anthropic)).toBe("corp.example");
+    expect(withoutDomains("anthropic.com.,api.anthropic.com.:443,.claude.ai.,corp.example.", anthropic)).toBe("corp.example.");
+    // Nor any entry that's `*` once a port, a leading `*.` or `.` and a trailing dot are dropped.
+    for (const entry of [".*", "*.*", ".*.", "*.*:443"]) expect(withoutDomains(`corp.example,${entry}`, anthropic), entry).toBe("corp.example");
   });
 
   it("keep this machine direct when a proxy is installed", () => {

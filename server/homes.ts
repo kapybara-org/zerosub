@@ -1,10 +1,11 @@
-import { lstat, mkdir, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { ApiSummary, Family } from "../shared/model";
 import { Mutex, readJson } from "./json-file";
-import { REQUIRED_NO_PROXY } from "./proxy";
-import { homesDir, mainClaudeDir, mainClaudeGlobalConfig, mainCodexHome, mainPiDir } from "./paths";
+import { REQUIRED_NO_PROXY, bypassesProxy, maskProxy } from "./proxy";
+import { providerEnv } from "./provider-env";
+import { homesDir, isOwnHome, mainClaudeDir, mainClaudeGlobalConfig, mainCodexHome, mainPiDir } from "./paths";
 
 /**
  * A managed account home is a real directory holding that account's own credentials and account
@@ -21,6 +22,11 @@ interface OverlaySpec {
 
 const SYNC_TTL_MS = 30_000;
 const lastSync = new Map<string, number>();
+
+/** Has the next sync of every home run in full: the CLI login's files, which theirs are made from, changed. */
+export function forgetSyncs(): void {
+  lastSync.clear();
+}
 
 async function exists(path: string): Promise<boolean> {
   try {
@@ -53,6 +59,20 @@ async function syncOverlay(home: string, spec: OverlaySpec): Promise<void> {
   await mkdir(home, { recursive: true, mode: 0o700 });
   await mkdir(spec.main, { recursive: true, mode: 0o700 });
   for (const directory of spec.shareDirs) await mkdir(join(spec.main, directory), { recursive: true });
+  // A home that isn't ZeroSub's own (see `isOwnHome`) is the user's: a link there is only changed or
+  // dropped when it points into main, as the ones made here do. One the user made elsewhere stays.
+  const own = await isOwnHome(home);
+  const mains = [resolve(spec.main), await realpath(spec.main).catch(() => resolve(spec.main))];
+  const ours = async (link: string) => {
+    if (own) return true;
+    const raw = await readlink(link).catch(() => null);
+    if (raw === null) return false;
+    const pointsAt = resolve(home, raw);
+    return mains.some((main) => {
+      const inside = relative(main, pointsAt);
+      return inside !== "" && !inside.startsWith("..") && !isAbsolute(inside);
+    });
+  };
 
   for (const name of await readdir(spec.main)) {
     if (name === ".DS_Store" || spec.isPrivate(name)) continue;
@@ -64,7 +84,7 @@ async function syncOverlay(home: string, spec: OverlaySpec): Promise<void> {
     const current = await lstat(link).catch(() => null);
     if (current) {
       if (!current.isSymbolicLink()) continue; // Created here by the CLI; leave it alone.
-      if ((await readlink(link)) === target) continue;
+      if ((await readlink(link)) === target || !(await ours(link))) continue;
       await unlink(link);
     }
     const targetStat = await stat(target).catch(() => null);
@@ -80,7 +100,7 @@ async function syncOverlay(home: string, spec: OverlaySpec): Promise<void> {
   for (const name of await readdir(home)) {
     const link = join(home, name);
     const current = await lstat(link).catch(() => null);
-    if (current?.isSymbolicLink() && !(await exists(link))) await unlink(link).catch(() => undefined);
+    if (current?.isSymbolicLink() && !(await exists(link)) && (await ours(link))) await unlink(link).catch(() => undefined);
   }
 }
 
@@ -110,6 +130,65 @@ export function removeHome(home: string): Promise<void> {
     await rm(home, { recursive: true, force: true });
   });
 }
+
+/**
+ * Moves a home's folder from `from` to `to`, which mustn't exist yet, then runs `commit` (saving
+ * where its account's home is now) while it still holds both homes' locks: a sync of `from` waiting
+ * meanwhile then finds its account gone from there and never makes the folder again. When `commit`
+ * fails the folder goes back. Onto another disk the folder is copied, links as they are, and `from`
+ * only deleted once `commit` worked.
+ */
+export function moveHome(from: string, to: string, commit: () => Promise<void>): Promise<void> {
+  return withHome(from, () =>
+    withHome(to, async () => {
+      const entry = await lstat(from).catch(() => null);
+      if (!entry?.isDirectory()) throw new Error(`${from} isn't a folder`);
+      if (await lstat(to).catch(() => null)) throw new Error(`${to} is already there`);
+      await mkdir(dirname(to), { recursive: true, mode: 0o700 });
+      const copied = await moveFolder(from, to);
+      try {
+        await commit();
+      } catch (error) {
+        if (copied) await rm(to, { recursive: true, force: true });
+        else await rename(to, from);
+        throw error;
+      }
+      if (copied) await removeTree(from);
+      for (const synced of [lastMcpSync, lastMcpKeys] as Map<string, unknown>[]) {
+        if (synced.has(from)) synced.set(to, synced.get(from));
+        synced.delete(from);
+      }
+      lastSync.delete(from);
+    }),
+  );
+}
+
+/** Renames `from` to `to`, or copies it there when that's another disk; says whether it copied. */
+async function moveFolder(from: string, to: string): Promise<boolean> {
+  try {
+    await rename(from, to);
+    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
+  }
+  try {
+    await cp(from, to, { recursive: true, verbatimSymlinks: true, preserveTimestamps: true, errorOnExist: true, force: false });
+  } catch (error) {
+    await rm(to, { recursive: true, force: true });
+    throw error;
+  }
+  return true;
+}
+
+/** Deletes a folder whose top level may link into main: the links go first, never followed. */
+async function removeTree(folder: string): Promise<void> {
+  for (const name of await readdir(folder).catch(() => [] as string[])) {
+    const path = join(folder, name);
+    if ((await lstat(path).catch(() => null))?.isSymbolicLink()) await unlink(path).catch(() => undefined);
+  }
+  await rm(folder, { recursive: true, force: true });
+}
+
 
 /** Atomic-write leftovers and scratch files: never worth sharing. */
 function isTemporary(name: string): boolean {
@@ -246,6 +325,34 @@ async function readJsonObject(path: string): Promise<Record<string, unknown> | n
   } catch {
     return null;
   }
+}
+
+/**
+ * One of Pi's own files as Pi reads it, so nothing Pi acts on is hidden from ZeroSub: a byte order
+ * mark is dropped, and in `models.json` (`comments`) so are `//` comments and trailing commas
+ * (`stripJsonComments` in Pi, the same from 1.4.0 to 1.5.2). Undefined without the file; throws when Pi couldn't parse it either.
+ */
+export async function readPiOwnJson(path: string, comments = false): Promise<unknown | undefined> {
+  let text: string;
+  try {
+    text = await readFile(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+  if (text.startsWith("\uFEFF")) text = text.slice(1);
+  if (comments) {
+    text = text
+      .replace(/"(?:\\.|[^"\\])*"|\/\/[^\n]*/g, (match) => (match[0] === '"' ? match : ""))
+      .replace(/"(?:\\.|[^"\\])*"|,(\s*[}\]])/g, (match, tail: string | undefined) => tail ?? (match[0] === '"' ? match : ""));
+  }
+  return JSON.parse(text) as unknown;
+}
+
+/** `readPiOwnJson` for a file that should hold an object: null without one, or when it doesn't parse. */
+async function readPiOwnObject(path: string, comments = false): Promise<Record<string, unknown> | null> {
+  const value = await readPiOwnJson(path, comments).catch(() => undefined);
+  return isObject(value) ? value : null;
 }
 
 async function writeJsonAtomically(path: string, value: unknown): Promise<void> {
@@ -427,6 +534,7 @@ export interface PiAccount {
 function piPrivate(name: string): boolean {
   return (
     name === PI_ACCOUNT_FILE ||
+    name === "zerosub.env" ||
     name.startsWith("auth.json") ||
     name.startsWith("models.json") ||
     name.startsWith("models-store.json") ||
@@ -441,7 +549,22 @@ function stringOrNull(value: unknown): string | null {
 
 /** The account's own settings; empty ones for a home without the file (or one that doesn't parse). */
 export async function readPiAccount(home: string): Promise<PiAccount> {
+  return piAccountFrom(await readJsonObject(join(home, PI_ACCOUNT_FILE)));
+}
+
+/**
+ * The account's settings to start an agent with. Unlike `readPiAccount`, a folder without a readable
+ * `zerosub.json` throws instead of reading as empty: the folder is being moved (renamed away while
+ * Pi's processes are checked) or is gone, and an agent started from empty settings would run without
+ * the account's proxy, and keep running that way.
+ */
+export async function readPiAccountForAgents(home: string): Promise<PiAccount> {
   const value = await readJsonObject(join(home, PI_ACCOUNT_FILE));
+  if (!value) throw new Error(`${home} has no readable ${PI_ACCOUNT_FILE} (it may be moving)`);
+  return piAccountFrom(value);
+}
+
+function piAccountFrom(value: Record<string, unknown> | null): PiAccount {
   return { key: stringOrNull(value?.key), baseUrl: stringOrNull(value?.baseUrl), proxy: stringOrNull(value?.proxy) };
 }
 
@@ -538,19 +661,67 @@ async function writeIfChanged(path: string, value: unknown): Promise<void> {
 async function syncPiFiles(home: string): Promise<void> {
   const account = await readPiAccount(home);
   const mainDir = mainPiDir();
-  const mainAuth = await readJsonObject(join(mainDir, "auth.json"));
+  const mainAuth = await readPiOwnObject(join(mainDir, "auth.json"));
   await writeIfChanged(join(home, "auth.json"), piAuth(mainAuth, account.key));
   const modelsPath = join(mainDir, "models.json");
   let mainModels: unknown = {};
   try {
-    mainModels = (await readJson(modelsPath)) ?? {};
+    mainModels = (await readPiOwnJson(modelsPath, true)) ?? {};
     unreadablePiModels.delete(modelsPath);
   } catch {
     // Still written, so the account's key never goes to a base URL it wasn't set up with.
-    if (!unreadablePiModels.has(modelsPath)) console.warn(`[ZeroSub] ${modelsPath} isn't valid JSON; added Pi accounts don't get its models until it's fixed`);
+    if (!unreadablePiModels.has(modelsPath)) console.warn(`[ZeroSub] ${modelsPath} doesn't parse; added Pi accounts don't get its models until it's fixed`);
     unreadablePiModels.add(modelsPath);
   }
   await writeIfChanged(join(home, "models.json"), piModels(mainModels, account.baseUrl));
+}
+
+/** Main's `settings.json` files that didn't parse, so each is only logged once. */
+const unreadablePiSettings = new Set<string>();
+
+/**
+ * The account's `settings.json`. Without a proxy of its own it's a link to the CLI login's, like
+ * the other shared entries. With one it's the CLI login's settings with `httpProxy` set to the
+ * proxy, so Pi started on the account's folder anywhere else (`PI_CODING_AGENT_DIR=<folder> pi` in
+ * a terminal, say) goes through it too, as long as its environment names no proxy (Pi only fills
+ * the proxy variables in from `httpProxy` when they're unset). It's remade from the CLI login's at
+ * every sync, so what Pi writes to it there doesn't last. A home ZeroSub made is the only kind a
+ * Pi account has, so the generated file is replaced by the link again once the proxy goes; while
+ * the CLI login has no settings to link to, it stays with `httpProxy` taken out.
+ */
+async function syncPiSettings(home: string, proxy: string | null): Promise<void> {
+  const target = join(home, "settings.json");
+  const current = await lstat(target).catch(() => null);
+  const mainSettings = join(mainPiDir(), "settings.json");
+  if (proxy) {
+    let main: unknown;
+    try {
+      main = await readPiOwnJson(mainSettings);
+      unreadablePiSettings.delete(mainSettings);
+    } catch {
+      if (!unreadablePiSettings.has(mainSettings)) console.warn(`[ZeroSub] ${mainSettings} isn't valid JSON; added Pi accounts with a proxy keep the rest of their settings as they were until it's fixed`);
+      unreadablePiSettings.add(mainSettings);
+      // The rest stays as it was, but never the proxy: the account's may have changed since.
+      if (current?.isFile()) main = await readJsonObject(target);
+    }
+    // Written over the link, never through it: the CLI login's settings stay as they are.
+    await writeIfChanged(target, { ...(isObject(main) ? main : {}), httpProxy: proxy });
+    return;
+  }
+  if (!current?.isFile()) return;
+  const real = await realpath(mainSettings).catch(() => null);
+  if (!real) {
+    // The CLI login has none to share, so the file stays, without the proxy that was the account's:
+    // Pi started on this folder would otherwise still go through it.
+    const own = await readJsonObject(target);
+    if (own && "httpProxy" in own) {
+      const { httpProxy: _gone, ...rest } = own;
+      await writeIfChanged(target, rest);
+    }
+    return;
+  }
+  await unlink(target);
+  await symlink(real, target);
 }
 
 /**
@@ -564,7 +735,10 @@ export function preparePiHome(home: string, force = false, wanted?: () => Promis
     if (wanted && !(await wanted())) return;
     const last = lastSync.get(home);
     if (!force && last && Date.now() - last < SYNC_TTL_MS) return;
-    await syncOverlay(home, { main: mainPiDir(), shareDirs: ["sessions"], isPrivate: piPrivate });
+    const { proxy } = await readPiAccount(home);
+    await syncPiSettings(home, proxy);
+    const isPrivate = (name: string) => piPrivate(name) || (proxy !== null && name === "settings.json");
+    await syncOverlay(home, { main: mainPiDir(), shareDirs: ["sessions"], isPrivate });
     await syncPiFiles(home);
     lastSync.set(home, Date.now());
   });
@@ -597,12 +771,29 @@ export function writePiAccountApi(home: string, config: { key: string | null; ba
 
 /**
  * Sets (or clears, with `null`) a Pi account's proxy, for its sessions started afterwards (see
- * `PiAdapter.env`). `wanted` as for `stillWanted`.
+ * `PiAdapter.env`). `wanted` as for `stillWanted`. `inherited` says which proxy the account would go
+ * through without one of its own, for a key that clearing it would send there in the clear.
  */
-export function writePiAccountProxy(home: string, proxy: string | null, wanted?: () => Promise<boolean>): Promise<void> {
+export function writePiAccountProxy(
+  home: string,
+  proxy: string | null,
+  wanted?: () => Promise<boolean>,
+  inherited?: (baseUrl: string | null) => Promise<{ proxy: string; from: string } | null>,
+): Promise<void> {
   return withHome(home, async () => {
     await stillWanted(wanted);
     const previous = await readPiAccount(home);
+    // Without its own, the account goes through the proxy it inherits: a plain-http:// key would then
+    // cross that one in the clear, as through a new one of its own, to this machine too (`inherited`
+    // is null where the no-proxy list keeps the base URL direct; see `crossesInheritedProxy`).
+    if (!proxy && previous.proxy && previous.key && plainHttp(previous.baseUrl)) {
+      const next = await inherited?.(previous.baseUrl);
+      if (next) {
+        throw new Error(
+          `This account sends its key over plain http://, and without its own proxy it would go through ${maskProxy(next.proxy)} (${next.from}), which could read it. Switch to an https:// base URL first, or keep this proxy.`,
+        );
+      }
+    }
     // As with a new base URL, a key is never sent somewhere new: over plain http:// a proxy reads it.
     if (proxy && proxy !== previous.proxy) {
       if (previous.key && sentInTheClear(previous.baseUrl)) {
@@ -610,7 +801,7 @@ export function writePiAccountProxy(home: string, proxy: string | null, wanted?:
           "This account sends its key over plain http://, which a proxy can read. To use a new proxy, remove the account and add it again with its key and the proxy, or switch to an https:// base URL.",
         );
       }
-      const exposed = await clearTextProviders();
+      const exposed = await clearTextProviders(false);
       if (exposed.length > 0) {
         throw new Error(
           `Pi's own models.json sends the API key for ${exposed.join(", ")} over plain http://, and every Pi account gets that key, so a proxy could read it. Use https:// there, or a gateway on this machine, before setting a proxy.`,
@@ -618,30 +809,104 @@ export function writePiAccountProxy(home: string, proxy: string | null, wanted?:
       }
     }
     await writePiAccount(home, { ...previous, proxy });
+    await syncPiSettings(home, proxy);
   });
 }
 
 /**
- * Providers whose credentials every account gets from the CLI login (an API key in its `auth.json`,
- * see `piAuth`, or an `apiKey`, `headers` or `authHeader` in its `models.json`, for the provider, a
- * model or an override) that Pi's own `models.json` sends over plain http:// to another machine
- * (see `sentInTheClear`), for the provider or any of its models.
+ * The variables Pi takes each of its own providers' key from when it has none stored
+ * (`getApiKeyEnvVars` in pi-ai): every name any version from 1.4.0 on reads, as a name an older or
+ * newer Pi doesn't read only refuses a proxy it could have allowed. 1.5.1 added
+ * `qwen-token-plan-individual-cn`; the per-plan Qwen variables come after 1.5.2 (on Pi's main
+ * branch, not released yet). Anthropic's are in `PI_ANTHROPIC_CREDENTIAL_ENV`.
  */
-async function clearTextProviders(): Promise<string[]> {
-  const auth = (await readJsonObject(join(mainPiDir(), "auth.json"))) ?? {};
-  const models = await readJsonObject(join(mainPiDir(), "models.json"));
-  const providers = isObject(models?.providers) ? models.providers : {};
-  const clear = (value: unknown) => typeof value === "string" && sentInTheClear(value);
+const PI_KEY_ENV: Readonly<Record<string, string | readonly string[]>> = {
+  "github-copilot": "COPILOT_GITHUB_TOKEN",
+  "ant-ling": "ANT_LING_API_KEY",
+  "qwen-token-plan": ["QWEN_TOKEN_PLAN_TEAM_API_KEY", "QWEN_TOKEN_PLAN_API_KEY"],
+  "qwen-token-plan-cn": ["QWEN_TOKEN_PLAN_TEAM_CN_API_KEY", "QWEN_TOKEN_PLAN_CN_API_KEY"],
+  "qwen-token-plan-individual": ["QWEN_TOKEN_PLAN_INDIVIDUAL_API_KEY", "QWEN_TOKEN_PLAN_API_KEY"],
+  "qwen-token-plan-individual-cn": ["QWEN_TOKEN_PLAN_INDIVIDUAL_CN_API_KEY", "QWEN_TOKEN_PLAN_CN_API_KEY"],
+  openai: "OPENAI_API_KEY",
+  azure: "AZURE_OPENAI_API_KEY",
+  nvidia: "NVIDIA_API_KEY",
+  deepseek: "DEEPSEEK_API_KEY",
+  google: "GEMINI_API_KEY",
+  "google-vertex": "GOOGLE_CLOUD_API_KEY",
+  groq: "GROQ_API_KEY",
+  cerebras: "CEREBRAS_API_KEY",
+  xai: "XAI_API_KEY",
+  typesafe: "TYPESAFE_API_KEY",
+  radius: "RADIUS_API_KEY",
+  openrouter: "OPENROUTER_API_KEY",
+  "vercel-ai-gateway": "AI_GATEWAY_API_KEY",
+  zai: "ZAI_API_KEY",
+  "zai-coding-cn": "ZAI_CODING_CN_API_KEY",
+  mistral: "MISTRAL_API_KEY",
+  minimax: "MINIMAX_API_KEY",
+  "minimax-cn": "MINIMAX_CN_API_KEY",
+  moonshotai: "MOONSHOT_API_KEY",
+  "moonshotai-cn": "MOONSHOT_API_KEY",
+  huggingface: "HF_TOKEN",
+  fireworks: "FIREWORKS_API_KEY",
+  together: "TOGETHER_API_KEY",
+  baseten: "BASETEN_API_KEY",
+  opencode: "OPENCODE_API_KEY",
+  "opencode-go": "OPENCODE_API_KEY",
+  "kimi-coding": "KIMI_API_KEY",
+  meta: "META_API_KEY",
+  "cloudflare-workers-ai": "CLOUDFLARE_API_KEY",
+  "cloudflare-ai-gateway": "CLOUDFLARE_API_KEY",
+  xiaomi: "XIAOMI_API_KEY",
+  "xiaomi-token-plan-cn": "XIAOMI_TOKEN_PLAN_CN_API_KEY",
+  "xiaomi-token-plan-ams": "XIAOMI_TOKEN_PLAN_AMS_API_KEY",
+  "xiaomi-token-plan-sgp": "XIAOMI_TOKEN_PLAN_SGP_API_KEY",
+};
+
+/**
+ * The variables that give Pi's own login something of Anthropic's to send: a key or token, headers
+ * the SDK adds to every request, or the federation rule Pi gets a token for when it has no key.
+ */
+const PI_ANTHROPIC_CREDENTIAL_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_FEDERATION_RULE_ID"];
+
+/**
+ * Providers that Pi's own `models.json` sends over plain http:// through the proxy (to another
+ * machine for an added account's, see `sentInTheClear`; for the login's, anywhere the no-proxy list
+ * doesn't keep direct, see `crossesInheritedProxy`), for the provider or any of its models, along
+ * with a credential a proxy could then read: an entry in the CLI login's `auth.json`, an `apiKey`,
+ * `headers` or `authHeader` in its `models.json` (for the provider, a model or an override), or a key
+ * in the environment Pi starts with (the daemon's, under the Pi provider's `env` in Paseo's config).
+ *
+ * For an added account's proxy these are the credentials every account gets from the CLI login: its
+ * `auth.json` API keys (see `piAuth`; its sign-ins aren't copied) and everything but Anthropic's, which
+ * the account has its own of (see `piModels`). For the proxy of Pi's own login (`login`) it's whatever
+ * that login sends: Anthropic's too, and its sign-ins. There a `models.json` that doesn't parse is
+ * refused, as nothing can be told from it; an added account gets none of it (see `syncPiFiles`).
+ */
+export async function clearTextProviders(login: boolean): Promise<string[]> {
+  const auth = (await readPiOwnObject(join(mainPiDir(), "auth.json"))) ?? {};
+  const modelsPath = join(mainPiDir(), "models.json");
+  let models: unknown;
+  try {
+    models = await readPiOwnJson(modelsPath, true);
+  } catch {
+    if (login) throw new Error(`${modelsPath} doesn't parse, so ZeroSub can't tell whether a key there would cross the proxy over plain http://. Fix it before setting a proxy.`);
+  }
+  const providers = isObject(models) && isObject(models.providers) ? models.providers : {};
+  const env: Record<string, string | undefined> = { ...process.env, ...providerEnv("pi") };
+  const inEnv = (name: string) => (name === "anthropic" ? PI_ANTHROPIC_CREDENTIAL_ENV : [PI_KEY_ENV[name] ?? []].flat()).some((key) => env[key]?.trim());
+  const clear = (value: unknown) => typeof value === "string" && (login ? crossesInheritedProxy(value, env) : sentInTheClear(value));
   // Set to something: an empty key or header list, or `authHeader: false`, sends nothing.
   const set = (value: unknown) => (isObject(value) ? Object.keys(value).length > 0 : value !== undefined && value !== null && value !== false && value !== "");
   const carries = (entry: unknown) => isObject(entry) && ["apiKey", "headers", "authHeader"].some((key) => set(entry[key]));
   return Object.entries(providers)
     .filter(([name, config]) => {
-      if (name === "anthropic" || !isObject(config)) return false;
+      if ((name === "anthropic" && !login) || !isObject(config)) return false;
       const list = Array.isArray(config.models) ? config.models.filter(isObject) : [];
       const overrides = isObject(config.modelOverrides) ? Object.values(config.modelOverrides) : [];
-      const stored = isObject(auth[name]) && auth[name].type === "api_key";
-      const shared = stored || carries(config) || overrides.some(carries);
+      const entry = auth[name];
+      const stored = isObject(entry) && (login || entry.type === "api_key");
+      const shared = stored || inEnv(name) || carries(config) || overrides.some(carries);
       // A model sends what the provider carries, plus its own headers, to its own base URL or the provider's.
       return list.some((model) => clear(model.baseUrl ?? config.baseUrl) && (shared || carries(model))) || (clear(config.baseUrl) && shared);
     })
@@ -649,8 +914,10 @@ async function clearTextProviders(): Promise<string[]> {
 }
 
 /**
- * Whether requests to `baseUrl` would cross a proxy unencrypted: plain http:// to anywhere but the
- * hosts that always stay direct (`REQUIRED_NO_PROXY`).
+ * Whether requests to `baseUrl` would cross a proxy ZeroSub gives an added account unencrypted:
+ * plain http:// to anywhere but the hosts that always stay direct (`REQUIRED_NO_PROXY`, which
+ * ZeroSub puts in that account's no-proxy list; see `proxyVariables`). For a proxy Pi takes itself,
+ * see `crossesInheritedProxy`.
  */
 export function sentInTheClear(baseUrl: string | null): boolean {
   if (!baseUrl) return false;
@@ -661,4 +928,25 @@ export function sentInTheClear(baseUrl: string | null): boolean {
   } catch {
     return false;
   }
+}
+
+/** Whether `baseUrl` is plain http://, which any proxy it goes through can read. */
+export function plainHttp(baseUrl: string | null): boolean {
+  if (!baseUrl) return false;
+  try {
+    return new URL(baseUrl).protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether requests to `baseUrl` would cross a proxy Pi takes from `httpProxy` or the environment
+ * (`env`, the one Pi starts with) unencrypted: plain http:// that the no-proxy list doesn't keep
+ * direct. Pi adds nothing to that list, and undici, which Pi sends its requests with, keeps no host
+ * direct without it, this machine included. The list is read as undici reads it: `no_proxy` wherever
+ * it's set, even empty, else `NO_PROXY`.
+ */
+export function crossesInheritedProxy(baseUrl: string | null, env: Record<string, string | undefined> = { ...process.env, ...providerEnv("pi") }): boolean {
+  return baseUrl !== null && plainHttp(baseUrl) && !bypassesProxy(env.no_proxy ?? env.NO_PROXY ?? null, baseUrl);
 }

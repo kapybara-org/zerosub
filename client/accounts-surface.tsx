@@ -258,7 +258,7 @@ function FamilySection({
       {accounts.length === 0 ? (
         <Text style={text.muted}>No {FAMILY_LABEL[family]} accounts yet.</Text>
       ) : null}
-      {family === "pi" ? <PiSectionNotes theme={theme} /> : null}
+      {family === "pi" ? <PiSectionNotes theme={theme} state={state} accounts={accounts} store={store} /> : null}
       {chunk(accounts, compact ? 1 : 2).map((row) => (
         <View key={row.map((account) => account.id).join()} style={{ flexDirection: "row", gap: 10 }}>
           {row.map((account) => (
@@ -480,7 +480,11 @@ function AccountCard({
               icon="Trash2"
               label="Remove"
               tooltip={
-                api ? "Remove: delete its saved key" : "Remove: sign it out and delete its saved login"
+                account.externalHome
+                  ? "Remove from ZeroSub only: its folder, key and script stay"
+                  : api
+                    ? "Remove: delete its saved key"
+                    : "Remove: sign it out and delete its saved login"
               }
               tone="danger"
               busy={busy === "remove"}
@@ -504,6 +508,13 @@ function AccountCard({
       {details ? (
         <Text selectable style={[text.small, faded]} numberOfLines={3}>
           {details}
+        </Text>
+      ) : null}
+      {account.moving ? (
+        <Text style={[account.moving.error ? text.danger : text.small, faded]}>
+          {account.moving.error
+            ? `Couldn't move its folder to ${account.moving.to}: ${account.moving.error}`
+            : `Moving its folder to ${account.moving.to}${account.moving.waiting ? `: ${account.moving.waiting}` : "…"}`}
         </Text>
       ) : null}
 
@@ -604,11 +615,13 @@ function AccountCard({
       <Modal title={`Remove ${account.label}?`} open={confirmRemove} onOpenChange={setConfirmRemove}>
         <Modal.Content>
           <Text style={text.body}>
-            {account.family === "pi"
-              ? "This deletes the account's folder and saved key on this machine. Agents using it move to the default account; their conversations are kept."
-              : account.family === "claude"
-                ? "This signs the account out on this machine and deletes its saved login. Agents using it move to the default account; their conversations are kept."
-                : "This signs the account out on this machine and deletes its saved login. New agents use the default account. Existing ChatGPT conversations on it can't move, so start new agents for them."}
+            {account.externalHome
+              ? `This only removes the account from ZeroSub. Its folder${account.home ? ` (${account.home})` : ""}, its key${account.launcher ? ` and its terminal script ${account.launcher}` : ""} stay as they are, and you can add it back from Add account. Agents using it move to the default account; their conversations are kept.`
+              : account.family === "pi"
+                ? "This deletes the account's folder and saved key on this machine. Agents using it move to the default account; their conversations are kept."
+                : account.family === "claude"
+                  ? "This signs the account out on this machine and deletes its saved login. Agents using it move to the default account; their conversations are kept."
+                  : "This signs the account out on this machine and deletes its saved login. New agents use the default account. Existing ChatGPT conversations on it can't move, so start new agents for them."}
           </Text>
           <View style={{ flexDirection: "row", gap: 8, justifyContent: "flex-end" }}>
             <Button theme={theme} label="Cancel" tooltip="Keep this account" tooltipAlign="end" onPress={() => setConfirmRemove(false)} />
@@ -618,7 +631,11 @@ function AccountCard({
               icon="Trash2"
               label="Remove"
               tooltip={
-                api ? "Delete its saved key; its agents move to the default" : "Sign it out and delete its saved login; its agents move to the default"
+                account.externalHome
+                  ? "Remove it from ZeroSub only; its agents move to the default"
+                  : api
+                    ? "Delete its saved key; its agents move to the default"
+                    : "Sign it out and delete its saved login; its agents move to the default"
               }
               tooltipAlign="end"
               busy={busy === "remove"}

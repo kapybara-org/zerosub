@@ -99,6 +99,19 @@ export const ApiSummarySchema = z.object({
 });
 export type ApiSummary = z.infer<typeof ApiSummarySchema>;
 
+/** The address an account's requests come from, as the provider's edge sees it. */
+export const EgressSchema = z.object({
+  /** From the last check that worked. */
+  ip: z.string().nullable(),
+  /** The country the edge places it in, like "US". */
+  country: z.string().nullable(),
+  /** When that check was. */
+  checkedAt: z.string().nullable(),
+  /** Why the latest check failed, when it did. */
+  error: z.string().nullable(),
+});
+export type Egress = z.infer<typeof EgressSchema>;
+
 /** `disabled`: the user set it aside for a while; it stays signed in but nothing is routed to it. */
 export const AccountStatusSchema = z.enum(["ready", "signed_out", "limited", "checking", "disabled"]);
 export type AccountStatus = z.infer<typeof AccountStatusSchema>;
@@ -120,16 +133,31 @@ export const AccountViewSchema = z.object({
   agentCount: z.number(),
   home: z.string().nullable(),
   auth: AuthKindSchema.default("subscription"),
-  /** An added Pi account's key (reduced to a hint) and base URL. */
+  /** An added Pi account's key (reduced to a hint) and base URL, and Pi's own login's while it keeps an Anthropic key. */
   api: ApiSummarySchema.nullable().default(null),
-  /** Its Anthropic key and base URL can be changed from its card (added Pi accounts). */
+  /** Its Anthropic key and base URL can be changed from its card (Pi accounts, Pi's own login included). */
   apiEditable: z.boolean().default(false),
   /** The account's own proxy, password hidden (as `HIDDEN`). Null when it uses whatever it inherits. */
   proxy: z.string().nullable().default(null),
-  /** A proxy can be set for this account here (added Pi accounts). */
+  /** A proxy can be set for this account here (Pi accounts, Pi's own login included). */
   proxyEditable: z.boolean().default(false),
   /** The proxy it goes through without one of its own, password hidden, and where that's set. */
   inheritedProxy: z.object({ proxy: z.string(), from: z.string() }).nullable().default(null),
+  /** The user's file its own proxy is kept in (Pi's own login: `httpProxy` in `~/.pi/agent/settings.json`). */
+  proxyFile: z.string().nullable().default(null),
+  /** Added accounts that go through the same proxy, having none of their own, while it's kept in `proxyFile`. */
+  proxyFollowers: z.array(z.string()).default([]),
+  /** Command (a script in `StateView.piLaunchers`) that starts the CLI on this account. */
+  launcher: z.string().nullable().default(null),
+  /** Where the account's requests come from, as Anthropic sees them; null when unknown or not Anthropic. */
+  egress: EgressSchema.nullable().default(null),
+  /**
+   * The home is outside ZeroSub's own `homes/` folder (where added Pi accounts are kept): removing the
+   * account only takes it out of ZeroSub, and its folder, key and script stay.
+   */
+  externalHome: z.boolean().default(false),
+  /** The account's home is due to move to `to`, and hasn't yet: what it waits for, or what went wrong. */
+  moving: z.object({ to: z.string(), waiting: z.string().nullable(), error: z.string().nullable() }).nullable().default(null),
 });
 export type AccountView = z.infer<typeof AccountViewSchema>;
 
@@ -210,6 +238,10 @@ export const StateViewSchema = z.object({
    * and daemons started over SSH, where only the code sign-in works.
    */
   browserSignIn: z.boolean().default(true),
+  /** Directory with a `pi-<account>.sh` script per added Pi account, to put on `PATH`. */
+  piLaunchers: z.string().nullable().default(null),
+  /** The folder added Pi accounts' homes are kept in (`~/.pi-config`, say), and whether it's the default. */
+  piHomes: z.object({ dir: z.string(), isDefault: z.boolean() }).nullable().default(null),
   showComposerPill: z.boolean(),
   /** Accounts at their limit are skipped, so agents can't be moved onto one by hand either. */
   autoSwitch: z.boolean().default(true),
