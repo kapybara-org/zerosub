@@ -16,6 +16,8 @@ const AGENT = "agent-1";
 
 let root: string;
 let previousHome: string | undefined;
+/** The services the current test made, stopped once it ends. */
+const services: Service[] = [];
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "zerosub-failover-"));
@@ -24,9 +26,12 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  // A reading is saved 3 s after it lands. Stopping saves it now, while PASEO_HOME is still this
+  // test's folder, rather than in whatever folder a later test has set by then.
+  await Promise.all(services.splice(0).map((service) => service.stop()));
   if (previousHome === undefined) delete process.env.PASEO_HOME;
   else process.env.PASEO_HOME = previousHome;
-  await rm(root, { recursive: true, force: true });
+  await rm(root, { recursive: true, force: true, maxRetries: 5 });
 });
 
 function account(id: string, label: string, kind: "main" | "managed") {
@@ -135,6 +140,7 @@ async function setUp(state: Partial<StoredState>, hit: () => LimitHit, options: 
     families as unknown as FamilyResolver,
     reopener as unknown as Reopener,
   );
+  services.push(service);
   const limitTurn = () =>
     service.onTurnEnded(
       { agent: { id: AGENT, provider: "claude" }, turnId: "t", outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never,
@@ -525,6 +531,7 @@ describe("forking to the other provider", () => {
       { resolve: async () => ({ claude: "claude" as const, codex: "codex" as const }) } as unknown as FamilyResolver,
       { locate: async () => "/usr/local/bin/paseo", reopen: async () => ({ ok: true as const }) } as unknown as Reopener,
     );
+    services.push(service);
     service.setPreferences(preferences.schema.parse({ forkOtherProvider: true }));
     const context = { paseo } as never;
     const limitTurn = () =>
@@ -834,6 +841,7 @@ describe("changing the default account", () => {
         },
       } as unknown as Reopener,
     );
+    services.push(service);
     service.setPreferences(KEEP);
     return { service, store, paseo: paseo as never, context, reopened };
   }
@@ -1139,6 +1147,7 @@ describe("a reading past its reset", () => {
         { resolve: async () => ({ claude: "claude" as const }) } as unknown as FamilyResolver,
         { locate: async () => "/usr/local/bin/paseo" } as unknown as Reopener,
       );
+      services.push(service);
       service.setPreferences(preferences.schema.parse({}));
       await service.refreshUsage(MAIN, true);
       signedIn = false;
@@ -1184,6 +1193,7 @@ describe("renewing an expired sign-in in the background", () => {
       { resolve: async () => ({ claude: "claude" as const }) } as unknown as FamilyResolver,
       { locate: async () => "/usr/local/bin/paseo" } as unknown as Reopener,
     );
+    services.push(service);
     service.setPreferences(preferences.schema.parse({}));
     return { service, store };
   }
