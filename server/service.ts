@@ -221,6 +221,7 @@ const MODE_REFUSAL =
   "This agent's mode changed since the OpenCode continuation was set up. Nothing was sent; check both chats before retrying.";
 const HOLD_REFUSAL =
   "ZeroSub's record of what it sent to OpenCode for this agent is damaged or incomplete, so it can't tell whether a continuation already has this work. Nothing was sent. Check this agent's OpenCode chats; to start a new continuation anyway, choose Continue on OpenCode again.";
+const OPENCODE_IN_FLIGHT = "A continuation of this agent on OpenCode is being set up. Wait for it to finish, then check that chat.";
 const SOURCE_BUSY_REFUSAL = "This agent is working or waiting for permission. Wait for it to stop, then continue it on OpenCode.";
 const NEWER_REFUSAL = "This agent received a newer message while ZeroSub prepared the handoff. Nothing was sent; try again.";
 
@@ -1745,6 +1746,17 @@ export class Service {
 
     const openCodeCopy = agents.find((agent) => agent.continuedFrom === agentId && agent.provider === OPENCODE_PROVIDER);
     if (openCodeCopy) return { skipped: alreadyContinued(openCodeCopy.title ?? `${OPENCODE_LABEL} agent ${openCodeCopy.id}`) };
+    if (this.openCodeForkInFlight.has(agentId)) return { skipped: OPENCODE_IN_FLIGHT };
+    // An OpenCode reservation is a continuation while its fork exists. One whose create never landed,
+    // or whose fork was archived, is dropped here: nothing more is ever sent to it without its record.
+    const reservation = state.opencodeForks[agentId]?.pending;
+    if (reservation) {
+      const target = (await paseo.agents.ref(reservation.targetId).refresh())?.agent;
+      if (target && !target.archivedAt) return { skipped: alreadyContinued(forkRef(target)) };
+      await this.store.update((draft) => {
+        if (draft.opencodeForks[agentId]?.pending?.messageId === reservation.messageId) delete draft.opencodeForks[agentId];
+      });
+    }
 
     if (this.availability.get(other)?.ok === false) return { skipped: `${PROVIDER_NAME[other]} isn't installed where the daemon runs.` };
     const provider = families[other] === other ? other : Object.keys(families).find((id) => families[id] === other);

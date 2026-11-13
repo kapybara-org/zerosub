@@ -2075,6 +2075,34 @@ describe("forking to the other provider", () => {
       await expect(service.forkAgent(paseo, AGENT)).rejects.toThrow(/already continued in “Fix the build \(continued on OpenCode\)”/);
       expect(created).toHaveLength(0);
     });
+
+    it("never ends with two continuations after a failed OpenCode create, a ChatGPT fork, then Continue on OpenCode", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: { autoSwitch: false } });
+      const paseo = setup.paseo as { workspaces: { ref: unknown } };
+      const workspaces = paseo.workspaces.ref;
+      paseo.workspaces.ref = () => ({ agents: { create: async () => { throw new Error("OpenCode couldn't start"); } } });
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/couldn't start/);
+      paseo.workspaces.ref = workspaces;
+      expect((await setup.store.read()).opencodeForks[AGENT]?.pending?.stage).toBe("creating");
+      await setup.service.forkAgent(setup.paseo, AGENT);
+      expect(setup.created.map((agent) => agent.config.provider.split("/")[0])).toEqual(["codex"]);
+      // The OpenCode create never landed, so the ChatGPT fork took the work and its reservation went.
+      expect((await setup.store.read()).opencodeForks[AGENT]).toBeUndefined();
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/already continued in “Fix the build \(continued on ChatGPT\)”/);
+      expect(setup.created).toHaveLength(1);
+      expect(setup.sends).toHaveLength(0);
+    });
+
+    it("creates no ChatGPT fork while an OpenCode reservation's fork exists", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: { autoSwitch: false } });
+      await setup.store.update((draft) => {
+        draft.opencodeForks[AGENT] = { forkAgentId: "oc-fork", pending: { stage: "creating", targetId: "oc-fork", messageId: "zerosub-handoff-m1", seen: { epoch: "epoch-1", seq: 0 } } };
+      });
+      // Paseo doesn't list it yet, but it answers for its ID.
+      setup.byId.set("oc-fork", openCodeAgent);
+      await expect(setup.service.forkAgent(setup.paseo, AGENT)).rejects.toThrow(/already continued in “Fix the build \(continued on OpenCode\)”/);
+      expect(setup.created).toHaveLength(0);
+    });
   });
 
   describe("OpenCode availability in the state view", () => {
