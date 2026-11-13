@@ -4,7 +4,7 @@ import { join, resolve } from "node:path";
 import type { ApiSummary, LoginMethod } from "../shared/model";
 import type { EnvPatch, FamilyAdapter, Identity, LoginHandle, ProxyState, RedeemReply, TurnEvent, UsageRead } from "./adapter";
 import { providerCommand } from "./binaries";
-import { clearTextProviders, forgetSyncs, normalizeBaseUrl, piLiteral, preparePiHome, readPiAccount, readPiAccountApi, sentInTheClear, writePiAccountApi, writePiAccountProxy } from "./homes";
+import { clearTextProviders, forgetSyncs, normalizeBaseUrl, piLiteral, preparePiHome, readPiAccount, readPiAccountApi, readPiAccountForAgents, sentInTheClear, writePiAccountApi, writePiAccountProxy } from "./homes";
 import { PI_LAUNCH_ENV } from "./launchers";
 import { Mutex, readJson, writeJsonAtomic } from "./json-file";
 import { eachProcessEnvironment, homesInEnvironment, parseTrace } from "./processes";
@@ -363,7 +363,9 @@ export class PiAdapter implements FamilyAdapter {
   async env(home: string | null, session?: { cwd: string }): Promise<EnvPatch> {
     // The CLI login runs as Paseo would run it without ZeroSub.
     if (!home) return {};
-    const account = await readPiAccount(home);
+    // Throws while the folder is being moved: routing then opens the agent on the CLI login rather
+    // than on the account without its proxy (see `readPiAccountForAgents`).
+    const account = await readPiAccountForAgents(home);
     const patch: EnvPatch = { PI_CODING_AGENT_DIR: home };
     // Pi would send what these give to the account's base URL, in place of or on top of the account's
     // key: an added account's agents only ever use its own key. Always blanked,

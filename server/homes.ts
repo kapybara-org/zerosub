@@ -520,7 +520,22 @@ function stringOrNull(value: unknown): string | null {
 
 /** The account's own settings; empty ones for a home without the file (or one that doesn't parse). */
 export async function readPiAccount(home: string): Promise<PiAccount> {
+  return piAccountFrom(await readJsonObject(join(home, PI_ACCOUNT_FILE)));
+}
+
+/**
+ * The account's settings to start an agent with. Unlike `readPiAccount`, a folder without a readable
+ * `zerosub.json` throws instead of reading as empty: the folder is being moved (renamed away while
+ * Pi's processes are checked) or is gone, and an agent started from empty settings would run without
+ * the account's proxy, and keep running that way.
+ */
+export async function readPiAccountForAgents(home: string): Promise<PiAccount> {
   const value = await readJsonObject(join(home, PI_ACCOUNT_FILE));
+  if (!value) throw new Error(`${home} has no readable ${PI_ACCOUNT_FILE} (it may be moving)`);
+  return piAccountFrom(value);
+}
+
+function piAccountFrom(value: Record<string, unknown> | null): PiAccount {
   return { key: stringOrNull(value?.key), baseUrl: stringOrNull(value?.baseUrl), proxy: stringOrNull(value?.proxy) };
 }
 

@@ -40,7 +40,7 @@ import { FamilyResolver } from "./families";
 import { sameAccountIdentity, withoutWorkspace } from "./account-identity";
 import { CodexContinuations } from "./continuations";
 import { CONTINUED_FROM_LABEL, continueInNewAgent, type Continuation } from "./handoff";
-import { isAccountHome, moveHome, normalizeBaseUrl, readPiAccount, removeHome, sentInTheClear } from "./homes";
+import { PI_ACCOUNT_FILE, isAccountHome, moveHome, normalizeBaseUrl, readPiAccount, removeHome, sentInTheClear } from "./homes";
 import { launcherNames, piLauncherDir, writeLaunchers, type LauncherAccount } from "./launchers";
 import { Mutex } from "./json-file";
 import { turnRows } from "./limits";
@@ -3223,9 +3223,13 @@ export class Service {
   /**
    * Finishes a recorded move of an account's home. Cut short before the folder moved: the move is
    * tried again. After the folder moved but before the account's new home was saved: it's saved now.
-   * Both folders there, or neither, before it's saved is left as it is for the user, and the app
-   * says so; the old folder still there after (a copy onto another disk not cleaned up) is left
-   * alone, and logged. The account's script is rewritten for the new home before the record goes.
+   * Both folders there before it's saved: the account goes with the one that has its key
+   * (`zerosub.json`). Only the new one has it when Pi made the old folder again while the move was
+   * checking for Pi (a terminal with the old script, say), so the folder couldn't go back: the move is
+   * finished, and the old folder left alone. Otherwise, and when neither folder is there, it's left as
+   * it is for the user, and the app says so, never asking to delete the folder with the key. The old
+   * folder still there after (a copy onto another disk not cleaned up) is left alone, and logged. The
+   * account's script is rewritten for the new home before the record goes.
    */
   private async finishMove(accountId: string, move: Move): Promise<void> {
     const forget = () => this.store.update((draft) => void delete draft.moves[accountId]);
@@ -3237,11 +3241,17 @@ export class Service {
         await forget();
         return;
       }
-      if (atFrom || !atTo) {
+      const keyed = async (path: string) => (await lstat(join(path, PI_ACCOUNT_FILE)).catch(() => null))?.isFile() === true;
+      const [keyFrom, keyTo] = atFrom && atTo ? [await keyed(move.from), await keyed(move.to)] : [false, false];
+      if (atFrom && atTo && keyTo && !keyFrom) {
+        console.log(`[ZeroSub] ${move.from} was made again while ${account.label} moved to ${move.to}, which has its key; finishing the move and leaving ${move.from} alone (delete it yourself)`);
+      } else if (atFrom || !atTo) {
         throw new Error(
-          atFrom
-            ? `ZeroSub stopped while copying ${shownPath(move.from)} to ${shownPath(move.to)} on another disk, and both are there now. The account still uses ${shownPath(move.from)}: delete ${shownPath(move.to)}, and the move starts again at ZeroSub's next check.`
-            : `ZeroSub stopped while moving ${shownPath(move.from)} to ${shownPath(move.to)}, and neither is there now.`,
+          !atFrom
+            ? `ZeroSub stopped while moving ${shownPath(move.from)} to ${shownPath(move.to)}, and neither is there now.`
+            : keyFrom
+              ? `ZeroSub stopped while copying ${shownPath(move.from)} to ${shownPath(move.to)} on another disk, and both are there now. The account still uses ${shownPath(move.from)}: delete ${shownPath(move.to)}, and the move starts again at ZeroSub's next check.`
+              : `Both ${shownPath(move.from)} and ${shownPath(move.to)} are there, and neither has the account's key (${PI_ACCOUNT_FILE}). Enter its key again from its card.`,
         );
       }
       await this.store.update((draft) => {
