@@ -85,7 +85,7 @@ describe("prepareGrokHome", () => {
     process.env.GROK_HOME = main;
     await mkdir(join(main, "skills"), { recursive: true });
     await mkdir(join(main, "logs"), { recursive: true });
-    const own = ["auth.json", "auth.json.lock", "mcp_credentials.json", "settings_cache.json", "models_cache.json", "experiments_remote_opt_out", "managed_config.toml", "leader.sock"];
+    const own = ["auth.json", "auth.json.lock", "mcp_credentials.json", "settings_cache.json", "models_cache.json", "experiments_remote_opt_out", "managed_config.toml", "managed_config_cache.json", "managed_config.sig.json", "managed_identity.sig.json", "requirements.toml", "leader.sock"];
     for (const name of [...own, "config.toml", "agent_id", "worktrees.db"]) await writeFile(join(main, name), "x");
     await prepareGrokHome(home, true);
 

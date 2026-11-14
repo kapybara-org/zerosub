@@ -106,7 +106,7 @@ function fakePaseo(recent: readonly Row[] | (() => Promise<{ entries: readonly R
 
 interface SetUpOptions {
   /** How `paseo agent reload` ends. `fails after another` fails once another reload has opened a session too. */
-  reload?: "works" | "fails" | "times out" | "fails after another";
+  reload?: "no session" | "works" | "fails" | "times out" | "fails after another";
   /** Runs when `paseo agent reload` starts, before Paseo asks where the new session opens. */
   reloading?: () => Promise<void>;
   /** Replaces parts of the Claude adapter. */
@@ -137,6 +137,7 @@ async function setUp(state: Partial<StoredState>, hit: () => LimitHit, options: 
     locate: async () => "/usr/local/bin/paseo",
     reopen: async (id: string) => {
       reopened.push(id);
+      if (options.reload === "no session") return { ok: true as const };
       await options.reloading?.();
       await reopenedSession();
       if (options.reload === "fails after another") {
@@ -397,6 +398,23 @@ describe("when the CLI login changes hands", () => {
 });
 
 describe("failover", () => {
+  it("does not continue or claim a switch when a successful CLI never opens a session", async () => {
+    const { store, sent, notes, limitTurn } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+        sessions: { [AGENT]: { accountId: MAIN, family: "claude", openedAt: "2026-09-23T07:00:00.000Z" } },
+      },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your weekly limit" }),
+      { reload: "no session" },
+    );
+    await limitTurn();
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+    expect(sent).toEqual([]);
+    expect(notes.at(-1)).toMatchObject({ outcome: "pending", continued: false });
+    expect(notes.at(-1)?.detail).toContain("did not open a new provider session");
+  });
+
   it("blames the CLI login for a session ZeroSub never routed, even when the agent is bound elsewhere", async () => {
     // Today's incident: the agent's session predates zerosub, and a switch to "hello" was waiting.
     const { store, reopened, sent, notes, limitTurn } = await setUp(
@@ -868,6 +886,31 @@ describe("forking to the other provider", () => {
     expect(prompt).toContain("Step 45 done.");
     expect(prompt).toContain("User: Now run the linter");
   });
+
+  it("carries an orchestrator's agent_message instructions when forking a sub-agent", async () => {
+    const lead = { id: "lead", provider: "claude", status: "idle", title: "Lead the release", workspaceId: "ws-1", archivedAt: null, labels: {} };
+    const agentPrompt = (id: string, text: string): AgentTimelineItem =>
+      ({
+        type: "tool_call",
+        callId: `paseo-agent-message:${id}`,
+        name: "agent_message",
+        status: "completed",
+        error: null,
+        agentMessage: { event: "message", sender: { id: "lead", title: "Lead the release" }, text },
+        detail: { type: "plain_text", text, icon: "bot" },
+      }) as AgentTimelineItem;
+    const conversation = [
+      ...inTurn("t0", agentPrompt("m1", "Implement the parser"), { type: "assistant_message", text: "Parser skeleton ready." }),
+      ...inTurn("t", agentPrompt("m2", "Now run the linter"), { type: "assistant_message", text: "You've hit your session limit · resets 3pm (UTC)" }),
+    ];
+    const { created, limitTurn } = await setUpFork("bypassPermissions", conversation, { "paseo.parent-agent-id": "lead" }, [lead]);
+    await limitTurn();
+    const prompt = created[0]?.prompt ?? "";
+    expect(prompt).toContain("From Lead the release (lead): Implement the parser");
+    expect(prompt).toContain("Assistant: Parser skeleton ready.");
+    expect(prompt).toContain("From Lead the release (lead): Now run the linter");
+    expect(prompt).not.toContain("[agent_message]");
+  });
 });
 
 describe("disabling an account", () => {
@@ -968,6 +1011,44 @@ describe("usage readings", () => {
     await service.refreshUsage(MAIN, true);
     expect(await limitedUntil(store)).toBeNull();
     expect(await newAgentOpensOn(service, store, paseo)).toBe(MAIN);
+  });
+
+  const fableFull = (): UsageRead => ({
+    fetchedAt: new Date().toISOString(),
+    windows: [
+      { id: "five_hour", label: "5-hour", usedPercent: 8, resetsAt: inFuture() },
+      { id: "seven_day", label: "Weekly", usedPercent: 73, resetsAt: inFuture() },
+      { id: "weekly_fable", label: "Weekly · Fable", usedPercent: 100, resetsAt: inFuture() },
+    ],
+    error: null,
+    cached: false,
+    resets: null,
+  });
+
+  it("clears a limit a reading took once the account's own windows have room, one model's window full or not", async () => {
+    // Saved by a version that took any full window for the account's: the account stayed blocked until Fable reset.
+    const { service, store, paseo } = await setUp(
+      state({ limitedUntil: inFuture(), limitKind: "window", limitedAt: inPast(), limitSource: "reading" }),
+      unused,
+      { usage: fableFull },
+    );
+    await settle(store);
+    await service.refreshUsage(MAIN, true);
+    expect(await limitedUntil(store)).toBeNull();
+    expect(await newAgentOpensOn(service, store, paseo)).toBe(MAIN);
+  });
+
+  it("leaves a limit a turn ran into while one model's window is full", async () => {
+    // The turn may have hit that model's limit: the account's room says nothing about it.
+    const { service, store, limitTurn } = await setUp(
+      state(),
+      () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your Fable limit" }),
+      { usage: fableFull },
+    );
+    await limitTurn();
+    await settle(store);
+    await service.refreshUsage(MAIN, true);
+    expect(await limitedUntil(store)).not.toBeNull();
   });
 
   it("takes a full window without credits for a limit, whatever the setting", async () => {

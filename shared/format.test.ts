@@ -4,6 +4,7 @@ import {
   describeReopen,
   formatAge,
   formatCredits,
+  formatExtraUsage,
   formatPlan,
   formatResetIn,
   moveProblem,
@@ -174,5 +175,18 @@ describe("move outcomes", () => {
     expect(moveProblem({ ...nothing, failed: [{ agentId: "a", error: "Timed out closing previous session during refresh" }] }, "work")).toBe(
       "Couldn't reload this agent onto work (Timed out closing previous session during refresh), so it moves when its session next starts.",
     );
+  });
+});
+
+describe("formatExtraUsage", () => {
+  it("shows spend and the monthly cap in the account's currency", () => {
+    expect(formatExtraUsage({ enabled: true, spend: 1234, limit: 5000, currency: "USD" })).toBe("Extra usage on · $12.34 of $50.00 this month");
+    expect(formatExtraUsage({ enabled: true, spend: 123456, limit: null, currency: "EUR" })).toBe("Extra usage on · €1,234.56 spent this month");
+    expect(formatExtraUsage({ enabled: true, spend: 50, limit: 1000, currency: "cad" })).toBe("Extra usage on · 0.50 CAD of 10.00 CAD this month");
+  });
+
+  it("says only that it's on when the spend isn't known, and nothing when it's off", () => {
+    expect(formatExtraUsage({ enabled: true, spend: null, limit: 5000, currency: "USD" })).toBe("Extra usage on");
+    expect(formatExtraUsage({ enabled: false, spend: 0, limit: 5000, currency: "USD" })).toBeNull();
   });
 });

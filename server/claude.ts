@@ -3,7 +3,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { readFile, rm } from "node:fs/promises";
 import { homedir, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
-import type { LoginMethod, Usage, UsageWindow } from "../shared/model";
+import type { ExtraUsage, LoginMethod, Usage, UsageWindow } from "../shared/model";
 import {
   ProgressEmitter,
   spawnEnv,
@@ -23,6 +23,10 @@ import { firstUrl, run, stripAnsi } from "./process";
 import { retryDelayMs } from "./usage";
 
 const API = "https://api.anthropic.com";
+/** Usage plus banked resets, and extra-usage spend (Claude Code's own /usage reads spend too). */
+const USAGE_WITH_SPEND = `${API}/api/oauth/usage?cedar_ember=1`;
+/** The same read without spend: the fallback, and all a reset redeem needs. */
+const USAGE_WITHOUT_SPEND = `${USAGE_WITH_SPEND}&skip_spend=1`;
 
 function apiHeaders(token: string): Record<string, string> {
   return {
@@ -113,15 +117,21 @@ export class ClaudeAdapter implements FamilyAdapter {
     if (credentials?.accessToken && isFresh(credentials) && profileScope) {
       try {
         // The `cedar_ember` read is the one Claude Code's /limit-reset makes: usage plus banked resets.
-        const response = await fetch(`${API}/api/oauth/usage?cedar_ember=1&skip_spend=1`, {
-          headers: apiHeaders(credentials.accessToken),
-          signal: AbortSignal.timeout(15_000),
-        });
+        // Spend (`extra_usage`) costs Anthropic another lookup, which `skip_spend` avoids; ask for it,
+        // and if it fails (except auth or rate limits), take the windows without it rather than none.
+        const token = credentials.accessToken;
+        const read = (url: string) => fetch(url, { headers: apiHeaders(token), signal: AbortSignal.timeout(15_000) });
+        let response = await read(USAGE_WITH_SPEND);
+        const withSpend = response.ok || [401, 403, 429].includes(response.status);
+        if (!withSpend) response = await read(USAGE_WITHOUT_SPEND);
         if (response.ok) {
-          const body = (await response.json()) as { cedar_ember?: unknown };
+          const body = (await response.json()) as { cedar_ember?: unknown; extra_usage?: unknown };
           const windows = parseUsage(body);
           this.noteResetStatus(home, body.cedar_ember);
-          return { fetchedAt, windows, error: null, cached: false, resets: parseClaudeResets(body.cedar_ember).offer, credits: null };
+          return {
+            fetchedAt, windows, error: null, cached: false, resets: parseClaudeResets(body.cedar_ember).offer, credits: null,
+            ...(withSpend ? { extraUsage: parseExtraUsage(body.extra_usage) } : {}),
+          };
         }
         // Anthropic rate-limits this endpoint (Claude Code and Paseo read it too). Wait as long as it
         // asks; meanwhile the last reading stays up, or Claude Code's own cached copy if it's newer.
@@ -187,7 +197,7 @@ export class ClaudeAdapter implements FamilyAdapter {
     // Ask which grant is next: the server only accepts that one.
     let status: ReturnType<typeof parseClaudeResets>;
     try {
-      const response = await fetch(`${API}/api/oauth/usage?cedar_ember=1&skip_spend=1`, {
+      const response = await fetch(USAGE_WITHOUT_SPEND, {
         headers: apiHeaders(token),
         signal: AbortSignal.timeout(15_000),
       });
@@ -460,6 +470,20 @@ const WINDOW_LABELS: Array<[key: string, label: string]> = [
   ["seven_day_opus", "Weekly · Opus"],
   ["seven_day_sonnet", "Weekly · Sonnet"],
 ];
+
+/** The usage response's `extra_usage` block, or `null` when it's missing or says nothing usable. */
+export function parseExtraUsage(block: unknown): ExtraUsage | null {
+  if (!block || typeof block !== "object") return null;
+  const record = block as Record<string, unknown>;
+  if (typeof record.is_enabled !== "boolean") return null;
+  const amount = (value: unknown) => (typeof value === "number" && Number.isFinite(value) ? value : null);
+  return {
+    enabled: record.is_enabled,
+    spend: amount(record.used_credits),
+    limit: amount(record.monthly_limit),
+    currency: typeof record.currency === "string" && record.currency ? record.currency : null,
+  };
+}
 
 export function parseUsage(body: unknown): UsageWindow[] {
   if (!body || typeof body !== "object") return [];

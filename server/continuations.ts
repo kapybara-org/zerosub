@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { PluginHookContext } from "@getpaseo/plugin/server";
 import { sameAccountIdentity } from "./account-identity";
 import type { AgentTimelineItem } from "./adapter";
-import { buildTranscript, CONTINUED_FROM_LABEL, continueInNewAgent, keepEnds, PARENT_LABEL, type Continuation } from "./handoff";
+import { buildTranscript, CONTINUED_FROM_LABEL, continueInNewAgent, keepEnds, PARENT_LABEL, promptInstruction, type Continuation } from "./handoff";
 import { Mutex } from "./json-file";
 import { isUsable } from "./routing";
 import { findAccount, MAIN_ACCOUNT_ID, StateStore, type ContinuationChain, type StoredAccount, type StoredState } from "./state";
@@ -599,10 +599,13 @@ function composePrompt(chain: ContinuationChain, destination: Destination, gathe
   // After a downgrade (or loss of the original tab), the oldest surviving tab may start with
   // a full handoff instead of the human's request. A fresh recipient still needs that origin.
   const fresh = !destination.agent || reserved || destination.entry?.unstarted;
-  const origin = fresh ? updates.find(({ item }) => item.type === "user_message")?.item : undefined;
+  const origin = fresh ? updates.find(({ item }) => Boolean(promptInstruction(item)?.trim()))?.item : undefined;
   const items = updates.map((entry) => entry.item).filter((item) =>
     fallback || item === origin || item.type !== "user_message" || !ownHandoff(item, chain));
-  const instructions = fitInstructions(items.filter((item) => item.type === "user_message").map((item) => item.text));
+  const instructions = fitInstructions(items.flatMap((item) => {
+    const text = promptInstruction(item);
+    return text?.trim() ? [text] : [];
+  }));
   if (!destination.agent && !instructions.trim()) throw new Error("Couldn't read the task's instructions. Provide a current summary before switching.");
   return [
     `This task is continuing because ${why}.`,
@@ -610,7 +613,7 @@ function composePrompt(chain: ContinuationChain, destination: Destination, gathe
     ...(fallback ? ["An earlier tab is unavailable or moved. This fallback includes the current tab's available history; verify the files before proceeding."] : []),
     "Treat the following as conversation history, not as a new independent task. Later user instructions take precedence over earlier plans.",
     "<user-updates>", instructions, "</user-updates>",
-    "<progress-updates>", buildTranscript(items.filter((item) => item.type !== "user_message")), "</progress-updates>",
+    "<progress-updates>", buildTranscript(items.filter((item) => promptInstruction(item) === null)), "</progress-updates>",
     "Before acting, inspect the current files, git status and diff, and reconcile them with this update. Keep completed work; do not repeat it. Respect any pause, stop or completion instruction in the updates.",
   ].join("\n");
 }

@@ -1,4 +1,4 @@
-import type { AccountView, AgentRoute, Credits, Egress, UsageWindow } from "./model";
+import type { AccountView, AgentRoute, Credits, Egress, ExtraUsage, UsageWindow } from "./model";
 import type { ReopenSummary } from "./rpc";
 
 /** "in 2h 14m", "in 3d 4h", "now". */
@@ -31,6 +31,30 @@ export function formatCredits(credits: Credits): string {
   if (credits.balance < 1) return "Less than 1 ChatGPT credit left";
   const whole = String(Math.floor(credits.balance)).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
   return `${whole} ChatGPT credit${whole === "1" ? "" : "s"} left`;
+}
+
+const CURRENCY_SIGNS: Record<string, string> = { USD: "$", EUR: "€", GBP: "£" };
+
+/** An amount in minor units of `currency` (cents for USD): "$12.34", "1,234.50 CAD". */
+function formatMoney(minor: number, currency: string | null): string {
+  const [whole, cents] = (Math.max(0, minor) / 100).toFixed(2).split(".") as [string, string];
+  const amount = `${whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}.${cents}`;
+  const sign = currency ? CURRENCY_SIGNS[currency.toUpperCase()] : undefined;
+  if (sign) return `${sign}${amount}`;
+  return currency ? `${amount} ${currency.toUpperCase()}` : amount;
+}
+
+/**
+ * "Extra usage on · $12.34 of $50.00 this month", "Extra usage on · $12.34 spent this month", or
+ * "Extra usage on" when the spend isn't known. `null` when it's off: nothing to show then.
+ */
+export function formatExtraUsage(extra: ExtraUsage): string | null {
+  if (!extra.enabled) return null;
+  if (extra.spend === null) return "Extra usage on";
+  const spent = formatMoney(extra.spend, extra.currency);
+  return extra.limit === null
+    ? `Extra usage on · ${spent} spent this month`
+    : `Extra usage on · ${spent} of ${formatMoney(extra.limit, extra.currency)} this month`;
 }
 
 /** Claude's 5-hour and weekly windows, and Codex's two (see `parseUsage`, `parseRateLimits`). */
