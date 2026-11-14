@@ -7,6 +7,7 @@ import {
   detectCodexSignOut,
   parseClaudeReset,
   parseCodexReset,
+  turnRows,
 } from "./limits";
 
 const completed = { kind: "completed" } as const;
@@ -90,6 +91,45 @@ describe("detectClaudeLimit", () => {
       { type: "assistant_message", text: "Done." },
     ];
     expect(detectClaudeLimit({ outcome: completed, timeline }, NOW)).toBeNull();
+  });
+
+  it("stops at an agent_message or scheduled heartbeat prompt when isolating the latest turn", () => {
+    const agentTurnPrompt = {
+      type: "tool_call",
+      callId: "paseo-agent-message:msg-2",
+      name: "agent_message",
+      status: "completed",
+      error: null,
+      agentMessage: { event: "message", sender: { id: "lead", title: "Lead" }, text: "continue" },
+      detail: { type: "plain_text", text: "continue", icon: "bot" },
+    } as AgentTimelineItem;
+    const heartbeatTurnPrompt = {
+      type: "tool_call",
+      callId: "paseo-system:run-2",
+      name: "heartbeat",
+      status: "completed",
+      error: null,
+      detail: { type: "plain_text", text: "run check", icon: "sparkles" },
+    } as AgentTimelineItem;
+
+    for (const prompt of [agentTurnPrompt, heartbeatTurnPrompt]) {
+      const timeline: AgentTimelineItem[] = [
+        ...turn("You've hit your session limit · resets 3pm (Asia/Kolkata)"),
+        prompt,
+        { type: "assistant_message", text: "Done." },
+      ];
+      expect(detectClaudeLimit({ outcome: completed, timeline }, NOW)).toBeNull();
+    }
+
+    // Reopened sessions count turn IDs from 1 again; an intervening agent-prompted turn still separates them.
+    const entries = [
+      { turnId: "1", item: { type: "assistant_message", text: "You've hit your session limit · resets 3pm (Asia/Kolkata)" } as AgentTimelineItem },
+      { turnId: "2", item: agentTurnPrompt },
+      { turnId: "2", item: { type: "assistant_message", text: "Intermediate work." } as AgentTimelineItem },
+      { turnId: "1", item: agentTurnPrompt },
+      { turnId: "1", item: { type: "assistant_message", text: "New session turn." } as AgentTimelineItem },
+    ];
+    expect(turnRows(entries, "1")).toEqual([agentTurnPrompt, { type: "assistant_message", text: "New session turn." }]);
   });
 
   it("recognises every wording Claude Code 2.1.280 uses", () => {
