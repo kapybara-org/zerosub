@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { PluginHookContext } from "@getpaseo/plugin/server";
 import { sameAccountIdentity } from "./account-identity";
 import type { AgentTimelineItem } from "./adapter";
@@ -8,30 +8,31 @@ import { isUsable } from "./routing";
 import { findAccount, MAIN_ACCOUNT_ID, StateStore, type ContinuationChain, type StoredAccount, type StoredState } from "./state";
 
 type PaseoApi = PluginHookContext["paseo"];
-type Agent = NonNullable<Awaited<ReturnType<ReturnType<PaseoApi["agents"]["ref"]>["refresh"]>>>["agent"];
+export type Agent = NonNullable<Awaited<ReturnType<ReturnType<PaseoApi["agents"]["ref"]>["refresh"]>>>["agent"];
 type Member = ContinuationChain["members"][string];
 type Pending = NonNullable<ContinuationChain["pending"]>;
 type Mark = Member["seen"][string];
 type Source = "auto" | "user";
 type Update = { item: AgentTimelineItem; timestamp: string };
-const MESSAGE_PREFIX = "zerosub-handoff-";
+/** Every handoff prompt of ours carries a caller message ID with this prefix. */
+export const MESSAGE_PREFIX = "zerosub-handoff-";
 const MAX_PAGES = 100;
 const MAX_INSTRUCTIONS = 60_000;
 const MAX_ORIGIN = 6_000;
 const OMITTED = "[… part of this message omitted to fit this update …]";
 
 /** The same checkout. Paseo starts a workspace's new agents in its directory, not the source's subfolder. */
-function samePlace(left: Agent, right: Agent): boolean {
+export function samePlace(left: Agent, right: Agent): boolean {
   if (left.provider !== right.provider || left.workspaceId !== right.workspaceId) return false;
   return Boolean(left.workspaceId) || left.cwd === right.cwd;
 }
 
-function ready(agent: Agent): boolean {
+export function ready(agent: Agent): boolean {
   return !agent.archivedAt && !agent.providerUnavailable && !agent.activeTurn &&
     !agent.pendingPermissions?.length && (agent.status === "idle" || agent.status === "closed" || agent.status === "error");
 }
 
-function busy(agent: Agent): boolean {
+export function busy(agent: Agent): boolean {
   return agent.status === "running" || agent.status === "initializing" || Boolean(agent.activeTurn);
 }
 
@@ -451,7 +452,7 @@ async function checkCurrent(paseo: PaseoApi, chain: ContinuationChain, sourceAge
 }
 
 /** The source must have stopped, without a newer message than the one that asked for the switch. */
-async function waitForSource(paseo: PaseoApi, original: Agent, source: Source): Promise<Agent> {
+export async function waitForSource(paseo: PaseoApi, original: Agent, source: Source): Promise<Agent> {
   let agent = await snapshot(paseo, original.id);
   // turn_ended can arrive just before the directory reports idle, as in the existing reopener.
   for (let attempt = 0; source === "auto" && agent && attempt < 20 && (agent.status === "running" || agent.status === "initializing"); attempt += 1) {
@@ -466,7 +467,7 @@ async function waitForSource(paseo: PaseoApi, original: Agent, source: Source): 
 }
 
 /** A tab created without a prompt can still report initializing for a moment before it is idle. */
-async function waitForCreated(paseo: PaseoApi, agentId: string): Promise<Agent | undefined> {
+export async function waitForCreated(paseo: PaseoApi, agentId: string): Promise<Agent | undefined> {
   let agent = await snapshot(paseo, agentId);
   for (let attempt = 0; agent?.status === "initializing" && attempt < 20; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 300));
@@ -616,20 +617,57 @@ function composePrompt(chain: ContinuationChain, destination: Destination, gathe
 }
 
 /** The daemon accepted this message as a turn: it carries our ID and a turn. */
-function delivered(entry: { item: AgentTimelineItem; turnId?: string }, messageId: string): boolean {
+export function delivered(entry: { item: AgentTimelineItem; turnId?: string }, messageId: string): boolean {
   return Boolean(entry.turnId) && entry.item.type === "user_message" && entry.item.clientMessageId === messageId;
 }
 
+/** The marker line that ends every OpenCode-path prompt, so a receipt can be found after a reload. */
+export function transferMarker(messageId: string): string {
+  return `zerosub transfer ${messageId}`;
+}
+
+function digestOf(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+/** Digest of the exact sent text, stored with the reservation so a receipt can be matched later. */
+export function sentDigestOf(prompt: string): string {
+  return digestOf(prompt);
+}
+
+/**
+ * Whether a timeline row proves this exact message arrived. The fast path is our caller message ID on
+ * a turn. A provider reload changes the timeline's epoch and drops that ID, so the marker line inside
+ * the exact text, hashed, settles it too.
+ */
+export function matchesTransfer(entry: { item: AgentTimelineItem; turnId?: string }, messageId: string, digest: string): boolean {
+  if (delivered(entry, messageId)) return true;
+  return entry.item.type === "user_message" && entry.item.text.includes(transferMarker(messageId)) &&
+    digestOf(entry.item.text) === digest;
+}
+
+export class UnresolvableEpochError extends Error {}
+
 /** Canonical sequence cursors avoid re-sending projected messages that merge across a watermark. */
-async function readUpdates(paseo: PaseoApi, agentId: string, since?: Mark, receiptId?: string) {
+export async function readUpdates(
+  paseo: PaseoApi,
+  agentId: string,
+  since?: Mark,
+  receiptId?: string,
+  options: { onEpochReset?: "replay" | "unresolvable" } = {},
+) {
   const timeline = paseo.agents.ref(agentId).timeline;
   let page = await timeline.refetch({ direction: "tail", limit: 500, projection: "canonical" });
   if (page.gap || page.staleCursor) throw new Error("The task's handoff history has a gap. Check its timeline before continuing.");
   const mark = { epoch: page.epoch, seq: page.window.maxSeq };
+  if (since && since.epoch !== page.epoch && options.onEpochReset === "unresolvable") {
+    throw new UnresolvableEpochError("The source timeline epoch changed, so its unread history can't be determined.");
+  }
   const after = since?.epoch === page.epoch ? since.seq : -1;
   const entries = [...page.entries];
   const foundReceipt = () => receiptId !== undefined && entries.some((entry) => delivered(entry, receiptId));
-  for (let pages = 1; page.hasOlder && (page.startCursor?.seq ?? 0) > after && !foundReceipt(); pages += 1) {
+  // Older rows with no cursor to reach them can't be proven read, whatever the watermark says.
+  for (let pages = 1; page.hasOlder && (page.startCursor?.seq ?? Infinity) > after && !foundReceipt(); pages += 1) {
     if (pages >= MAX_PAGES || !page.startCursor) throw new Error("Couldn't read the complete handoff history. Try again after checking the task's timeline.");
     page = await timeline.refetch({ direction: "before", cursor: page.startCursor, limit: 500, projection: "canonical" });
     if (page.epoch !== mark.epoch || page.staleCursor || page.gap) throw new Error("The task's history changed during the handoff. Try again.");

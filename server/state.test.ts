@@ -39,6 +39,21 @@ describe("salvageState", () => {
     expect(Object.keys(state.bindings)).toEqual(["a"]);
     expect(state.defaults.claude).toBe("claude-main");
   });
+
+  it("keeps valid OpenCode fork records when an unrelated record is malformed", () => {
+    const record = {
+      forkAgentId: "fork-1",
+      seen: { epoch: "epoch-1", seq: 3 },
+      pending: { stage: "sending", targetId: "fork-1", messageId: "zerosub-handoff-m1", seen: { epoch: "epoch-1", seq: 3 }, sentDigest: "abc" },
+    };
+    const { state, dropped } = salvageState({
+      accounts: [account],
+      defaults: { claude: "claude-main", codex: null },
+      opencodeForks: { good: record, bad: { forkAgentId: 7 } },
+    });
+    expect(state.opencodeForks).toEqual({ good: record });
+    expect(dropped).toBe(true);
+  });
 });
 
 describe("StateStore", () => {
@@ -101,6 +116,105 @@ describe("StateStore backups", () => {
     const kept = (await readdir(dir)).filter((name) => name.startsWith("state.json.bad-"));
     expect(kept).toHaveLength(damage === null ? 0 : 1);
     if (damage !== null) expect(await readFile(join(dir, kept[0] ?? ""), "utf8")).toBe(damage);
+  });
+
+  const MARK = { epoch: "epoch-1", seq: 3 };
+  const reservation = (stage: "creating" | "sending") => ({
+    forkAgentId: "fork-1",
+    seen: MARK,
+    pending: {
+      stage,
+      targetId: "fork-1",
+      messageId: "zerosub-handoff-m2",
+      seen: { epoch: "epoch-1", seq: 9 },
+      ...(stage === "creating"
+        ? { config: { provider: "opencode/glm", modeId: "build", workspaceId: "ws", cwd: null, parentId: null, title: "Fix the build (continued on OpenCode)", why: "the work was moved to OpenCode" } }
+        : {}),
+      sentDigest: "digest-m2",
+    },
+  });
+
+  it.each(["creating", "sending"] as const)(
+    "keeps the file's current %s reservation over a lagging snapshot when an unrelated record is broken",
+    async (stage) => {
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const writer = new StateStore(path());
+      await writer.update((draft) => Object.assign(draft, { accounts: [{ ...account, label: "older" }], opencodeForks: { "agent-1": { forkAgentId: "fork-1", seen: MARK } } }));
+      // The registry is written before its snapshot, and a failed snapshot is tolerated: the file is newer.
+      await writeFile(path(), JSON.stringify({ accounts: [account, { id: "broken", family: "gemini" }], opencodeForks: { "agent-1": reservation(stage) } }));
+
+      const state = await new StateStore(path()).read();
+      expect(state.accounts.map((entry) => entry.label)).toEqual(["older"]);
+      expect(state.opencodeForks).toEqual({ "agent-1": reservation(stage) });
+      expect(JSON.parse(await readFile(path(), "utf8")).opencodeForks["agent-1"].pending.messageId).toBe("zerosub-handoff-m2");
+    },
+  );
+
+  it.each([
+    ["not valid JSON", "{ not json"],
+    ["partly invalid in that record", JSON.stringify({ accounts: [account], opencodeForks: { "agent-1": { forkAgentId: "fork-1", pending: { stage: "bogus" } } } })],
+  ])("drops OpenCode fork records it can't trust when the file is %s, instead of restoring the snapshot's", async (_, damage) => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const writer = new StateStore(path());
+    await writer.update((draft) => Object.assign(draft, { accounts: [account], opencodeForks: { "agent-1": reservation("sending") } }));
+    await writeFile(path(), damage);
+
+    const state = await new StateStore(path()).read();
+    expect(state.accounts.map((entry) => entry.id)).toEqual(["claude-main"]);
+    expect(state.opencodeForks).toEqual({});
+  });
+
+  it("holds every OpenCode source when the registry can't be read at all", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const writer = new StateStore(path());
+    await writer.update((draft) => Object.assign(draft, { accounts: [account], opencodeForks: { "agent-1": reservation("sending") } }));
+    await writeFile(path(), "{ not json");
+
+    const state = await new StateStore(path()).read();
+    expect(state.opencodeForks).toEqual({});
+    expect(Object.keys(state.opencodeHolds)).toEqual(["*"]);
+    // The hold is written back, so a second restart still knows authority was lost.
+    expect(Object.keys((await new StateStore(path()).read()).opencodeHolds)).toEqual(["*"]);
+  });
+
+  it("holds only the source whose record didn't validate, keeping the others", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const writer = new StateStore(path());
+    await writer.update((draft) => Object.assign(draft, { accounts: [account] }));
+    await writeFile(path(), JSON.stringify({ accounts: [account], opencodeForks: { "agent-1": { forkAgentId: 7 }, "agent-2": reservation("sending") } }));
+
+    const state = await new StateStore(path()).read();
+    expect(state.opencodeForks).toEqual({ "agent-2": reservation("sending") });
+    expect(Object.keys(state.opencodeHolds)).toEqual(["agent-1"]);
+  });
+
+  it.each([
+    ["a source's hold doesn't validate", { "agent-1": { at: 7 } }, ["agent-1"]],
+    ["the holds themselves are unreadable", "holds", ["*"]],
+  ])("keeps holding when %s", async (_, holds, expected) => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const writer = new StateStore(path());
+    await writer.update((draft) => Object.assign(draft, { accounts: [account] }));
+    await writeFile(path(), JSON.stringify({ accounts: [account], opencodeHolds: holds }));
+    const state = await new StateStore(path()).read();
+    expect(Object.keys(state.opencodeHolds)).toEqual(expected);
+    expect(Object.values(state.opencodeHolds).every((hold) => !hold.told)).toBe(true);
+  });
+
+  it("resets an earlier acknowledgement when the source's record is lost again", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const writer = new StateStore(path());
+    await writer.update((draft) => Object.assign(draft, { accounts: [account] }));
+    await writeFile(path(), JSON.stringify({ accounts: [account], opencodeForks: { "agent-1": { forkAgentId: 7 } }, opencodeHolds: { "agent-1": { at: "2026-01-01", told: true } } }));
+    expect((await new StateStore(path()).read()).opencodeHolds["agent-1"]?.told).toBeUndefined();
+  });
+
+  it("holds nothing when the fork records are intact", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const writer = new StateStore(path());
+    await writer.update((draft) => Object.assign(draft, { accounts: [account] }));
+    await writeFile(path(), JSON.stringify({ accounts: [account, { id: "broken", family: "gemini" }], opencodeForks: { "agent-2": reservation("sending") } }));
+    expect((await new StateStore(path()).read()).opencodeHolds).toEqual({});
   });
 
   it("starts empty on a new install, without writing anything", async () => {

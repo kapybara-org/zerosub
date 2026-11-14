@@ -33,9 +33,15 @@ export const preferences = defineSettings({
     useCredits: z.boolean().default(false),
     /**
      * When every account of a provider is at its limit, carry the chat on in a new agent on the
-     * other provider (Claude ↔ ChatGPT), in a mode no more permissive than the original's.
+     * other provider (Claude ↔ ChatGPT) or, for Claude, on OpenCode. ChatGPT gets a mode no looser than the original's; OpenCode runs the host's policy.
      */
     forkOtherProvider: z.boolean().default(false),
+    /** Where a stopped Claude chat continues when the fork option is on. */
+    claudeForkDestination: z.enum(["codex", "opencode"]).default("codex"),
+    /** OpenCode model for that fork, from this host's catalog. Empty uses the host's default. */
+    forkOpenCodeModel: z.string().default(""),
+    /** Thinking option that model offers, from this host's catalog. Empty uses the model's default. */
+    forkOpenCodeThinking: z.string().default(""),
     /** Show the account pill in the composer of Claude and Codex agents. */
     showComposerPill: z.boolean().default(true),
   }),

@@ -11,6 +11,7 @@ export const PARENT_LABEL = "paseo.parent-agent-id";
 
 const MAX_TRANSCRIPT = 40_000;
 const MAX_FIRST_MESSAGE = 6_000;
+const MAX_TODOS = 6_000;
 const MAX_EARLIER_HANDOFF = 6_000;
 
 const OPEN = "<previous-session>";
@@ -83,14 +84,23 @@ function describeTool(item: Extract<AgentTimelineItem, { type: "tool_call" }>): 
 export function buildTranscript(timeline: readonly AgentTimelineItem[], max = MAX_TRANSCRIPT): string {
   const lines: string[] = [];
   let firstUser: string | null = null;
+  let firstUserIndex: number | null = null;
+  let latestUser: string | null = null;
+  let latestUserIndex: number | null = null;
   let todos: string | null = null;
+  let todosIndex = 0;
   for (const item of timeline) {
     switch (item.type) {
       case "user_message": {
         // Clipping below can't then split a quoted pair: the prompt's own tags are the only ones.
         const text = neutralise(shortenEarlierHandOff(item.text));
-        if (firstUser === null) firstUser = clip(text, MAX_FIRST_MESSAGE);
-        lines.push(`User: ${text.trim()}`);
+        if (firstUser === null) {
+          firstUser = text;
+          firstUserIndex = lines.length;
+        }
+        latestUser = text.trim();
+        latestUserIndex = lines.length;
+        lines.push(`User: ${latestUser}`);
         break;
       }
       case "assistant_message":
@@ -101,36 +111,67 @@ export function buildTranscript(timeline: readonly AgentTimelineItem[], max = MA
         break;
       case "todo":
         todos = item.items.map((task) => `- [${task.completed ? "x" : " "}] ${task.text}`).join("\n");
+        todosIndex = lines.length;
         break;
       default:
         break;
     }
   }
-  let body = lines.join("\n\n");
-  if (body.length > max) {
-    const tail = body.slice(body.length - max);
-    const start = tail.indexOf("\n\n");
-    body = `${firstUser ? `User (original request): ${firstUser}\n\n` : ""}[… earlier conversation omitted …]\n\n${
-      start >= 0 ? tail.slice(start + 2) : tail
-    }`;
+  // The todo snapshot counts against `max`. Unclipped, it sits where the list last changed, so an
+  // instruction given after it stays after it. Clipped, the latest user instruction is lifted out
+  // and goes last, after the snapshot; when it is also the original request, it appears only there.
+  const onlyUser = latestUserIndex === firstUserIndex;
+  const label = onlyUser ? "User (original request and latest instruction)" : "User (latest instruction)";
+  const todoSection = todos === null ? "" : `Task list at the time it stopped:\n${keepEnds(todos, Math.min(MAX_TODOS, Math.floor(max / 4)))}`;
+  const rest = latestUser !== null ? lines.filter((_, index) => index !== latestUserIndex) : lines;
+  const body = lines.join("\n\n");
+  if (body.length + todoSection.length <= max) {
+    return [...lines.slice(0, todosIndex), todoSection, ...lines.slice(todosIndex)].filter(Boolean).join("\n\n");
   }
-  return todos ? `${body}\n\nTask list at the time it stopped:\n${todos}` : body;
+  const head = firstUser && !onlyUser ? `User (original request): ${clip(firstUser, MAX_FIRST_MESSAGE)}` : "";
+  const omitted = "[… earlier conversation omitted …]";
+  const latest = latestUser === null ? "" : `${label}: ${keepEnds(latestUser, MAX_FIRST_MESSAGE)}`;
+  const progress = rest.join("\n\n");
+  const room = Math.max(0, max - [head, omitted, todoSection, latest].filter(Boolean).join("\n\n").length - 2);
+  let kept = progress;
+  if (progress.length > room) {
+    const tail = progress.slice(progress.length - room);
+    const start = tail.indexOf("\n\n");
+    kept = start >= 0 ? tail.slice(start + 2) : tail;
+  }
+  return [head, omitted, kept, todoSection, latest].filter(Boolean).join("\n\n");
 }
 
 export function continuationPrompt(transcript: string, why: string, previous = "Codex"): string {
   return [
     `This task is continuing from an earlier ${previous} session that stopped because ${why}.`,
-    "The working directory already contains every change that session made. Here is its conversation, oldest first:",
+    "The working directory already contains every change that session made. Here is its conversation:",
     "",
     OPEN,
     transcript,
     CLOSE,
     "",
-    "Pick up exactly where it left off. Check the current state of the files before changing anything, and don't redo finished work.",
+    "Pick up exactly where it left off, unless the latest user instruction says to stop or pause: then do only what it allows. Check the current state of the files before changing anything, and don't redo finished work.",
   ].join("\n");
 }
 
-async function defaultModel(paseo: PaseoApi, provider: string): Promise<string | null> {
+/**
+ * An update for an OpenCode fork that already exists: only what the source gained since the fork last
+ * looked. Long text is shortened with explicit omissions by the caller (`fitInstructions`,
+ * `buildTranscript`), never refused. `marker` ends the prompt so the receipt can be reconciled later.
+ */
+export function updatePrompt(instructions: string, progress: string, previous: string, marker: string): string {
+  return [
+    `This is an update from the original ${previous} session you are continuing.`,
+    "Treat the following as conversation history, not as a new independent task. Later user instructions take precedence over earlier plans.",
+    "<progress-updates>", progress, "</progress-updates>",
+    "<user-updates>", instructions, "</user-updates>",
+    "Before acting, inspect the current files, git status and diff, and reconcile them with this update. Keep completed work; do not repeat it. Respect any pause, stop or completion instruction in the updates.",
+    marker,
+  ].join("\n");
+}
+
+export async function defaultModel(paseo: PaseoApi, provider: string): Promise<string | null> {
   try {
     const { models } = await paseo.providers.listModels(provider);
     return (models?.find((entry) => entry.isDefault) ?? models?.[0])?.id ?? null;
@@ -150,8 +191,12 @@ export interface ContinuationTarget {
   provider: string;
   /** Its name for people, used in the new agent's title, e.g. `ChatGPT`. */
   label: string;
-  /** A mode no more permissive than the source agent's. */
+  /** The fork's mode. ChatGPT gets one no looser than the source's; OpenCode gets Plan or Build. */
   modeId: string;
+  /** A model from the host's catalog for this provider. Empty uses the provider's default. */
+  model?: string;
+  /** A thinking option that model offers. Empty uses the model's default. */
+  thinkingOptionId?: string;
 }
 
 /**
@@ -164,7 +209,8 @@ export async function continueInNewAgent(options: {
   paseo: PaseoApi;
   sourceAgentId: string;
   timeline?: readonly AgentTimelineItem[];
-  why: string;
+  /** Why the session stopped; the first prompt names it. A promptless create needs none. */
+  why?: string;
   bind(agentId: string): Promise<void>;
   target?: ContinuationTarget;
   /** What to call the session that stopped, e.g. `Claude Code`. */
@@ -179,11 +225,19 @@ export async function continueInNewAgent(options: {
    * fail outright once the parent has been closed.
    */
   parentId?: string;
+  /**
+   * A request reserved earlier under `agentId`: its frozen title is used, so a retry repeats the
+   * same request, and a source no longer at its frozen location refuses instead.
+   */
+  reserved?: { title: string; workspaceId: string | null; cwd: string | null };
 }): Promise<Continuation> {
-  const { paseo, sourceAgentId } = options;
+  const { paseo, sourceAgentId, reserved } = options;
   const refreshed = await paseo.agents.ref(sourceAgentId).refresh();
   const source = refreshed?.agent;
   if (!source) throw new Error("The original agent is no longer available.");
+  if (reserved && ((source.workspaceId ?? null) !== reserved.workspaceId || (source.cwd ?? null) !== reserved.cwd)) {
+    throw new Error("The original agent moved since its continuation was reserved. Check it before continuing it again.");
+  }
 
   let timeline = options.timeline;
   if (!timeline && !options.deferPrompt) {
@@ -196,18 +250,24 @@ export async function continueInNewAgent(options: {
   const { target } = options;
   const provider = target?.provider ?? source.provider;
   const model = target
-    ? await defaultModel(paseo, provider)
+    ? (target.model ?? (await defaultModel(paseo, provider)))
     : (source.model ?? source.runtimeInfo?.model ?? (await defaultModel(paseo, provider)));
   if (!model) throw new Error(`Couldn't tell which ${provider} model to use for the new agent.`);
 
   const agentId = options.agentId ?? randomUUID();
   await options.bind(agentId);
-  const title = target
+  const title = reserved?.title ?? (target
     ? `${source.title?.trim() || "Task"} (continued on ${target.label})`
-    : `${source.title?.trim() || "Codex task"} (continued)`;
+    : `${source.title?.trim() || "Codex task"} (continued)`);
   // Modes and thinking options are provider-specific: only carry them over within one provider.
+  // `provider/model` is Paseo's config shape: the OpenCode provider id plus the catalog's full model
+  // id (which itself may carry a catalog prefix, e.g. `opencode/bifrost-fireworks/…/glm-5p3-flash`).
   const config = target
-    ? { provider: `${provider}/${model}`, modeId: target.modeId }
+    ? {
+        provider: `${provider}/${model}`,
+        modeId: target.modeId,
+        ...(target.thinkingOptionId ? { thinkingOptionId: target.thinkingOptionId } : {}),
+      }
     : {
         provider: `${provider}/${model}`,
         ...(source.currentModeId ? { modeId: source.currentModeId } : {}),
@@ -219,9 +279,12 @@ export async function continueInNewAgent(options: {
     ...(options.agentId ? { idempotencyKey: options.agentId } : {}),
     config,
     title,
-    ...(!options.deferPrompt ? { prompt: continuationPrompt(buildTranscript(timeline ?? []), options.why, options.previous) } : {}),
+    ...(!options.deferPrompt && options.why !== undefined
+      ? { prompt: continuationPrompt(buildTranscript(timeline ?? []), options.why, options.previous) }
+      : {}),
     labels: { [CONTINUED_FROM_LABEL]: sourceAgentId, ...(options.parentId ? { [PARENT_LABEL]: options.parentId } : {}) },
   };
+  // A reserved request's location was checked against this snapshot above, so the two agree.
   if (source.workspaceId) await paseo.workspaces.ref(source.workspaceId).agents.create(request);
   else await paseo.agents.create({ ...request, cwd: source.cwd });
   return { agentId, title };
