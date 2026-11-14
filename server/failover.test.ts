@@ -106,7 +106,7 @@ function fakePaseo(recent: readonly Row[] | (() => Promise<{ entries: readonly R
 
 interface SetUpOptions {
   /** How `paseo agent reload` ends. `fails after another` fails once another reload has opened a session too. */
-  reload?: "works" | "fails" | "times out" | "fails after another";
+  reload?: "no session" | "works" | "fails" | "times out" | "fails after another";
   /** Runs when `paseo agent reload` starts, before Paseo asks where the new session opens. */
   reloading?: () => Promise<void>;
   /** Replaces parts of the Claude adapter. */
@@ -137,6 +137,7 @@ async function setUp(state: Partial<StoredState>, hit: () => LimitHit, options: 
     locate: async () => "/usr/local/bin/paseo",
     reopen: async (id: string) => {
       reopened.push(id);
+      if (options.reload === "no session") return { ok: true as const };
       await options.reloading?.();
       await reopenedSession();
       if (options.reload === "fails after another") {
@@ -397,6 +398,23 @@ describe("when the CLI login changes hands", () => {
 });
 
 describe("failover", () => {
+  it("does not continue or claim a switch when a successful CLI never opens a session", async () => {
+    const { store, sent, notes, limitTurn } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+        sessions: { [AGENT]: { accountId: MAIN, family: "claude", openedAt: "2026-09-23T07:00:00.000Z" } },
+      },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your weekly limit" }),
+      { reload: "no session" },
+    );
+    await limitTurn();
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+    expect(sent).toEqual([]);
+    expect(notes.at(-1)).toMatchObject({ outcome: "pending", continued: false });
+    expect(notes.at(-1)?.detail).toContain("did not open a new provider session");
+  });
+
   it("blames the CLI login for a session ZeroSub never routed, even when the agent is bound elsewhere", async () => {
     // Today's incident: the agent's session predates zerosub, and a switch to "hello" was waiting.
     const { store, reopened, sent, notes, limitTurn } = await setUp(
