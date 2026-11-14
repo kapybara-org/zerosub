@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AgentTimelineItem } from "./adapter";
-import { parseUsage } from "./claude";
+import { parseExtraUsage, parseUsage } from "./claude";
 import { parseCredits, parseRateLimits } from "./codex";
 import { buildTranscript, continuationPrompt } from "./handoff";
 
@@ -22,6 +22,24 @@ describe("Claude usage", () => {
   it("tolerates missing or malformed data", () => {
     expect(parseUsage(null)).toEqual([]);
     expect(parseUsage({ five_hour: { utilization: null } })).toEqual([]);
+  });
+});
+
+describe("Claude extra usage", () => {
+  it("reads whether extra usage is on, and its spend and cap when the response has them", () => {
+    expect(
+      parseExtraUsage({ is_enabled: true, monthly_limit: 5000, used_credits: 1234, utilization: 24.7, currency: "USD" }),
+    ).toEqual({ enabled: true, spend: 1234, limit: 5000, currency: "USD" });
+    // The amounts may be missing, e.g. from the fallback read without spend.
+    expect(parseExtraUsage({ is_enabled: false, monthly_limit: null, used_credits: null })).toEqual({
+      enabled: false, spend: null, limit: null, currency: null,
+    });
+  });
+
+  it("says nothing when the block is missing or unreadable", () => {
+    expect(parseExtraUsage(undefined)).toBeNull();
+    expect(parseExtraUsage({ used_credits: 12 })).toBeNull();
+    expect(parseExtraUsage("on")).toBeNull();
   });
 });
 
