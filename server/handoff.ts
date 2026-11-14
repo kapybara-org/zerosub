@@ -53,7 +53,92 @@ export function shortenEarlierHandOff(text: string): string {
   return `${neutralise(text.slice(0, open))}${OPEN}\n${kept}\n${CLOSE}${neutralise(after)}`;
 }
 
-function describeTool(item: Extract<AgentTimelineItem, { type: "tool_call" }>): string {
+type ToolCallItem = Extract<AgentTimelineItem, { type: "tool_call" }>;
+
+interface ParsedAgentMessage {
+  event: string;
+  sender: string | null;
+  text: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function formatSender(sender: unknown): string | null {
+  if (!isRecord(sender) || typeof sender.id !== "string" || !sender.id.trim()) return null;
+  const id = sender.id.trim();
+  const title = typeof sender.title === "string" ? sender.title.trim() : "";
+  return title && title !== id ? `${title} (${id})` : id;
+}
+
+/**
+ * Since Paseo 0.11.1, a prompt or finish notification from another agent is projected as an
+ * `agent_message` tool call (`paseo-agent-message:…`) rather than a `user_message`.
+ */
+function readAgentMessage(item: ToolCallItem): ParsedAgentMessage | null {
+  if (isRecord(item.agentMessage) && typeof item.agentMessage.event === "string" && typeof item.agentMessage.text === "string") {
+    return {
+      event: item.agentMessage.event,
+      sender: formatSender(item.agentMessage.sender),
+      text: item.agentMessage.text,
+    };
+  }
+  if (
+    item.name === "agent_message" &&
+    item.callId.startsWith("paseo-agent-message:") &&
+    item.detail.type === "plain_text" &&
+    typeof item.detail.text === "string"
+  ) {
+    return { event: "message", sender: null, text: item.detail.text };
+  }
+  return null;
+}
+
+/** Paseo projects a schedule or heartbeat fire (`<paseo-system>…</paseo-system>`) as a `heartbeat` tool call. */
+function readHeartbeatPrompt(item: ToolCallItem): string | null {
+  if (
+    item.name === "heartbeat" &&
+    item.callId.startsWith("paseo-system:") &&
+    item.detail.type === "plain_text" &&
+    typeof item.detail.text === "string"
+  ) {
+    return item.detail.text;
+  }
+  return null;
+}
+
+/** Whether `item` is a prompt row that starts or steers a turn (human, another agent, or a schedule). */
+export function isTurnPrompt(item: AgentTimelineItem): boolean {
+  if (item.type === "user_message") return true;
+  if (item.type !== "tool_call") return false;
+  return readAgentMessage(item) !== null || readHeartbeatPrompt(item) !== null;
+}
+
+/**
+ * Task instructions sent into the conversation: a human message, a prompt from another agent
+ * (`create_agent` / `send_agent_prompt`), or a scheduled prompt. Child lifecycle notifications
+ * (`event !== "message"`) return `null` so they stay in progress updates rather than instructions.
+ */
+export function promptInstruction(item: AgentTimelineItem): string | null {
+  if (item.type === "user_message") return item.text;
+  if (item.type !== "tool_call") return null;
+  const agentMsg = readAgentMessage(item);
+  if (agentMsg) {
+    if (agentMsg.event !== "message") return null;
+    if (!agentMsg.text.trim()) return "";
+    return agentMsg.sender ? `From ${agentMsg.sender}:\n${agentMsg.text}` : agentMsg.text;
+  }
+  return readHeartbeatPrompt(item);
+}
+
+function describeTool(item: ToolCallItem): string {
+  const agentMsg = readAgentMessage(item);
+  if (agentMsg) {
+    const head = `[agent_message: ${agentMsg.event}${agentMsg.sender ? ` from ${agentMsg.sender}` : ""}]`;
+    const body = clip(neutralise(agentMsg.text), 2_000);
+    return body ? `${head}\n${body}` : head;
+  }
   const detail = item.detail;
   const failed = item.status === "failed" ? " (failed)" : "";
   switch (detail.type) {
@@ -82,23 +167,37 @@ function describeTool(item: Extract<AgentTimelineItem, { type: "tool_call" }>): 
  */
 export function buildTranscript(timeline: readonly AgentTimelineItem[], max = MAX_TRANSCRIPT): string {
   const lines: string[] = [];
-  let firstUser: string | null = null;
+  let firstRequest: string | null = null;
   let todos: string | null = null;
+  const recordPrompt = (speaker: string, rawText: string) => {
+    // Clipping below can't then split a quoted pair: the prompt's own tags are the only ones.
+    const text = neutralise(shortenEarlierHandOff(rawText));
+    const clipped = clip(text, MAX_FIRST_MESSAGE);
+    if (firstRequest === null && clipped) firstRequest = `${speaker} (original request): ${clipped}`;
+    lines.push(`${speaker}: ${text.trim()}`);
+  };
   for (const item of timeline) {
     switch (item.type) {
-      case "user_message": {
-        // Clipping below can't then split a quoted pair: the prompt's own tags are the only ones.
-        const text = neutralise(shortenEarlierHandOff(item.text));
-        if (firstUser === null) firstUser = clip(text, MAX_FIRST_MESSAGE);
-        lines.push(`User: ${text.trim()}`);
+      case "user_message":
+        recordPrompt("User", item.text);
         break;
-      }
       case "assistant_message":
         if (item.text.trim()) lines.push(`Assistant: ${item.text.trim()}`);
         break;
-      case "tool_call":
+      case "tool_call": {
+        const agentMsg = readAgentMessage(item);
+        if (agentMsg?.event === "message") {
+          if (agentMsg.text.trim()) recordPrompt(agentMsg.sender ? `From ${agentMsg.sender}` : "Agent", agentMsg.text);
+          break;
+        }
+        const heartbeat = readHeartbeatPrompt(item);
+        if (heartbeat !== null) {
+          if (heartbeat.trim()) recordPrompt("Scheduled", heartbeat);
+          break;
+        }
         lines.push(describeTool(item));
         break;
+      }
       case "todo":
         todos = item.items.map((task) => `- [${task.completed ? "x" : " "}] ${task.text}`).join("\n");
         break;
@@ -110,7 +209,7 @@ export function buildTranscript(timeline: readonly AgentTimelineItem[], max = MA
   if (body.length > max) {
     const tail = body.slice(body.length - max);
     const start = tail.indexOf("\n\n");
-    body = `${firstUser ? `User (original request): ${firstUser}\n\n` : ""}[… earlier conversation omitted …]\n\n${
+    body = `${firstRequest ? `${firstRequest}\n\n` : ""}[… earlier conversation omitted …]\n\n${
       start >= 0 ? tail.slice(start + 2) : tail
     }`;
   }

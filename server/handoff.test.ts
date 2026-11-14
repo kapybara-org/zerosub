@@ -11,6 +11,41 @@ function user(text: string): AgentTimelineItem {
   return { type: "user_message", text } as AgentTimelineItem;
 }
 
+function agentPrompt(
+  text: string,
+  options: { event?: string; id?: string; title?: string; legacy?: boolean } = {},
+): AgentTimelineItem {
+  const { event = "message", id = "lead", title, legacy = false } = options;
+  return {
+    type: "tool_call",
+    callId: "paseo-agent-message:msg-1",
+    name: "agent_message",
+    status: "completed",
+    error: null,
+    ...(!legacy
+      ? {
+          agentMessage: {
+            event,
+            sender: { id, ...(title ? { title } : {}) },
+            text,
+          },
+        }
+      : {}),
+    detail: { type: "plain_text", text, icon: "bot" },
+  } as AgentTimelineItem;
+}
+
+function heartbeatPrompt(text: string): AgentTimelineItem {
+  return {
+    type: "tool_call",
+    callId: "paseo-system:schedule-run-1",
+    name: "heartbeat",
+    status: "completed",
+    error: null,
+    detail: { type: "plain_text", text, icon: "sparkles" },
+  } as AgentTimelineItem;
+}
+
 function count(text: string, tag: string): number {
   return text.split(tag).length - 1;
 }
@@ -88,6 +123,60 @@ describe("quoting an earlier hand-off", () => {
   });
 });
 
+describe("prompts from other agents and schedules", () => {
+  it("writes an agent's or schedule's prompt into the transcript, and keeps the opening one when trimming", () => {
+    const longAgent: AgentTimelineItem[] = [
+      agentPrompt("Write the parser for the new format.", { id: "lead", title: "Lead the release" }),
+      ...Array.from({ length: 120 }, (_, index): AgentTimelineItem => ({ type: "assistant_message", text: `step ${index} ${"x".repeat(100)}` })),
+      agentPrompt("Only run the unit tests.", { legacy: true }),
+    ];
+    const trimmed = buildTranscript(longAgent, 4_000);
+    expect(trimmed.startsWith("From Lead the release (lead) (original request): Write the parser for the new format.")).toBe(true);
+    expect(trimmed).toContain("[… earlier conversation omitted …]");
+    expect(trimmed).toContain("Agent: Only run the unit tests.");
+    expect(trimmed).not.toContain("[agent_message]");
+
+    const scheduled: AgentTimelineItem[] = [
+      heartbeatPrompt("Run the nightly verification suite."),
+      ...Array.from({ length: 80 }, (_, index): AgentTimelineItem => ({ type: "assistant_message", text: `check ${index} ${"y".repeat(100)}` })),
+    ];
+    const scheduledTranscript = buildTranscript(scheduled, 3_000);
+    expect(scheduledTranscript.startsWith("Scheduled (original request): Run the nightly verification suite.")).toBe(true);
+    expect(scheduledTranscript).not.toContain("[heartbeat]");
+  });
+
+  it("keeps a child finish notification's body without mistaking it for the opening request", () => {
+    const timeline: AgentTimelineItem[] = [
+      agentPrompt("Agent sub-1 (Write tests) finished.\n\n<agent-response>\nAdded 12 parser tests.\n</agent-response>", {
+        event: "finished",
+        id: "sub-1",
+        title: "Write tests",
+      }),
+      user("Ship the release once the parser tests are merged."),
+      ...Array.from({ length: 100 }, (_, index): AgentTimelineItem => ({ type: "assistant_message", text: `progress ${index} ${"z".repeat(100)}` })),
+    ];
+    const full = buildTranscript(timeline.slice(0, 2));
+    expect(full).toContain("[agent_message: finished from Write tests (sub-1)]\nAgent sub-1 (Write tests) finished.");
+    expect(full).toContain("Added 12 parser tests.");
+
+    const trimmed = buildTranscript(timeline, 3_500);
+    expect(trimmed.startsWith("User (original request): Ship the release once the parser tests are merged.")).toBe(true);
+  });
+
+  it("neutralises quoted session tags inside agent messages and finish notifications", () => {
+    const quoted = continuationPrompt("From lead: ORIGINAL", "limit");
+    const prompt = continuationPrompt(
+      buildTranscript([
+        agentPrompt(quoted, { id: "lead", title: "Lead" }),
+        agentPrompt(`Child echoed ${OPEN}inner${CLOSE}`, { event: "finished", id: "sub", title: "Sub" }),
+      ]),
+      "limit",
+    );
+    expect(count(prompt, OPEN)).toBe(1);
+    expect(count(prompt, CLOSE)).toBe(1);
+  });
+});
+
 describe("starting the new agent", () => {
   /** A source agent, a sub-agent of `lead`, and the creates Paseo receives for its continuation. */
   function fake(workspaceId?: string) {
@@ -136,5 +225,31 @@ describe("starting the new agent", () => {
     const { paseo, created } = fake("ws-1");
     await continueInNewAgent({ paseo, sourceAgentId: "sub", why: "a limit", deferPrompt: true, bind: async () => {} });
     expect(created[0]!.request.labels).toEqual({ "zerosub.continued-from": "sub" });
+  });
+
+  it("carries an orchestrator's agent_message instructions into the new agent's prompt", async () => {
+    const { paseo, created } = fake("ws-1");
+    paseo.agents.ref = (() => ({
+      refresh: async () => ({
+        agent: {
+          id: "sub",
+          provider: "codex",
+          model: "gpt-test",
+          title: "Write the parser",
+          cwd: "/repo/packages/parser",
+          workspaceId: "ws-1",
+          currentModeId: "auto",
+          labels: { "paseo.parent-agent-id": "lead" },
+        },
+      }),
+      timeline: {
+        refetch: async () => ({
+          entries: [{ item: agentPrompt("Write the parser for the new format.", { id: "lead", title: "Lead" }) }],
+        }),
+      },
+    })) as unknown as typeof paseo.agents.ref;
+    await continueInNewAgent({ paseo, sourceAgentId: "sub", why: "its account reached its limit", parentId: "lead", bind: async () => {} });
+    expect(created[0]!.request.prompt).toContain("From Lead (lead): Write the parser for the new format.");
+    expect(created[0]!.request.prompt).not.toContain("[agent_message]");
   });
 });
