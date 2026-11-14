@@ -13,7 +13,7 @@ export function contributeCommands(client: PluginClientContext, store: ZeroSubSt
       id: "open-accounts",
       title: "Manage subscription accounts (ZeroSub)",
       icon: "Users",
-      keywords: ["zerosub", "claude", "chatgpt", "codex", "pi", "account", "subscription", "login", "switch"],
+      keywords: ["zerosub", "claude", "chatgpt", "codex", "pi", "grok", "account", "subscription", "login", "switch"],
       context: "global",
       onSelect({ openSurface }) {
         openSurface("accounts");
@@ -30,7 +30,7 @@ export function contributeCommands(client: PluginClientContext, store: ZeroSubSt
       async onSubmit({ args, agent, openSurface }) {
         const state = await currentState(store);
         const family = state.providers[agent.provider];
-        if (!family) throw new Error(`${agent.provider} agents don't use Claude or ChatGPT subscription accounts.`);
+        if (!family) throw new Error(`${agent.provider} agents don't use Claude, ChatGPT or Grok subscription accounts.`);
         const query = args.trim();
         if (!query) {
           openSurface("accounts");

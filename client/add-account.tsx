@@ -80,11 +80,11 @@ export function AddAccountModal({
     onClose();
   }, [loginId, finished, store, onClose]);
 
-  // Claude's flow serves both links at once; ChatGPT needs a fresh flow to switch.
+  // Claude's flow serves both links at once; ChatGPT and Grok need a fresh flow to switch.
   const switchMethod = useCallback(
     (next: LoginMethod) => {
       setMethod(next);
-      if (family === "codex") void begin(next);
+      if (family !== "claude") void begin(next);
     },
     [family, begin],
   );
@@ -247,8 +247,8 @@ function SignInSteps({
     [theme],
   );
 
-  const service = family === "claude" ? "Claude" : "ChatGPT";
-  const canSwitch = browserUsable && (family === "codex" || (Boolean(login.url) && Boolean(login.codeUrl)));
+  const service = family === "codex" ? "ChatGPT" : FAMILY_LABEL[family];
+  const canSwitch = browserUsable && (family !== "claude" || (Boolean(login.url) && Boolean(login.codeUrl)));
   return (
     <View style={{ gap: 16 }}>
       <Step theme={theme} number={1} title={`Open the ${service} sign-in page`}>
@@ -296,10 +296,12 @@ function SignInSteps({
               onPress={() => void copy(login.userCode ?? "", "Code")}
             />
           </Row>
-          <Text style={text.small}>
-            If the page says code sign-in is off, turn on device code sign-in in ChatGPT → Settings → Security (or ask
-            your workspace admin), then try again.
-          </Text>
+          {family === "codex" ? (
+            <Text style={text.small}>
+              If the page says code sign-in is off, turn on device code sign-in in ChatGPT → Settings → Security (or ask
+              your workspace admin), then try again.
+            </Text>
+          ) : null}
         </Step>
       ) : null}
 
