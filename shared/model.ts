@@ -1,10 +1,10 @@
 import { z } from "zod";
 
 /**
- * The provider families this plugin manages: the two subscription CLIs, and Pi, whose added accounts
- * are Anthropic API keys. Custom provider profiles map onto one of them.
+ * The provider families this plugin manages: the subscription CLIs (Claude Code, Codex, Grok Build),
+ * and Pi, whose added accounts are Anthropic API keys. Custom provider profiles map onto one of them.
  */
-export const FamilySchema = z.enum(["claude", "codex", "pi"]);
+export const FamilySchema = z.enum(["claude", "codex", "pi", "grok"]);
 export type Family = z.infer<typeof FamilySchema>;
 export const FAMILIES: readonly Family[] = FamilySchema.options;
 
@@ -12,13 +12,34 @@ export const FAMILY_LABEL: Record<Family, string> = {
   claude: "Claude",
   codex: "ChatGPT",
   pi: "Pi",
+  grok: "Grok",
 };
 
 /**
  * The provider a stopped chat can carry on with when every account of its own is out (Claude ↔
- * ChatGPT); null for Pi, whose added accounts are billed per use and never take work over by themselves.
+ * ChatGPT); null for Pi, whose added accounts are billed per use and never take work over by themselves,
+ * and for Grok, whose chats don't fork to another provider.
  */
-export const OTHER_FAMILY: Record<Family, Family | null> = { claude: "codex", codex: "claude", pi: null };
+export const OTHER_FAMILY: Record<Family, Family | null> = { claude: "codex", codex: "claude", pi: null, grok: null };
+
+/**
+ * Families not every Paseo user runs: one shows once its CLI login is registered (its CLI is there,
+ * and for Grok a Paseo provider runs it) or an account of it was added, and its CLI is only missed
+ * once an account of it was added.
+ */
+export const OPTIONAL: Record<Family, boolean> = { claude: false, codex: false, pi: true, grok: true };
+
+/** The families the Accounts screen shows, given the accounts there are (the CLI logins registered included). */
+export function shownFamilies(accounts: readonly { family: Family }[]): Family[] {
+  return FAMILIES.filter((family) => !OPTIONAL[family] || accounts.some((account) => account.family === family));
+}
+
+/**
+ * For a provider whose conversations can't change accounts in place: one with history carries on in a
+ * new agent on the account picked for it (Codex's). False for Grok's, which stay on their account
+ * until moving them is known to work; only new agents follow a pick or the default.
+ */
+export const HAND_OFF: Record<Family, boolean> = { claude: true, codex: true, pi: true, grok: false };
 
 /** Stands for a proxy's password (or a user name with none) wherever the proxy is shown. */
 export const HIDDEN = "•••";
