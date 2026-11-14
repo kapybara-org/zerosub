@@ -1898,6 +1898,9 @@ export class Service {
     } finally {
       this.reloads.delete(agentId);
     }
+    if (result.ok && reload.opens === 0) {
+      result = { ok: false, error: "Paseo reported a reload but did not open a new provider session", timedOut: false };
+    }
     if (result.ok && this.unrouted.has(agentId)) {
       // Paseo stopped waiting for routing and reopened the session as it was (see `onSessionOpen`).
       result = { ok: false, error: "ZeroSub couldn't pick its account in time, so it reopened on your CLI login", timedOut: false };
