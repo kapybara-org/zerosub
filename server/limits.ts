@@ -1,4 +1,5 @@
 import type { AgentTimelineItem, LimitHit, LimitKind, TurnEvent } from "./adapter";
+import { isTurnPrompt } from "./handoff";
 
 /**
  * Claude Code's exact wording for hard limits (2.1.x templates: `You've hit your ${limit}${suffix}`),
@@ -71,7 +72,7 @@ export function turnRows(entries: ReadonlyArray<{ item: AgentTimelineItem; turnI
     const entry = entries[index];
     if (!entry) continue;
     if (entry.turnId === turnId) rows.push(entry.item);
-    else if (rows.length > 0 && entry.turnId && entry.item.type === "user_message") break;
+    else if (rows.length > 0 && entry.turnId && isTurnPrompt(entry.item)) break;
   }
   return rows.reverse();
 }
@@ -91,7 +92,7 @@ function notices(event: TurnEvent, includeFinalReplies: boolean): string[] {
   for (let index = timeline.length - 1; index >= 0; index -= 1) {
     const item = timeline[index];
     if (!item) continue;
-    if (item.type === "user_message") break;
+    if (isTurnPrompt(item)) break;
     if (item.type === "error") found.push(item.message);
     else if (item.type === "notification" && item.level !== "info") found.push(item.message);
     else if (item.type === "assistant_message") {

@@ -1015,6 +1015,115 @@ describe("Codex continuations of a sub-agent", () => {
     expect(t.created.find((request) => request.agentId === b.agentId)!.labels).toEqual({ [FROM]: "root", [PARENT]: "lead" });
     expect((await t.store.read()).continuations.root!.pending).toBeUndefined();
   });
+
+  function agentMessage(
+    text: string,
+    options: { event?: string; id?: string; title?: string; legacy?: boolean } = {},
+  ): AgentTimelineItem {
+    const { event = "message", id = "lead", title = "Lead the release", legacy = false } = options;
+    return {
+      type: "tool_call",
+      callId: `paseo-agent-message:${id}-${Math.random().toString(36).slice(2)}`,
+      name: "agent_message",
+      status: "completed",
+      error: null,
+      ...(!legacy
+        ? {
+            agentMessage: {
+              event,
+              sender: { id, ...(title ? { title } : {}) },
+              text,
+            },
+          }
+        : {}),
+      detail: { type: "plain_text", text, icon: "bot" },
+    } as AgentTimelineItem;
+  }
+
+  function heartbeat(text: string): AgentTimelineItem {
+    return {
+      type: "tool_call",
+      callId: "paseo-system:nightly-check",
+      name: "heartbeat",
+      status: "completed",
+      error: null,
+      detail: { type: "plain_text", text, icon: "sparkles" },
+    } as AgentTimelineItem;
+  }
+
+  it("continues a sub-agent whose instructions came only from its orchestrator, across tabs and fallback", async () => {
+    const t = await setup();
+    await withLead(t);
+    // Paseo projects agent-to-agent prompts as tool_call items and leaves lastUserMessageAt null.
+    t.timelines.set("root", []);
+    t.agents.get("root")!.lastUserMessageAt = null;
+    t.add("root", agentMessage("Implement the parser for the new wire format."));
+    t.add("root", { type: "assistant_message", text: "Lexer is done; parser AST next." });
+
+    const b = await t.switchTo("root", "b");
+    const firstHandoff = t.sent.at(-1)!.text;
+    expect(firstHandoff).toContain("<user-updates>\nFrom Lead the release (lead):\nImplement the parser for the new wire format.\n</user-updates>");
+    expect(firstHandoff).toContain("<progress-updates>\nAssistant: Lexer is done; parser AST next.\n</progress-updates>");
+    expect(firstHandoff).not.toContain("[agent_message]");
+
+    t.add(b.agentId, agentMessage("Skip benchmarks; only unit tests."));
+    t.add(b.agentId, { type: "assistant_message", text: "Unit tests added." });
+    expect((await t.switchTo(b.agentId, "a")).agentId).toBe("root");
+    const returnHandoff = t.sent.at(-1)!.text;
+    expect(returnHandoff).toContain("<user-updates>\nFrom Lead the release (lead):\nSkip benchmarks; only unit tests.\n</user-updates>");
+    expect(returnHandoff).toContain("<progress-updates>\nAssistant: Unit tests added.\n</progress-updates>");
+    expect(returnHandoff).not.toContain("Implement the parser for the new wire format.");
+
+    // If the original tab is gone, switching from B to a fresh C keeps the earlier handoff as origin.
+    t.agents.delete("root");
+    await t.switchTo(b.agentId, "c");
+    const fallbackHandoff = t.sent.at(-1)!.text;
+    expect(fallbackHandoff).toContain("Implement the parser for the new wire format.");
+    expect(fallbackHandoff).toContain("Skip benchmarks; only unit tests.");
+  });
+
+  it("reads legacy agent_message envelopes without provenance and scheduled heartbeat prompts", async () => {
+    const t = await setup();
+    t.timelines.set("root", []);
+    t.agents.get("root")!.lastUserMessageAt = null;
+    t.add("root", agentMessage("Audit the migration scripts.", { legacy: true }));
+    t.add("root", { type: "assistant_message", text: "Checked 3 of 5 scripts." });
+    await t.switchTo("root", "b");
+    expect(t.sent.at(-1)!.text).toContain("<user-updates>\nAudit the migration scripts.\n</user-updates>");
+
+    t.addAgent("scheduled", { lastUserMessageAt: null, title: "Nightly check" });
+    await t.store.update((draft) => {
+      draft.bindings.scheduled = { accountId: "a", source: "thread", at: "now" };
+      draft.sessions.scheduled = { accountId: "a", family: "codex", openedAt: "now" };
+    });
+    t.add("scheduled", heartbeat("Run the nightly regression check and open a summary."));
+    t.add("scheduled", { type: "assistant_message", text: "Suite started." });
+    await t.switchTo("scheduled", "b");
+    expect(t.sent.at(-1)!.text).toContain("<user-updates>\nRun the nightly regression check and open a summary.\n</user-updates>");
+  });
+
+  it("keeps child finish notifications in progress updates, and still refuses a fresh switch with no task instructions", async () => {
+    const t = await setup();
+    t.timelines.set("root", []);
+    t.agents.get("root")!.lastUserMessageAt = null;
+    t.add("root", agentMessage("   "));
+    t.add(
+      "root",
+      agentMessage("Agent sub-1 (Parser) finished.\n\n<agent-response>\nAll 14 parser tests pass.\n</agent-response>", {
+        event: "finished",
+        id: "sub-1",
+        title: "Parser",
+      }),
+    );
+    await expect(t.switchTo("root", "b")).rejects.toThrow(/Couldn't read the task's instructions/);
+
+    t.add("root", { type: "user_message", text: "Coordinate the parser and CLI changes." });
+    await t.switchTo("root", "b");
+    const handoff = t.sent.at(-1)!.text;
+    expect(handoff).toContain("<user-updates>\nCoordinate the parser and CLI changes.\n</user-updates>");
+    expect(handoff).toContain("[agent_message: finished from Parser (sub-1)]\nAgent sub-1 (Parser) finished.");
+    expect(handoff).toContain("All 14 parser tests pass.");
+  });
 });
 
 describe("fitting pending instructions", () => {

@@ -868,6 +868,31 @@ describe("forking to the other provider", () => {
     expect(prompt).toContain("Step 45 done.");
     expect(prompt).toContain("User: Now run the linter");
   });
+
+  it("carries an orchestrator's agent_message instructions when forking a sub-agent", async () => {
+    const lead = { id: "lead", provider: "claude", status: "idle", title: "Lead the release", workspaceId: "ws-1", archivedAt: null, labels: {} };
+    const agentPrompt = (id: string, text: string): AgentTimelineItem =>
+      ({
+        type: "tool_call",
+        callId: `paseo-agent-message:${id}`,
+        name: "agent_message",
+        status: "completed",
+        error: null,
+        agentMessage: { event: "message", sender: { id: "lead", title: "Lead the release" }, text },
+        detail: { type: "plain_text", text, icon: "bot" },
+      }) as AgentTimelineItem;
+    const conversation = [
+      ...inTurn("t0", agentPrompt("m1", "Implement the parser"), { type: "assistant_message", text: "Parser skeleton ready." }),
+      ...inTurn("t", agentPrompt("m2", "Now run the linter"), { type: "assistant_message", text: "You've hit your session limit · resets 3pm (UTC)" }),
+    ];
+    const { created, limitTurn } = await setUpFork("bypassPermissions", conversation, { "paseo.parent-agent-id": "lead" }, [lead]);
+    await limitTurn();
+    const prompt = created[0]?.prompt ?? "";
+    expect(prompt).toContain("From Lead the release (lead): Implement the parser");
+    expect(prompt).toContain("Assistant: Parser skeleton ready.");
+    expect(prompt).toContain("From Lead the release (lead): Now run the linter");
+    expect(prompt).not.toContain("[agent_message]");
+  });
 });
 
 describe("disabling an account", () => {
