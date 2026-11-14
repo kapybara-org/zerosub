@@ -511,6 +511,7 @@ const GROK_PRIVATE = new Set([
   "managed_config_cache.json",
   "managed_config.sig.json",
   "managed_identity.sig.json",
+  "staged",
   "requirements.toml",
   "active_sessions.json",
   "logs",
