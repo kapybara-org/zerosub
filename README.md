@@ -1,6 +1,6 @@
 # ZeroSub
 
-Use several Claude and ChatGPT (Codex) subscriptions side by side in [Paseo](https://paseo.sh), without logging in and out of the CLI, and run Paseo's Pi agents on several Anthropic API keys, each with its own proxy.
+Use several Claude, ChatGPT (Codex) and Grok subscriptions side by side in [Paseo](https://paseo.sh), without logging in and out of the CLI, and run Paseo's Pi agents on several Anthropic API keys, each with its own proxy.
 
 - **Add accounts in the app.** Click **Add account** under Claude or ChatGPT and sign in on any device, including your phone. You don't need a terminal, environment variables or config files.
 - **Your existing CLI logins show up automatically.** Nothing changes until you add a second account.
@@ -11,6 +11,7 @@ Use several Claude and ChatGPT (Codex) subscriptions side by side in [Paseo](htt
 - **Set an account aside.** Disable an account for a while and its agents move to your other accounts, then come back when you enable it again.
 - **Several hosts.** Each Paseo host keeps its own accounts, and the Accounts screen says which host you're looking at.
 - **Fork to the other provider (optional).** When every Claude account is out, a stopped chat can carry on in a new ChatGPT agent, and the other way round.
+- **Grok accounts.** Sign in several Grok (SuperGrok, X Premium+) accounts for Paseo's Grok agents and pick the one each new agent starts on. See [Grok accounts](#grok-accounts).
 - **Pi accounts.** Add Anthropic API keys for Paseo's Pi agents, each with an optional base URL and its own proxy, and pick one per Pi agent. See [Pi accounts](#pi-accounts).
 - **Everything else stays the same.** Every account shares your settings, skills, plugins, MCP servers, `CLAUDE.md`/`AGENTS.md` and conversation history.
 
@@ -19,7 +20,7 @@ Use several Claude and ChatGPT (Codex) subscriptions side by side in [Paseo](htt
 Requirements:
 
 - Paseo 0.9.1 or later, with plugins enabled (**Settings → Plugins → Enable plugins**).
-- The `claude` and/or `codex` CLI installed where the daemon runs, the same ones Paseo already uses.
+- The `claude` and/or `codex` CLI installed where the daemon runs, the same ones Paseo already uses. For Grok accounts, the `grok` CLI and a Grok provider in Paseo (see [Grok accounts](#grok-accounts)).
 
 In the app, open **Settings → Plugins**, paste `npm:@kapybara/zerosub` as the plugin source, and install. Or, on the daemon host:
 
@@ -130,6 +131,25 @@ How it works:
 
 Tested on macOS with Pi 1.4.0 and Paseo 0.15.0.
 
+## Grok accounts
+
+Grok is optional, like Pi. Nothing about it shows until a Paseo provider runs Grok Build's agent, `grok agent stdio` (as Paseo's own Grok entry does), and `grok` runs where the daemon runs, or until you've added a Grok account. Without the `grok` CLI you see no Grok section and no warning. Its first card is Grok's own login, `~/.grok` (or `GROK_HOME` in the daemon's environment), and agents on it run as Paseo would run them.
+
+- **Add account** under Grok runs `grok login` for a new account. In a browser on the host's own computer, the page finishes by itself. Anywhere else, choose **Use a code instead**: open the page on any device and confirm the code ZeroSub shows.
+- **Each conversation stays on its account.** Pick an account for a new Grok agent from its account button, with `/account` or the next-new-agent pick, or make it the default. Once an agent has a conversation, it stays on the account it started on, as ChatGPT conversations do, but without a hand-off: to use another account, start a new agent. Changing the default doesn't move existing conversations.
+- **Usage is deferred.** ZeroSub runs Grok's own `grok usage --json` with the account's home, but does not interpret successful JSON until the CLI's real supported-route format is verified. The card stays unavailable and directs you to `/usage` inside Grok; timeouts and known CLI errors still say why.
+- **No automatic switching yet.** ZeroSub doesn't watch Grok's turns for limits or sign-outs, so it never moves a Grok agent by itself. There are no banked resets for Grok, and Grok chats are never forked to another provider.
+- An account that still has Grok conversations on it can't be removed until you archive them.
+
+How it works:
+
+- A provider counts as Grok when it extends `acp` and runs `grok` (by path, or `grok-<version>`) with `agent … stdio`. One that joins a shared leader (`--leader`), is disabled, or brings its own login or endpoint in its `env` (`GROK_HOME`, `GROK_AUTH`, `GROK_AUTH_PATH`, the Grok API-key variables, external-provider variables, OIDC variables, `GROK_DEPLOYMENT_KEY` or `GROK_CLI_CHAT_PROXY_BASE_URL`) is left exactly as configured.
+- Each added account has its own home in `$PASEO_HOME/zerosub/homes/grok-<id>`, which its agents get as `GROK_HOME`, with `GROK_AUTH_PATH` set to its `auth.json`. Known daemon-level Grok login, API-key, external-provider, OIDC, deployment-key and chat-proxy overrides are blanked for managed homes, so an account's agents don't fall back to another login, key or endpoint.
+- The home keeps the account's own files: its sign-in (`auth.json`, and `mcp_credentials.json` for MCP servers), what Grok fetched for it (`settings_cache.json`, `models_cache.json`, `experiments_remote_opt_out`, a team's `managed_config.toml` and `requirements.toml`), and the running processes' locks, sockets, leader and logs. Everything else is linked to `~/.grok`, including `config.toml`, `sessions/`, memory, skills and plugins.
+- ZeroSub reads who is signed in (email, user and team) from the home's `auth.json`, never its login itself.
+
+Built against Grok 1.0.77 and Paseo 0.15.4 on Linux. A separate daemon verified two real logins running concurrently, next-agent and default routing, historical-session pinning across a reload, and the removal guard. Successful plan-usage JSON, quota exhaustion and removal after archival remain unverified.
+
 ## Several hosts
 
 Paseo installs plugins per host (daemon), so install ZeroSub on each host whose agents should use it. When more than one host has it, Paseo shows a single **Accounts (ZeroSub)** item with a host picker at the top.
@@ -144,9 +164,9 @@ Paseo installs plugins per host (daemon), so install ZeroSub on each host whose 
 
 Each added account gets its own credential home under `$PASEO_HOME/zerosub/homes/`:
 
-- Claude uses it as `CLAUDE_CONFIG_DIR`; Codex uses it as `CODEX_HOME`.
-- The CLIs keep each home's login separate: Claude in its own keychain entry (`.credentials.json` on Linux), Codex in its own `auth.json`.
-- Everything that isn't account-specific is a symlink back to `~/.claude` or `~/.codex`. For Claude that includes `settings.json`, `skills/`, `plugins/` and `projects/`; for Codex, `config.toml`, `sessions/` and more. Codex also shares its thread database through `CODEX_SQLITE_HOME`.
+- Claude uses it as `CLAUDE_CONFIG_DIR`; Codex uses it as `CODEX_HOME`; Grok uses it as `GROK_HOME`.
+- The CLIs keep each home's login separate: Claude in its own keychain entry (`.credentials.json` on Linux), Codex and Grok in their own `auth.json`.
+- Everything that isn't account-specific is a symlink back to `~/.claude`, `~/.codex` or `~/.grok`. For Claude that includes `settings.json`, `skills/`, `plugins/` and `projects/`; for Codex and Grok, `config.toml`, `sessions/` and more. Codex also shares its thread database through `CODEX_SQLITE_HOME`.
 - Claude's `.claude.json` holds the account identity, so each account keeps its own copy. It's seeded from yours, and your MCP servers stay in sync.
 
 A `before("agent.session_open")` hook sets those variables for every session Paseo opens: create, resume, refresh and import. To move a live agent, ZeroSub reopens its session through Paseo's own reload (Paseo 0.16 and later), or with `paseo agent reload` on older versions. The CLI can't find background agents (ones another plugin starts in a background workspace), so on older versions those move the next time their session starts. It never interrupts a running turn; a busy agent moves when its turn ends, even when that turn ends at a limit. On Paseo 0.16 and later, a reload also cancels background work an agent left running after its turn (shells or monitors), so the 30-second check below and moving idle agents off an account at its limit wait for that work to stop. Failover at a limit, which ZeroSub also starts by itself, doesn't, and neither do moves you ask for, since that work can run for hours (a dev server, say). It looks at the agent again just before reloading it, and the moves it starts by itself also wait until nobody has used the agent for a minute, so a message you've just sent isn't cancelled. Only one move of an agent runs at a time. Every 30 seconds it also checks each open agent, and moves one off an account it can't work on (at its limit, signed out, disabled or removed) to the account it's routed to. That catches what no button press moved it for, such as a limit read from usage, and carries out a move that was waiting for a turn that never came. An agent whose account still works isn't moved unasked, even when it's now routed elsewhere (automatic switching turned off, a limit cleared, a move lost when the plugin restarted): its account button shows the move still to come, and it moves when its session next starts or when you switch it. A move that doesn't land isn't tried again for 30 minutes; the agent's timeline says so once, and it moves when its session next starts.
@@ -159,6 +179,7 @@ Sign-in runs the official CLIs:
 
 - Claude: `claude auth login`.
 - Codex: `codex app-server`'s account API.
+- Grok: `grok login --oauth`, or `grok login --device-auth` for the code.
 
 ZeroSub never implements OAuth itself and never copies credentials between accounts.
 
@@ -167,23 +188,26 @@ ZeroSub never implements OAuth itself and never copies credentials between accou
 - Credentials stay in the CLIs' own stores. ZeroSub's registry (`$PASEO_HOME/zerosub/state.json`) holds account names, emails, plans, which agent uses which account, and continuation links with timeline positions. Handoff text stays in the agents' conversation histories; it isn't copied into the registry.
 - Every write of the registry also leaves a snapshot in `$PASEO_HOME/zerosub/backups/`, readable only by you: the last 5 writes, then the last one of each of 12 recent hours and 7 recent days, 24 files at most. If the registry is missing, empty, not JSON, or has entries that don't validate (a hand edit gone wrong, say), ZeroSub restores the newest snapshot, keeps the damaged file as `state.json.bad-<time>`, and says so in its log.
 - To show Claude usage, ZeroSub reads each account's current access token and calls Anthropic's usage endpoint, the same way Paseo's built-in usage display and `/usage` do. It never logs or stores tokens and never refreshes them itself. When you refresh usage (the ↻ button beside the title) or use a reset and a token has expired, it runs `claude -p /usage` so Claude Code renews its own sign-in. In the background it does the same at most every 30 minutes per account, and only for a reading that has passed its reset time or an account at its 5-hour or weekly limit. Codex usage comes from `codex app-server`.
+- Grok usage invokes only `grok usage --json`, run with the account's home. ZeroSub doesn't call xAI's endpoints, read Grok's tokens, or interpret successful JSON before its CLI contract is verified.
 - Using a banked reset calls the provider's own reset endpoint with that account's sign-in, and only after you confirm (or turn on automatic use).
-- Removing an account moves its agents to the default account, then signs it out (`claude auth logout` / `codex` logout) and deletes its home. This happens once no agent is mid-turn on it. Abandoned sign-ins are cleaned up the same way; one a restart interrupted is deleted only if it isn't signed in.
+- Removing an account moves its agents to the default account, then signs it out (`claude auth logout` / `codex` logout / `grok logout`) and deletes its home. This happens once no agent is mid-turn on it. Abandoned sign-ins are cleaned up the same way; one a restart interrupted is deleted only if it isn't signed in.
 - ZeroSub only signs out or deletes homes it recorded for cleanup when you removed the account or started the sign-in, never a home just because the registry doesn't list it: a damaged or hand-edited registry may simply be missing accounts. Folders in `homes/` that no account uses are left alone and named in the log at startup.
-- An account that still has ChatGPT conversations on it can't be removed until you archive them or continue them elsewhere, because they can't move.
+- An account that still has ChatGPT conversations on it can't be removed until you archive them or continue them elsewhere, because they can't move. Grok conversations can only be archived.
 - Your CLI login can't be removed from ZeroSub.
 
 ## Limitations
 
 - **MCP servers that use OAuth** (Linear, Notion, …) store their tokens per Claude account, so sign in to them once on each account.
-- **Shared settings apply to every account.** If `~/.claude/settings.json` sets an `apiKeyHelper` or API-key `env`, every account uses that key instead of its subscription.
+- **Shared settings apply to every account.** If `~/.claude/settings.json` sets an `apiKeyHelper` or API-key `env`, every account uses that key instead of its subscription. Likewise, an `[auth]` command, customer SSO (`[grok_com_config.oidc]`) or a model's own `api_key` in `~/.grok/config.toml` signs every Grok account in the same way.
+- **Grok conversations can't change accounts yet.** A Grok conversation's history carries encrypted reasoning (Grok has an `encrypted_content_mismatch` error), which may be tied to the account that wrote it. Switching may be allowed later, once resuming a conversation on a second account is verified. Live switches would also likely hit Paseo's 3-second reload timeout for now ([getpaseo/paseo#8267](https://github.com/getpaseo/paseo/issues/8267)).
+- **Grok usage is not displayed yet.** Successful plan-level `grok usage --json` output hasn't been captured on a supported route, so ZeroSub deliberately leaves usage unavailable and directs you to `/usage` inside Grok. Grok limits don't move agents (see [Grok accounts](#grok-accounts)).
 - **Usage for an idle Claude account** shows the last reading until the account is used again or you refresh usage. If a window in it has passed its reset time, or the account is at its limit, ZeroSub also renews the sign-in in the background to read it again, at most every 30 minutes, so an early reset or one used on another machine shows up too. Anthropic rate-limits its usage endpoint (Claude Code and Paseo read it too), so a reading can be a few minutes old; the card then says when it was taken. Readings are saved in `$PASEO_HOME/zerosub/usage.json`, so they survive restarts.
 - **A leftover Claude process after a move.** Rarely, an agent ends up with a second, untracked Claude Code process on the same session, and after a move it can keep running on the account the agent left. This is a Paseo bug ([getpaseo/paseo#9408](https://github.com/getpaseo/paseo/issues/9408), tracked in [#4450](https://github.com/getpaseo/paseo/issues/4450)); ZeroSub doesn't touch processes it didn't start. To check, run `pgrep -af stream-json` and stop an extra process by hand.
 - **Password-protected daemons:** `paseo agent reload` can't authenticate. Agents then switch the next time their session starts, not immediately, and their account button and timeline note say so.
 - **Imported Codex threads** (`paseo agent import`) are assigned to your CLI login, since that's where standalone Codex sessions come from.
 - **Agents in background workspaces** (`paseo workspace create --background`) are left out of the list of agents Paseo gives plugins, so they have no account button: switch one with `/account` in its message box. Each still opens on the account it's routed to, switches when a turn hits a limit and moves off an account you remove, but changing the default, disabling an account and the 30-second check don't move it.
 - **ChatGPT device-code sign-in** has to be enabled in ChatGPT → Settings → Security. The browser option works from a browser on the host's own computer.
-- Tested on macOS with Claude Code 2.1.280, Codex 0.156.1 and Paseo 0.9.1. Linux should work. Windows is untested.
+- Tested on macOS with Claude Code 2.1.280, Codex 0.156.1 and Paseo 0.9.1; Grok accounts are built against Grok 1.0.77 and Paseo 0.15.4 on Linux. Linux should work. Windows is untested.
 
 ## Development
 
@@ -203,7 +227,7 @@ paseo plugin logs zerosub
 Code layout:
 
 - `client/`: React Native UI (Accounts surface, sign-in modal, composer pill, commands, timeline note).
-- `server/`: routing, account homes, Claude, Codex and Pi adapters, failover, Pi account folders and scripts.
+- `server/`: routing, account homes, Claude, Codex, Grok and Pi adapters, failover, Pi account folders and scripts.
 - `shared/`: RPC contracts and the view model.
 
 Report problems at [github.com/kapybara-org/ZeroSub/issues](https://github.com/kapybara-org/ZeroSub/issues).

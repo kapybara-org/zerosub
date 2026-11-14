@@ -37,6 +37,12 @@ export function mainCodexHome(): string {
   return configured ? resolve(configured) : join(homedir(), ".codex");
 }
 
+/** Grok Build's home: `GROK_HOME` in the daemon's environment, else `~/.grok`. */
+export function mainGrokHome(): string {
+  const configured = process.env.GROK_HOME?.trim();
+  return configured ? resolve(configured) : join(homedir(), ".grok");
+}
+
 /** Pi's agent directory: `PI_CODING_AGENT_DIR` (a leading `~` is the home folder, as Pi reads it), else `~/.pi/agent`. */
 export function mainPiDir(): string {
   const configured = process.env.PI_CODING_AGENT_DIR?.trim();
@@ -72,7 +78,7 @@ export function inHomesDir(home: string): boolean {
  */
 export async function isOwnHome(home: string): Promise<boolean> {
   const path = resolve(home);
-  if (!inHomesDir(path) || path === mainClaudeDir() || path === mainCodexHome() || path === mainPiDir()) return false;
+  if (!inHomesDir(path) || path === mainClaudeDir() || path === mainCodexHome() || path === mainPiDir() || path === mainGrokHome()) return false;
   const entry = await lstat(path).catch(() => null);
   return !entry?.isSymbolicLink();
 }

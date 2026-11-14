@@ -1,6 +1,7 @@
 import type { PluginServerContext, PluginSettingsState } from "@getpaseo/plugin/server";
 import { ClaudeAdapter } from "./server/claude";
 import { CodexAdapter } from "./server/codex";
+import { GrokAdapter } from "./server/grok";
 import { PiAdapter } from "./server/pi";
 import { Service, describe } from "./server/service";
 import { preferences } from "./shared/preferences";
@@ -26,7 +27,7 @@ import {
 } from "./shared/rpc";
 
 export default function contribute(server: PluginServerContext) {
-  const service = new Service({ claude: new ClaudeAdapter(), codex: new CodexAdapter(), pi: new PiAdapter() });
+  const service = new Service({ claude: new ClaudeAdapter(), codex: new CodexAdapter(), pi: new PiAdapter(), grok: new GrokAdapter() });
 
   const settings = server.registerSettings(preferences);
   const applySettings = (state: PluginSettingsState<typeof preferences.schema>) => {

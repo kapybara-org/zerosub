@@ -5,7 +5,7 @@ import type {
   PluginClientContext,
 } from "@getpaseo/plugin/client";
 import { accountPeak, formatCredits, formatPercent, moveProblem, pillText } from "../shared/format";
-import { FAMILY_LABEL, OTHER_FAMILY, type AccountView, type StateView } from "../shared/model";
+import { FAMILY_LABEL, HAND_OFF, OTHER_FAMILY, type AccountView, type StateView } from "../shared/model";
 import { setAgentAccount } from "../shared/rpc";
 import { forkPopover } from "./fork-confirm";
 import { resetPopover } from "./reset-confirm";
@@ -179,13 +179,16 @@ function buttonFor(
 
   // Codex threads can't change accounts in place; continue in this task's tab for that account.
   const movable = route?.movable ?? true;
+  // Grok conversations stay on their account: the others are listed, not offered.
+  const stays = !movable && !HAND_OFF[family];
   const items: PluginButtonMenuEntry[] = accounts.map((account, index) => ({
     kind: "item",
     id: `account-${index}`,
-    title: account.id === current.id || movable ? menuTitle(account) : `Continue on ${account.label}`,
-    icon: account.id === current.id ? "CircleCheck" : movable ? "Circle" : "ArrowRightLeft",
+    title: account.id === current.id || movable || stays ? menuTitle(account) : `Continue on ${account.label}`,
+    icon: account.id === current.id ? "CircleCheck" : movable || stays ? "Circle" : "ArrowRightLeft",
     // With automatic switching on, an account at its limit would only pass the agent on (the server refuses it too).
     disabled:
+      stays ||
       account.status === "signed_out" ||
       account.status === "disabled" ||
       (state.autoSwitch && account.status === "limited") ||
@@ -219,6 +222,13 @@ function buttonFor(
     items.push({
       kind: "item", id: "selection-reason",
       title: "Started here: weekly reset was near",
+      icon: "Info", disabled: true, behavior: { kind: "action", onPress() {} },
+    });
+  }
+  if (stays) {
+    items.push({
+      kind: "item", id: "stays",
+      title: `${FAMILY_LABEL[family]} conversations stay on their account; new agents follow your pick`,
       icon: "Info", disabled: true, behavior: { kind: "action", onPress() {} },
     });
   }

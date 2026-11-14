@@ -1,6 +1,7 @@
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { FAMILIES, type Family } from "../shared/model";
+import { familiesFromConfig, grokCommand } from "./families";
 import { readJson } from "./json-file";
 import { dataDir, paseoHome } from "./paths";
 
@@ -35,6 +36,29 @@ export async function providerCommand(provider: Family): Promise<Command> {
   // Paseo's Pi provider also takes its binary from PI_COMMAND (or the older PI_ACP_PI_COMMAND).
   const fallback = provider === "pi" ? process.env.PI_COMMAND?.trim() || process.env.PI_ACP_PI_COMMAND?.trim() || "pi" : provider;
   return cache.value[provider] ?? { command: fallback, prefix: [] };
+}
+
+/**
+ * The binary of the Paseo provider that runs Grok Build (see `grokCommand`), preferring one with the
+ * id `grok`, as Paseo's catalog names it; null when no provider runs Grok, or the config can't be read.
+ */
+export async function grokBinary(): Promise<string | null> {
+  try {
+    const config = (await readJson(join(paseoHome(), "config.json"))) as { agents?: { providers?: Record<string, unknown> } } | undefined;
+    const providers = config?.agents?.providers;
+    const ids = Object.entries(familiesFromConfig(providers))
+      .filter(([, family]) => family === "grok")
+      .map(([id]) => id)
+      .sort((a, b) => (a === "grok" ? -1 : b === "grok" ? 1 : 0));
+    for (const id of ids) {
+      const entry = providers?.[id];
+      const binary = grokCommand(entry && typeof entry === "object" && !Array.isArray(entry) ? (entry as Record<string, unknown>) : undefined);
+      if (binary) return binary;
+    }
+  } catch {
+    // Unreadable config: no Grok provider to go by.
+  }
+  return null;
 }
 
 let browserShim: Promise<string | null> | null = null;
