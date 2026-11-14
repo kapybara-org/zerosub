@@ -970,6 +970,44 @@ describe("usage readings", () => {
     expect(await newAgentOpensOn(service, store, paseo)).toBe(MAIN);
   });
 
+  const fableFull = (): UsageRead => ({
+    fetchedAt: new Date().toISOString(),
+    windows: [
+      { id: "five_hour", label: "5-hour", usedPercent: 8, resetsAt: inFuture() },
+      { id: "seven_day", label: "Weekly", usedPercent: 73, resetsAt: inFuture() },
+      { id: "weekly_fable", label: "Weekly · Fable", usedPercent: 100, resetsAt: inFuture() },
+    ],
+    error: null,
+    cached: false,
+    resets: null,
+  });
+
+  it("clears a limit a reading took once the account's own windows have room, one model's window full or not", async () => {
+    // Saved by a version that took any full window for the account's: the account stayed blocked until Fable reset.
+    const { service, store, paseo } = await setUp(
+      state({ limitedUntil: inFuture(), limitKind: "window", limitedAt: inPast(), limitSource: "reading" }),
+      unused,
+      { usage: fableFull },
+    );
+    await settle(store);
+    await service.refreshUsage(MAIN, true);
+    expect(await limitedUntil(store)).toBeNull();
+    expect(await newAgentOpensOn(service, store, paseo)).toBe(MAIN);
+  });
+
+  it("leaves a limit a turn ran into while one model's window is full", async () => {
+    // The turn may have hit that model's limit: the account's room says nothing about it.
+    const { service, store, limitTurn } = await setUp(
+      state(),
+      () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your Fable limit" }),
+      { usage: fableFull },
+    );
+    await limitTurn();
+    await settle(store);
+    await service.refreshUsage(MAIN, true);
+    expect(await limitedUntil(store)).not.toBeNull();
+  });
+
   it("takes a full window without credits for a limit, whatever the setting", async () => {
     for (const prefs of [preferences.schema.parse({}), USE_CREDITS]) {
       const { service, store } = await setUp(state(), unused, { usage: full(null) });
