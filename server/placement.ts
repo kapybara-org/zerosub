@@ -1,7 +1,7 @@
 import { access, constants, lstat, mkdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { idSuffix, piName, slug } from "./launchers";
+import { idSuffix, kindName, slug } from "./launchers";
 import { dataDir, homesDir, inHomesDir, mainClaudeDir, mainCodexHome, mainPiDir, piLauncherDir, shownPath } from "./paths";
 import type { PiHomes, StoredAccount } from "./state";
 
@@ -89,7 +89,7 @@ export async function chooseImportedPiHome(input: string, accounts: readonly Sto
  */
 export async function placeFor(account: StoredAccount & { home: string }, dir: string, taken: ReadonlySet<string>): Promise<string> {
   const suffix = idSuffix(account.id);
-  const base = inHomesDir(account.home) ? (slug(account.label) ? piName(account.label) : `pi-${suffix}`) : basename(account.home);
+  const base = inHomesDir(account.home) ? (slug(account.label) ? kindName("pi", account.label) : `pi-${suffix}`) : basename(account.home);
   const free = async (name: string) => !taken.has(resolve(dir, name)) && (await lstat(join(dir, name)).catch(() => null)) === null;
   let name = base;
   if (!(await free(name))) name = `${base}-${suffix}`;

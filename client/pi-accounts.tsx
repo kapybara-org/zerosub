@@ -65,7 +65,15 @@ export function PiSectionNotes({ theme, state, accounts, store }: { theme: Theme
         share Pi's settings, sessions and other API keys; subscription sign-ins (/login) stay on the CLI login, whose files ZeroSub changes only when you edit its key or proxy on its card.
       </Text>
       <PiProxyNote theme={theme} />
-      {state.piLaunchers ? <ShellHint theme={theme} directory={state.piLaunchers} accounts={accounts} /> : null}
+      {state.piLaunchers ? (
+        <ShellHint
+          theme={theme}
+          directory={state.piLaunchers}
+          accounts={accounts}
+          example="pi-<account>.sh"
+          note="Each runs pi on its account with the proxy its agents use in Paseo, whatever your shell exports."
+        />
+      ) : null}
       {state.piHomes ? <HomesHint theme={theme} homes={state.piHomes} store={store} /> : null}
     </>
   );
@@ -100,7 +108,21 @@ function PiProxyNote({ theme }: { theme: Theme }) {
 }
 
 /** The line to put the scripts' directory on `PATH`, and the scripts there. */
-function ShellHint({ theme, directory, accounts }: { theme: Theme; directory: string; accounts: AccountView[] }) {
+export function ShellHint({
+  theme,
+  directory,
+  accounts,
+  example,
+  note,
+}: {
+  theme: Theme;
+  directory: string;
+  accounts: AccountView[];
+  /** What a script is called, shown while there's none. */
+  example: string;
+  /** What else to know about the scripts. */
+  note: string;
+}) {
   const text = useText(theme);
   const toast = useToast();
   // Readable when the path needs no quoting, which is nearly always.
@@ -119,8 +141,8 @@ function ShellHint({ theme, directory, accounts }: { theme: Theme; directory: st
       <Icon name="SquareTerminal" size={16} color={theme.colors.foregroundMuted} />
       <View style={{ flex: 1, gap: 4 }}>
         <Text style={text.small}>
-          From a terminal on this host: add this line to your shell profile once, then run {commands.length > 0 ? commands.join(", ") : "pi-<account>.sh"}.
-          Accounts added later work without changing it. Each runs pi on its account with the proxy its agents use in Paseo, whatever your shell exports.
+          From a terminal on this host: add this line to your shell profile once, then run {commands.length > 0 ? commands.join(", ") : example}.
+          Accounts added later work without changing it. {note}
         </Text>
         <Text selectable style={[text.small, { color: theme.colors.foreground }]}>
           {line}

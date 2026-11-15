@@ -215,7 +215,7 @@ export const AccountViewSchema = z.object({
   proxyFile: z.string().nullable().default(null),
   /** Added accounts that go through the same proxy, having none of their own, while it's kept in `proxyFile`. */
   proxyFollowers: z.array(z.string()).default([]),
-  /** Command (a script in `StateView.piLaunchers`) that starts the CLI on this account. */
+  /** Command (a script in `StateView.launchers` or `StateView.piLaunchers`) that starts the CLI on this account. */
   launcher: z.string().nullable().default(null),
   /** Where the account's requests come from, as Anthropic sees them; null when unknown or not Anthropic. */
   egress: EgressSchema.nullable().default(null),
@@ -306,6 +306,8 @@ export const StateViewSchema = z.object({
    * and daemons started over SSH, where only the code sign-in works.
    */
   browserSignIn: z.boolean().default(true),
+  /** Directory with a `claude-<account>.sh` script per added Claude account, to put on `PATH`. */
+  launchers: z.string().nullable().default(null),
   /** Directory with a `pi-<account>.sh` script per added Pi account, to put on `PATH`. */
   piLaunchers: z.string().nullable().default(null),
   /** The folder added Pi accounts' homes are kept in (`~/.pi-config`, say), and whether it's the default. */

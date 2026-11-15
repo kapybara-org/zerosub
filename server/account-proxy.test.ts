@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -11,16 +11,21 @@ import { absentPi } from "./fakes.test-support";
 
 let root: string;
 let previousHome: string | undefined;
+let previousLaunchers: string | undefined;
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "zerosub-proxy-"));
   previousHome = process.env.PASEO_HOME;
+  previousLaunchers = process.env.ZEROSUB_LAUNCHER_DIR;
+  process.env.ZEROSUB_LAUNCHER_DIR = join(root, "launchers");
   process.env.PASEO_HOME = root;
 });
 
 afterEach(async () => {
   if (previousHome === undefined) delete process.env.PASEO_HOME;
   else process.env.PASEO_HOME = previousHome;
+  if (previousLaunchers === undefined) delete process.env.ZEROSUB_LAUNCHER_DIR;
+  else process.env.ZEROSUB_LAUNCHER_DIR = previousLaunchers;
   // Retried: a write the test set off in the background can still be landing in it.
   await rm(root, { recursive: true, force: true, maxRetries: 5 });
 });
@@ -157,5 +162,18 @@ describe("the accounts' proxies, as the app shows them", () => {
       proxyFile: null,
       proxyFollowers: [],
     });
+  });
+});
+
+describe("shell launchers", () => {
+  it("follow the accounts' names, and the app shows each account's", async () => {
+    const work = managed("claude-work01", "Work");
+    const { service } = await setUp({ accounts: [work] as never });
+    await service.rename(work.id, "Personal");
+    const directory = join(root, "launchers");
+    expect(await readdir(directory)).toEqual(["claude-personal.sh"]);
+    expect(await readFile(join(directory, "claude-personal.sh"), "utf8")).toContain(`export CLAUDE_CONFIG_DIR='${work.home}'`);
+    const paseo = { agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false, nextCursor: null } }) } } as never;
+    expect((await service.view(paseo)).accounts.find((account) => account.id === work.id)?.launcher).toBe("claude-personal.sh");
   });
 });

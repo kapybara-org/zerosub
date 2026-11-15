@@ -48,6 +48,7 @@ async function menu(route: Partial<AgentRoute>): Promise<readonly PluginButtonMe
     providers: { codex: "codex" },
     canReopen: true,
     browserSignIn: true,
+    launchers: null,
     piLaunchers: null,
     piHomes: null,
     showComposerPill: true,

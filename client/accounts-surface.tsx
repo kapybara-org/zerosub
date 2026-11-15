@@ -16,7 +16,7 @@ import {
 } from "../shared/rpc";
 import { AddAccountModal } from "./add-account";
 import { ApiAccountModal } from "./api-account";
-import { AddPiAccountModal, ApiKeyModal, PiSectionNotes, ProxyModal, piCardDetails } from "./pi-accounts";
+import { AddPiAccountModal, ApiKeyModal, PiSectionNotes, ProxyModal, ShellHint, piCardDetails } from "./pi-accounts";
 import { ResetConfirm, redeemToast, resetBadge } from "./reset-confirm";
 import { describe, stoppedWaiting, useStore, VISIBLE_POLL_MS, type ZeroSubStore } from "./store";
 import { Badge, Button, Card, IconButton, UsageBar, useText } from "./ui";
@@ -261,6 +261,15 @@ function FamilySection({
         <Text style={text.muted}>No {FAMILY_LABEL[family]} accounts yet.</Text>
       ) : null}
       {family === "pi" ? <PiSectionNotes theme={theme} state={state} accounts={accounts} store={store} /> : null}
+      {family === "claude" && state.launchers ? (
+        <ShellHint
+          theme={theme}
+          directory={state.launchers}
+          accounts={accounts}
+          example="claude-<account>.sh"
+          note="Each runs claude on its account, with its settings and proxy, whatever your shell exports."
+        />
+      ) : null}
       {!HAND_OFF[family] ? (
         <Text style={text.small}>
           A {FAMILY_LABEL[family]} conversation stays on the account it started on. New agents use the default account, or the
@@ -848,6 +857,7 @@ function claudeCardDetails(account: AccountView): string | null {
     api ? `${api.keyKind === "api_key" ? "Key" : "Token"}${api.keyHint ? ` …${api.keyHint}` : ""} · ${api.baseUrl ?? "Anthropic API"}` : null,
     account.proxy ? `Via ${account.proxy}` : null,
     egressText(account.egress),
+    account.launcher ? `Terminal: ${account.launcher}` : null,
   ].filter(Boolean);
   return parts.length > 0 ? parts.join(" · ") : null;
 }
