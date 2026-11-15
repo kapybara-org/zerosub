@@ -477,17 +477,17 @@ export class Service {
       if (now - (this.identityCheckedAt.get(account.id) ?? 0) > IDENTITY_MS) {
         void this.refreshIdentity(account.id).catch(() => undefined);
       }
-      if (now - (this.egressCheckedAt.get(account.id) ?? 0) >= EGRESS_MS) void this.checkEgress(account);
+      if (account.signedIn && now - (this.egressCheckedAt.get(account.id) ?? 0) >= EGRESS_MS) void this.checkEgress(account);
     }
     for (const [id, login] of this.logins) {
       if (login.finishedAt && now - login.finishedAt > LOGIN_TTL_MS) this.logins.delete(id);
       else if (!login.finishedAt && now - Date.parse(login.view.startedAt) > LOGIN_TTL_MS) void this.cancelLogin(id);
     }
-    // Keep added Pi homes in step with Pi's own directory (shared entries, sign-ins, settings) even
-    // when they're only used from a terminal, which ZeroSub never sees start.
+    // Keep added Claude and Pi homes in step with main (shared entries, generated settings; a Pi home's
+    // sign-ins too) even when they're only used from a terminal, which ZeroSub never sees start.
     for (const account of state.accounts) {
-      if (account.family === "pi" && account.kind === "managed" && account.home && !this.moving.has(account.id)) {
-        await this.adapters.pi
+      if ((account.family === "claude" || account.family === "pi") && account.kind === "managed" && account.home && !this.moving.has(account.id)) {
+        await this.adapters[account.family]
           .prepareHome(account.home, this.stillHas(account))
           .catch((error: unknown) => log(`could not refresh the home of ${account.label}`, error));
       }
@@ -2329,7 +2329,8 @@ export class Service {
         const adapter = this.adapters[account.family];
         // A home of null is the CLI's own login; its files are only read here.
         if (adapter.proxyState && (account.kind === "main" || account.home)) {
-          proxies.set(account.id, await adapter.proxyState(account.home).catch((): ProxyState => ({ own: null, file: null, inherited: null })));
+          const unknown = (error: unknown): ProxyState => ({ own: null, file: null, inherited: null, blocked: describe(error) });
+          proxies.set(account.id, await adapter.proxyState(account.home).catch(unknown));
         }
         if (account.kind === "main" && adapter.mainApi && adapter.api) apis.set(account.id, await adapter.api(null).catch(() => null));
         if (account.kind !== "managed" || !account.home) return;
@@ -2372,6 +2373,7 @@ export class Service {
         apiEditable: account.auth === "api" || (account.kind === "main" && this.adapters[account.family].mainApi === true),
         proxy: proxy?.own ? maskProxy(proxy.own) : null,
         proxyEditable: proxy !== undefined,
+        proxyBlocked: proxy?.blocked ?? null,
         inheritedProxy: proxy?.inherited ? { ...proxy.inherited, proxy: maskProxy(proxy.inherited.proxy) } : null,
         proxyFile: proxy?.file ?? null,
         proxyFollowers: proxy?.file ? followers(account.family) : [],
@@ -2862,22 +2864,29 @@ export class Service {
   }
 
   /**
-   * Sets an account's proxy; an empty value clears it. Processes started afterwards use it. Pi's own
-   * login's is kept in Pi's own settings, changed there only when asked to here.
+   * Sets an account's proxy; an empty value clears it. Processes started afterwards use it. The CLI
+   * login's is kept in the user's own settings when they set one (Pi's in Pi's settings, Claude's
+   * in `~/.claude/settings.json`), changed there only when asked to here.
    */
   async setProxy(accountId: string, input: string): Promise<string | null> {
-    const { account, proxy } = await this.onAccount(accountId, async (account) => {
+    const { account, proxy, kept } = await this.onAccount(accountId, async (account) => {
       if (!account) throw new Error("That account no longer exists.");
       const adapter = this.adapters[account.family];
-      const main = account.kind === "main" && adapter.mainApi === true;
-      if (!adapter.setProxy || !(main || (account.kind === "managed" && account.home))) throw new Error("A proxy can only be set for Pi accounts.");
+      const main = account.kind === "main";
+      if (!adapter.setProxy || !(main || (account.kind === "managed" && account.home))) throw new Error("A proxy can only be set for Claude and Pi accounts.");
       const proxy = input.trim() ? normalizeProxy(input) : null;
-      if (main && proxy && proxy !== (await adapter.proxyState?.(null))?.own) await this.refuseClearTextFollowers(account.family);
+      const kept = main ? await adapter.proxyState?.(null).catch(() => null) : null;
+      if (main && account.family === "pi" && proxy && proxy !== kept?.own) await this.refuseClearTextFollowers(account.family);
       await adapter.setProxy(main ? null : account.home, proxy, this.stillHas(account));
-      return { account, proxy };
+      return { account, proxy, kept };
     });
-    if (account.kind === "main") await this.followMainSettings(account.family);
-    else void this.checkEgress(account);
+    if (account.kind === "main" && account.family === "pi") {
+      await this.followMainSettings(account.family);
+    } else {
+      void this.checkEgress(account);
+      // The CLI login's proxy kept in main's settings is every added account's without one of its own.
+      if (account.kind === "main" && kept?.file) void this.followMainSettings(account.family);
+    }
     return proxy ? maskProxy(proxy) : null;
   }
 
@@ -2921,16 +2930,18 @@ export class Service {
   }
 
   /**
-   * Checks where an added account's requests come from; a failed check keeps the last address it
-   * saw. The CLI login is never checked, so nothing is sent while no account is added.
+   * Checks where an account's requests come from; a failed check keeps the last address it saw.
+   * Pi's own login is never checked: only an added Pi account's requests are ZeroSub's to place, so
+   * nothing is sent while none is added. Claude's CLI login is, as its proxy can be set here too.
    */
   private async checkEgress(account: StoredAccount): Promise<void> {
     const adapter = this.adapters[account.family];
-    if (!adapter.egress || account.kind !== "managed" || !account.home || !account.signedIn) return;
+    if (!adapter.egress || !account.signedIn) return;
+    if (account.kind === "main" ? account.family !== "claude" : !account.home) return;
     this.egressCheckedAt.set(account.id, Date.now());
     const checkedAt = new Date().toISOString();
     try {
-      const seen = await this.onAccount(account.id, async (current) => (current?.home ? adapter.egress!(current.home) : null));
+      const seen = await this.onAccount(account.id, async (current) => (current?.home || current?.kind === "main" ? adapter.egress!(current.home) : null));
       if (seen) this.egress.set(account.id, { ...seen, checkedAt, error: null });
       else this.egress.delete(account.id);
     } catch (error) {
@@ -3323,11 +3334,11 @@ export class Service {
 
   // ------------------------------------------------------------------ RPC: sign-in
 
-  startLogin(family: Family, method: LoginMethod, accountId?: string): Promise<LoginView> {
-    return this.loginLocks[family].run(() => this.beginLogin(family, method, accountId));
+  startLogin(family: Family, method: LoginMethod, accountId?: string, proxy?: string): Promise<LoginView> {
+    return this.loginLocks[family].run(() => this.beginLogin(family, method, accountId, proxy));
   }
 
-  private async beginLogin(family: Family, method: LoginMethod, accountId?: string): Promise<LoginView> {
+  private async beginLogin(family: Family, method: LoginMethod, accountId?: string, proxyInput?: string): Promise<LoginView> {
     // Pi's added accounts are API keys, and its own login signs in inside Pi.
     if (family === "pi") throw new Error("Pi accounts use an Anthropic API key: add one with Add account, or change its key from its card. Sign Pi's own login in with /login inside Pi.");
     let availability = this.availability.get(family);
@@ -3343,6 +3354,9 @@ export class Service {
     const state = await this.store.read();
     const existing = accountId ? findAccount(state, accountId) : undefined;
     if (accountId && (!existing || existing.family !== family)) throw new Error("That account no longer exists.");
+    // A new account's proxy is in place before the CLI starts, so the sign-in itself goes through it.
+    const proxy = !existing && proxyInput?.trim() ? normalizeProxy(proxyInput) : null;
+    if (proxy && !this.adapters[family].setProxy) throw new Error(`A proxy can't be set for ${FAMILY_LABEL[family]} accounts yet.`);
 
     const id = randomBytes(6).toString("hex");
     const home = existing ? existing.home : join(homesDir(), `${family}-${id}`);
@@ -3376,6 +3390,7 @@ export class Service {
           draft.cleanup[home] = { family, accountId: `${family}-${id}`, why: "unfinished", at: new Date().toISOString() };
         });
       }
+      if (home && proxy) await this.adapters[family].setProxy?.(home, proxy);
       if (home) await this.adapters[family].prepareHome(home);
       const handle = await this.adapters[family].login(home, method);
       if (session.finishedAt) {

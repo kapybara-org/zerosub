@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { ApiSummary, Family } from "../shared/model";
 import { Mutex, readJson } from "./json-file";
-import { REQUIRED_NO_PROXY, bypassesProxy, maskProxy } from "./proxy";
+import { NO_PROXY_KEYS, PROXY_KEYS, REQUIRED_NO_PROXY, bypassesProxy, maskProxy, noProxyFromEnv, proxyFromEnv, withClaudeNoProxy, withoutClaudeDomains } from "./proxy";
 import { providerEnv } from "./provider-env";
 import { homesDir, isOwnHome, mainClaudeDir, mainClaudeGlobalConfig, mainCodexHome, mainGrokHome, mainPiDir } from "./paths";
 
@@ -23,7 +23,7 @@ interface OverlaySpec {
 const SYNC_TTL_MS = 30_000;
 const lastSync = new Map<string, number>();
 
-/** Has the next sync of every home run in full: the CLI login's files, which theirs are made from, changed. */
+/** Has the next sync of every home run in full: main's files, which theirs are made from, changed. */
 export function forgetSyncs(): void {
   lastSync.clear();
 }
@@ -197,12 +197,25 @@ function isTemporary(name: string): boolean {
 
 // --------------------------------------------------------------------------- Claude
 
+/** The account's own settings, layered over main's `settings.json`. Claude Code never writes it. */
+export const ACCOUNT_SETTINGS = "settings.account.json";
+
+/**
+ * The `settings.json` last generated for an account, kept beside it: what differs from it in
+ * `settings.json` was saved there since (by Claude Code's `/model`, say; see `foldSavedSettings`).
+ */
+const GENERATED_SETTINGS = ".settings.generated.json";
+
 /**
  * Per-account entries, from Claude Code's own split between configuration and state: credentials,
  * the global config (it holds `oauthAccount`), account caches, org policy, telemetry and locks.
+ * `settings.json` is generated per account from main's plus the account's own overrides.
  */
 const CLAUDE_PRIVATE = new Set([
   ".credentials.json",
+  "settings.json",
+  ACCOUNT_SETTINGS,
+  GENERATED_SETTINGS,
   ".config.json",
   ".oauth_refresh.lock",
   ".storage-write",
@@ -428,16 +441,251 @@ async function syncClaudeGlobalConfig(home: string): Promise<void> {
   }
 }
 
-export async function prepareClaudeHome(home: string, force = false): Promise<void> {
-  const last = lastSync.get(home);
-  if (!force && last && Date.now() - last < SYNC_TTL_MS) return;
-  await syncOverlay(home, {
-    main: mainClaudeDir(),
-    shareDirs: ["projects", "file-history", "todos", "plans", "tasks", "session-env", "shell-snapshots"],
-    isPrivate: claudePrivate,
+/** Settings whose lists Claude Code joins across settings files rather than letting one replace another. */
+const JOINED_LISTS = new Set(["permissions", "hooks"]);
+
+/**
+ * Account overrides win; object values (`env`, `permissions`, …) merge one level deep. Lists in
+ * `permissions` (`allow`, `deny`, …) and each `hooks` event's list are joined, main's entries first
+ * and each entry once, the way Claude Code merges them across its own settings files.
+ */
+export function mergeSettings(main: Json, account: Json): Json {
+  const merged: Json = { ...main };
+  for (const [key, value] of Object.entries(account)) {
+    const base = main[key];
+    if (!isObject(value) || !isObject(base)) {
+      merged[key] = value;
+      continue;
+    }
+    const next: Json = { ...base, ...value };
+    if (JOINED_LISTS.has(key)) {
+      for (const [name, entries] of Object.entries(value)) {
+        const inherited = base[name];
+        if (Array.isArray(entries) && Array.isArray(inherited)) next[name] = joinLists(inherited, entries);
+      }
+    }
+    merged[key] = next;
+  }
+  return merged;
+}
+
+function joinLists(first: readonly unknown[], second: readonly unknown[]): unknown[] {
+  const joined: unknown[] = [];
+  for (const entry of [...first, ...second]) {
+    if (!joined.some((existing) => JSON.stringify(existing) === JSON.stringify(entry))) joined.push(entry);
+  }
+  return joined;
+}
+
+async function readSettings(path: string): Promise<Json | null> {
+  const value = await readJson(path);
+  if (value === undefined) return null;
+  if (!isObject(value)) throw new Error(`${path} is not a JSON object`);
+  return value;
+}
+
+/**
+ * Writes the account's `settings.json` as main's settings with the account's overrides on top, so
+ * each account can carry its own `env` (a proxy, say) while everything else stays shared.
+ *
+ * `settings.account.json` marks a file as ZeroSub's, so a home gets one (empty) at its first sync,
+ * whether or not main has settings, before Claude Code can write a `settings.json` of its own there
+ * (for `/model`, say). A plain `settings.json` without one was made by hand and is left alone, except
+ * in a home of ZeroSub's own (see `isOwnHome`): there it's what Claude Code wrote into a home made
+ * before the marker was, so it becomes the account's overrides, and main's settings apply under it
+ * again. A link the user made (see `userSettingsLink`) is left alone too. A file that doesn't parse
+ * stops the sync and keeps the previous one: dropping the account's overrides would quietly send it
+ * out without them. What Claude Code saved in the generated file since the last sync is kept (see
+ * `foldSavedSettings`).
+ */
+async function syncClaudeSettings(home: string): Promise<void> {
+  const target = join(home, "settings.json");
+  const overrides = join(home, ACCOUNT_SETTINGS);
+  const current = await lstat(target).catch(() => null);
+  if (current?.isSymbolicLink() && (await userSettingsLink(home))) return;
+  let account = await readSettings(overrides);
+  if (!account && current && !current.isSymbolicLink()) {
+    if (!current.isFile() || !(await isOwnHome(home))) return;
+    account = (await readSettings(target)) ?? {};
+    await writeJsonAtomically(overrides, account);
+    console.log(`[ZeroSub] kept ${target}, which had no ${ACCOUNT_SETTINGS}, as that account's own settings; main's settings apply under it again`);
+  }
+  if (!account) {
+    account = {};
+    await writeJsonAtomically(overrides, account);
+  }
+  if (current?.isFile()) {
+    const folded = await foldSavedSettings(home, account);
+    if (folded) {
+      account = folded;
+      await writeJsonAtomically(overrides, account);
+    }
+  }
+
+  const main = await readSettings(join(mainClaudeDir(), "settings.json"));
+  // Homes from earlier versions link to main's file; replace the link, never write through it.
+  if (current?.isSymbolicLink()) await unlink(target);
+  const inherited = { ...process.env, ...providerEnv("claude") };
+  const next = `${JSON.stringify(accountSettings(main ?? {}, account, inherited), null, 2)}\n`;
+  const generated = join(home, GENERATED_SETTINGS);
+  if (current?.isFile() && (await readFile(target, "utf8").catch(() => null)) === next) {
+    if ((await readFile(generated, "utf8").catch(() => null)) !== next) await writeJsonAtomically(generated, JSON.parse(next));
+    return;
+  }
+  await writeJsonAtomically(generated, JSON.parse(next));
+  await writeJsonAtomically(target, JSON.parse(next));
+}
+
+/**
+ * `account` with what was saved in the home's `settings.json` since it was last generated folded
+ * in, so the next generated file keeps it: Claude Code saves `/model`, a plugin turned on and the
+ * like there, and regenerating would otherwise take it back out. A setting that changed or was
+ * added becomes the account's own (only the keys that changed, for one holding an object such as
+ * `enabledPlugins`, so main's others still come through); one taken out leaves the account's own
+ * settings, though main's still applies underneath. Null when nothing was saved, or when there's
+ * no copy of the last generated file to tell by (a home from an earlier version: it gets one now).
+ */
+async function foldSavedSettings(home: string, account: Json): Promise<Json | null> {
+  const before = await readSettings(join(home, GENERATED_SETTINGS)).catch(() => null);
+  const now = await readSettings(join(home, "settings.json")).catch(() => null);
+  if (!before || !now) return null;
+  const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+  const next: Json = { ...account };
+  let changed = false;
+  for (const key of new Set([...Object.keys(before), ...Object.keys(now)])) {
+    const was = before[key];
+    const is = now[key];
+    if (same(was, is)) continue;
+    changed = true;
+    if (is === undefined) {
+      delete next[key];
+    } else if (isObject(is) && isObject(was)) {
+      const own: Json = isObject(next[key]) ? { ...next[key] } : {};
+      for (const name of new Set([...Object.keys(was), ...Object.keys(is)])) {
+        if (same(was[name], is[name])) continue;
+        if (is[name] === undefined) delete own[name];
+        else own[name] = is[name];
+      }
+      if (Object.keys(own).length > 0) next[key] = own;
+      else delete next[key];
+    } else {
+      next[key] = is;
+    }
+  }
+  return changed ? next : null;
+}
+
+/**
+ * An account's generated settings: main's with the account's overrides on top (see `mergeSettings`).
+ *
+ * An account with a proxy of its own also gets `no_proxy` and `NO_PROXY`, both set to the no-proxy
+ * list it would otherwise have (from `inherited`, the environment Paseo starts it with, then the
+ * merged `env`) without the entries that would send Anthropic or Claude traffic past the proxy,
+ * plus localhost, 127.0.0.1 and `downloads.claude.ai`. Claude Code applies them over what it
+ * inherits, so a `NO_PROXY` in main's settings, the daemon or a shell can't send the account out
+ * directly while ZeroSub's own calls for it go through the proxy. Any other account gets the
+ * plain merge.
+ */
+export function accountSettings(main: Json, account: Json, inherited: Readonly<Record<string, string | undefined>> = {}): Json {
+  const merged = mergeSettings(main, account);
+  if (proxyFromEnv(stringEnv(account))) {
+    const env: Json = isObject(merged.env) ? { ...merged.env } : {};
+    const noProxy = withClaudeNoProxy(withoutClaudeDomains(noProxyFromEnv({ ...inherited, ...stringEnv({ env }) })));
+    for (const key of NO_PROXY_KEYS) env[key] = noProxy;
+    merged.env = env;
+  }
+  return merged;
+}
+
+function stringEnv(settings: Json | null): Record<string, string> {
+  const env = isObject(settings?.env) ? settings.env : {};
+  const strings: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) if (typeof value === "string") strings[key] = value;
+  return strings;
+}
+
+/** The proxy set in the account's own settings, or null when it uses whatever it inherits. */
+export async function readAccountProxy(home: string): Promise<string | null> {
+  return proxyFromEnv(stringEnv(await readSettings(join(home, ACCOUNT_SETTINGS)).catch(() => null)));
+}
+
+/**
+ * Where `home`'s `settings.json` links to when the link is the user's: in a home that isn't
+ * ZeroSub's own (see `isOwnHome`), a link to anything but main's settings, which homes of earlier
+ * versions link to. Such a link is left as it is.
+ */
+async function userSettingsLink(home: string): Promise<string | null> {
+  const target = join(home, "settings.json");
+  const to = await readlink(target).catch(() => null);
+  if (to === null || (await isOwnHome(home))) return null;
+  const main = join(mainClaudeDir(), "settings.json");
+  if (resolve(home, to) === resolve(main)) return null;
+  const [real, mainReal] = await Promise.all([realpath(target).catch(() => null), realpath(main).catch(() => null)]);
+  return real !== null && real === mainReal ? null : to;
+}
+
+/** The account's overrides; a hand-made `settings.json` becomes them, so taking the home over loses nothing. */
+async function readOverrides(home: string): Promise<Json> {
+  await mkdir(home, { recursive: true, mode: 0o700 });
+  const link = await userSettingsLink(home);
+  // Overrides written here would never reach Claude Code, which reads the linked file.
+  if (link) throw new Error(`${join(home, "settings.json")} links to ${link}, which ZeroSub leaves as it is: set this there instead`);
+  const account = await readSettings(join(home, ACCOUNT_SETTINGS));
+  if (account) return account;
+  const target = join(home, "settings.json");
+  const current = await lstat(target).catch(() => null);
+  return current?.isFile() ? ((await readSettings(target)) ?? {}) : {};
+}
+
+/** Writes the account's overrides with `edit` applied to their `env`, then regenerates `settings.json`. */
+async function editOverridesEnv(home: string, edit: (env: Json) => void): Promise<void> {
+  const account = await readOverrides(home);
+  const env: Json = isObject(account.env) ? { ...account.env } : {};
+  edit(env);
+  const next: Json = { ...account, env };
+  if (Object.keys(env).length === 0) delete next.env;
+  await writeJsonAtomically(join(home, ACCOUNT_SETTINGS), next);
+  await syncClaudeSettings(home);
+}
+
+/**
+ * Sets (or clears, with `null`) the account's proxy and regenerates its `settings.json` at once.
+ * All four proxy variables get the same value, so nothing Claude Code inherits (a lower-case
+ * `https_proxy` in the shell, say) can outrank it, and the generated file pins the no-proxy list
+ * too (see `accountSettings`). `wanted` as for `stillWanted`.
+ */
+export function writeAccountProxy(home: string, proxy: string | null, wanted?: () => Promise<boolean>): Promise<void> {
+  return withHome(home, async () => {
+    await stillWanted(wanted);
+    await editOverridesEnv(home, (env) => {
+      for (const key of PROXY_KEYS) {
+        if (proxy) env[key] = proxy;
+        else delete env[key];
+      }
+    });
   });
-  await syncClaudeGlobalConfig(home);
-  lastSync.set(home, Date.now());
+}
+
+/**
+ * Brings a Claude home in step with main: shared entries, `.claude.json` and generated settings.
+ * It holds the home's lock, so a sync never writes back settings an edit just replaced. `wanted`,
+ * if given, is asked once the lock is held: a home whose account has gone since the caller looked
+ * is left as it is, so it's never written to (or made again) after its account is.
+ */
+export function prepareClaudeHome(home: string, force = false, wanted?: () => Promise<boolean>): Promise<void> {
+  return withHome(home, async () => {
+    if (wanted && !(await wanted())) return;
+    const last = lastSync.get(home);
+    if (!force && last && Date.now() - last < SYNC_TTL_MS) return;
+    await syncOverlay(home, {
+      main: mainClaudeDir(),
+      shareDirs: ["projects", "file-history", "todos", "plans", "tasks", "session-env", "shell-snapshots"],
+      isPrivate: claudePrivate,
+    });
+    await syncClaudeGlobalConfig(home);
+    await syncClaudeSettings(home);
+    lastSync.set(home, Date.now());
+  });
 }
 
 // --------------------------------------------------------------------------- Codex

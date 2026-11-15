@@ -11,15 +11,21 @@ import {
   type FamilyAdapter,
   type Identity,
   type LoginHandle,
+  type ProxyState,
   type RedeemReply,
   type UsageRead,
 } from "./adapter";
 import { browserCaptureScript, providerCommand } from "./binaries";
 import { CLAUDE_RESET_PROGRAM, describeResetBlock, parseClaudeResets, readClaimReply } from "./claude-resets";
-import { prepareClaudeHome } from "./homes";
+import { prepareClaudeHome, readAccountProxy, writeAccountProxy } from "./homes";
+import { readJson } from "./json-file";
 import { detectClaudeLimit, detectClaudeSignOut } from "./limits";
+import { inheritedClaudeProxy, mainProxyBlock, mainProxyEnv, mainSettingsEnv, readMainProxy, writeMainProxy } from "./main-proxy";
 import { mainClaudeGlobalConfig } from "./paths";
 import { firstUrl, run, stripAnsi } from "./process";
+import { parseTrace } from "./processes";
+import { providerEnv } from "./provider-env";
+import { bypassesProxy, noProxyFromEnv, proxiedFetch, proxyFromEnv } from "./proxy";
 import { retryDelayMs } from "./usage";
 
 const API = "https://api.anthropic.com";
@@ -65,7 +71,8 @@ export class ClaudeAdapter implements FamilyAdapter {
   private readonly resetNotes = new Map<string, string>();
 
   async env(home: string | null): Promise<EnvPatch> {
-    if (!home) return { CLAUDE_CONFIG_DIR: null, CLAUDE_SECURESTORAGE_CONFIG_DIR: null };
+    // The CLI login's proxy set here, unless main's settings set one (see `mainProxyEnv`).
+    if (!home) return { CLAUDE_CONFIG_DIR: null, CLAUDE_SECURESTORAGE_CONFIG_DIR: null, ...(await mainProxyEnv()) };
     // Both point at the home so the keychain entry and refresh locks follow it even when the
     // daemon itself runs with CLAUDE_SECURESTORAGE_CONFIG_DIR set.
     const patch: EnvPatch = { CLAUDE_CONFIG_DIR: home, CLAUDE_SECURESTORAGE_CONFIG_DIR: home };
@@ -80,14 +87,28 @@ export class ClaudeAdapter implements FamilyAdapter {
     return { ok: false, detail: (result.stderr || result.stdout).trim().split("\n")[0] || `${command} not found` };
   }
 
-  prepareHome(home: string): Promise<void> {
-    return prepareClaudeHome(home);
+  prepareHome(home: string, wanted?: () => Promise<boolean>): Promise<void> {
+    return prepareClaudeHome(home, false, wanted);
+  }
+
+  async proxyState(home: string | null): Promise<ProxyState> {
+    if (home) return { own: await readAccountProxy(home), file: null, inherited: await inheritedClaudeProxy(), blocked: null };
+    const { proxy, file } = await readMainProxy();
+    return { own: proxy, file, inherited: await inheritedClaudeProxy(true), blocked: await mainProxyBlock() };
+  }
+
+  setProxy(home: string | null, proxy: string | null, wanted?: () => Promise<boolean>): Promise<void> {
+    return home ? writeAccountProxy(home, proxy, wanted) : writeMainProxy(proxy);
+  }
+
+  egress(home: string | null): Promise<{ ip: string; country: string | null } | null> {
+    return claudeEgress(home);
   }
 
   async identity(home: string | null): Promise<Identity> {
     const { command, prefix } = await providerCommand("claude");
     const result = await run(command, [...prefix, "auth", "status", "--json"], {
-      env: spawnEnv(await this.env(home)),
+      env: spawnEnv(await this.env(home), "claude"),
       timeoutMs: 30_000,
     });
     const status = parseJsonObject(result.stdout);
@@ -120,7 +141,7 @@ export class ClaudeAdapter implements FamilyAdapter {
         // Spend (`extra_usage`) costs Anthropic another lookup, which `skip_spend` avoids; ask for it,
         // and if it fails (except auth or rate limits), take the windows without it rather than none.
         const token = credentials.accessToken;
-        const read = (url: string) => fetch(url, { headers: apiHeaders(token), signal: AbortSignal.timeout(15_000) });
+        const read = (url: string) => apiFetch(home, url, { headers: apiHeaders(token), signal: AbortSignal.timeout(15_000) });
         let response = await read(USAGE_WITH_SPEND);
         const withSpend = response.ok || [401, 403, 429].includes(response.status);
         if (!withSpend) response = await read(USAGE_WITHOUT_SPEND);
@@ -175,7 +196,7 @@ export class ClaudeAdapter implements FamilyAdapter {
       pending = (async () => {
         const { command, prefix } = await providerCommand("claude");
         await run(command, [...prefix, "-p", "/usage", "--no-session-persistence", "--output-format", "json"], {
-          env: spawnEnv(await this.env(home)),
+          env: spawnEnv(await this.env(home), "claude"),
           cwd: tmpdir(),
           timeoutMs: 90_000,
         });
@@ -197,7 +218,7 @@ export class ClaudeAdapter implements FamilyAdapter {
     // Ask which grant is next: the server only accepts that one.
     let status: ReturnType<typeof parseClaudeResets>;
     try {
-      const response = await fetch(USAGE_WITHOUT_SPEND, {
+      const response = await apiFetch(home, USAGE_WITHOUT_SPEND, {
         headers: apiHeaders(token),
         signal: AbortSignal.timeout(15_000),
       });
@@ -222,7 +243,7 @@ export class ClaudeAdapter implements FamilyAdapter {
     const organization = await this.organizationId(home);
     if (!organization) return { outcome: "error", message: "Couldn't tell which Claude organization this account belongs to.", left: null };
     try {
-      const response = await fetch(`${API}/api/organizations/${organization}/reset_rate_limits`, {
+      const response = await apiFetch(home, `${API}/api/organizations/${organization}/reset_rate_limits`, {
         method: "POST",
         headers: apiHeaders(token),
         body: JSON.stringify({ program: CLAUDE_RESET_PROGRAM, grant_id: status.nextGrantId, request_id: randomUUID() }),
@@ -246,7 +267,7 @@ export class ClaudeAdapter implements FamilyAdapter {
     let id = typeof account?.organizationUuid === "string" ? account.organizationUuid : null;
     if (!id) {
       const { command, prefix } = await providerCommand("claude");
-      const result = await run(command, [...prefix, "auth", "status", "--json"], { env: spawnEnv(await this.env(home)), timeoutMs: 30_000 });
+      const result = await run(command, [...prefix, "auth", "status", "--json"], { env: spawnEnv(await this.env(home), "claude"), timeoutMs: 30_000 });
       id = str(parseJsonObject(result.stdout)?.orgId);
     }
     return id && /^[0-9a-f-]{8,64}$/i.test(id) ? id : null;
@@ -256,7 +277,7 @@ export class ClaudeAdapter implements FamilyAdapter {
     const { command, prefix } = await providerCommand("claude");
     const shim = await browserCaptureScript();
     const capture = join(tmpdir(), `zerosub-login-${randomBytes(6).toString("hex")}.url`);
-    const env = spawnEnv(await this.env(home));
+    const env = spawnEnv(await this.env(home), "claude");
     if (shim) {
       env.BROWSER = shim;
       env.ZEROSUB_BROWSER_OUT = capture;
@@ -266,7 +287,7 @@ export class ClaudeAdapter implements FamilyAdapter {
 
   async logout(home: string): Promise<void> {
     const { command, prefix } = await providerCommand("claude");
-    const result = await run(command, [...prefix, "auth", "logout"], { env: spawnEnv(await this.env(home)), timeoutMs: 30_000 });
+    const result = await run(command, [...prefix, "auth", "logout"], { env: spawnEnv(await this.env(home), "claude"), timeoutMs: 30_000 });
     if (result.code === 0 || process.platform !== "darwin") return; // Elsewhere the login lives in the home itself.
     // Don't leave a live refresh token behind in the keychain for a home that is about to be deleted.
     await run("/usr/bin/security", ["delete-generic-password", "-a", keychainAccount(), "-s", keychainService(home)], {
@@ -371,6 +392,71 @@ function friendlyFailure(message: string): string {
   if (!message) return "Sign-in did not finish.";
   if (/status code 400/i.test(message)) return "That code was rejected. Start again and paste the newest code.";
   return message.replace(/^Login failed:\s*/i, "Sign-in failed: ");
+}
+
+// --------------------------------------------------------------------------- network
+
+/**
+ * The proxy Claude Code would use for this account to reach `target`, or null when it goes direct:
+ * the environment Paseo starts it with (the daemon's, with the provider's configured `env` over it,
+ * and for the CLI login the proxy set for it here) and the account's `settings.json` `env` applied
+ * on top, as Claude Code does at startup, then its no-proxy list. An added account's settings file
+ * that doesn't parse is an error, not "no proxy", so the token never leaves from the daemon's own
+ * address. Main's sets nothing then (see `mainSettingsEnv`), and the CLI login keeps the proxy set
+ * for it here.
+ */
+export async function accountProxy(home: string | null, target: string): Promise<string | null> {
+  return proxyFor(await accountEnv(home), target);
+}
+
+/** The environment Claude Code starts with for this account (see `accountProxy`). */
+async function accountEnv(home: string | null): Promise<Record<string, string | undefined>> {
+  const env: Record<string, string | undefined> = { ...process.env, ...providerEnv("claude") };
+  if (!home) return { ...env, ...(await mainProxyEnv()), ...(await mainSettingsEnv()) };
+  const settings = await readJson(join(home, "settings.json"));
+  const overrides = settings && typeof settings === "object" && !Array.isArray(settings) ? (settings as { env?: unknown }).env : undefined;
+  if (overrides && typeof overrides === "object" && !Array.isArray(overrides)) {
+    for (const [key, value] of Object.entries(overrides)) if (typeof value === "string") env[key] = value;
+  }
+  return env;
+}
+
+function proxyFor(env: Record<string, string | undefined>, target: string): string | null {
+  const proxy = proxyFromEnv(env);
+  return proxy && !bypassesProxy(noProxyFromEnv(env), target) ? proxy : null;
+}
+
+/** Anthropic's edge (Cloudflare) answers this with the address it sees the request come from. */
+const TRACE = `${API}/cdn-cgi/trace`;
+
+/**
+ * The address Anthropic sees this account's requests come from: asked of its own host through the
+ * account's proxy, so a proxy that routes by domain takes the way Claude Code's requests take (an
+ * IP service elsewhere could go another way). Null when the account's requests go to another base
+ * URL: whatever is there reaches Anthropic from its own address.
+ */
+export async function claudeEgress(home: string | null): Promise<{ ip: string; country: string | null } | null> {
+  const env = await accountEnv(home);
+  const base = env.ANTHROPIC_BASE_URL?.trim();
+  if (base && hostOf(base) !== hostOf(API)) return null;
+  const response = await proxiedFetch(proxyFor(env, TRACE), TRACE, { signal: AbortSignal.timeout(10_000) });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const seen = parseTrace(await response.text());
+  if (!seen) throw new Error("The answer didn't say");
+  return seen;
+}
+
+function hostOf(url: string): string | null {
+  try {
+    return new URL(url).host;
+  } catch {
+    return null;
+  }
+}
+
+/** Calls Anthropic with an account's token from the address that account's Claude Code uses. */
+async function apiFetch(home: string | null, url: string, init: { method?: string; headers: Record<string, string>; body?: string; signal: AbortSignal }): Promise<Response> {
+  return proxiedFetch(await accountProxy(home, url), url, init);
 }
 
 // --------------------------------------------------------------------------- credentials (read-only)

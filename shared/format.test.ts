@@ -85,6 +85,7 @@ describe("account presentation", () => {
     apiEditable: false,
     proxy: null,
     proxyEditable: false,
+    proxyBlocked: null,
     inheritedProxy: null,
     proxyFile: null,
     proxyFollowers: [],

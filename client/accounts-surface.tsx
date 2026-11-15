@@ -3,7 +3,7 @@ import { Icon, Modal, TextInput, useToast } from "@getpaseo/plugin/client/react-
 import { SettingsCard, SettingsSwitch } from "@getpaseo/plugin/client/ui";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ScrollView, Text, View } from "react-native";
-import { accountSubtitle, describeReopen, formatAge, formatCredits, formatExtraUsage, formatPlan, staleNotice, usageSummary } from "../shared/format";
+import { accountSubtitle, describeReopen, egressText, formatAge, formatCredits, formatExtraUsage, formatPlan, staleNotice, usageSummary } from "../shared/format";
 import { FAMILY_LABEL, HAND_OFF, shownFamilies, type AccountView, type Family, type StateView } from "../shared/model";
 import { preferences } from "../shared/preferences";
 import {
@@ -302,7 +302,7 @@ function AccountCard({
   const [editingApi, setEditingApi] = useState(false);
   const [editingProxy, setEditingProxy] = useState(false);
   const api = account.auth === "api";
-  const details = piCardDetails(account);
+  const details = piCardDetails(account) ?? claudeCardDetails(account);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const resets = account.usage?.resets ?? null;
@@ -823,6 +823,13 @@ function AutomationSettings({ theme }: { theme: Theme }) {
 }
 
 /** Paseo stopped waiting for a change that moves agents; the daemon carries on with it. */
+/** A Claude card's line about its network: its own proxy and the address Anthropic sees its requests come from. */
+function claudeCardDetails(account: AccountView): string | null {
+  if (account.family !== "claude") return null;
+  const parts = [account.proxy ? `Via ${account.proxy}` : null, egressText(account.egress)].filter(Boolean);
+  return parts.length > 0 ? parts.join(" · ") : null;
+}
+
 function stillMoving(label: string): string {
   return `Still moving agents for ${label}. Their timelines say when each has switched.`;
 }

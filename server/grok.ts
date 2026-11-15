@@ -128,7 +128,7 @@ export class GrokAdapter implements FamilyAdapter {
   async usage(home: string | null): Promise<UsageRead> {
     const fetchedAt = new Date().toISOString();
     const command = (await grokBinary()) ?? "grok";
-    const result = await run(command, ["usage", "--json"], { env: spawnEnv(await this.env(home)), timeoutMs: 30_000 });
+    const result = await run(command, ["usage", "--json"], { env: spawnEnv(await this.env(home), "grok"), timeoutMs: 30_000 });
     return { fetchedAt, windows: [], error: grokUsageProblem(result), cached: false, resets: null };
   }
 
@@ -138,7 +138,7 @@ export class GrokAdapter implements FamilyAdapter {
 
   async login(home: string | null, method: LoginMethod): Promise<LoginHandle> {
     const command = (await grokBinary()) ?? "grok";
-    const env = spawnEnv(await this.env(home));
+    const env = spawnEnv(await this.env(home), "grok");
     // The link is read from what `grok login` prints; no browser opens on the daemon's machine.
     const shim = await browserCaptureScript();
     if (shim) env.BROWSER = shim;
@@ -147,7 +147,7 @@ export class GrokAdapter implements FamilyAdapter {
 
   async logout(home: string): Promise<void> {
     const command = (await grokBinary()) ?? "grok";
-    const result = await run(command, ["logout"], { env: spawnEnv(await this.env(home)), timeoutMs: 30_000 });
+    const result = await run(command, ["logout"], { env: spawnEnv(await this.env(home), "grok"), timeoutMs: 30_000 });
     if (result.code !== 0) throw new Error((result.stderr || result.stdout).trim().split("\n")[0] || "grok logout failed");
   }
 

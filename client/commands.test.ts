@@ -24,6 +24,7 @@ function account(status: AccountView["status"], nextAgentUntil: string | null): 
     apiEditable: false,
     proxy: null,
     proxyEditable: false,
+    proxyBlocked: null,
     inheritedProxy: null,
     proxyFile: null,
     proxyFollowers: [],

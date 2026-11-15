@@ -12,10 +12,16 @@ export async function readText(path: string): Promise<string | undefined> {
   }
 }
 
+/** The file's JSON, or `undefined` when there is no file. */
 export async function readJson(path: string): Promise<unknown | undefined> {
   const raw = await readText(path);
   if (raw === undefined) return undefined;
-  return JSON.parse(raw) as unknown;
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    // The parser's message quotes the text around the mistake, and settings files hold keys and tokens.
+    throw new Error(`${path} isn't valid JSON`);
+  }
 }
 
 /**

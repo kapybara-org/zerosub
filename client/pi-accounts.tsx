@@ -15,7 +15,7 @@ type Theme = PluginSurfaceProps["theme"];
  * optional base URL and proxy in an agent directory of its own. Everything here is only shown for Pi.
  */
 
-function useInputStyle(theme: Theme) {
+export function useInputStyle(theme: Theme) {
   return useMemo(
     () => ({
       color: theme.colors.foreground,
@@ -436,9 +436,12 @@ export function ProxyModal({ theme, account, store, onClose }: { theme: Theme; a
   const [proxy, setProxy] = useState(current);
   const typed = proxy.trim();
   const hidden = typed.includes(HIDDEN);
-  const changed = typed !== "" && typed !== current && !hidden;
+  // Main's settings can outrank a proxy set here for Claude's CLI login: it's set there instead.
+  const blocked = account.proxyBlocked;
+  const changed = typed !== "" && typed !== current && !hidden && !blocked;
   const inherited = account.inheritedProxy;
   const followers = account.proxyFollowers.length > 0 ? `, and so do ${account.proxyFollowers.join(", ")}, which have no proxy of their own` : "";
+  const afterRemoval = inherited ? `they then go through ${inherited.proxy}, set in ${inherited.from}` : "they then use the network the daemon has";
   const [saving, setSaving] = useState<"save" | "clear" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const save = useCallback(
@@ -467,32 +470,54 @@ export function ProxyModal({ theme, account, store, onClose }: { theme: Theme; a
             : inherited
               ? `Now: no proxy of its own; it goes through ${inherited.proxy}, set in ${inherited.from}.`
               : "Now: no proxy of its own; it uses the network the daemon has."}
-          {account.kind === "main"
-            ? ` Saving writes it as httpProxy in ~/.pi/agent/settings.json, so plain pi uses it too unless its environment names a proxy${followers || ", and so do added accounts without a proxy of their own"}. Pi agents started afterwards use the new setting; running ones keep theirs until they reopen.`
-            : " Its Pi agents started after saving use the new setting, for every request they make; running ones keep theirs until they reopen. It's also httpProxy in the settings of its folder, and its script uses it."}
+          {blocked
+            ? null
+            : account.family === "claude"
+              ? account.proxyFile
+                ? ` Saving changes it there, so plain claude in a terminal uses it too${followers}. Removing it takes it out of there, and ${afterRemoval}. Agents started afterwards use the new setting; running ones keep theirs until they reopen.`
+                : account.kind === "main"
+                  ? " Agents started after saving use the new setting; running ones keep theirs until they reopen. Plain claude in a terminal doesn't: it goes the way ~/.claude/settings.json and your shell say."
+                  : " Its agents started after saving use the new setting; running ones keep theirs until they reopen. It's kept in the env of its folder's settings.json, so Claude Code started on that folder uses it too."
+              : account.kind === "main"
+                ? ` Saving writes it as httpProxy in ~/.pi/agent/settings.json, so plain pi uses it too unless its environment names a proxy${followers || ", and so do added accounts without a proxy of their own"}. Pi agents started afterwards use the new setting; running ones keep theirs until they reopen.`
+                : " Its Pi agents started after saving use the new setting, for every request they make; running ones keep theirs until they reopen. It's also httpProxy in the settings of its folder, and its script uses it."}
         </Text>
-        <TextInput
-          value={proxy}
-          onChangeText={setProxy}
-          autoFocus
-          maxLength={2048}
-          // Empty keeps the proxy it goes through without one of its own, so that's what it shows.
-          placeholder={inherited?.proxy ?? "http://host:port"}
-          placeholderTextColor={theme.colors.foregroundMuted}
-          autoCapitalize="none"
-          autoCorrect={false}
-          onSubmitEditing={() => (changed ? void save(typed) : undefined)}
-          style={inputStyle}
-          accessibilityLabel="Proxy URL"
-        />
-        <Text style={text.small}>{hidden ? `${HIDDEN} hides the proxy's password: type it in full to save a change.` : "http:// or https://, with user:password@ if the proxy needs it."}</Text>
+        {blocked ? <Text style={text.danger}>{blocked}</Text> : null}
+        {blocked ? null : (
+          <>
+          <TextInput
+            value={proxy}
+            onChangeText={setProxy}
+            autoFocus
+            maxLength={2048}
+            // Empty keeps the proxy it goes through without one of its own, so that's what it shows.
+            placeholder={inherited?.proxy ?? "http://host:port"}
+            placeholderTextColor={theme.colors.foregroundMuted}
+            autoCapitalize="none"
+            autoCorrect={false}
+            onSubmitEditing={() => (changed ? void save(typed) : undefined)}
+            style={inputStyle}
+            accessibilityLabel="Proxy URL"
+          />
+          <Text style={text.small}>{hidden ? `${HIDDEN} hides the proxy's password: type it in full to save a change.` : "http:// or https://, with user:password@ if the proxy needs it."}</Text>
+          </>
+        )}
         {error ? <Text style={text.danger}>{error}</Text> : null}
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, justifyContent: "flex-end" }}>
-          <Button theme={theme} label="Cancel" tooltip="Keep the current proxy" tooltipAlign="end" onPress={onClose} />
-          {account.proxy ? (
-            <Button theme={theme} label="Remove proxy" tooltip="Stop using a proxy of its own" tooltipAlign="end" busy={saving === "clear"} onPress={() => void save("")} />
+          <Button theme={theme} label={blocked ? "Close" : "Cancel"} tooltip={blocked ? "Close" : "Keep the current proxy"} tooltipAlign="end" onPress={onClose} />
+          {account.proxy && !blocked ? (
+            <Button
+              theme={theme}
+              label="Remove proxy"
+              tooltip={account.proxyFile ? `Take the proxy out of ${account.proxyFile}` : "Stop using a proxy of its own"}
+              tooltipAlign="end"
+              busy={saving === "clear"}
+              onPress={() => void save("")}
+            />
           ) : null}
-          <Button theme={theme} tone="primary" label="Save" tooltip="Use this proxy for the account" tooltipAlign="end" busy={saving === "save"} disabled={!changed} onPress={() => void save(typed)} />
+          {blocked ? null : (
+            <Button theme={theme} tone="primary" label="Save" tooltip="Use this proxy for the account" tooltipAlign="end" busy={saving === "save"} disabled={!changed} onPress={() => void save(typed)} />
+          )}
         </View>
       </Modal.Content>
     </Modal>

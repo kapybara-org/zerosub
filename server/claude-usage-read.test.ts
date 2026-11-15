@@ -1,4 +1,6 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -10,6 +12,9 @@ import { mergeUsage } from "./usage";
 // A synthetic home with a made-up token; `fetch` is stubbed, so nothing real is read or called.
 let home: string;
 const calls: string[] = [];
+/** Proxy settings the daemon may have: cleared, so the reads go straight to the stubbed `fetch`. */
+const PROXY_VARIABLES = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy"];
+let savedProxy: Record<string, string | undefined>;
 
 const body = {
   five_hour: { utilization: 12, resets_at: "2026-11-11T14:00:00Z" },
@@ -28,6 +33,8 @@ function answer(responses: Array<() => Response>) {
 
 beforeEach(async () => {
   calls.length = 0;
+  savedProxy = Object.fromEntries(PROXY_VARIABLES.map((key) => [key, process.env[key]]));
+  for (const key of PROXY_VARIABLES) delete process.env[key];
   home = await mkdtemp(join(tmpdir(), "zerosub-usage-read-"));
   await writeFile(
     join(home, ".credentials.json"),
@@ -37,6 +44,10 @@ beforeEach(async () => {
 
 afterEach(async () => {
   vi.unstubAllGlobals();
+  for (const [key, value] of Object.entries(savedProxy)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   await rm(home, { recursive: true, force: true });
 });
 
@@ -87,5 +98,35 @@ describe("Claude usage read", () => {
     answer([() => new Response("", { status: 429, headers: { "retry-after": "60" } })]);
     await new ClaudeAdapter().usage(home);
     expect(calls).toHaveLength(1);
+  });
+});
+
+describe("Claude's calls with an account's token", () => {
+  let proxy: Server | null = null;
+
+  afterEach(async () => {
+    await new Promise((resolve) => (proxy ? proxy.close(resolve) : resolve(undefined)));
+    proxy = null;
+  });
+
+  it("go through the account's own proxy: the usage read, and the read before redeeming a reset", async () => {
+    // A proxy that records where each tunnel was asked to go, then refuses it: nothing leaves the machine.
+    const seen: string[] = [];
+    proxy = createServer();
+    proxy.on("connect", (request, socket) => {
+      seen.push(request.url ?? "");
+      socket.end("HTTP/1.1 403 Nope\r\n\r\n");
+    });
+    const port = await new Promise<number>((resolve) => proxy!.listen(0, "127.0.0.1", () => resolve((proxy!.address() as AddressInfo).port)));
+    await writeFile(join(home, "settings.json"), JSON.stringify({ env: { HTTPS_PROXY: `http://127.0.0.1:${port}` } }));
+    answer([]);
+
+    const adapter = new ClaudeAdapter();
+    expect((await adapter.usage(home)).error).not.toBeNull();
+    expect(seen).toEqual(["api.anthropic.com:443"]);
+    expect((await adapter.redeemReset(home)).outcome).toBe("error");
+    expect(seen).toEqual(["api.anthropic.com:443", "api.anthropic.com:443"]);
+    // Never straight to Anthropic past the proxy.
+    expect(calls).toEqual([]);
   });
 });
