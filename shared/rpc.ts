@@ -15,6 +15,8 @@ export const startLogin = defineRpc({
     /** Sign an existing account back in instead of adding a new one. */
     accountId: z.string().optional(),
     method: LoginMethodSchema.default("browser"),
+    /** A new account's proxy, set before the CLI signs in so the sign-in goes through it too. */
+    proxy: z.string().trim().max(2048).optional(),
   }),
   output: LoginViewSchema,
 });
@@ -61,7 +63,7 @@ export const updateApiAccount = defineRpc({
   output: z.object({ ok: z.literal(true) }),
 });
 
-/** Sets a Pi account's proxy (Pi's own login's included); an empty value clears it. */
+/** Sets a Claude or Pi account's proxy (their CLI logins' included); an empty value clears it. */
 export const setAccountProxy = defineRpc({
   name: "zerosub.accounts.proxy",
   input: z.object({ accountId: z.string(), proxy: z.string().trim().max(2048) }),

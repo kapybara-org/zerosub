@@ -86,7 +86,7 @@ export default function contribute(server: PluginServerContext) {
   }
 
   server.handle(getState, ({ refreshUsage }, { paseo }) => service.view(paseo, refreshUsage));
-  server.handle(startLogin, ({ family, method, accountId }) => service.startLogin(family, method, accountId));
+  server.handle(startLogin, ({ family, method, accountId, proxy }) => service.startLogin(family, method, accountId, proxy));
   server.handle(submitLoginCode, ({ loginId, code }) => service.submitCode(loginId, code));
   server.handle(cancelLogin, ({ loginId }) => service.cancelLogin(loginId));
   server.handle(renameAccount, async ({ accountId, label }) => {

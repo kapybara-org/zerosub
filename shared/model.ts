@@ -176,11 +176,16 @@ export const AccountViewSchema = z.object({
   apiEditable: z.boolean().default(false),
   /** The account's own proxy, password hidden (as `HIDDEN`). Null when it uses whatever it inherits. */
   proxy: z.string().nullable().default(null),
-  /** A proxy can be set for this account here (Pi accounts, Pi's own login included). */
+  /** A proxy can be set for this account here (Claude and Pi accounts, their CLI logins included). */
   proxyEditable: z.boolean().default(false),
+  /** Why a proxy can't be set for it just now (the CLI login's, while main's settings would outrank it); null when one can. */
+  proxyBlocked: z.string().nullable().default(null),
   /** The proxy it goes through without one of its own, password hidden, and where that's set. */
   inheritedProxy: z.object({ proxy: z.string(), from: z.string() }).nullable().default(null),
-  /** The user's file its own proxy is kept in (Pi's own login: `httpProxy` in `~/.pi/agent/settings.json`). */
+  /**
+   * The user's file its own proxy is kept in (Pi's own login: `httpProxy` in `~/.pi/agent/settings.json`;
+   * Claude's CLI login: `env` in `~/.claude/settings.json`, when that sets one).
+   */
   proxyFile: z.string().nullable().default(null),
   /** Added accounts that go through the same proxy, having none of their own, while it's kept in `proxyFile`. */
   proxyFollowers: z.array(z.string()).default([]),

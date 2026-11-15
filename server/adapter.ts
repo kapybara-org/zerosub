@@ -1,6 +1,7 @@
 import type { PluginLifecycleEvents, PluginTurnOutcome } from "@getpaseo/plugin/server";
 import type { ApiSummary, Family, LoginMethod, LoginStep, Usage } from "../shared/model";
 import type { RedeemOutcome } from "../shared/rpc";
+import { providerEnv } from "./provider-env";
 
 /**
  * One timeline entry. Taken from the SDK rather than `@getpaseo/protocol`: Paseo only supplies
@@ -78,6 +79,8 @@ export interface ProxyState {
   file: string | null;
   /** The proxy it goes through without one of its own, and where that's set; null when that's direct. */
   inherited: { proxy: string; from: string } | null;
+  /** Why one can't be set here just now; null when it can. */
+  blocked?: string | null;
 }
 
 /**
@@ -120,9 +123,8 @@ export interface FamilyAdapter {
   login(home: string | null, method: LoginMethod): Promise<LoginHandle>;
   logout(home: string): Promise<void>;
   /**
-   * The rest is only there for providers whose added accounts are API keys with a proxy each (Pi's).
-   * An account's key (reduced to a hint) and base URL; `home === null` (the CLI login) only where
-   * `mainApi` says so.
+   * Only for providers whose added accounts are API keys (Pi's): an account's key (reduced to a hint)
+   * and base URL; `home === null` (the CLI login) only where `mainApi` says so.
    */
   api?(home: string | null): Promise<ApiSummary | null>;
   /** The CLI login's Anthropic key and base URL can be set here too. */
@@ -132,7 +134,10 @@ export interface FamilyAdapter {
    * once nothing else works on the home; false throws and writes nothing.
    */
   setApi?(home: string | null, config: { key: string | null; baseUrl: string | null }, wanted?: () => Promise<boolean>): Promise<void>;
-  /** Where an account's CLI (`home === null`: the CLI's own login) gets its proxy. */
+  /**
+   * Where an account's CLI (`home === null`: the CLI's own login) gets its proxy, for providers that
+   * let ZeroSub set one per account (Claude's and Pi's).
+   */
   proxyState?(home: string | null): Promise<ProxyState>;
   /** Sets (or clears, with `null`) an account's proxy, for processes started afterwards. `wanted` as for `setApi`. */
   setProxy?(home: string | null, proxy: string | null, wanted?: () => Promise<boolean>): Promise<void>;
@@ -174,9 +179,12 @@ export function missingAdapter(family: Family): FamilyAdapter {
   };
 }
 
-/** The environment for a process ZeroSub spawns against `patch`. */
-export function spawnEnv(patch: EnvPatch): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env };
+/**
+ * The environment for a process ZeroSub spawns against `patch`: what Paseo gives a session of the
+ * family's provider, the daemon's environment with the provider's configured `env` over it.
+ */
+export function spawnEnv(patch: EnvPatch, family: Family): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, ...providerEnv(family) };
   for (const [key, value] of Object.entries(patch)) if (value !== null) env[key] = value;
   return env;
 }

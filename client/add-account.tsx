@@ -5,6 +5,7 @@ import { ActivityIndicator, Pressable, Text, View } from "react-native";
 import { formatPlan } from "../shared/format";
 import { FAMILY_LABEL, type Family, type LoginMethod, type LoginView } from "../shared/model";
 import { cancelLogin, startLogin, submitLoginCode } from "../shared/rpc";
+import { useInputStyle } from "./pi-accounts";
 import { describe, useStore, type ZeroSubStore } from "./store";
 import { Button, useText } from "./ui";
 
@@ -40,8 +41,14 @@ export function AddAccountModal({
   const [method, setMethod] = useState<LoginMethod>(hostBrowser && !mobile ? "browser" : "code");
   const [loginId, setLoginId] = useState<string | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
+  // A new Claude account can get a proxy of its own first, so the sign-in itself goes through it.
+  const askProxy = family === "claude" && !accountId;
+  const [proxy, setProxy] = useState("");
+  const [proxyDone, setProxyDone] = useState(!askProxy);
   // Each start gets a number; only the newest one's answer counts.
   const attempt = useRef(0);
+  /** A sign-in was started for the proxy step as it was last left. */
+  const started = useRef(false);
   const closed = useRef(false);
 
   const begin = useCallback(
@@ -50,7 +57,7 @@ export function AddAccountModal({
       setStartError(null);
       setLoginId(null);
       try {
-        const login = await store.rpc(startLogin, { family, accountId, method: next });
+        const login = await store.rpc(startLogin, { family, accountId, method: next, proxy: askProxy && proxy.trim() ? proxy.trim() : undefined });
         // The modal closed (or a newer start replaced this one) before the daemon answered.
         if (closed.current || mine !== attempt.current) {
           void store.rpc(cancelLogin, { loginId: login.id }).catch(() => undefined);
@@ -61,12 +68,14 @@ export function AddAccountModal({
         if (!closed.current && mine === attempt.current) setStartError(describe(error));
       }
     },
-    [store, family, accountId],
+    [store, family, accountId, askProxy, proxy],
   );
 
   useEffect(() => {
-    if (attempt.current === 0) void begin(method);
-  }, [begin, method]);
+    if (!proxyDone || started.current) return;
+    started.current = true;
+    void begin(method);
+  }, [proxyDone, begin, method]);
 
   useEffect(() => store.watchClosely(), [store]);
 
@@ -89,14 +98,30 @@ export function AddAccountModal({
     [family, begin],
   );
 
+  // Back to the proxy step: the sign-in started with the old one stops, and starts again after.
+  const changeProxy = useCallback(() => {
+    // A start still under way is answered for an older attempt, so it's canceled when it comes back.
+    attempt.current += 1;
+    started.current = false;
+    if (loginId && !finished) void store.rpc(cancelLogin, { loginId }).catch(() => undefined);
+    setLoginId(null);
+    setStartError(null);
+    setProxyDone(false);
+  }, [loginId, finished, store]);
+
   const title = accountId ? "Sign in again" : `Add ${FAMILY_LABEL[family]} account`;
   let body: ReactNode;
-  if (startError) {
+  if (!proxyDone) {
+    body = <ProxyStep theme={theme} proxy={proxy} onChange={setProxy} onCancel={close} onContinue={() => setProxyDone(true)} />;
+  } else if (startError) {
     body = (
       <>
         <Text style={text.danger}>{startError}</Text>
         <Row>
           <Button theme={theme} label="Close" tooltip="Close without adding an account" tooltipAlign="end" onPress={close} />
+          {askProxy ? (
+            <Button theme={theme} label="Change proxy" tooltip="Go back and change the proxy for this account" tooltipAlign="end" onPress={changeProxy} />
+          ) : null}
           <Button
             theme={theme}
             tone="primary"
@@ -374,6 +399,57 @@ function Step({ theme, number, title, children }: { theme: Theme; number: number
         {children}
       </View>
     </View>
+  );
+}
+
+/** A new Claude account's optional proxy, asked before its sign-in starts. */
+function ProxyStep({
+  theme,
+  proxy,
+  onChange,
+  onCancel,
+  onContinue,
+}: {
+  theme: Theme;
+  proxy: string;
+  onChange(proxy: string): void;
+  onCancel(): void;
+  onContinue(): void;
+}) {
+  const text = useText(theme);
+  const inputStyle = useInputStyle(theme);
+  return (
+    <>
+      <Text style={text.strong}>Proxy for this account (optional)</Text>
+      <TextInput
+        value={proxy}
+        onChangeText={onChange}
+        autoFocus
+        maxLength={2048}
+        placeholder="http://host:port"
+        placeholderTextColor={theme.colors.foregroundMuted}
+        autoCapitalize="none"
+        autoCorrect={false}
+        onSubmitEditing={onContinue}
+        style={inputStyle}
+        accessibilityLabel="Proxy URL"
+      />
+      <Text style={text.small}>
+        http:// or https://, with user:password@ if the proxy needs it. The CLI signs in through it, and the account's agents use it too.
+        Leave it empty to use the network the daemon has; you can set one later from the account's card.
+      </Text>
+      <Row>
+        <Button theme={theme} label="Cancel" tooltip="Close without adding an account" tooltipAlign="end" onPress={onCancel} />
+        <Button
+          theme={theme}
+          tone="primary"
+          label={proxy.trim() ? "Continue" : "Continue without a proxy"}
+          tooltip="Start signing in"
+          tooltipAlign="end"
+          onPress={onContinue}
+        />
+      </Row>
+    </>
   );
 }
 

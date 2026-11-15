@@ -20,6 +20,9 @@ export const NO_PROXY_KEYS = ["no_proxy", "NO_PROXY"] as const;
 /** Hosts that stay direct when ZeroSub gives a process a proxy: this machine, where a local gateway may be. */
 export const REQUIRED_NO_PROXY = ["localhost", "127.0.0.1", "::1"] as const;
 
+/** For Claude Code, its updater's host as well. */
+export const CLAUDE_REQUIRED_NO_PROXY = [...REQUIRED_NO_PROXY, "downloads.claude.ai"] as const;
+
 /** The no-proxy list in an environment: `*` if either variable is, else both when they differ. */
 export function noProxyFromEnv(env: Record<string, string | undefined>): string | null {
   const { no_proxy: lower, NO_PROXY: upper } = env;
@@ -49,6 +52,14 @@ export function bypassesProxy(noProxy: string | null, target: string): boolean {
     });
 }
 
+/** Where Claude Code signs in, reads usage and sends an account's requests. */
+const CLAUDE_DOMAINS = ["anthropic.com", "claude.ai", "claude.com"];
+
+/** `noProxy` without anything that could send Anthropic or Claude traffic past the proxy (see `withoutDomains`). */
+export function withoutClaudeDomains(noProxy: string | null): string {
+  return withoutDomains(noProxy, CLAUDE_DOMAINS);
+}
+
 /**
  * `noProxy` without anything that could send a request to one of `domains` past the proxy, in any of
  * the forms HTTP clients accept: `*`, `*.domain`, `.domain`, `domain`, with or without a port, for
@@ -76,11 +87,11 @@ export function withoutDomains(noProxy: string | null, domains: readonly string[
 }
 
 /** Adds this machine's addresses, without duplicating entries. */
-export function withRequiredNoProxy(noProxy: string | null): string {
+export function withRequiredNoProxy(noProxy: string | null, required: readonly string[] = REQUIRED_NO_PROXY): string {
   const entries = (noProxy ?? "").split(/[\s,]+/).filter(Boolean);
   const seen = new Set<string>();
   const result: string[] = [];
-  for (const entry of [...REQUIRED_NO_PROXY, ...entries]) {
+  for (const entry of [...required, ...entries]) {
     const key = entry.toLowerCase();
     if (!seen.has(key)) {
       seen.add(key);
@@ -90,9 +101,14 @@ export function withRequiredNoProxy(noProxy: string | null): string {
   return result.join(",");
 }
 
+/** Adds this machine's addresses and Claude's updater host, as Claude Code's processes need. */
+export function withClaudeNoProxy(noProxy: string | null): string {
+  return withRequiredNoProxy(noProxy, CLAUDE_REQUIRED_NO_PROXY);
+}
+
 /**
  * Checks a proxy typed by the user and returns it in canonical form. Only http:// and https://
- * proxies are accepted: they're what Pi and ZeroSub's own requests can both use. One
+ * proxies are accepted: they're what Claude Code, Pi and ZeroSub's own requests can all use. One
  * still holding the hidden password it was shown with (see `maskProxy`) isn't a proxy to save.
  */
 export function normalizeProxy(input: string): string {
@@ -144,7 +160,8 @@ export function maskProxy(proxy: string): string {
 export function openTunnel(proxy: string, host: string, port: number, signal?: AbortSignal): Promise<Socket> {
   let url: URL;
   try {
-    url = new URL(proxy);
+    // One without a scheme (`127.0.0.1:7890`, as the environment or a settings file may have it) is http://.
+    url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(proxy.trim()) ? proxy.trim() : `http://${proxy.trim()}`);
   } catch {
     return Promise.reject(new Error("The account's proxy isn't a valid URL"));
   }
