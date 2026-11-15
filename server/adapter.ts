@@ -137,6 +137,12 @@ export interface FamilyAdapter {
    */
   setApi?(home: string | null, config: ApiConfig, wanted?: () => Promise<boolean>): Promise<void>;
   /**
+   * The proxy an added account's requests to `baseUrl` would cross as plain http:// (`through`: as
+   * if it were that one), which could read its key; null when none would. For providers whose API
+   * accounts keep their key in the home's settings (Claude's; Pi checks its own when it writes).
+   */
+  clearTextProxy?(home: string, baseUrl: string | null, through?: string): Promise<string | null>;
+  /**
    * Where an account's CLI (`home === null`: the CLI's own login) gets its proxy, for providers that
    * let ZeroSub set one per account (Claude's and Pi's).
    */

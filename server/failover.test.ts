@@ -2764,3 +2764,22 @@ describe("forking to the other provider by hand", () => {
   });
 });
 
+describe("an API account at a limit with every other account out", () => {
+  it("is never spent a banked reset on automatically, which it doesn't have", async () => {
+    const redeemed: Array<string | null> = [];
+    const api = { ...account("claude-api", "Gateway", "managed"), auth: "api" as const };
+    const main = { ...account(MAIN, "main", "main"), limitedUntil: inFuture(), limitKind: "window" as const };
+    const { service, limitTurn } = await setUp(
+      {
+        accounts: [main as never, api as never],
+        defaults: { claude: "claude-api", codex: null, pi: null },
+        sessions: { [AGENT]: { accountId: "claude-api", family: "claude", openedAt: "2026-09-23T07:00:00.000Z" } },
+      },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "429 from the gateway" }),
+      { claude: { redeemReset: async (home: string | null) => (redeemed.push(home), { outcome: "reset", message: "Limits reset.", left: 0 }) } },
+    );
+    service.setPreferences(preferences.schema.parse({ autoRedeem: true }));
+    await limitTurn();
+    expect(redeemed).toEqual([]);
+  });
+});

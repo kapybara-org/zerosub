@@ -17,7 +17,7 @@ import {
 } from "./adapter";
 import { browserCaptureScript, providerCommand } from "./binaries";
 import { CLAUDE_RESET_PROGRAM, describeResetBlock, parseClaudeResets, readClaimReply } from "./claude-resets";
-import { prepareClaudeHome, readAccountApi, readAccountProxy, writeAccountApi, writeAccountProxy, type ApiConfig } from "./homes";
+import { claudeClearTextProxy, prepareClaudeHome, readAccountApi, readAccountProxy, writeAccountApi, writeAccountProxy, type ApiConfig } from "./homes";
 import { readJson } from "./json-file";
 import { detectClaudeLimit, detectClaudeSignOut } from "./limits";
 import { inheritedClaudeProxy, mainProxyBlock, mainProxyEnv, mainSettingsEnv, readMainProxy, writeMainProxy } from "./main-proxy";
@@ -107,6 +107,10 @@ export class ClaudeAdapter implements FamilyAdapter {
 
   api(home: string | null): Promise<ApiSummary | null> {
     return home ? readAccountApi(home) : Promise.resolve(null);
+  }
+
+  clearTextProxy(home: string, baseUrl: string | null, through?: string): Promise<string | null> {
+    return claudeClearTextProxy(home, baseUrl, through);
   }
 
   setApi(home: string | null, config: ApiConfig, wanted?: () => Promise<boolean>): Promise<void> {

@@ -118,6 +118,14 @@ describe("adding an API account", () => {
     );
   });
 
+  it("takes Anthropic's API typed out for the same endpoint as none, so the same key isn't added twice", async () => {
+    const { service } = await setUp();
+    await service.addApiAccount({ label: "One", key: "sk-ant-test-1234567890", keyKind: "api_key" });
+    await expect(service.addApiAccount({ label: "Two", key: "sk-ant-test-1234567890", keyKind: "api_key", baseUrl: "https://api.anthropic.com/" })).rejects.toThrow(
+      'already added as "One"',
+    );
+  });
+
   it("checks the base URL and proxy before creating anything", async () => {
     const { service, store, calls } = await setUp();
     await expect(service.addApiAccount({ label: "x", keyKind: "api_key", key: KEY, baseUrl: "gw.example.com" })).rejects.toThrow();

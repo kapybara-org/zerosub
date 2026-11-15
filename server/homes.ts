@@ -789,6 +789,21 @@ function keyKindOf(env: Record<string, string>): ApiKeyKind | null {
 }
 
 /**
+ * The proxy an added Claude account's requests to `baseUrl` cross as plain http://, which that proxy
+ * can read, key and all; null for https://, or when nothing carries them, or the no-proxy list keeps
+ * them direct. Read as Claude Code starts on the home: its generated settings' env over the daemon's
+ * (and Paseo's for Claude). `through` asks the same of another proxy (the CLI login's new one, say)
+ * with the account's no-proxy list as it is. Any proxy variable counts, http_proxy or https_proxy.
+ */
+export async function claudeClearTextProxy(home: string, baseUrl: string | null, through?: string): Promise<string | null> {
+  if (!baseUrl || !plainHttp(baseUrl)) return null;
+  const settings = await readSettings(join(home, "settings.json")).catch(() => null);
+  const env: Record<string, string | undefined> = { ...process.env, ...providerEnv("claude"), ...stringEnv(settings) };
+  const proxy = through ?? proxyFromEnv(env);
+  return proxy && !bypassesProxy(noProxyFromEnv(env), baseUrl) ? proxy : null;
+}
+
+/**
  * The account's API settings with the key reduced to a hint (its last four characters, or empty for
  * a short key), or null when it has no key of its own.
  */
