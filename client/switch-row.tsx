@@ -38,7 +38,7 @@ export function describeRow(row: SwitchRow): string {
       row.reason === "exhausted"
         ? `Every ${FAMILY_LABEL[row.family]} account is at its limit${reset ? ` (${row.from ?? "this one"} resets ${reset})` : ""}, so the work`
         : "The work";
-    return `${lead} continues on ${FAMILY_LABEL[row.toFamily]} in a new agent: “${row.continuedIn.title}” (${row.to}).`;
+    return `${lead} continues on ${FAMILY_LABEL[row.toFamily]} in a new agent: “${row.continuedIn.title}” (${row.to}).${row.detail ? ` ${row.detail}` : ""}`;
   }
   if (row.reason === "exhausted") {
     const reset = formatResetIn(row.resetsAt);
@@ -56,7 +56,7 @@ export function describeRow(row: SwitchRow): string {
   switch (row.outcome) {
     case "continued":
       return row.continuedIn
-        ? `${lead}ChatGPT conversations can't change accounts, so this task continues in “${row.continuedIn.title}” on ${row.to}.`
+        ? `${lead}ChatGPT conversations can't change accounts, so this task continues in “${row.continuedIn.title}” on ${row.to}.${row.detail ? ` ${row.detail}` : ""}`
         : `${lead}Continuing on ${row.to}.`;
     case "stayed":
       return `${lead}This conversation stays on ${row.from ?? "its account"}.${row.detail ? ` ${row.detail}` : ""}`;

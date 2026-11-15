@@ -5,6 +5,7 @@ import { ActivityIndicator, Pressable, Text, View } from "react-native";
 import { formatPlan } from "../shared/format";
 import { FAMILY_LABEL, type Family, type LoginMethod, type LoginView } from "../shared/model";
 import { cancelLogin, startLogin, submitLoginCode } from "../shared/rpc";
+import { CodexKindStep } from "./azure-accounts";
 import { useInputStyle } from "./pi-accounts";
 import { describe, useStore, type ZeroSubStore } from "./store";
 import { Button, useText } from "./ui";
@@ -20,6 +21,7 @@ export function AddAccountModal({
   family,
   accountId,
   onClose,
+  onChooseAzure,
 }: {
   theme: Theme;
   layout: PluginSurfaceProps["layout"];
@@ -30,6 +32,8 @@ export function AddAccountModal({
   family: Family;
   accountId?: string;
   onClose(): void;
+  /** A new ChatGPT account can be an Azure OpenAI key instead: this hands over to its form. */
+  onChooseAzure?(): void;
 }) {
   const text = useText(theme);
   const { state } = useStore(store);
@@ -45,6 +49,9 @@ export function AddAccountModal({
   const askProxy = family === "claude" && !accountId;
   const [proxy, setProxy] = useState("");
   const [proxyDone, setProxyDone] = useState(!askProxy);
+  // A new ChatGPT account first asks which kind: a subscription sign-in, or an Azure OpenAI key.
+  const askKind = family === "codex" && !accountId && Boolean(onChooseAzure);
+  const [kindDone, setKindDone] = useState(!askKind);
   // Each start gets a number; only the newest one's answer counts.
   const attempt = useRef(0);
   /** A sign-in was started for the proxy step as it was last left. */
@@ -72,10 +79,10 @@ export function AddAccountModal({
   );
 
   useEffect(() => {
-    if (!proxyDone || started.current) return;
+    if (!proxyDone || !kindDone || started.current) return;
     started.current = true;
     void begin(method);
-  }, [proxyDone, begin, method]);
+  }, [proxyDone, kindDone, begin, method]);
 
   useEffect(() => store.watchClosely(), [store]);
 
@@ -111,7 +118,9 @@ export function AddAccountModal({
 
   const title = accountId ? "Sign in again" : `Add ${FAMILY_LABEL[family]} account`;
   let body: ReactNode;
-  if (!proxyDone) {
+  if (!kindDone) {
+    body = <CodexKindStep theme={theme} onSubscription={() => setKindDone(true)} onAzure={() => onChooseAzure?.()} onCancel={close} />;
+  } else if (!proxyDone) {
     body = <ProxyStep theme={theme} proxy={proxy} onChange={setProxy} onCancel={close} onContinue={() => setProxyDone(true)} />;
   } else if (startError) {
     body = (

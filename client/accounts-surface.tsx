@@ -15,6 +15,7 @@ import {
   setNextAgentAccount,
 } from "../shared/rpc";
 import { AddAccountModal } from "./add-account";
+import { AzureAccountModal, AzureUsage, azureCardDetails } from "./azure-accounts";
 import { AddPiAccountModal, ApiKeyModal, PiSectionNotes, ProxyModal, piCardDetails } from "./pi-accounts";
 import { ResetConfirm, redeemToast, resetBadge } from "./reset-confirm";
 import { describe, stoppedWaiting, useStore, VISIBLE_POLL_MS, type ZeroSubStore } from "./store";
@@ -26,7 +27,7 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
   const { theme, layout, host, store } = props;
   const { state, error, updatedAt } = useStore(store);
   const text = useText(theme);
-  const [adding, setAdding] = useState<{ family: Family; accountId?: string } | null>(null);
+  const [adding, setAdding] = useState<{ family: Family; accountId?: string; azure?: boolean } | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const refreshUsage = useCallback(async () => {
     setRefreshing(true);
@@ -138,6 +139,8 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
 
       {adding?.family === "pi" ? (
         <AddPiAccountModal theme={theme} store={store} onClose={() => setAdding(null)} />
+      ) : adding?.azure ? (
+        <AzureAccountModal theme={theme} store={store} onClose={() => setAdding(null)} />
       ) : adding ? (
         <AddAccountModal
           theme={theme}
@@ -148,6 +151,7 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
           family={adding.family}
           accountId={adding.accountId}
           onClose={() => setAdding(null)}
+          onChooseAzure={adding.family === "codex" && !adding.accountId ? () => setAdding({ family: "codex", azure: true }) : undefined}
         />
       ) : null}
     </View>
@@ -251,7 +255,13 @@ function FamilySection({
           icon="Plus"
           label={compact ? "Add" : "Add account"}
           accessibilityLabel={`Add ${FAMILY_LABEL[family]} account`}
-          tooltip={family === "pi" ? "Add a Pi account with an Anthropic API key and its own proxy" : `Sign in another ${FAMILY_LABEL[family]} account`}
+          tooltip={
+            family === "pi"
+              ? "Add a Pi account with an Anthropic API key and its own proxy"
+              : family === "codex"
+                ? "Sign in another ChatGPT account, or add an Azure OpenAI API key"
+                : `Sign in another ${FAMILY_LABEL[family]} account`
+          }
           tooltipAlign="end"
           onPress={onAdd}
         />
@@ -302,13 +312,15 @@ function AccountCard({
   const [editingApi, setEditingApi] = useState(false);
   const [editingProxy, setEditingProxy] = useState(false);
   const api = account.auth === "api";
-  const details = piCardDetails(account) ?? claudeCardDetails(account);
+  const azure = account.azure !== null;
+  const [editingAzure, setEditingAzure] = useState(false);
+  const details = piCardDetails(account) ?? claudeCardDetails(account) ?? azureCardDetails(account);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const resets = account.usage?.resets ?? null;
   const credits = account.usage?.credits ?? null;
   const extraUsage = account.usage?.extraUsage ? formatExtraUsage(account.usage.extraUsage) : null;
-  const plan = formatPlan(account.plan);
+  const plan = azure ? null : formatPlan(account.plan);
   const summary = usageSummary(account);
   const subtitle = accountSubtitle(account);
   const signedOut = account.status === "signed_out";
@@ -478,6 +490,9 @@ function AccountCard({
           {account.apiEditable ? (
             <IconButton theme={theme} icon="KeyRound" label="API settings" tooltip="API settings: key and base URL" onPress={() => setEditingApi(true)} />
           ) : null}
+          {azure ? (
+            <IconButton theme={theme} icon="KeyRound" label="Azure settings" tooltip="Azure settings: endpoint, key and prices" onPress={() => setEditingAzure(true)} />
+          ) : null}
           {account.proxyEditable ? (
             <IconButton theme={theme} icon="Globe" label="Proxy" tooltip="Proxy: the network this account uses" onPress={() => setEditingProxy(true)} />
           ) : null}
@@ -506,7 +521,7 @@ function AccountCard({
         {account.isDefault ? <Badge theme={theme} label="Default" tone="accent" /> : null}
         {disabled ? <Badge theme={theme} label="Disabled" /> : null}
         {plan ? <Badge theme={theme} label={plan} /> : null}
-        {api ? <Badge theme={theme} label="API" /> : null}
+        {azure ? <Badge theme={theme} label="Azure · API" tone="warning" /> : api ? <Badge theme={theme} label="API" /> : null}
         {account.kind === "main" ? <Badge theme={theme} label="CLI login" /> : null}
         {account.status === "limited" ? <Badge theme={theme} label="Limit reached" tone="danger" /> : null}
         {account.status === "signed_out" ? <Badge theme={theme} label="Signed out" tone="warning" /> : null}
@@ -529,6 +544,8 @@ function AccountCard({
       <View style={[{ gap: 10 }, faded]}>
         {signedOut ? (
           <Text style={text.small}>{api ? "The key was refused. Enter a working one to use this account." : "Sign in again to use this account."}</Text>
+        ) : azure ? (
+          <AzureUsage theme={theme} account={account} />
         ) : api ? (
           <Text style={text.small}>Billed per use · used only as the default or when picked for an agent</Text>
         ) : windows.length > 0 ? (
@@ -570,7 +587,7 @@ function AccountCard({
             label={api ? "Fix key" : "Sign in"}
             tooltip={api ? "Enter a working key for this account" : "Sign this account in again"}
             tooltipAlign="end"
-            onPress={api ? () => setEditingApi(true) : onSignIn}
+            onPress={azure ? () => setEditingAzure(true) : api ? () => setEditingApi(true) : onSignIn}
           />
         ) : disabled ? (
           <Button
@@ -620,6 +637,7 @@ function AccountCard({
         <RenameModal theme={theme} account={account} store={store} onClose={() => setRenaming(false)} />
       ) : null}
       {editingApi ? <ApiKeyModal theme={theme} store={store} account={account} onClose={() => setEditingApi(false)} /> : null}
+      {editingAzure ? <AzureAccountModal theme={theme} store={store} account={account} onClose={() => setEditingAzure(false)} /> : null}
       {editingProxy ? <ProxyModal theme={theme} store={store} account={account} onClose={() => setEditingProxy(false)} /> : null}
       <Modal title={`Remove ${account.label}?`} open={confirmRemove} onOpenChange={setConfirmRemove}>
         <Modal.Content>
@@ -628,6 +646,8 @@ function AccountCard({
               ? `This only removes the account from ZeroSub. Its folder${account.home ? ` (${account.home})` : ""}, its key${account.launcher ? ` and its terminal script ${account.launcher}` : ""} stay as they are, and you can add it back from Add account. Agents using it move to the default account; their conversations are kept.`
               : account.family === "pi"
                 ? "This deletes the account's folder and saved key on this machine. Agents using it move to the default account; their conversations are kept."
+                : azure
+                  ? "This deletes the account's saved key and endpoint on this machine, and its token counts. New agents use the default account. Existing ChatGPT conversations on it can't move, so archive them or continue them on another account first."
                 : account.family === "claude"
                   ? "This signs the account out on this machine and deletes its saved login. Agents using it move to the default account; their conversations are kept."
                   : `This signs the account out on this machine and deletes its saved login. New agents use the default account. Existing ${FAMILY_LABEL[account.family]} conversations on it can't move, so start new agents for them.`}
