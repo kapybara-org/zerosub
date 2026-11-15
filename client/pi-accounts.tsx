@@ -4,7 +4,7 @@ import { useCallback, useMemo, useState, type ReactNode } from "react";
 import { Text, View } from "react-native";
 import { egressText } from "../shared/format";
 import { HIDDEN, type AccountView, type StateView } from "../shared/model";
-import { addApiAccount, importPiAccount, setAccountProxy, setPiHomesDir, updateApiAccount } from "../shared/rpc";
+import { addApiAccount, importPiAccount, setAccountProxy, setClaudeHomesDir, setPiHomesDir, updateApiAccount } from "../shared/rpc";
 import { describe, type ZeroSubStore } from "./store";
 import { Button, IconButton, useText } from "./ui";
 
@@ -74,7 +74,7 @@ export function PiSectionNotes({ theme, state, accounts, store }: { theme: Theme
           note="Each runs pi on its account with the proxy its agents use in Paseo, whatever your shell exports."
         />
       ) : null}
-      {state.piHomes ? <HomesHint theme={theme} homes={state.piHomes} store={store} /> : null}
+      {state.piHomes ? <HomesHint theme={theme} family="pi" homes={state.piHomes} store={store} /> : null}
     </>
   );
 }
@@ -153,15 +153,40 @@ export function ShellHint({
   );
 }
 
-/** Where added Pi accounts' folders are kept, and the way to keep them somewhere else. */
-function HomesHint({ theme, homes, store }: { theme: Theme; homes: NonNullable<StateView["piHomes"]>; store: ZeroSubStore }) {
+/** What the folder setting says for each family whose added accounts' folders ZeroSub keeps outside its own. */
+const HOMES_COPY = {
+  claude: {
+    name: "Claude",
+    holds: "sign-in, settings and proxy",
+    variable: "CLAUDE_CONFIG_DIR",
+    setUp: "signed in",
+    runner: "a Claude agent or a terminal",
+    leftBehind: "its folder, sign-in and script stay",
+    rpc: setClaudeHomesDir,
+  },
+  pi: {
+    name: "Pi",
+    holds: "key, proxy and settings",
+    variable: "PI_CODING_AGENT_DIR",
+    setUp: "set up",
+    runner: "a Pi agent or a terminal",
+    leftBehind: "its folder, key and script stay",
+    rpc: setPiHomesDir,
+  },
+} as const;
+
+type HomesFamily = keyof typeof HOMES_COPY;
+type HomesState = NonNullable<StateView["piHomes"]>;
+
+/** Where a family's added accounts' folders are kept, and the way to keep them somewhere else. */
+export function HomesHint({ theme, family, homes, store }: { theme: Theme; family: HomesFamily; homes: HomesState; store: ZeroSubStore }) {
   const text = useText(theme);
   const [editing, setEditing] = useState(false);
   return (
     <View style={{ flexDirection: "row", alignItems: "flex-start", gap: 10, paddingHorizontal: 2 }}>
       <Icon name="FolderOpen" size={16} color={theme.colors.foregroundMuted} />
       <View style={{ flex: 1, gap: 4 }}>
-        <Text style={text.small}>Each added account keeps its key, proxy and settings in a folder of its own in</Text>
+        <Text style={text.small}>Each added account keeps its {HOMES_COPY[family].holds} in a folder of its own in</Text>
         <Text selectable style={[text.small, { color: theme.colors.foreground }]}>
           {homes.dir}
         </Text>
@@ -174,12 +199,13 @@ function HomesHint({ theme, homes, store }: { theme: Theme; homes: NonNullable<S
         tooltipAlign="end"
         onPress={() => setEditing(true)}
       />
-      {editing ? <HomesModal theme={theme} homes={homes} store={store} onClose={() => setEditing(false)} /> : null}
+      {editing ? <HomesModal theme={theme} family={family} homes={homes} store={store} onClose={() => setEditing(false)} /> : null}
     </View>
   );
 }
 
-function HomesModal({ theme, homes, store, onClose }: { theme: Theme; homes: NonNullable<StateView["piHomes"]>; store: ZeroSubStore; onClose(): void }) {
+function HomesModal({ theme, family, homes, store, onClose }: { theme: Theme; family: HomesFamily; homes: HomesState; store: ZeroSubStore; onClose(): void }) {
+  const copy = HOMES_COPY[family];
   const text = useText(theme);
   const toast = useToast();
   const inputStyle = useInputStyle(theme);
@@ -192,9 +218,9 @@ function HomesModal({ theme, homes, store, onClose }: { theme: Theme; homes: Non
     setSaving(true);
     setError(null);
     try {
-      const result = await store.rpc(setPiHomesDir, { dir: typed });
+      const result = await store.rpc(copy.rpc, { dir: typed });
       const moving = result.moving > 0 ? ` · ${result.moving} account${result.moving === 1 ? "" : "s"} move there once nothing runs on ${result.moving === 1 ? "it" : "them"}` : "";
-      toast.show(`Pi accounts are kept in ${result.dir} now${moving}`, { variant: "success", durationMs: 5_000 });
+      toast.show(`${copy.name} accounts are kept in ${result.dir} now${moving}`, { variant: "success", durationMs: 5_000 });
       await store.refresh();
       onClose();
     } catch (failure) {
@@ -202,17 +228,15 @@ function HomesModal({ theme, homes, store, onClose }: { theme: Theme; homes: Non
     } finally {
       setSaving(false);
     }
-  }, [typed, store, toast, onClose]);
+  }, [copy, typed, store, toast, onClose]);
   return (
-    <Modal title="Where Pi accounts are kept" open onOpenChange={(open) => (open ? undefined : onClose())}>
+    <Modal title={`Where ${copy.name} accounts are kept`} open onOpenChange={(open) => (open ? undefined : onClose())}>
       <Modal.Content>
         <Text style={text.muted}>
-          {`Now: ${homes.dir}${homes.isDefault ? ", beside the terminal scripts" : ""}. Each added account has a folder of its own there (its PI_CODING_AGENT_DIR), named after it like its script, with its key, proxy and settings; new ones are set up inside ZeroSub's own folder, then moved there.`}
+          {`Now: ${homes.dir}${homes.isDefault ? ", beside the terminal scripts" : ""}. Each added account has a folder of its own there (its ${copy.variable}), named after it like its script, with its ${copy.holds}; new ones are ${copy.setUp} inside ZeroSub's own folder, then moved there.`}
         </Text>
         <Text style={text.muted}>
-          Saving another folder moves every account kept here, and any still in ZeroSub's own folder, to it. Each moves once nothing runs on it: a Pi
-          agent or a terminal using it holds it back until it stops. Removing an account later only takes it out of ZeroSub; its folder, key and
-          script stay.
+          {`Saving another folder moves every account kept here, and any still in ZeroSub's own folder, to it. Each moves once nothing runs on it: ${copy.runner} using it holds it back until it stops. Removing an account later only takes it out of ZeroSub; ${copy.leftBehind}.`}
         </Text>
         <TextInput
           value={dir}
@@ -225,7 +249,7 @@ function HomesModal({ theme, homes, store, onClose }: { theme: Theme; homes: Non
           autoCorrect={false}
           onSubmitEditing={() => (changed ? void save() : undefined)}
           style={inputStyle}
-          accessibilityLabel="Folder for Pi accounts"
+          accessibilityLabel={`Folder for ${copy.name} accounts`}
         />
         {error ? <Text style={text.danger}>{error}</Text> : null}
         <View style={{ flexDirection: "row", gap: 8, justifyContent: "flex-end" }}>

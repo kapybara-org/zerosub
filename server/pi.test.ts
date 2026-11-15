@@ -1020,6 +1020,8 @@ describe("Pi accounts in the service", () => {
       expect(findAccount(state, moved)?.home).toBe(movedTo);
       expect(findAccount(state, stayed)?.home).toBe(join(homes, stayed));
       expect(state.moves).toEqual({});
+      // Finished before anything synced the homes, so the old folder wasn't made again, empty.
+      await expect(stat(join(homes, moved))).rejects.toThrow();
       expect(await readFile(join(root, "pi-config", "pi-moved.sh"), "utf8")).toContain(`export PI_CODING_AGENT_DIR='${movedTo}'`);
       // Pi still runs on the one left behind, so it moves later.
       expect((await second.view(paseo as never)).accounts.find((account) => account.id === stayed)?.moving?.waiting).toMatch(/Pi runs on it/);

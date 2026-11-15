@@ -51,6 +51,7 @@ async function menu(route: Partial<AgentRoute>): Promise<readonly PluginButtonMe
     launchers: null,
     piLaunchers: null,
     piHomes: null,
+    claudeHomes: null,
     showComposerPill: true,
     autoSwitch: true,
     warnings: [],

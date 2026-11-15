@@ -3,8 +3,8 @@ import { copyText, Modal, TextInput, useToast } from "@getpaseo/plugin/client/re
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ActivityIndicator, Pressable, Text, View } from "react-native";
 import { formatPlan } from "../shared/format";
-import { FAMILY_LABEL, type Family, type LoginMethod, type LoginView } from "../shared/model";
-import { cancelLogin, startLogin, submitLoginCode } from "../shared/rpc";
+import { FAMILY_LABEL, type AccountView, type Family, type LoginMethod, type LoginView } from "../shared/model";
+import { cancelLogin, importAccount, startLogin, submitLoginCode } from "../shared/rpc";
 import { ApiAccountForm } from "./api-account";
 import { useInputStyle } from "./pi-accounts";
 import { describe, useStore, type ZeroSubStore } from "./store";
@@ -46,9 +46,11 @@ export function AddAccountModal({
   const askProxy = family === "claude" && !accountId;
   const [proxy, setProxy] = useState("");
   const [proxyDone, setProxyDone] = useState(!askProxy);
-  // A new Claude account is a subscription to sign in, or an API key or token; asked first.
-  const [mode, setMode] = useState<"ask" | "subscription" | "api">(askProxy ? "ask" : "subscription");
+  // A new Claude account is a subscription to sign in, an API key or token, or a folder that's
+  // signed in already; asked first.
+  const [mode, setMode] = useState<"ask" | "subscription" | "api" | "import">(askProxy ? "ask" : "subscription");
   const [apiAdded, setApiAdded] = useState<string | null>(null);
+  const [imported, setImported] = useState<string | null>(null);
   // Each start gets a number; only the newest one's answer counts.
   const attempt = useRef(0);
   /** A sign-in was started for the proxy step as it was last left. */
@@ -113,10 +115,42 @@ export function AddAccountModal({
     setProxyDone(false);
   }, [loginId, finished, store]);
 
-  const title = accountId ? "Sign in again" : mode === "api" ? "Add Claude API account" : `Add ${FAMILY_LABEL[family]} account`;
+  const title = accountId
+    ? "Sign in again"
+    : mode === "api"
+      ? "Add Claude API account"
+      : mode === "import"
+        ? "Add a signed-in folder"
+        : `Add ${FAMILY_LABEL[family]} account`;
   let body: ReactNode;
   if (mode === "ask") {
-    body = <ModeStep theme={theme} autoSwitch={state?.autoSwitch ?? true} onSubscription={() => setMode("subscription")} onApi={() => setMode("api")} onCancel={close} />;
+    body = (
+      <ModeStep
+        theme={theme}
+        autoSwitch={state?.autoSwitch ?? true}
+        onSubscription={() => setMode("subscription")}
+        onApi={() => setMode("api")}
+        onImport={() => setMode("import")}
+        onCancel={close}
+      />
+    );
+  } else if (mode === "import") {
+    const added = imported ? state?.accounts.find((entry) => entry.id === imported) : undefined;
+    body = imported ? (
+      <>
+        <Text style={text.heading}>Account added</Text>
+        <Text style={text.body}>
+          {added ? describeAccount(added) : "The account"} is ready, signed in as it was. New Claude agents
+          {multiHost ? ` on ${host.label}` : ""} can use it, and you can move an agent to it from the account button in the
+          message box.
+        </Text>
+        <Row>
+          <Button theme={theme} tone="primary" label="Done" tooltip="Close this window" tooltipAlign="end" onPress={onClose} />
+        </Row>
+      </>
+    ) : (
+      <ImportStep theme={theme} store={store} onDone={setImported} onCancel={close} />
+    );
   } else if (mode === "api") {
     const added = apiAdded ? state?.accounts.find((entry) => entry.id === apiAdded) : undefined;
     body = apiAdded ? (
@@ -173,11 +207,7 @@ export function AddAccountModal({
   } else if (login.step === "verifying") {
     body = <Waiting theme={theme} label="Checking your account…" />;
   } else if (login.step === "done") {
-    const who = account
-      ? `${account.label}${account.email && account.email !== account.label ? ` (${account.email})` : ""}${
-          account.plan ? ` · ${formatPlan(account.plan)}` : ""
-        }`
-      : "The account";
+    const who = account ? describeAccount(account) : "The account";
     body = (
       <>
         <Text style={text.heading}>You're signed in</Text>
@@ -427,11 +457,19 @@ function Step({ theme, number, title, children }: { theme: Theme; number: number
 }
 
 /** How a new Claude account connects: a subscription to sign in, or an API key or token. */
+/** "work (work@acme.com) · Max": an account as the finished steps name it. */
+function describeAccount(account: AccountView): string {
+  return `${account.label}${account.email && account.email !== account.label ? ` (${account.email})` : ""}${
+    account.plan ? ` · ${formatPlan(account.plan)}` : ""
+  }`;
+}
+
 function ModeStep({
   theme,
   autoSwitch,
   onSubscription,
   onApi,
+  onImport,
   onCancel,
 }: {
   theme: Theme;
@@ -439,6 +477,7 @@ function ModeStep({
   autoSwitch: boolean;
   onSubscription(): void;
   onApi(): void;
+  onImport(): void;
   onCancel(): void;
 }) {
   const text = useText(theme);
@@ -461,6 +500,12 @@ function ModeStep({
         detail="An Anthropic API key, or a key for another endpoint via its base URL. Billed per use; used only when you choose it."
         onPress={onApi}
       />
+      <Choice
+        theme={theme}
+        title="A folder that's signed in already"
+        detail="A Claude Code folder (its CLAUDE_CONFIG_DIR) signed in with a subscription: one you set up yourself, or one kept when you removed its account here. No sign-in; it stays where it is."
+        onPress={onImport}
+      />
       <Row>
         <Button theme={theme} label="Cancel" tooltip="Close without adding an account" tooltipAlign="end" onPress={onCancel} />
       </Row>
@@ -480,6 +525,69 @@ function Choice({ theme, title, detail, onPress }: { theme: Theme; title: string
       <Text style={text.strong}>{title}</Text>
       <Text style={text.small}>{detail}</Text>
     </Pressable>
+  );
+}
+
+/** Adds a folder Claude Code is signed in with already, where it is. */
+function ImportStep({ theme, store, onDone, onCancel }: { theme: Theme; store: ZeroSubStore; onDone(accountId: string): void; onCancel(): void }) {
+  const text = useText(theme);
+  const inputStyle = useInputStyle(theme);
+  const [path, setPath] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const add = useCallback(async () => {
+    if (!path.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await store.rpc(importAccount, { path: path.trim() });
+      await store.refresh();
+      onDone(result.accountId);
+    } catch (failure) {
+      setError(describe(failure));
+    } finally {
+      setBusy(false);
+    }
+  }, [path, store, onDone]);
+  return (
+    <View style={{ gap: 12 }}>
+      <Text style={text.strong}>Folder on this host</Text>
+      <Text style={text.muted}>
+        The folder Claude Code was started with as CLAUDE_CONFIG_DIR, written the same way: its sign-in is saved under that exact path. ZeroSub
+        checks who it's signed in as, and adds it unless that account is here already.
+      </Text>
+      <TextInput
+        value={path}
+        onChangeText={setPath}
+        maxLength={1024}
+        placeholder="~/.claude-config/claude-work"
+        placeholderTextColor={theme.colors.foregroundMuted}
+        autoCapitalize="none"
+        autoCorrect={false}
+        autoFocus
+        onSubmitEditing={() => void add()}
+        style={inputStyle}
+        accessibilityLabel="Folder to add"
+      />
+      <Text style={text.small}>
+        A full path; ~ is your home folder. Its files are kept as they are; ZeroSub only adds what it shares with your other accounts. Removing the
+        account here later only takes it out of ZeroSub again.
+      </Text>
+      {error ? <Text style={text.danger}>{error}</Text> : null}
+      <Row>
+        <Button theme={theme} label="Cancel" tooltip="Close without adding an account" tooltipAlign="end" onPress={onCancel} />
+        <Button
+          theme={theme}
+          tone="primary"
+          label="Add account"
+          tooltip="Check the folder's sign-in and add it"
+          tooltipAlign="end"
+          busy={busy}
+          disabled={!path.trim()}
+          onPress={() => void add()}
+        />
+      </Row>
+    </View>
   );
 }
 

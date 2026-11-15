@@ -804,6 +804,17 @@ export async function claudeClearTextProxy(home: string, baseUrl: string | null,
 }
 
 /**
+ * Whether `home` holds a Claude account: signed in (`oauthAccount` in its `.claude.json`, or a
+ * `.credentials.json` off macOS), or an API key of its own. A folder made again by a sync has none.
+ */
+export async function claudeHomeHoldsAccount(home: string): Promise<boolean> {
+  const config = await readJson(join(home, ".claude.json")).catch(() => undefined);
+  if (isObject(config) && isObject(config.oauthAccount)) return true;
+  if ((await lstat(join(home, ".credentials.json")).catch(() => null))?.isFile()) return true;
+  return (await readAccountApi(home).catch(() => null)) !== null;
+}
+
+/**
  * The account's API settings with the key reduced to a hint (its last four characters, or empty for
  * a short key), or null when it has no key of its own.
  */
@@ -1101,6 +1112,11 @@ const KEY_HINT_MIN_LENGTH = 12;
  * variables (see `PiAdapter.env`).
  */
 export const PI_ACCOUNT_FILE = "zerosub.json";
+
+/** Whether `home` holds a Pi account: its key, base URL and proxy are in its account file. */
+export async function piHomeHoldsAccount(home: string): Promise<boolean> {
+  return (await lstat(join(home, PI_ACCOUNT_FILE)).catch(() => null))?.isFile() === true;
+}
 
 export interface PiAccount {
   key: string | null;

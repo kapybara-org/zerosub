@@ -54,7 +54,7 @@ import { turnRows } from "./limits";
 import { canSignInWithBrowser } from "./machine";
 import { equivalentMode } from "./modes";
 import { homesDir, inHomesDir, isOwnHome, shownPath } from "./paths";
-import { chooseImportedPiHome, choosePiHomesDir, piHomesDir, placeFor } from "./placement";
+import { chooseHomesDir, chooseImportedHome, chooseImportedPiHome, homesDirFor, PLACED, placeFor, type PlacedFamily } from "./placement";
 import { maskProxy, normalizeProxy } from "./proxy";
 import { Reopener, hostCanReload } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
@@ -168,6 +168,9 @@ interface HomeMove {
 
 /** A move that gave way to something started on the home meanwhile (see `moveAccountHome`). */
 class MoveGaveWay extends Error {}
+
+/** Where the registry keeps the folder each family's added accounts' homes are kept in. */
+const HOMES_KEY = { claude: "claudeHomes", pi: "piHomes" } as const satisfies Record<PlacedFamily, keyof StoredState>;
 
 interface AgentInfo {
   id: string;
@@ -353,6 +356,8 @@ export class Service {
   private placing: Promise<void> | null = null;
   /** The move of each account's home under way now (see `moveAccountHome`). */
   private readonly moving = new Map<string, HomeMove>();
+  /** Recorded moves being finished, by account (see `finishOne`). */
+  private readonly finishing = new Map<string, Promise<void>>();
   /** Each account's last finished move, for a session routed from a registry read before it. */
   private readonly moved = new Map<string, { from: string; to: string }>();
   /** ZeroSub's own calls running on each home (see `onAccount`), which a move of it gives way to. */
@@ -512,9 +517,11 @@ export class Service {
       if (login.finishedAt && now - login.finishedAt > LOGIN_TTL_MS) this.logins.delete(id);
       else if (!login.finishedAt && now - Date.parse(login.view.startedAt) > LOGIN_TTL_MS) void this.cancelLogin(id);
     }
+    // Moves a stop cut short are finished first: the sync below would make their old folders again.
+    if (this.hasRecordedMoves(state)) await this.finishRecordedMoves();
     // Keep added Claude and Pi homes in step with main (shared entries, generated settings; a Pi home's
     // sign-ins too) even when they're only used from a terminal, which ZeroSub never sees start.
-    for (const account of state.accounts) {
+    for (const account of (await this.store.read()).accounts) {
       if ((account.family === "claude" || account.family === "pi") && account.kind === "managed" && account.home && !this.moving.has(account.id)) {
         await this.adapters[account.family]
           .prepareHome(account.home, this.stillHas(account))
@@ -868,6 +875,8 @@ export class Service {
       return undefined;
     }
     const adapter = this.adapters[family];
+    // A move a stop cut short is finished first, so no session opens on a folder that has moved.
+    if (this.hasRecordedMoves(await this.store.read())) await this.finishRecordedMoves();
     const now = Date.now();
     const interactive = request.purpose === "interactive";
     // The first session a reload of ours opens is the one it rolls back if the reload fails.
@@ -2601,13 +2610,13 @@ export class Service {
     // account without its own goes through.
     const followers = (family: Family) =>
       state.accounts.filter((other) => other.family === family && other.kind === "managed" && proxies.get(other.id)?.own === null).map((other) => other.label);
-    const piHomesNow = piHomesDir(state.piHomes);
+    const homesNow = (family: PlacedFamily) => homesDirFor(family, state[HOMES_KEY[family]]);
     const due = new Set((await this.dueMoves(state)).map((account) => account.id));
     const moving = (account: StoredAccount): AccountView["moving"] => {
       const move = state.moves[account.id];
       if (!move && !due.has(account.id)) return null;
       const note = this.moveNotes.get(account.id);
-      return { to: shownPath(move?.to ?? piHomesNow), waiting: note?.waiting ?? null, error: note?.error ?? null };
+      return { to: shownPath(move?.to ?? homesNow(account.family === "pi" ? "pi" : "claude")), waiting: note?.waiting ?? null, error: note?.error ?? null };
     };
     const accounts: AccountView[] = state.accounts.map((account) => {
       const limited = isLimited(account, now);
@@ -2655,7 +2664,8 @@ export class Service {
       warnings: await this.warnings(),
       launchers: claudeScripts.length > 0 ? launcherDir() : null,
       piLaunchers: piScripts.length > 0 ? piLauncherDir() : null,
-      piHomes: this.adapters.pi.homesInUse ? { dir: shownPath(piHomesNow), isDefault: state.piHomes.dir === null } : null,
+      claudeHomes: this.adapters.claude.homesInUse ? { dir: shownPath(homesNow("claude")), isDefault: state.claudeHomes.dir === null } : null,
+      piHomes: this.adapters.pi.homesInUse ? { dir: shownPath(homesNow("pi")), isDefault: state.piHomes.dir === null } : null,
     };
   }
 
@@ -3047,9 +3057,10 @@ export class Service {
     const affected = Object.entries(state.sessions)
       .filter(([, session]) => session.accountId === accountId)
       .map(([agentId]) => agentId);
-    // A home kept outside ZeroSub's own `homes/` (where added Pi accounts are kept) is the user's:
-    // removing its account only takes it out of ZeroSub, and its folder, key and script stay.
-    const kept = account.home !== null && account.family === "pi" && !(await isOwnHome(account.home));
+    // A home kept outside ZeroSub's own `homes/` (where added Claude and Pi accounts are kept) is the
+    // user's: removing its account only takes it out of ZeroSub, and its folder, sign-in or key and
+    // script stay.
+    const kept = account.home !== null && !(await isOwnHome(account.home));
     await this.store.update((draft) => {
       draft.accounts = draft.accounts.filter((entry) => entry.id !== accountId);
       if (account.home && !kept) draft.cleanup[account.home] = { family: account.family, accountId, why: "removed", at: new Date().toISOString() };
@@ -3075,12 +3086,15 @@ export class Service {
   // ------------------------------------------------------------------ Pi accounts
 
   /**
-   * Whether `account` is still registered, asked with its home's lock held before anything is
-   * written to it: a home whose account was removed meanwhile is never written to (or made again).
+   * Whether `account` still has the home it had, asked with its home's lock held before anything is
+   * written to it: a home whose account was removed or moved meanwhile, or that a move on record is
+   * taking it away from, is never written to (or made again, empty, beside the folder that moved).
    */
   private stillHas(account: StoredAccount): () => Promise<boolean> {
     return async () => {
-      const current = findAccount(await this.store.read(), account.id);
+      const state = await this.store.read();
+      if (state.moves[account.id]?.from === account.home) return false;
+      const current = findAccount(state, account.id);
       return current !== undefined && current.home === account.home;
     };
   }
@@ -3387,6 +3401,52 @@ export class Service {
   }
 
   /**
+   * Adds a folder Claude Code is signed in with already (with a subscription) as an account: one the
+   * user set up, or one ZeroSub kept when its account was removed. The folder stays where it is,
+   * unless it's in ZeroSub's `homes/` or a folder picked before, which it moves out of like any
+   * account's (see `placeHomes`); removing the account later only takes it out of ZeroSub, as for
+   * any folder outside `homes/`. Refused, saying why, for a folder `chooseImportedHome` turns down,
+   * one not signed in with a Claude subscription, or one signed in as an account here already.
+   * Returns the new account's ID.
+   */
+  async importAccount(input: string): Promise<string> {
+    const home = await chooseImportedHome(input, (await this.store.read()).accounts);
+    const shown = shownPath(home);
+    if ([...this.logins.values()].some((login) => login.home === home && !login.finishedAt)) throw new Error(`${shown} is being signed in right now.`);
+    const identity = await this.adapters.claude.identity(home).catch((error: unknown) => {
+      throw new Error(`ZeroSub couldn't tell whether ${shown} is signed in: ${describe(error)}`);
+    });
+    if (!identity.signedIn) {
+      throw new Error(
+        `Claude Code isn't signed in with ${shown}. Sign in there first (CLAUDE_CONFIG_DIR=${shown} claude, then /login), using the same path, or add the account with a Claude subscription sign-in instead.`,
+      );
+    }
+    if (!identity.identity) throw new Error(`${shown} uses an API key or token, not a Claude subscription. Add it with "API key or token" instead.`);
+    let account: StoredAccount | undefined;
+    await this.store.update((draft) => {
+      if (draft.accounts.some((entry) => entry.home && resolve(entry.home) === home)) throw new Error(`${shown} is already added.`);
+      // The CLI's own login counts too: an added account must be one of its own.
+      const duplicate = accountsOf(draft, "claude").find((entry) => entry.identity === identity.identity);
+      if (duplicate) throw new Error(`${identity.email ?? shown} is already added as "${duplicate.label}".`);
+      // A folder of ZeroSub's own gets its ID back: a managed account's ID matches its folder's name there.
+      const name = basename(home);
+      const id = inHomesDir(home) && /^claude-[0-9a-f]{12}$/.test(name) && !findAccount(draft, name) ? name : `claude-${randomBytes(6).toString("hex")}`;
+      account = newAccount({ id, family: "claude", kind: "managed", home });
+      draft.accounts.push(account);
+      applyIdentity(account, identity, draft);
+      // A removed account's folder that's back isn't cleaned up after all.
+      for (const folder of Object.keys(draft.cleanup)) if (resolve(folder) === home) delete draft.cleanup[folder];
+    });
+    const added = account!;
+    this.identityCheckedAt.set(added.id, Date.now());
+    console.log(`[ZeroSub] added ${home}, signed in already, as ${added.label}`);
+    await this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
+    await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
+    void this.refreshUsage(added.id, true).catch(() => undefined);
+    return added.id;
+  }
+
+  /**
    * Adds back a Pi account from its folder, which ZeroSub set up and kept when the account was
    * removed (outside `homes/`, removing one only unregisters it): its key, base URL and proxy are
    * still in its `zerosub.json`. The folder stays where it is, unless it's in `homes/` or a folder
@@ -3434,42 +3494,44 @@ export class Service {
   }
 
   /**
-   * Changes the folder added Pi accounts' homes are kept in (empty: the default, `~/.pi-config`).
-   * New accounts go there, and the accounts in the folder it replaces, or still in ZeroSub's
-   * `homes/`, move there one at a time as nothing runs on them (see `placeHomes`). Returns the
-   * folder as shown, and how many accounts are due to move.
+   * Changes the folder `family`'s added accounts' homes are kept in (empty: the default,
+   * `~/.claude-config` or `~/.pi-config`). New accounts go there, and the accounts in the folder it
+   * replaces, or still in ZeroSub's `homes/`, move there one at a time as nothing runs on them (see
+   * `placeHomes`). Returns the folder as shown, and how many accounts are due to move.
    */
-  async setPiHomesDir(input: string): Promise<{ dir: string; moving: number }> {
+  async setHomesDir(input: string, family: PlacedFamily): Promise<{ dir: string; moving: number }> {
     const state = await this.store.read();
-    const chosen = await choosePiHomesDir(input, state.accounts);
-    const previous = resolve(piHomesDir(state.piHomes));
+    const key = HOMES_KEY[family];
+    const chosen = await chooseHomesDir(input, state.accounts, family);
+    const previous = resolve(homesDirFor(family, state[key]));
     const updated = await this.store.update((draft) => {
-      const from = new Set(draft.piHomes.from.map((folder) => resolve(folder)));
+      const from = new Set(draft[key].from.map((folder) => resolve(folder)));
       from.add(previous);
-      from.delete(resolve(piHomesDir({ dir: chosen, from: [] })));
-      draft.piHomes = { dir: chosen, from: [...from] };
+      from.delete(resolve(homesDirFor(family, { dir: chosen, from: [] })));
+      draft[key] = { dir: chosen, from: [...from] };
     });
     this.moveNotes.clear();
-    const dir = piHomesDir(updated.piHomes);
-    console.log(`[ZeroSub] added Pi accounts' homes are kept in ${dir} now`);
+    const dir = homesDirFor(family, updated[key]);
+    console.log(`[ZeroSub] added ${FAMILY_LABEL[family]} accounts' homes are kept in ${dir} now`);
     void this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
-    return { dir: shownPath(dir), moving: (await this.dueMoves(updated)).length };
+    return { dir: shownPath(dir), moving: (await this.dueMoves(updated)).filter((account) => account.family === family).length };
+  }
+
+  setClaudeHomesDir(input: string): Promise<{ dir: string; moving: number }> {
+    return this.setHomesDir(input, "claude");
+  }
+
+  setPiHomesDir(input: string): Promise<{ dir: string; moving: number }> {
+    return this.setHomesDir(input, "pi");
   }
 
   /**
-   * Moves added Pi accounts' homes to the folder they're kept in (see `piHomesDir`): a new account's
-   * from ZeroSub's own `homes/`, where it was set up, and every account's from a folder picked
-   * before. Moves cut short (the plugin stopped halfway) are finished first. Each home moves only
-   * while nothing runs on it (see `moveAccountHome`); one in use waits for a later pass, and the app
-   * says why. One pass at a time; a call during one gets that one.
-   */
-
-  /**
-   * Moves added Pi accounts' homes to the folder they're kept in (see `piHomesDir`): a new account's
-   * from ZeroSub's own `homes/`, where it was set up, and every account's from a folder picked
-   * before. Moves cut short (the plugin stopped halfway) are finished first. Each home moves only
-   * while nothing runs on it (see `moveAccountHome`); one in use waits for a later pass, and the app
-   * says why. One pass at a time; a call during one gets that one.
+   * Moves added Claude and Pi accounts' homes to the folder they're kept in (see `homesDirFor`): a
+   * new account's from ZeroSub's own `homes/`, where it was set up, and every account's from a
+   * folder picked before. Moves cut short (the plugin stopped halfway) are finished first. Each home
+   * moves only while nothing runs on it (see `moveAccountHome`); one in use waits for a later pass,
+   * and the app says why. Only families whose adapter can tell what runs on a home take part. One
+   * pass at a time; a call during one gets that one.
    */
   placeHomes(): Promise<void> {
     this.placing ??= this.placePass().finally(() => {
@@ -3478,38 +3540,69 @@ export class Service {
     return this.placing;
   }
 
-  private async placePass(): Promise<void> {
-    const adapter = this.adapters.pi;
-    if (!adapter.homesInUse) return;
+  /**
+   * Finishes the moves on record that aren't under way in this process (ones a stop cut short).
+   * Runs before homes are synced or a session is routed: either would otherwise make the old folder
+   * again for a home whose registry entry still names it, or open an agent there without its sign-in.
+   */
+  private async finishRecordedMoves(): Promise<void> {
     for (const [accountId, move] of Object.entries((await this.store.read()).moves)) {
-      await this.finishMove(accountId, move).catch((error: unknown) => {
+      if (this.moving.has(accountId)) continue;
+      await this.finishOne(accountId, move).catch((error: unknown) => {
         this.moveNotes.set(accountId, { waiting: null, error: describe(error) });
         log(`could not finish moving ${move.from} to ${move.to}`, error);
       });
     }
+  }
+
+  /** Whether a move of an account's home is on record and not under way here: one a stop cut short. */
+  private hasRecordedMoves(state: StoredState): boolean {
+    return Object.keys(state.moves).some((accountId) => !this.moving.has(accountId));
+  }
+
+  /** `finishMove`, once at a time per account: the pass, routing and the move itself may all ask. */
+  private finishOne(accountId: string, move: Move): Promise<void> {
+    let finishing = this.finishing.get(accountId);
+    if (!finishing) {
+      finishing = this.finishMove(accountId, move).finally(() => this.finishing.delete(accountId));
+      this.finishing.set(accountId, finishing);
+    }
+    return finishing;
+  }
+
+  private async placePass(): Promise<void> {
+    await this.finishRecordedMoves();
     const state = await this.store.read();
     const due = await this.dueMoves(state);
     for (const accountId of this.moveNotes.keys()) {
       if (!due.some((account) => account.id === accountId) && !state.moves[accountId]) this.moveNotes.delete(accountId);
     }
     if (due.length === 0) return this.forgetEmptiedFolders(state);
-    let inUse: Set<string>;
-    try {
-      inUse = await adapter.homesInUse(due.map((account) => account.home));
-    } catch (error) {
-      for (const account of due) this.moveNotes.set(account.id, { waiting: null, error: `ZeroSub couldn't tell whether anything runs on it: ${describe(error)}` });
-      return;
+    const inUse = new Set<string>();
+    const unknown = new Set<string>();
+    for (const family of PLACED) {
+      const homes = due.filter((account) => account.family === family).map((account) => account.home);
+      if (homes.length === 0) continue;
+      try {
+        for (const home of await this.adapters[family].homesInUse!(homes)) inUse.add(home);
+      } catch (error) {
+        for (const account of due.filter((entry) => entry.family === family)) {
+          unknown.add(account.id);
+          this.moveNotes.set(account.id, { waiting: null, error: `ZeroSub couldn't tell whether anything runs on it: ${describe(error)}` });
+        }
+      }
     }
-    const dir = piHomesDir(state.piHomes);
     const taken = new Set(state.accounts.flatMap((account) => (account.home ? [resolve(account.home)] : [])));
     let moved = false;
     for (const account of due) {
+      if (unknown.has(account.id)) continue;
+      const family = account.family as PlacedFamily;
       const waiting = this.moveBlocker(account, inUse);
       if (waiting) {
         this.moveNotes.set(account.id, { waiting, error: null });
         continue;
       }
-      const to = await placeFor(account, dir, taken);
+      const to = await placeFor(account, homesDirFor(family, state[HOMES_KEY[family]]), taken);
       taken.add(resolve(to));
       try {
         if (await this.moveAccountHome(account, to)) moved = true;
@@ -3522,20 +3615,24 @@ export class Service {
   }
 
   /**
-   * Added Pi accounts whose homes are due to move: a folder of their own (a link stays where it
-   * points) in ZeroSub's `homes/` or a folder picked before, and no move of theirs under way.
+   * Added Claude and Pi accounts whose homes are due to move: a folder of their own (a link stays
+   * where it points) in ZeroSub's `homes/` or a folder picked before, and no move of theirs under way.
+   * Only families whose adapter can tell what runs on a home (the real ones; not test doubles).
    */
   private async dueMoves(state: StoredState): Promise<Array<StoredAccount & { home: string }>> {
-    if (!this.adapters.pi.homesInUse) return [];
-    const dir = resolve(piHomesDir(state.piHomes));
-    const sources = new Set([homesDir(), ...state.piHomes.from].map((folder) => resolve(folder)));
     const due: Array<StoredAccount & { home: string }> = [];
-    for (const account of accountsOf(state, "pi")) {
-      const home = account.home;
-      if (account.kind !== "managed" || !home || state.moves[account.id]) continue;
-      const folder = dirname(resolve(home));
-      if (folder === dir || !sources.has(folder)) continue;
-      if ((await lstat(home).catch(() => null))?.isDirectory()) due.push({ ...account, home });
+    for (const family of PLACED) {
+      if (!this.adapters[family].homesInUse) continue;
+      const homes = state[HOMES_KEY[family]];
+      const dir = resolve(homesDirFor(family, homes));
+      const sources = new Set([homesDir(), ...homes.from].map((folder) => resolve(folder)));
+      for (const account of accountsOf(state, family)) {
+        const home = account.home;
+        if (account.kind !== "managed" || !home || state.moves[account.id]) continue;
+        const folder = dirname(resolve(home));
+        if (folder === dir || !sources.has(folder)) continue;
+        if ((await lstat(home).catch(() => null))?.isDirectory()) due.push({ ...account, home });
+      }
     }
     return due;
   }
@@ -3543,8 +3640,9 @@ export class Service {
   /** Why an account's home can't move just now, or null when it can. */
   private moveBlocker(account: StoredAccount & { home: string }, inUse: ReadonlySet<string>): string | null {
     const { home } = account;
+    if ([...this.logins.values()].some((login) => login.home === home && (!login.finishedAt || login.saving))) return "it's being signed in";
     if (this.creatingHomes.has(home)) return "it's being set up";
-    if (inUse.has(home)) return "Pi runs on it (an agent or a terminal); it moves once that stops";
+    if (inUse.has(home)) return `${PROVIDER_NAME[account.family]} runs on it (an agent or a terminal); it moves once that stops`;
     if ((this.homeCalls.get(home) ?? 0) > 0) return "ZeroSub is working on it";
     if (Date.now() - (this.routedAt.get(account.id) ?? 0) < ROUTED_SETTLE_MS) return "an agent has just started on it";
     return null;
@@ -3555,28 +3653,33 @@ export class Service {
    * routed to the home, or a call of ZeroSub's on it, while the folder is being moved makes the move
    * give way (the folder goes back, and it's tried at a later pass), and once the move is saved
    * they're given the new folder (see `homeNow`). The move is written down first (`moves`), so one
-   * cut short is finished or undone at the next pass (see `finishMove`). Everything a Pi account has
-   * is in its folder, so the folder is all that moves. False when it had to wait after all.
+   * cut short is finished or undone at the next pass (see `finishMove`). What the CLI keeps for the
+   * home outside its folder (Claude's Keychain entry) is copied before the folder moves, and the
+   * copy goes again when the move gives way. False when it had to wait after all.
    */
   private async moveAccountHome(account: StoredAccount & { home: string }, to: string): Promise<boolean> {
+    const adapter = this.adapters[account.family];
     const from = account.home;
-    const homesInUse = (homes: readonly string[]) => this.adapters.pi.homesInUse!(homes);
+    const homesInUse = (homes: readonly string[]) => adapter.homesInUse!(homes);
     const waiting = this.moveBlocker(account, await homesInUse([from]));
     if (waiting) {
       this.moveNotes.set(account.id, { waiting, error: null });
       return false;
     }
     const startedAt = Date.now();
-    const move: Move = { from, to, at: new Date(startedAt).toISOString() };
+    const move: Move = { from, to, at: new Date(startedAt).toISOString(), family: account.family };
     const run: HomeMove = { from, to, committed: false };
     this.moving.set(account.id, run);
     try {
       await this.store.update((draft) => void (draft.moves[account.id] = move));
+      let copied = false;
       try {
+        await adapter.copyCredentials?.(from, to);
+        copied = true;
         await moveHome(from, to, async () => {
           // Checked again once the folder is there: anything that started on it meanwhile keeps it.
           const started = (await homesInUse([from])).has(from)
-            ? "Pi started on it (an agent or a terminal); it moves once that stops"
+            ? `${PROVIDER_NAME[account.family]} started on it (an agent or a terminal); it moves once that stops`
             : (this.homeCalls.get(from) ?? 0) > 0
               ? "ZeroSub is working on it"
               : (this.routedAt.get(account.id) ?? 0) >= startedAt
@@ -3596,9 +3699,13 @@ export class Service {
           }
         });
       } catch (error) {
-        // Still where it was: the record goes. Otherwise it stays, for `finishMove` to sort out.
+        // Still where it was: the copy of its sign-in goes, and so does the record. Otherwise the
+        // record stays, for `finishMove` to sort out.
         const back = (await lstat(from).catch(() => null))?.isDirectory() && !(await lstat(to).catch(() => null));
-        if (back) await this.store.update((draft) => void delete draft.moves[account.id]).catch(() => undefined);
+        if (back) {
+          if (copied) await adapter.dropCopiedCredentials?.(from, to).catch((failure: unknown) => log(`could not remove the copy of ${account.label}'s sign-in for ${to}`, failure));
+          await this.store.update((draft) => void delete draft.moves[account.id]).catch(() => undefined);
+        }
         if (!(error instanceof MoveGaveWay)) throw error;
         this.moveNotes.set(account.id, { waiting: error.message, error: null });
         return false;
@@ -3607,49 +3714,59 @@ export class Service {
     } finally {
       this.moving.delete(account.id);
     }
-    await this.finishMove(account.id, move);
+    await this.finishOne(account.id, move);
     return true;
   }
 
   /**
-   * Finishes a recorded move of an account's home. Cut short before the folder moved: the move is
-   * tried again. After the folder moved but before the account's new home was saved: it's saved now.
-   * Both folders there before it's saved: the account goes with the one that has its key
-   * (`zerosub.json`). Only the new one has it when Pi made the old folder again while the move was
-   * checking for Pi (a terminal with the old script, say), so the folder couldn't go back: the move is
-   * finished, and the old folder left alone. Otherwise, and when neither folder is there, it's left as
-   * it is for the user, and the app says so, never asking to delete the folder with the key. The old
-   * folder still there after (a copy onto another disk not cleaned up) is left alone, and logged. The
-   * account's script is rewritten for the new home before the record goes.
+   * Finishes a recorded move of an account's home. Cut short before the folder moved: the copy of
+   * its sign-in goes, and the move is tried again. After the folder moved but before the account's
+   * new home was saved: the sign-in is copied (again) and the new home saved. Both folders there
+   * before it's saved: the account goes with the one that holds its sign-in or key (see
+   * `FamilyAdapter.holdsAccount`). Only the new one does when the old folder was made again after
+   * the folder moved (by the CLI on the old script, say): the move is finished, and the old folder
+   * left alone. Otherwise, and when neither folder is there, it's left as it is for the user, and
+   * the app says so, never asking to delete the folder that holds the account. Once it's saved, the
+   * old Keychain entry goes, provided the new one holds the sign-in. The old folder still there
+   * after (a copy onto another disk not cleaned up) is left alone, and logged. The account's script
+   * is rewritten for the new home before the record goes.
    */
   private async finishMove(accountId: string, move: Move): Promise<void> {
     const forget = () => this.store.update((draft) => void delete draft.moves[accountId]);
     let account = findAccount(await this.store.read(), accountId);
+    // Records of earlier versions have no family: the account says whose home it is.
+    const family = move.family ?? account?.family;
+    const adapter = family ? this.adapters[family] : undefined;
     const folder = async (path: string) => (await lstat(path).catch(() => null))?.isDirectory() === true;
     const [atFrom, atTo] = [await folder(move.from), await folder(move.to)];
     if (account?.home === move.from) {
       if (atFrom && !atTo) {
+        await adapter?.dropCopiedCredentials?.(move.from, move.to);
         await forget();
         return;
       }
-      const keyed = async (path: string) => (await lstat(join(path, PI_ACCOUNT_FILE)).catch(() => null))?.isFile() === true;
-      const [keyFrom, keyTo] = atFrom && atTo ? [await keyed(move.from), await keyed(move.to)] : [false, false];
-      if (atFrom && atTo && keyTo && !keyFrom) {
-        console.log(`[ZeroSub] ${move.from} was made again while ${account.label} moved to ${move.to}, which has its key; finishing the move and leaving ${move.from} alone (delete it yourself)`);
+      const holds = async (path: string) => (adapter?.holdsAccount ? adapter.holdsAccount(path) : false);
+      const [holdsFrom, holdsTo] = atFrom && atTo ? [await holds(move.from), await holds(move.to)] : [false, false];
+      if (atFrom && atTo && holdsTo && !holdsFrom) {
+        console.log(`[ZeroSub] ${move.from} was made again while ${account.label} moved to ${move.to}, which holds its sign-in or key; finishing the move and leaving ${move.from} alone (delete it yourself)`);
       } else if (atFrom || !atTo) {
         throw new Error(
           !atFrom
             ? `ZeroSub stopped while moving ${shownPath(move.from)} to ${shownPath(move.to)}, and neither is there now.`
-            : keyFrom
+            : holdsFrom
               ? `ZeroSub stopped while copying ${shownPath(move.from)} to ${shownPath(move.to)} on another disk, and both are there now. The account still uses ${shownPath(move.from)}: delete ${shownPath(move.to)}, and the move starts again at ZeroSub's next check.`
-              : `Both ${shownPath(move.from)} and ${shownPath(move.to)} are there, and neither has the account's key (${PI_ACCOUNT_FILE}). Enter its key again from its card.`,
+              : `Both ${shownPath(move.from)} and ${shownPath(move.to)} are there, and neither holds ${account.label}'s sign-in or key. Sign it in again, or give it its key again, from its card.`,
         );
       }
+      await adapter?.copyCredentials?.(move.from, move.to);
       await this.store.update((draft) => {
         const target = findAccount(draft, accountId);
         if (target?.home === move.from) target.home = move.to;
       });
       account = findAccount(await this.store.read(), accountId);
+    }
+    if (account?.home === move.to && adapter?.dropOldCredentials && !(await adapter.dropOldCredentials(move.from, move.to))) {
+      console.log(`[ZeroSub] kept the sign-in saved for ${move.from}: ${move.to} has none of its own`);
     }
     // While the move is still on record, so the account's script is rewritten, not released.
     if (account?.home === move.to) await this.refreshLaunchers();
@@ -3666,9 +3783,9 @@ export class Service {
     const used = (folder: string) =>
       state.accounts.some((account) => account.home && dirname(resolve(account.home)) === resolve(folder)) ||
       Object.values(state.moves).some((move) => dirname(resolve(move.from)) === resolve(folder));
-    if (state.piHomes.from.every(used)) return;
+    if (PLACED.every((family) => state[HOMES_KEY[family]].from.every(used))) return;
     await this.store.update((draft) => {
-      draft.piHomes.from = draft.piHomes.from.filter(used);
+      for (const family of PLACED) draft[HOMES_KEY[family]].from = draft[HOMES_KEY[family]].from.filter(used);
     });
   }
 
@@ -3842,9 +3959,11 @@ export class Service {
     if (accountId) this.identityCheckedAt.set(accountId, Date.now());
     if (accountId && handedOver) this.forgetReading(accountId);
     session.accountId = accountId;
-    // A new account's script is there by the time the app says it's added.
+    // A new account's script is there by the time the app says it's added; its home then moves out
+    // of `homes/` to where accounts are kept.
     await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
     session.view = { ...session.view, step: "done", accountId, message: null };
+    void this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
     if (accountId) void this.refreshUsage(accountId, true).catch(() => undefined);
   }
 

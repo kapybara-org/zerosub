@@ -117,7 +117,7 @@ describe("adding a Claude account", () => {
     const choices = [...elements(mount(modes.type as (props: unknown) => ReactNode, modes.props)())].flatMap((element) =>
       typeof element.props.title === "string" ? [element.props.title] : [],
     );
-    expect(choices).toEqual(["Claude subscription", "API key or token"]);
+    expect(choices).toEqual(["Claude subscription", "API key or token", "A folder that's signed in already"]);
   });
 
   it("takes an API key in its own form, without starting a sign-in", () => {
@@ -132,5 +132,63 @@ describe("adding a Claude account", () => {
     (step("ModeStep").props.onSubscription as () => void)();
     expect(step("ProxyStep")).toBeTruthy();
     expect(store.rpc).not.toHaveBeenCalled();
+  });
+});
+
+describe("adding a folder that's signed in already", () => {
+  function setUp() {
+    const store = {
+      state: { accounts: [] as Partial<AccountView>[], logins: [], autoSwitch: true, browserSignIn: true },
+      rpc: vi.fn(),
+      refresh: vi.fn(async () => undefined),
+      watchClosely: () => () => undefined,
+    };
+    const draw = mount(AddAccountModal, {
+      theme,
+      layout: { platform: "web", compact: false },
+      host: { label: "This Mac" },
+      multiHost: false,
+      store,
+      family: "claude",
+      onClose: () => undefined,
+    } as never);
+    const modes = find(draw(), (element) => typeof element.type === "function" && element.type.name === "ModeStep");
+    (modes.props.onImport as () => void)();
+    const step = find(draw(), (element) => typeof element.type === "function" && element.type.name === "ImportStep");
+    const fill = mount(step.type as (props: unknown) => ReactNode, step.props);
+    const type = (text: string) => (find(fill(), (element) => element.type === "TextInput").props.onChangeText as (text: string) => void)(text);
+    const add = () => find(fill(), (element) => element.type === "Button" && element.props.label === "Add account");
+    return { store, draw, fill, type, add };
+  }
+
+  it("asks for the folder Claude Code was started with", () => {
+    const { fill, add } = setUp();
+    expect(find(fill(), (element) => element.type === "TextInput").props.placeholder).toBe("~/.claude-config/claude-work");
+    expect(textOf(fill())).toContain("CLAUDE_CONFIG_DIR");
+    expect(add().props.disabled).toBe(true);
+  });
+
+  it("adds the folder typed, then says who it's signed in as", async () => {
+    const { store, draw, type, add } = setUp();
+    type(" ~/.claude-config/claude-work ");
+    expect(add().props.disabled).toBe(false);
+    store.rpc.mockResolvedValue({ accountId: "claude-aaaaaaaaaaaa" });
+    store.state.accounts = [{ id: "claude-aaaaaaaaaaaa", label: "work", email: "work@acme.com", plan: "max" }];
+    (add().props.onPress as () => void)();
+    await vi.waitFor(() => expect(textOf(draw())).toContain("work (work@acme.com) · Max is ready, signed in as it was."));
+    expect(store.rpc).toHaveBeenCalledWith(expect.objectContaining({ name: "zerosub.accounts.import" }), { path: "~/.claude-config/claude-work" });
+    expect(store.refresh).toHaveBeenCalled();
+  });
+
+  it("says why a folder can't be added, and keeps what was typed", async () => {
+    const { store, fill, type, add } = setUp();
+    type("~/somewhere");
+    store.rpc.mockRejectedValue(
+      new Error("Request failed: Claude Code isn't signed in with ~/somewhere. requestType=plugin.rpc.invoke.request code=handler_error"),
+    );
+    (add().props.onPress as () => void)();
+    await vi.waitFor(() => expect(textOf(fill())).toContain("Claude Code isn't signed in with ~/somewhere."));
+    expect(textOf(fill())).not.toContain("requestType");
+    expect(find(fill(), (element) => element.type === "TextInput").props.value).toBe("~/somewhere");
   });
 });

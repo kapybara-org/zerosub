@@ -16,7 +16,7 @@ import {
 } from "../shared/rpc";
 import { AddAccountModal } from "./add-account";
 import { ApiAccountModal } from "./api-account";
-import { AddPiAccountModal, ApiKeyModal, PiSectionNotes, ProxyModal, ShellHint, piCardDetails } from "./pi-accounts";
+import { AddPiAccountModal, ApiKeyModal, HomesHint, PiSectionNotes, ProxyModal, ShellHint, piCardDetails } from "./pi-accounts";
 import { ResetConfirm, redeemToast, resetBadge } from "./reset-confirm";
 import { describe, stoppedWaiting, useStore, VISIBLE_POLL_MS, type ZeroSubStore } from "./store";
 import { Badge, Button, Card, IconButton, UsageBar, useText } from "./ui";
@@ -270,6 +270,7 @@ function FamilySection({
           note="Each runs claude on its account, with its settings and proxy, whatever your shell exports."
         />
       ) : null}
+      {family === "claude" && state.claudeHomes ? <HomesHint theme={theme} family="claude" homes={state.claudeHomes} store={store} /> : null}
       {!HAND_OFF[family] ? (
         <Text style={text.small}>
           A {FAMILY_LABEL[family]} conversation stays on the account it started on. New agents use the default account, or the

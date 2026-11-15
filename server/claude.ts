@@ -17,13 +17,13 @@ import {
 } from "./adapter";
 import { browserCaptureScript, providerCommand } from "./binaries";
 import { CLAUDE_RESET_PROGRAM, describeResetBlock, parseClaudeResets, readClaimReply } from "./claude-resets";
-import { claudeClearTextProxy, prepareClaudeHome, readAccountApi, readAccountProxy, writeAccountApi, writeAccountProxy, type ApiConfig } from "./homes";
+import { claudeClearTextProxy, claudeHomeHoldsAccount, prepareClaudeHome, readAccountApi, readAccountProxy, writeAccountApi, writeAccountProxy, type ApiConfig } from "./homes";
 import { readJson } from "./json-file";
 import { detectClaudeLimit, detectClaudeSignOut } from "./limits";
 import { inheritedClaudeProxy, mainProxyBlock, mainProxyEnv, mainSettingsEnv, readMainProxy, writeMainProxy } from "./main-proxy";
 import { mainClaudeGlobalConfig } from "./paths";
 import { firstUrl, run, stripAnsi } from "./process";
-import { parseTrace } from "./processes";
+import { eachProcessEnvironment, homesInEnvironment as inEnvironment, parseTrace } from "./processes";
 import { providerEnv } from "./provider-env";
 import { bypassesProxy, noProxyFromEnv, proxiedFetch, proxyFromEnv } from "./proxy";
 import { retryDelayMs } from "./usage";
@@ -308,6 +308,58 @@ export class ClaudeAdapter implements FamilyAdapter {
     });
   }
 
+  /**
+   * Which of `homes` a Claude process runs on right now (started with that `CLAUDE_CONFIG_DIR`: by
+   * Paseo, or its script in a terminal), so its home isn't moved under it (see `Service.placeHomes`).
+   */
+  async homesInUse(homes: readonly string[]): Promise<Set<string>> {
+    const found = new Set<string>();
+    if (homes.length === 0) return found;
+    await eachProcessEnvironment((line) => {
+      for (const home of homesInEnvironment(line, homes)) found.add(home);
+    });
+    return found;
+  }
+
+  holdsAccount(home: string): Promise<boolean> {
+    return claudeHomeHoldsAccount(home);
+  }
+
+  async copyCredentials(from: string, to: string): Promise<void> {
+    if (process.platform !== "darwin") return; // Elsewhere the login lives in the home itself.
+    const secret = await readKeychainEntry(from);
+    // Signed out, or copied before and the old entry already gone: nothing to carry over.
+    if (secret === null) return;
+    if (!secret.trimStart().startsWith("{") || !parseJsonObject(secret)) {
+      throw new Error(`the Keychain entry "${keychainService(from)}" isn't what Claude Code writes, so ZeroSub left it where it is`);
+    }
+    const there = await readKeychainEntry(to);
+    if (there === secret) return;
+    if (there !== null) {
+      throw new Error(
+        `the Keychain entry "${keychainService(to)}", where Claude Code looks for ${to}'s sign-in, already holds another one. Delete it if nothing uses it any more, or pick another folder.`,
+      );
+    }
+    await writeKeychainEntry(to, secret);
+    if ((await readKeychainEntry(to)) !== secret) {
+      await deleteKeychainEntry(to).catch(() => undefined);
+      throw new Error(`copying the Keychain entry "${keychainService(from)}" to "${keychainService(to)}" didn't read back the same`);
+    }
+  }
+
+  async dropCopiedCredentials(from: string, to: string): Promise<void> {
+    if (process.platform !== "darwin") return;
+    const copy = await readKeychainEntry(to);
+    if (copy !== null && copy === (await readKeychainEntry(from))) await deleteKeychainEntry(to);
+  }
+
+  async dropOldCredentials(from: string, to: string): Promise<boolean> {
+    if (process.platform !== "darwin") return true;
+    if ((await readKeychainEntry(to)) === null) return (await readKeychainEntry(from)) === null;
+    await deleteKeychainEntry(from);
+    return true;
+  }
+
   detectLimit = detectClaudeLimit;
   detectSignOut = detectClaudeSignOut;
 }
@@ -508,6 +560,50 @@ export function keychainService(home: string | null): string {
 
 /** `security`'s exit code when there's no such keychain item (errSecItemNotFound). */
 const KEYCHAIN_ITEM_NOT_FOUND = 44;
+
+function keychainFailure(result: { code: number | null; stderr: string; timedOut: boolean }): string {
+  return result.timedOut ? "timed out" : result.stderr.trim() || `exit ${result.code}`;
+}
+
+/**
+ * The home's Keychain entry exactly as Claude Code wrote it, null when there's none. Only read to
+ * move it with its home (see `copyCredentials`); never logged or stored.
+ */
+async function readKeychainEntry(home: string): Promise<string | null> {
+  const service = keychainService(home);
+  const result = await run("/usr/bin/security", ["find-generic-password", "-a", keychainAccount(), "-w", "-s", service], { timeoutMs: 10_000 });
+  if (result.code === KEYCHAIN_ITEM_NOT_FOUND) return null;
+  if (result.code !== 0) throw new Error(`couldn't read the Keychain entry "${service}" (${keychainFailure(result)})`);
+  return result.stdout.endsWith("\n") ? result.stdout.slice(0, -1) : result.stdout;
+}
+
+/** Longest command `security -i` takes on one line. */
+const SECURITY_LINE_MAX = 4_000;
+
+/**
+ * Writes the home's Keychain entry the way Claude Code does: through `security -i`'s standard
+ * input, so the secret never shows in the process list.
+ */
+async function writeKeychainEntry(home: string, secret: string): Promise<void> {
+  const service = keychainService(home);
+  const line = `add-generic-password -U -a "${keychainAccount()}" -s "${service}" -X "${Buffer.from(secret, "utf8").toString("hex")}"\n`;
+  if (line.length > SECURITY_LINE_MAX) throw new Error(`the sign-in is too long to write to the Keychain entry "${service}" without showing it in the process list`);
+  const result = await run("/usr/bin/security", ["-i"], { input: line, timeoutMs: 10_000 });
+  if (result.code !== 0) throw new Error(`couldn't write the Keychain entry "${service}" (${keychainFailure(result)})`);
+}
+
+async function deleteKeychainEntry(home: string): Promise<void> {
+  const service = keychainService(home);
+  const result = await run("/usr/bin/security", ["delete-generic-password", "-a", keychainAccount(), "-s", service], { timeoutMs: 10_000 });
+  if (result.code !== 0 && result.code !== KEYCHAIN_ITEM_NOT_FOUND) {
+    throw new Error(`couldn't remove the Keychain entry "${service}" (${keychainFailure(result)})`);
+  }
+}
+
+/** The homes in `homes` a Claude process was started with (see `processes.ts`). */
+export function homesInEnvironment(line: string, homes: readonly string[]): string[] {
+  return inEnvironment(line, homes, ["CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR"]);
+}
 
 /**
  * Whether the home's Keychain entry holds a Claude sign-in: false once it's gone or holds none, null

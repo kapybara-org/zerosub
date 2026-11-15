@@ -15,6 +15,7 @@ function view(overrides: Partial<StateView> = {}): StateView {
     launchers: null,
     piLaunchers: null,
     piHomes: null,
+    claudeHomes: null,
     showComposerPill: false,
     autoSwitch: false,
     warnings: [],
