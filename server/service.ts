@@ -14,12 +14,15 @@ import {
   OTHER_FAMILY,
   type AccountView,
   type ApiSummary,
+  ApiSummarySchema,
   type AgentRoute,
+  type ApiKeyKind,
   type Egress,
   type Family,
   type LoginMethod,
   type LoginView,
   type StateView,
+  type TrafficSwitches,
   type Usage,
 } from "../shared/model";
 import { capsAccount, limitedPick } from "../shared/format";
@@ -1492,6 +1495,7 @@ export class Service {
     this.attach(paseo);
     const account = findAccount(await this.store.read(), accountId);
     if (!account) throw new Error("That account no longer exists.");
+    if (account.auth === "api") throw new Error(`${account.label} uses an API key, which has no banked resets.`);
     if (!account.signedIn) throw new Error(`${account.label} is signed out. Sign it in first.`);
     const pending = (message: string): RedeemResult => ({ outcome: "pending", message, left: null, continued: false });
     if (this.redeeming.has(account.id)) {
@@ -1720,8 +1724,17 @@ export class Service {
       ? (await paseo.providers.listAvailable()).providers?.some((entry) => entry.provider === provider && entry.available)
       : false;
     if (!provider || !available) return { skipped: `${name} isn't available in Paseo on this host.` };
-    const account = mostAvailable(state, other, (id) => this.usage.get(id), Date.now(), new Set());
-    if (!account) return { skipped: `Every ${name} account is at its limit too.` };
+    const now = Date.now();
+    const account = mostAvailable(state, other, (id) => this.usage.get(id), now, new Set());
+    if (!account) {
+      // API accounts are billed per use, so they never take work over by themselves; say so rather than "at its limit".
+      const apiOnly = accountsOf(state, other).some((entry) => entry.auth === "api" && isUsable(entry, now));
+      return {
+        skipped: apiOnly
+          ? `The only ${name} accounts with room use an API key, which ZeroSub never moves work onto by itself. To use one, start a ${name} agent and pick it from the agent's account button.`
+          : `Every ${name} account is at its limit too.`,
+      };
+    }
 
     const original = (await paseo.agents.ref(agentId).refresh())?.agent;
     if (!original) throw new Error("That agent is no longer available.");
@@ -2580,7 +2593,7 @@ export class Service {
         agentCount: counts.get(account.id) ?? 0,
         home: account.home,
         auth: account.auth,
-        api: apis.get(account.id) ?? null,
+        api: apiView(apis.get(account.id)),
         apiEditable: account.auth === "api" || (account.kind === "main" && this.adapters[account.family].mainApi === true),
         proxy: proxy?.own ? maskProxy(proxy.own) : null,
         proxyEditable: proxy !== undefined,
@@ -3185,35 +3198,39 @@ export class Service {
    * Adds a Pi account: an Anthropic API key, optionally sent to another base URL, with an optional
    * proxy. Set up in `homes/`, then moved to where Pi accounts are kept (see `placeHomes`).
    */
-  async addApiAccount(input: { label: string; key: string; baseUrl?: string; proxy?: string }): Promise<string> {
-    const adapter = this.adapters.pi;
+  async addApiAccount(input: ApiAccountInput & { label: string; key: string; proxy?: string; family?: "claude" | "pi" }): Promise<string> {
+    // Pi's are an Anthropic API key and nothing else, so its form sends no kind; Claude's always says which.
+    const family = input.family ?? (input.keyKind ? "claude" : "pi");
+    const keyKind = input.keyKind ?? "api_key";
+    const adapter = this.adapters[family];
     if (!adapter.setApi) throw new Error("API accounts aren't supported here.");
+    if (family === "pi" && keyKind !== "api_key") throw new Error("Pi accounts use an API key (x-api-key), not an auth token.");
     const baseUrl = input.baseUrl?.trim() ? normalizeBaseUrl(input.baseUrl) : null;
     const proxy = input.proxy?.trim() ? normalizeProxy(input.proxy) : null;
     const key = input.key.trim();
-    if (!key) throw new Error("Enter the API key.");
+    if (!key) throw new Error(family === "pi" ? "Enter the API key." : "Enter the API key or token.");
     const identity = apiIdentity(baseUrl, keyDigest(key));
-    const duplicate = accountsOf(await this.store.read(), "pi").find((account) => account.identity === identity);
+    const duplicate = accountsOf(await this.store.read(), family).find((account) => account.identity === identity);
     if (duplicate) throw new Error(`That key is already added as "${duplicate.label}".`);
 
     // A managed account's ID matches its home's folder name, as its cleanup entry does.
-    const id = `pi-${randomBytes(6).toString("hex")}`;
+    const id = `${family}-${randomBytes(6).toString("hex")}`;
     const home = join(homesDir(), id);
     this.creatingHomes.add(home);
     try {
       // On the cleanup list until the account is saved, so a home left half made is cleaned up even
       // after a restart. While it's being made, cleanup leaves it alone.
       await this.store.update((draft) => {
-        draft.cleanup[home] = { family: "pi", accountId: id, why: "unfinished", at: new Date().toISOString() };
+        draft.cleanup[home] = { family, accountId: id, why: "unfinished", at: new Date().toISOString() };
       });
       if (proxy) await adapter.setProxy?.(home, proxy);
-      await adapter.setApi(home, { key, baseUrl });
+      await adapter.setApi(home, { ...trafficSwitches(input), keyKind, key, baseUrl });
       await adapter.prepareHome(home);
       await this.store.update((draft) => {
         // Checked again here too: another add of the same key may have finished meanwhile.
-        const twin = accountsOf(draft, "pi").find((entry) => entry.identity === identity);
+        const twin = accountsOf(draft, family).find((entry) => entry.identity === identity);
         if (twin) throw new Error(`That key is already added as "${twin.label}".`);
-        const account = newAccount({ id, family: "pi", kind: "managed", home, auth: "api" });
+        const account = newAccount({ id, family, kind: "managed", home, auth: "api" });
         account.label = input.label.trim();
         account.autoLabel = false;
         account.identity = identity;
@@ -3224,7 +3241,7 @@ export class Service {
       // Gone now, or left on the cleanup list for a later pass.
       const removed = await removeHome(home).then(
         () => true,
-        () => false,
+        (failure: unknown) => (log(`could not delete the half-made home ${home}; the cleanup pass tries again`, failure), false),
       );
       if (removed) await this.store.update((draft) => void delete draft.cleanup[home]).catch(() => undefined);
       throw error;
@@ -3238,8 +3255,8 @@ export class Service {
     return id;
   }
 
-  /** Changes a Pi account's key (empty keeps it) or base URL; Pi's own login's too, when asked to here. */
-  async updateApiAccount(accountId: string, input: { key?: string; baseUrl?: string }): Promise<void> {
+  /** Changes an API account's key (empty keeps it), base URL or traffic switches; Pi's own login's too, when asked to here. */
+  async updateApiAccount(accountId: string, input: ApiAccountInput & { key?: string }): Promise<void> {
     await this.onAccount(accountId, async (account) => {
       if (!account) throw new Error("That account no longer exists.");
       const adapter = this.adapters[account.family];
@@ -3247,7 +3264,7 @@ export class Service {
       const baseUrl = input.baseUrl?.trim() ? normalizeBaseUrl(input.baseUrl) : null;
       // Pi's own login keeps its key in Pi's own files, which the adapter changes in place.
       if (account.kind === "main" && adapter.mainApi && adapter.setApi) {
-        await adapter.setApi(null, { key, baseUrl });
+        await adapter.setApi(null, { ...trafficSwitches(input), keyKind: "api_key", key, baseUrl });
         await this.followMainSettings(account.family);
         return;
       }
@@ -3258,14 +3275,15 @@ export class Service {
         const duplicate = accountsOf(await this.store.read(), account.family).find((entry) => entry.id !== account.id && entry.identity === identity);
         if (duplicate) throw new Error(`That key is already added as "${duplicate.label}".`);
       }
-      await adapter.setApi(account.home, { key, baseUrl }, this.stillHas(account));
+      await adapter.setApi(account.home, { ...trafficSwitches(input), keyKind: input.keyKind ?? "api_key", key, baseUrl }, this.stillHas(account));
       await this.store.update((draft) => {
         const target = findAccount(draft, accountId);
         if (!target) return;
-        if (!identity) return;
-        target.identity = identity;
-        // A new key is worth trying again even if the old one had been refused.
-        target.signedIn = true;
+        if (identity) target.identity = identity;
+        // A new key is worth trying again even if the old one had been refused. A Pi account's key is
+        // only marked refused by Anthropic, so a new base URL alone doesn't clear that; a Claude one's
+        // refusal may be the endpoint's, so saving its settings again tries it again.
+        if (key || account.family !== "pi") target.signedIn = true;
       });
     });
     const account = findAccount(await this.store.read(), accountId);
@@ -3580,6 +3598,7 @@ export class Service {
     const state = await this.store.read();
     const existing = accountId ? findAccount(state, accountId) : undefined;
     if (accountId && (!existing || existing.family !== family)) throw new Error("That account no longer exists.");
+    if (existing?.auth === "api") throw new Error(`${existing.label} uses an API key. Change the key from its card instead.`);
     // A new account's proxy is in place before the CLI starts, so the sign-in itself goes through it.
     const proxy = !existing && proxyInput?.trim() ? normalizeProxy(proxyInput) : null;
     if (proxy && !this.adapters[family].setProxy) throw new Error(`A proxy can't be set for ${FAMILY_LABEL[family]} accounts yet.`);
@@ -3741,6 +3760,23 @@ export class Service {
 }
 
 // -------------------------------------------------------------------- helpers
+
+/** An adapter's API summary as the app shows it, the key kind and switches filled in. */
+function apiView(api: ApiSummary | null | undefined): AccountView["api"] {
+  return api ? ApiSummarySchema.parse(api) : null;
+}
+
+/** An API account's fields as the app sends them. */
+type ApiAccountInput = Partial<TrafficSwitches> & { keyKind?: ApiKeyKind; baseUrl?: string };
+
+/** The traffic switches in `input`, each off unless it's on. */
+function trafficSwitches(input: Partial<TrafficSwitches>): TrafficSwitches {
+  return {
+    disableTelemetry: input.disableTelemetry === true,
+    disableErrorReporting: input.disableErrorReporting === true,
+    disableNonessentialTraffic: input.disableNonessentialTraffic === true,
+  };
+}
 
 /** What tells an API key's account from another: where the key goes, and a short hash of the key. */
 function apiIdentity(baseUrl: string | null, digest: string): string {

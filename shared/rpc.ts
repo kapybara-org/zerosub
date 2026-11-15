@@ -1,6 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import { FamilySchema, LoginMethodSchema, LoginViewSchema, StateViewSchema } from "./model";
+import { ApiKeyKindSchema, FamilySchema, LoginMethodSchema, LoginViewSchema, StateViewSchema, TrafficSwitchesSchema } from "./model";
 
 export const getState = defineRpc({
   name: "zerosub.state",
@@ -39,27 +39,35 @@ export const renameAccount = defineRpc({
   output: z.object({ ok: z.literal(true) }),
 });
 
-/** Adds a Pi account: an Anthropic API key, with an optional base URL and proxy. */
+const ApiFieldsSchema = TrafficSwitchesSchema.extend({
+  /** Left out for a Pi account, which only takes an API key. */
+  keyKind: ApiKeyKindSchema.optional(),
+  /** Empty or omitted when editing: keep the current key. */
+  key: z.string().trim().max(4096).optional(),
+  /** Empty for Anthropic's own API. */
+  baseUrl: z.string().trim().max(2048).optional(),
+});
+
+/**
+ * Adds an account that uses an API key or token instead of a subscription: a Claude one, or a Pi one
+ * (an Anthropic API key Pi agents on it use), with an optional base URL and proxy.
+ */
 export const addApiAccount = defineRpc({
   name: "zerosub.accounts.api.add",
-  input: z.object({
+  input: ApiFieldsSchema.extend({
+    /** Left out, it's a Claude one when `keyKind` is given and a Pi one otherwise. */
+    family: z.enum(["claude", "pi"]).optional(),
     label: z.string().trim().min(1).max(40),
     key: z.string().trim().min(1).max(4096),
-    /** Empty for Anthropic's own API. */
-    baseUrl: z.string().trim().max(2048).optional(),
     proxy: z.string().trim().max(2048).optional(),
   }),
   output: z.object({ accountId: z.string() }),
 });
 
-/** Changes a Pi account's key (empty or omitted keeps it) or base URL; Pi's own login's too. */
+/** Changes an API account's key (empty or omitted keeps it), base URL or traffic switches; Pi's own login's too. */
 export const updateApiAccount = defineRpc({
   name: "zerosub.accounts.api.update",
-  input: z.object({
-    accountId: z.string(),
-    key: z.string().trim().max(4096).optional(),
-    baseUrl: z.string().trim().max(2048).optional(),
-  }),
+  input: ApiFieldsSchema.extend({ accountId: z.string() }),
   output: z.object({ ok: z.literal(true) }),
 });
 

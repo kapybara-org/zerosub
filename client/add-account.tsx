@@ -5,6 +5,7 @@ import { ActivityIndicator, Pressable, Text, View } from "react-native";
 import { formatPlan } from "../shared/format";
 import { FAMILY_LABEL, type Family, type LoginMethod, type LoginView } from "../shared/model";
 import { cancelLogin, startLogin, submitLoginCode } from "../shared/rpc";
+import { ApiAccountForm } from "./api-account";
 import { useInputStyle } from "./pi-accounts";
 import { describe, useStore, type ZeroSubStore } from "./store";
 import { Button, useText } from "./ui";
@@ -45,6 +46,9 @@ export function AddAccountModal({
   const askProxy = family === "claude" && !accountId;
   const [proxy, setProxy] = useState("");
   const [proxyDone, setProxyDone] = useState(!askProxy);
+  // A new Claude account is a subscription to sign in, or an API key or token; asked first.
+  const [mode, setMode] = useState<"ask" | "subscription" | "api">(askProxy ? "ask" : "subscription");
+  const [apiAdded, setApiAdded] = useState<string | null>(null);
   // Each start gets a number; only the newest one's answer counts.
   const attempt = useRef(0);
   /** A sign-in was started for the proxy step as it was last left. */
@@ -109,9 +113,27 @@ export function AddAccountModal({
     setProxyDone(false);
   }, [loginId, finished, store]);
 
-  const title = accountId ? "Sign in again" : `Add ${FAMILY_LABEL[family]} account`;
+  const title = accountId ? "Sign in again" : mode === "api" ? "Add Claude API account" : `Add ${FAMILY_LABEL[family]} account`;
   let body: ReactNode;
-  if (!proxyDone) {
+  if (mode === "ask") {
+    body = <ModeStep theme={theme} autoSwitch={state?.autoSwitch ?? true} onSubscription={() => setMode("subscription")} onApi={() => setMode("api")} onCancel={close} />;
+  } else if (mode === "api") {
+    const added = apiAdded ? state?.accounts.find((entry) => entry.id === apiAdded) : undefined;
+    body = apiAdded ? (
+      <>
+        <Text style={text.heading}>Account added</Text>
+        <Text style={text.body}>
+          {added?.label ?? "The account"} is ready. Make it the default, or pick it for an agent from the account button in
+          the message box; ZeroSub never moves agents onto it by itself.
+        </Text>
+        <Row>
+          <Button theme={theme} tone="primary" label="Done" tooltip="Close this window" tooltipAlign="end" onPress={onClose} />
+        </Row>
+      </>
+    ) : (
+      <ApiAccountForm theme={theme} store={store} onDone={setApiAdded} onCancel={close} />
+    );
+  } else if (!proxyDone) {
     body = <ProxyStep theme={theme} proxy={proxy} onChange={setProxy} onCancel={close} onContinue={() => setProxyDone(true)} />;
   } else if (startError) {
     body = (
@@ -401,6 +423,63 @@ function Step({ theme, number, title, children }: { theme: Theme; number: number
         {children}
       </View>
     </View>
+  );
+}
+
+/** How a new Claude account connects: a subscription to sign in, or an API key or token. */
+function ModeStep({
+  theme,
+  autoSwitch,
+  onSubscription,
+  onApi,
+  onCancel,
+}: {
+  theme: Theme;
+  /** Agents move off an account at its limit by themselves only with automatic switching on. */
+  autoSwitch: boolean;
+  onSubscription(): void;
+  onApi(): void;
+  onCancel(): void;
+}) {
+  const text = useText(theme);
+  return (
+    <View style={{ gap: 12 }}>
+      <Text style={text.strong}>How does this account connect?</Text>
+      <Choice
+        theme={theme}
+        title="Claude subscription"
+        detail={`Sign in with a Claude Pro or Max account. Usage limits are tracked${
+          autoSwitch
+            ? " and agents move between accounts automatically."
+            : "; turn on automatic switching to have agents move between accounts by themselves."
+        }`}
+        onPress={onSubscription}
+      />
+      <Choice
+        theme={theme}
+        title="API key or token"
+        detail="An Anthropic API key, or a key for another endpoint via its base URL. Billed per use; used only when you choose it."
+        onPress={onApi}
+      />
+      <Row>
+        <Button theme={theme} label="Cancel" tooltip="Close without adding an account" tooltipAlign="end" onPress={onCancel} />
+      </Row>
+    </View>
+  );
+}
+
+function Choice({ theme, title, detail, onPress }: { theme: Theme; title: string; detail: string; onPress(): void }) {
+  const text = useText(theme);
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={title}
+      onPress={onPress}
+      style={{ gap: 4, padding: 12, borderRadius: 10, borderWidth: 1, borderColor: theme.colors.border, backgroundColor: theme.colors.surface1 }}
+    >
+      <Text style={text.strong}>{title}</Text>
+      <Text style={text.small}>{detail}</Text>
+    </Pressable>
   );
 }
 

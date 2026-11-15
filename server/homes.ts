@@ -1,7 +1,7 @@
 import { cp, lstat, mkdir, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import type { ApiSummary, Family } from "../shared/model";
+import type { ApiKeyKind, ApiSummary, Family, TrafficSwitches } from "../shared/model";
 import { Mutex, readJson } from "./json-file";
 import { NO_PROXY_KEYS, PROXY_KEYS, REQUIRED_NO_PROXY, bypassesProxy, maskProxy, noProxyFromEnv, proxyFromEnv, withClaudeNoProxy, withoutClaudeDomains } from "./proxy";
 import { providerEnv } from "./provider-env";
@@ -637,6 +637,10 @@ function hooksFor(groups: readonly unknown[], group: HookGroup): unknown[] {
 
 /**
  * An account's generated settings: main's with the account's overrides on top (see `mergeSettings`).
+ * An API account (overrides holding a key) uses exactly what was entered for it: `API_ACCOUNT_ENV`
+ * goes under its own `env`, and main's `apiKeyHelper` is left out, since Claude Code would send the
+ * helper's answer along with the key or in its place. Each sync so also corrects a file generated
+ * before they were pinned.
  *
  * An account with a proxy of its own also gets `no_proxy` and `NO_PROXY`, both set to the no-proxy
  * list it would otherwise have (from `inherited`, the environment Paseo starts it with, then the
@@ -648,6 +652,12 @@ function hooksFor(groups: readonly unknown[], group: HookGroup): unknown[] {
  */
 export function accountSettings(main: Json, account: Json, inherited: Readonly<Record<string, string | undefined>> = {}): Json {
   const merged = mergeSettings(main, account);
+  if (keyKindOf(stringEnv(account))) {
+    const env: Json = { ...(isObject(main.env) ? main.env : {}), ...API_ACCOUNT_ENV, ...(isObject(account.env) ? account.env : {}) };
+    if (typeof env.ANTHROPIC_BASE_URL !== "string" || !env.ANTHROPIC_BASE_URL.trim()) env.ANTHROPIC_BASE_URL = ANTHROPIC_API;
+    merged.env = env;
+    if (!("apiKeyHelper" in account)) delete merged.apiKeyHelper;
+  }
   if (proxyFromEnv(stringEnv(account))) {
     const env: Json = isObject(merged.env) ? { ...merged.env } : {};
     const noProxy = withClaudeNoProxy(withoutClaudeDomains(noProxyFromEnv({ ...inherited, ...stringEnv({ env }) })));
@@ -729,6 +739,134 @@ export function writeAccountProxy(home: string, proxy: string | null, wanted?: (
       }
     });
   });
+}
+
+// --------------------------------------------------------------------------- API accounts
+
+const KEY_VARIABLE: Record<ApiKeyKind, string> = { api_key: "ANTHROPIC_API_KEY", auth_token: "ANTHROPIC_AUTH_TOKEN" };
+const TRAFFIC_VARIABLE: Record<keyof TrafficSwitches, string> = {
+  disableTelemetry: "DISABLE_TELEMETRY",
+  disableErrorReporting: "DISABLE_ERROR_REPORTING",
+  disableNonessentialTraffic: "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+};
+
+/** What an API account is stored with. Pi's take the key and base URL only. */
+export interface ApiConfig extends TrafficSwitches {
+  keyKind: ApiKeyKind;
+  /** `null` keeps the current key. */
+  key: string | null;
+  /** `null` for Anthropic's own API. */
+  baseUrl: string | null;
+}
+
+/** Anthropic's own API, where an API account without a base URL sends its key. */
+const ANTHROPIC_API = "https://api.anthropic.com";
+
+/**
+ * What an API account's generated `env` holds under its own values: a base URL (Anthropic's unless
+ * the account has one) and blanks for every other way Claude Code would pick up a key or token,
+ * extra request headers, or another provider (Bedrock, Vertex and the like) instead of the base
+ * URL. Claude Code applies `settings.json` `env` over the environment it was started with, so these
+ * also beat what the daemon or the shell exports.
+ */
+const API_ACCOUNT_ENV: Readonly<Record<string, string>> = {
+  ANTHROPIC_BASE_URL: ANTHROPIC_API,
+  ANTHROPIC_API_KEY: "",
+  ANTHROPIC_AUTH_TOKEN: "",
+  CLAUDE_CODE_OAUTH_TOKEN: "",
+  ANTHROPIC_CUSTOM_HEADERS: "",
+  CLAUDE_CODE_USE_BEDROCK: "",
+  CLAUDE_CODE_USE_VERTEX: "",
+  CLAUDE_CODE_USE_FOUNDRY: "",
+  CLAUDE_CODE_USE_ANTHROPIC_AWS: "",
+  CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD: "",
+  CLAUDE_CODE_USE_MANTLE: "",
+};
+
+/** Which key the account's own `env` holds, if any: what makes it an API account. */
+function keyKindOf(env: Record<string, string>): ApiKeyKind | null {
+  return env.ANTHROPIC_AUTH_TOKEN ? "auth_token" : env.ANTHROPIC_API_KEY ? "api_key" : null;
+}
+
+/**
+ * The account's API settings with the key reduced to a hint (its last four characters, or empty for
+ * a short key), or null when it has no key of its own.
+ */
+export async function readAccountApi(home: string): Promise<ApiSummary | null> {
+  const env = stringEnv(await readSettings(join(home, ACCOUNT_SETTINGS)).catch(() => null));
+  const keyKind = keyKindOf(env);
+  if (!keyKind) return null;
+  const on = (name: string) => Boolean(env[name]) && env[name] !== "0" && env[name]?.toLowerCase() !== "false";
+  const key = (env[KEY_VARIABLE[keyKind]] ?? "").trim();
+  return {
+    keyKind,
+    keyHint: key.length >= KEY_HINT_MIN_LENGTH ? key.slice(-4) : "",
+    baseUrl: env.ANTHROPIC_BASE_URL || null,
+    disableTelemetry: on(TRAFFIC_VARIABLE.disableTelemetry),
+    disableErrorReporting: on(TRAFFIC_VARIABLE.disableErrorReporting),
+    disableNonessentialTraffic: on(TRAFFIC_VARIABLE.disableNonessentialTraffic),
+  };
+}
+
+/**
+ * Stores an API account's key, base URL and traffic switches in its overrides. No base URL is
+ * stored for Anthropic's own API; the generated settings write it out (see `accountSettings`). A
+ * switch that's off is left out rather than set to 0, so it's whatever main's settings say. An
+ * `x-api-key` key is also approved in the account's `.claude.json`, the way answering Claude
+ * Code's "use this API key?" question would, so a session doesn't stop to ask about a key added
+ * here. `wanted` as for `stillWanted`.
+ */
+export function writeAccountApi(home: string, config: ApiConfig, wanted?: () => Promise<boolean>): Promise<void> {
+  return withHome(home, async () => {
+    await stillWanted(wanted);
+    await storeAccountApi(home, config);
+  });
+}
+
+async function storeAccountApi(home: string, config: ApiConfig): Promise<void> {
+  const previous = stringEnv(await readOverrides(home));
+  const replaced = previous.ANTHROPIC_AUTH_TOKEN || previous.ANTHROPIC_API_KEY || null;
+  const key = config.key?.trim() || replaced;
+  if (!key) throw new Error("Enter the API key or token");
+  const baseUrl = config.baseUrl?.trim() ? normalizeBaseUrl(config.baseUrl) : null;
+  // A kept key only goes where it went before: sending it somewhere new takes typing it again.
+  if (!config.key?.trim() && (previous.ANTHROPIC_BASE_URL || null) !== baseUrl) {
+    throw new Error("Enter the key again to use it with a different base URL");
+  }
+  if (config.keyKind === "api_key") await approveApiKey(home, key, replaced);
+  await editOverridesEnv(home, (env) => {
+    for (const name of Object.values(KEY_VARIABLE)) delete env[name];
+    env[KEY_VARIABLE[config.keyKind]] = key;
+    if (baseUrl) env.ANTHROPIC_BASE_URL = baseUrl;
+    else delete env.ANTHROPIC_BASE_URL;
+    for (const [field, name] of Object.entries(TRAFFIC_VARIABLE) as [keyof TrafficSwitches, string][]) {
+      if (config[field]) env[name] = "1";
+      else delete env[name];
+    }
+  });
+}
+
+/** Claude Code remembers an approved key by its last 20 characters. */
+function keyFingerprint(key: string): string {
+  return key.trim().slice(-20);
+}
+
+async function approveApiKey(home: string, key: string, replaced: string | null): Promise<void> {
+  const file = join(home, ".claude.json");
+  // Seed a new home first, so the account still gets the user's preferences and MCP servers.
+  if (!(await exists(file))) await syncClaudeGlobalConfig(home);
+  const approve = keyFingerprint(key);
+  const retire = replaced ? keyFingerprint(replaced) : null;
+  const done = await withClaudeConfigLock(file, async () => {
+    const value = await readJson(file);
+    const config: Json = isObject(value) ? value : {};
+    const responses: Json = isObject(config.customApiKeyResponses) ? config.customApiKeyResponses : {};
+    const list = (entry: unknown) => (Array.isArray(entry) ? entry.filter((item): item is string => typeof item === "string") : []);
+    const approved = list(responses.approved).filter((item) => item !== retire && item !== approve);
+    const rejected = list(responses.rejected).filter((item) => item !== approve);
+    await writeJsonAtomically(file, { ...config, customApiKeyResponses: { ...responses, approved: [...approved, approve], rejected } });
+  });
+  if (!done) throw new Error("Claude Code is writing this account's settings right now. Try again in a moment.");
 }
 
 /**

@@ -3,7 +3,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { readFile, rm } from "node:fs/promises";
 import { homedir, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
-import type { ExtraUsage, LoginMethod, Usage, UsageWindow } from "../shared/model";
+import type { ApiSummary, ExtraUsage, LoginMethod, Usage, UsageWindow } from "../shared/model";
 import {
   ProgressEmitter,
   spawnEnv,
@@ -17,7 +17,7 @@ import {
 } from "./adapter";
 import { browserCaptureScript, providerCommand } from "./binaries";
 import { CLAUDE_RESET_PROGRAM, describeResetBlock, parseClaudeResets, readClaimReply } from "./claude-resets";
-import { prepareClaudeHome, readAccountProxy, writeAccountProxy } from "./homes";
+import { prepareClaudeHome, readAccountApi, readAccountProxy, writeAccountApi, writeAccountProxy, type ApiConfig } from "./homes";
 import { readJson } from "./json-file";
 import { detectClaudeLimit, detectClaudeSignOut } from "./limits";
 import { inheritedClaudeProxy, mainProxyBlock, mainProxyEnv, mainSettingsEnv, readMainProxy, writeMainProxy } from "./main-proxy";
@@ -103,6 +103,15 @@ export class ClaudeAdapter implements FamilyAdapter {
 
   egress(home: string | null): Promise<{ ip: string; country: string | null } | null> {
     return claudeEgress(home);
+  }
+
+  api(home: string | null): Promise<ApiSummary | null> {
+    return home ? readAccountApi(home) : Promise.resolve(null);
+  }
+
+  setApi(home: string | null, config: ApiConfig, wanted?: () => Promise<boolean>): Promise<void> {
+    if (!home) return Promise.reject(new Error("Your Claude CLI login's key isn't set here."));
+    return writeAccountApi(home, config, wanted);
   }
 
   async identity(home: string | null): Promise<Identity> {
