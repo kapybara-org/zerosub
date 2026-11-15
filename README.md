@@ -12,6 +12,7 @@ Use several Claude, ChatGPT (Codex) and Grok subscriptions side by side in [Pase
 - **Several hosts.** Each Paseo host keeps its own accounts, and the Accounts screen says which host you're looking at.
 - **Fork to the other provider (optional).** When every Claude account is out, a stopped chat can carry on in a new ChatGPT agent, and the other way round.
 - **Grok accounts.** Sign in several Grok (SuperGrok, X Premium+) accounts for Paseo's Grok agents and pick the one each new agent starts on. See [Grok accounts](#grok-accounts).
+- **Azure OpenAI accounts (this fork).** Add an Azure OpenAI API key under ChatGPT (Codex); Codex agents use it only when every ChatGPT subscription is at its limit, or when you pick it. See [Azure OpenAI accounts (fork)](#azure-openai-accounts-fork).
 - **Pi accounts.** Add Anthropic API keys for Paseo's Pi agents, each with an optional base URL and its own proxy, and pick one per Pi agent. See [Pi accounts](#pi-accounts).
 - **Everything else stays the same.** Every account shares your settings, skills, plugins, MCP servers, `CLAUDE.md`/`AGENTS.md` and conversation history.
 
@@ -107,6 +108,54 @@ ZeroSub tries these in order, and a timeline note says which one happened:
    - The original agent stays as it was, and prompting it again while its provider is still out points to the same fork rather than starting another.
    - With the option off, a stopped agent's account button offers **Continue on ChatGPT (new agent)…** (or Claude) instead, with a confirmation.
 3. **Stop and say so**, with the time the account frees up.
+
+## Azure OpenAI accounts (fork)
+
+This fork adds Azure OpenAI as a kind of ChatGPT (Codex) account: a Codex agent can run on an Azure OpenAI resource with its API key, managed by ZeroSub like any other account, and used as a paid last resort once every ChatGPT subscription is at its limit.
+
+**Set it up.** Under ChatGPT (Codex), click **Add account → Azure OpenAI (API key)** and enter:
+
+- **Name**, as for any account.
+- **Endpoint**: your resource's v1 API, `https://<resource>.openai.azure.com/openai/v1`. It must be `https://`; a trailing slash is dropped, and a bare resource URL (or one ending in `/openai`) gets `/openai/v1` added.
+- **API key**: Key 1 or Key 2 of the resource.
+
+There's no sign-in. ZeroSub checks the key by listing the endpoint's models (`GET {endpoint}/models` with an `api-key` header) from the daemon: a refused key (HTTP 401/403) isn't saved; if the endpoint can't be reached, or answers otherwise, the account is saved anyway and a warning says so. The key button on its card changes the endpoint, the key (empty keeps it; a new endpoint needs the key typed again) and the price table. Removing the account deletes its home, key included, and its token counts. Like any ChatGPT account, it can't be removed while ChatGPT conversations still run on it.
+
+**Models.** Your Azure deployments must be named after the models (`gpt-5.1-codex`, say): the model Paseo picks for the agent is sent as the deployment name, unchanged.
+
+**Routing: last resort, or by hand.**
+
+- Automatic choices (failover at a limit, **Spread new agents across accounts**, a default that's out, the account with the most room) only use an Azure account when every other ChatGPT account is at its limit, disabled or signed out. A ChatGPT agent that hits its limit mid-turn then carries on in its continuation tab on Azure, as it would on another ChatGPT account, and its timeline says it moved to Azure OpenAI, a paid API, because every ChatGPT account is at its limit.
+- You can still pick it for an agent (the account button, `/account <name>`, the next-new-agent pick), or make it the default; then new agents start on it.
+- Once a subscription account has room again, new agents go back to it. Agents already on Azure stay there, like any ChatGPT conversation.
+- Azure has no 5-hour or weekly limits, so it counts as available unless Azure turns a turn down. A rate limit (HTTP 429) sets it aside for a minute, or for as long as Azure's "retry after" says (10 minutes at most); an exhausted quota (`insufficient_quota`) for 30 minutes. A refused key (401/403) marks it signed out until you fix the key. The usual safety stop still applies: an agent changes accounts at most 4 times in 10 minutes.
+- **Fork to the other provider** treats it as a ChatGPT account: a Claude chat forked to ChatGPT lands on Azure only when every ChatGPT subscription is out too.
+
+**Where the key is.** Only in the account's home, `$PASEO_HOME/zerosub/homes/codex-<id>/azure.json` (with the endpoint and prices), readable only by you (mode 600, in a folder only you can open). The registry keeps a short hash of it, to spot the same key added twice; the app only ever gets its last four characters; ZeroSub never logs it.
+
+**How it runs.** The home is a Codex home like any added account's: sessions, `AGENTS.md`, skills and the rest are links to `~/.codex`, and there's no `auth.json`. Its `config.toml` is its own: a copy of `~/.codex/config.toml` with `model_provider = "zerosub_azure"` put first (a top-level `model_provider` there is taken out) and this table added at the end:
+
+```toml
+[model_providers.zerosub_azure]
+name = "Azure OpenAI"
+base_url = "https://<resource>.openai.azure.com/openai/v1"
+env_key = "ZEROSUB_AZURE_OPENAI_API_KEY"
+wire_api = "responses"
+```
+
+It's remade whenever `~/.codex/config.toml` has changed, checked each time a session opens on the account. When Paseo opens a session on the account, ZeroSub's `agent.session_open` hook sets `CODEX_HOME` to the home and `ZEROSUB_AZURE_OPENAI_API_KEY` to the key, read from `azure.json` right then; Codex sends it as `Authorization: Bearer`, which Azure's v1 API accepts.
+
+**Usage.** In place of usage bars, the card shows the tokens used this calendar month (UTC): input (with how much of it was cached) and output, and an estimated cost. At the end of each turn on the account, ZeroSub reads the agent's Codex session file (`~/.codex/sessions/…/rollout-…-<thread>.jsonl`) and adds what the thread used since it was last counted; totals are kept by model in `$PASEO_HOME/zerosub/azure-usage.json` and start again each month. The cost comes from the price table in the account's settings (USD per million input, cached input and output tokens, per model; cached input without a price counts at the input price). With no prices it says "cost unknown". It's an estimate from Codex's own counts, not Azure's bill.
+
+**Limitations.**
+
+- A `profile` in `~/.codex/config.toml` that sets its own `model_provider` still wins over the Azure provider, as it would in Codex. An inline `model_providers = { … }` table isn't changed. What Codex itself writes to `config.toml` while running on the account (a project's trust level, say) goes to the generated copy and is lost when it's remade: set it in `~/.codex/config.toml`.
+- The key reaches Codex through the session's environment, which Paseo starts the agent with; anything that can read that process's environment can read it.
+- Token counts need the Codex session file: a turn whose file isn't found (a thread whose file is more than 120 days of folders back, or a Codex that keeps sessions elsewhere) is counted as "couldn't be counted", and the card says the totals are short. Turns run on the account from a terminal aren't seen.
+- ChatGPT conversations can't change accounts, so a task that moved to Azure keeps its Azure tab; the next limit-free ChatGPT account takes new agents, not that tab.
+- Tested with unit tests and type checks only, not yet against a live Azure resource and Paseo daemon.
+
+Install this fork on a Paseo host with `paseo plugin install github:haar09/zerosub --ref azure-account` (remove the upstream `zerosub` plugin first if it's installed: both use the id `zerosub`).
 
 ## Pi accounts
 
