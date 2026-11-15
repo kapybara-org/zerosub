@@ -366,3 +366,54 @@ describe("a Grok conversation stays on its account", () => {
     expect(adapter.detectSignOut()).toBeNull();
   });
 });
+
+describe("a Grok sign-in set in the daemon's environment", () => {
+  // `afterEach` puts back every variable in `KEYS`, so each test leaves process.env as it found it.
+  const warned = expect.arrayContaining([expect.stringContaining("GROK_AUTH_PROVIDER_COMMAND")]);
+  const grokRuns = { ...missingGrok(), available: async () => ({ ok: true, detail: null }) };
+
+  async function warningsWith(env: Record<string, string>, accounts: StoredAccount[]): Promise<string[]> {
+    Object.assign(process.env, env);
+    const { service } = await grokService(accounts, grokRuns);
+    const { warnings } = await service.view(paseoWith(false) as never);
+    await service.stop();
+    await rm(join(root, "paseo"), { recursive: true, force: true });
+    return warnings;
+  }
+
+  it("is warned about once Grok is there: an external auth provider", async () => {
+    const warnings = await warningsWith({ GROK_AUTH_PROVIDER_COMMAND: "/usr/local/bin/company-auth" }, [grokAccount("grok-main", "main")]);
+    expect(warnings).toEqual(warned);
+  });
+
+  it("is warned about once Grok is there: customer SSO, issuer and client both set", async () => {
+    const env = { GROK_OIDC_ISSUER: "https://id.example", GROK_OIDC_CLIENT_ID: "client" };
+    expect(await warningsWith(env, [grokAccount("grok-a", "managed")])).toEqual(warned);
+  });
+
+  it("isn't warned about for half an SSO setup, until the other half is set", async () => {
+    const account = [grokAccount("grok-main", "main")];
+    expect(await warningsWith({ GROK_OIDC_ISSUER: "https://id.example" }, account)).not.toEqual(warned);
+    expect(await warningsWith({ GROK_OIDC_CLIENT_ID: "client" }, account)).toEqual(warned);
+    delete process.env.GROK_OIDC_ISSUER;
+    expect(await warningsWith({}, account)).not.toEqual(warned);
+  });
+
+  it("isn't warned about for empty values, until one is filled in", async () => {
+    const account = [grokAccount("grok-main", "main")];
+    const empty = { GROK_AUTH_PROVIDER_COMMAND: "", GROK_OIDC_ISSUER: "", GROK_OIDC_CLIENT_ID: "" };
+    expect(await warningsWith(empty, account)).not.toEqual(warned);
+    expect(await warningsWith({ GROK_AUTH_PROVIDER_COMMAND: "/usr/local/bin/company-auth" }, account)).toEqual(warned);
+  });
+
+  it("isn't warned about where Grok isn't there, until a Grok account is", async () => {
+    const env = { GROK_AUTH_PROVIDER_COMMAND: "/usr/local/bin/company-auth", GROK_OIDC_ISSUER: "https://id.example", GROK_OIDC_CLIENT_ID: "client" };
+    // Grok not installed, so no CLI login is registered either.
+    Object.assign(process.env, env);
+    const { service } = await grokService([], missingGrok());
+    expect((await service.view(paseoWith(false) as never)).warnings).not.toEqual(warned);
+    await service.stop();
+    await rm(join(root, "paseo"), { recursive: true, force: true });
+    expect(await warningsWith(env, [grokAccount("grok-a", "managed")])).toEqual(warned);
+  });
+});

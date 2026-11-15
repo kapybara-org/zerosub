@@ -2441,6 +2441,13 @@ export class Service {
     if (process.env.CODEX_ACCESS_TOKEN) {
       warnings.push("The daemon's environment sets CODEX_ACCESS_TOKEN. Codex agents on your CLI login use it instead of a ChatGPT sign-in.");
     }
+    // Only once Grok is on the Accounts screen (its CLI login registered or an account of it added), like `shownFamilies`.
+    const grokSignIn = process.env.GROK_AUTH_PROVIDER_COMMAND || (process.env.GROK_OIDC_ISSUER && process.env.GROK_OIDC_CLIENT_ID);
+    if (grokSignIn && state.accounts.some((account) => account.family === "grok")) {
+      warnings.push(
+        "The daemon's environment sets a Grok sign-in (GROK_AUTH_PROVIDER_COMMAND, or GROK_OIDC_ISSUER and GROK_OIDC_CLIENT_ID). Grok agents on your CLI login use it; added Grok accounts don't, so one that can only sign in that way may fail to sign in or stay signed in.",
+      );
+    }
     if (!(await this.canReopen(this.paseo))) {
       warnings.push(
         "Paseo's command-line tool wasn't found, so running agents change accounts the next time their session starts instead of right away.",
