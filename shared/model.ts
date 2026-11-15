@@ -122,10 +122,66 @@ export type AccountKind = z.infer<typeof AccountKindSchema>;
 export const AuthKindSchema = z.enum([
   /** Signed in with a Claude or ChatGPT subscription (or, for Pi's own login, whatever Pi is signed in to). */
   "subscription",
-  /** An added Pi account: an Anthropic API key, billed per use, so never picked automatically. */
+  /**
+   * An API key, billed per use: an added Pi account (an Anthropic key, never picked automatically), or
+   * an Azure OpenAI account under ChatGPT (Codex), only picked automatically as a last resort.
+   */
   "api",
 ]);
 export type AuthKind = z.infer<typeof AuthKindSchema>;
+
+/** An Azure OpenAI account: the only kind of API-key account the ChatGPT (Codex) family has. */
+export function isAzureAccount(account: { family: Family; auth?: AuthKind }): boolean {
+  return account.family === "codex" && account.auth === "api";
+}
+
+/** Month key (`YYYY-MM`, UTC) Azure token totals are kept under. */
+export function usageMonth(at: number | Date = Date.now()): string {
+  return new Date(at).toISOString().slice(0, 7);
+}
+
+/**
+ * The estimated cost of `month` at `prices` (USD per million tokens, by model). `complete` is false
+ * when a model that used tokens has no price, or a price it needs is empty; `usd` then counts only
+ * what has a price, and is null when nothing does.
+ */
+export function estimateAzureCost(month: AzureMonth | null, prices: Readonly<Record<string, AzurePrice>>): { usd: number | null; complete: boolean } {
+  if (!month) return { usd: null, complete: true };
+  let usd = 0;
+  let priced = false;
+  let complete = true;
+  for (const [model, count] of Object.entries(month.models)) {
+    const price = prices[model];
+    const uncached = Math.max(0, count.input - count.cachedInput);
+    const parts: Array<[number, number | null | undefined]> = [
+      [uncached, price?.input],
+      // Cached input without a price of its own is billed as input.
+      [count.cachedInput, price?.cachedInput ?? price?.input],
+      [count.output, price?.output],
+    ];
+    for (const [tokens, perMillion] of parts) {
+      if (tokens === 0) continue;
+      if (perMillion == null) {
+        complete = false;
+        continue;
+      }
+      usd += (tokens / 1_000_000) * perMillion;
+      priced = true;
+    }
+  }
+  return { usd: priced ? usd : null, complete };
+}
+
+/** A month's tokens over every model. */
+export function totalTokens(month: AzureMonth | null): TokenCount {
+  const total = { input: 0, cachedInput: 0, output: 0 };
+  for (const count of Object.values(month?.models ?? {})) {
+    total.input += count.input;
+    total.cachedInput += count.cachedInput;
+    total.output += count.output;
+  }
+  return total;
+}
 
 /** An API key's settings as shown in the app; the key itself never leaves the host. */
 export const ApiSummarySchema = z.object({
@@ -135,6 +191,47 @@ export const ApiSummarySchema = z.object({
   baseUrl: z.string().nullable(),
 });
 export type ApiSummary = z.infer<typeof ApiSummarySchema>;
+
+/** USD per million tokens for one model on an Azure OpenAI account; null where the user left it empty. */
+export const AzurePriceSchema = z.object({
+  input: z.number().nonnegative().nullable().default(null),
+  cachedInput: z.number().nonnegative().nullable().default(null),
+  output: z.number().nonnegative().nullable().default(null),
+});
+export type AzurePrice = z.infer<typeof AzurePriceSchema>;
+
+/** Tokens one model used. `input` includes `cachedInput`, as OpenAI and Codex count them. */
+export const TokenCountSchema = z.object({
+  input: z.number().nonnegative().default(0),
+  cachedInput: z.number().nonnegative().default(0),
+  output: z.number().nonnegative().default(0),
+});
+export type TokenCount = z.infer<typeof TokenCountSchema>;
+
+/** An Azure OpenAI account's tokens this calendar month (UTC), as Codex counted them, by model. */
+export const AzureMonthSchema = z.object({
+  /** `YYYY-MM`, UTC. */
+  month: z.string(),
+  models: z.record(z.string(), TokenCountSchema).default({}),
+  /** Turns that ended on the account whose tokens couldn't be read (no Codex session file found). */
+  uncounted: z.number().nonnegative().default(0),
+  updatedAt: z.string().nullable().default(null),
+});
+export type AzureMonth = z.infer<typeof AzureMonthSchema>;
+
+/** An Azure OpenAI account (a ChatGPT/Codex account on an API key) as the app sees it. The key never leaves the host. */
+export const AzureSummarySchema = z.object({
+  /** The endpoint's base URL, e.g. `https://<resource>.openai.azure.com/openai/v1`. */
+  endpoint: z.string(),
+  host: z.string(),
+  /** The key's last four characters, or empty for a key too short to show any of it. */
+  keyHint: z.string(),
+  /** USD per million tokens, by model (deployment name). */
+  prices: z.record(z.string(), AzurePriceSchema).default({}),
+  /** This month's tokens; null before the first counted turn. */
+  usage: AzureMonthSchema.nullable().default(null),
+});
+export type AzureSummary = z.infer<typeof AzureSummarySchema>;
 
 /** The address an account's requests come from, as the provider's edge sees it. */
 export const EgressSchema = z.object({
@@ -198,6 +295,8 @@ export const AccountViewSchema = z.object({
    * account only takes it out of ZeroSub, and its folder, key and script stay.
    */
   externalHome: z.boolean().default(false),
+  /** Set for an Azure OpenAI account (a ChatGPT/Codex account on an API key, used last); null for any other. */
+  azure: AzureSummarySchema.nullable().default(null),
   /** The account's home is due to move to `to`, and hasn't yet: what it waits for, or what went wrong. */
   moving: z.object({ to: z.string(), waiting: z.string().nullable(), error: z.string().nullable() }).nullable().default(null),
 });

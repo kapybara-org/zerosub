@@ -1,6 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import { FamilySchema, LoginMethodSchema, LoginViewSchema, StateViewSchema } from "./model";
+import { AzurePriceSchema, FamilySchema, LoginMethodSchema, LoginViewSchema, StateViewSchema } from "./model";
 
 export const getState = defineRpc({
   name: "zerosub.state",
@@ -61,6 +61,33 @@ export const updateApiAccount = defineRpc({
     baseUrl: z.string().trim().max(2048).optional(),
   }),
   output: z.object({ ok: z.literal(true) }),
+});
+
+/**
+ * Adds an Azure OpenAI account under ChatGPT (Codex): an endpoint and an API key. The key is checked
+ * against the endpoint first; a refused one isn't saved, and `warning` says when it couldn't be checked.
+ */
+export const addAzureAccount = defineRpc({
+  name: "zerosub.accounts.azure.add",
+  input: z.object({
+    label: z.string().trim().min(1).max(40),
+    /** `https://<resource>.openai.azure.com/openai/v1`; a bare resource URL gets `/openai/v1`. */
+    endpoint: z.string().trim().min(1).max(2048),
+    key: z.string().trim().min(1).max(4096),
+  }),
+  output: z.object({ accountId: z.string(), warning: z.string().nullable() }),
+});
+
+/** Changes an Azure OpenAI account's endpoint, key (empty or omitted keeps it) or price table (USD per million tokens, by model). */
+export const updateAzureAccount = defineRpc({
+  name: "zerosub.accounts.azure.update",
+  input: z.object({
+    accountId: z.string(),
+    endpoint: z.string().trim().max(2048).optional(),
+    key: z.string().trim().max(4096).optional(),
+    prices: z.record(z.string().trim().max(200), AzurePriceSchema).optional(),
+  }),
+  output: z.object({ ok: z.literal(true), warning: z.string().nullable() }),
 });
 
 /** Sets a Claude or Pi account's proxy (their CLI logins' included); an empty value clears it. */

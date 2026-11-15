@@ -32,6 +32,7 @@ function account(status: AccountView["status"], nextAgentUntil: string | null): 
     egress: null,
     externalHome: false,
     moving: null,
+    azure: null,
   };
 }
 

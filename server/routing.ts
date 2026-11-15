@@ -1,5 +1,5 @@
 import { accountPeak } from "../shared/format";
-import type { Family, Usage, UsageWindow } from "../shared/model";
+import { isAzureAccount, type Family, type Usage, type UsageWindow } from "../shared/model";
 import { FIVE_HOUR_MINUTES, WEEK_MINUTES } from "./codex";
 import {
   accountsOf,
@@ -42,6 +42,15 @@ export function isUsable(account: StoredAccount, now: number): boolean {
  */
 export function canStandIn(account: StoredAccount, now: number): boolean {
   return account.family !== "pi" && account.auth !== "api" && isUsable(account, now);
+}
+
+/**
+ * An Azure OpenAI account: billed per token, so routing only puts agents on it by itself as a last
+ * resort, when no subscription account of the family can stand in (see `mostAvailable`). It can always
+ * be picked by hand, or made the default.
+ */
+export function isLastResort(account: StoredAccount): boolean {
+  return isAzureAccount(account);
 }
 
 /**
@@ -89,9 +98,11 @@ export function mostAvailable(
   exclude: ReadonlySet<string> = new Set(),
 ): StoredAccount | undefined {
   const preferred = defaultAccount(state, family)?.id;
-  const candidates = accountsOf(state, family).filter(
-    (account) => !exclude.has(account.id) && canStandIn(account, now),
-  );
+  const open = accountsOf(state, family).filter((account) => !exclude.has(account.id));
+  const subscriptions = open.filter((account) => canStandIn(account, now));
+  // Only once every subscription account is out (at its limit, signed out, disabled) does routing
+  // put work on a paid Azure account by itself.
+  const candidates = subscriptions.length > 0 ? subscriptions : open.filter((account) => isLastResort(account) && isUsable(account, now));
   const rank = (account: StoredAccount) => {
     const usage = usageOf(account.id);
     const score = headroomScore(usage, now);
@@ -117,7 +128,8 @@ export function mostAvailable(
 
 /** Prefer a weekly reset within a day only when every usable account has fresh, complete usage. */
 function soonestWeeklyReset(state: StoredState, family: Family, usageOf: RouteInput["usageOf"], now: number): StoredAccount | undefined {
-  const candidates = accountsOf(state, family).filter((account) => isUsable(account, now));
+  // A paid Azure account has no plan windows, and is never preferred for a reset coming up.
+  const candidates = accountsOf(state, family).filter((account) => isUsable(account, now) && !isLastResort(account));
   const readings = candidates.map((account) => ({ account, usage: usageOf(account.id) }));
   const complete = readings.every(({ usage }) => {
     if (!usage || usage.error || usage.cached) return false;
@@ -228,8 +240,11 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   const mayMove = fresh || input.portable;
   if (why && mayMove && (input.autoSwitch || why !== "limited")) {
     const staying = findAccount(state, input.current);
+    // A paid Azure stand-in is only kept while no subscription account could take over from it.
+    const keepsStaying = (stand: StoredAccount) =>
+      !isLastResort(stand) || !accountsOf(state, input.family).some((other) => other.id !== account!.id && canStandIn(other, input.now));
     const alternative =
-      staying && staying.family === input.family && staying.id !== account.id && isUsable(staying, input.now)
+      staying && staying.family === input.family && staying.id !== account.id && isUsable(staying, input.now) && keepsStaying(staying)
         ? staying
         : mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]));
     if (alternative) {

@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { lstat, readdir } from "node:fs/promises";
+import { lstat, readdir, readFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import type {
   PluginHookContext,
@@ -21,6 +21,9 @@ import {
   type LoginView,
   type StateView,
   type Usage,
+  isAzureAccount,
+  type AzurePrice,
+  type AzureSummary,
 } from "../shared/model";
 import { capsAccount, limitedPick } from "../shared/format";
 import { DEFAULT_CONTINUE_PROMPT, type Preferences } from "../shared/preferences";
@@ -46,7 +49,21 @@ import { CONTINUED_FROM_LABEL, continueInNewAgent, type Continuation } from "./h
 import { PI_ACCOUNT_FILE, crossesInheritedProxy, isAccountHome, moveHome, normalizeBaseUrl, plainHttp, readPiAccount, readPiAccountForAgents, removeHome } from "./homes";
 import { launcherNames, piLauncherDir, writeLaunchers, type LauncherAccount } from "./launchers";
 import { Mutex } from "./json-file";
-import { turnRows } from "./limits";
+import { detectAzureLimit, detectAzureSignOut, turnRows } from "./limits";
+import {
+  AzureUsageStore,
+  type AzureUsageFile,
+  azureIdentity,
+  azureSummary,
+  checkAzureKey,
+  currentMonth,
+  findRollout,
+  isAzureHome,
+  normalizeAzureEndpoint,
+  parseRollout,
+  readAzureAccount,
+  writeAzureAccount,
+} from "./azure";
 import { canSignInWithBrowser } from "./machine";
 import { equivalentMode } from "./modes";
 import { homesDir, inHomesDir, isOwnHome, shownPath } from "./paths";
@@ -55,7 +72,7 @@ import { maskProxy, normalizeProxy } from "./proxy";
 import { Reopener, hostCanReload } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
-import { chooseAccount, isLimited, isUsable, mostAvailable, type RouteDecision, type RouteInput } from "./routing";
+import { chooseAccount, isLastResort, isLimited, isUsable, mostAvailable, type RouteDecision, type RouteInput } from "./routing";
 import {
   MAIN_ACCOUNT_ID,
   StateStore,
@@ -378,6 +395,7 @@ export class Service {
     private readonly store = new StateStore(),
     private readonly families = new FamilyResolver(),
     private readonly reopener = new Reopener(),
+    private readonly azureUsage = new AzureUsageStore(),
   ) {
     this.adapters = Object.fromEntries(FAMILIES.map((family) => [family, adapters[family] ?? missingAdapter(family)])) as Record<Family, FamilyAdapter>;
     this.continuations = new CodexContinuations(store);
@@ -658,7 +676,8 @@ export class Service {
     // sign-in that has since become an account the registry no longer knows.
     // A Pi account is saved, and its entry dropped, in one write (see `addApiAccount`): an entry left
     // means it never became an account, so its home goes, key and all.
-    const earlier = entry.why === "unfinished" && entry.family !== "pi" && !this.endedHere(home);
+    // So is an Azure OpenAI account's (its home holds azure.json): nothing in it is signed in.
+    const earlier = entry.why === "unfinished" && entry.family !== "pi" && !isAzureHome(home) && !this.endedHere(home);
     let deleteFolder = true;
     let outcome: string;
     try {
@@ -914,16 +933,21 @@ export class Service {
     const agentId = event.agent.id;
     // The account the turn ran on, read before anything that takes a while: the agent may be moved
     // meanwhile, and the limit is still this account's.
-    const accountId = this.runningOn(await this.store.read(), agentId, family) ?? null;
+    const ranOn = await this.store.read();
+    const accountId = this.runningOn(ranOn, agentId, family) ?? null;
     if (accountId) this.activeAt.set(accountId, Date.now());
+    // An Azure OpenAI account fails on the API's errors, not the ChatGPT plan's notices.
+    const ranAccount = findAccount(ranOn, accountId);
+    const azure = ranAccount !== undefined && isAzureAccount(ranAccount);
+    if (azure && accountId) void this.countAzureTurn(context.paseo, agentId, accountId).catch((error: unknown) => log(`could not count the tokens of ${agentId}'s turn`, error));
     if (event.outcome.kind !== "canceled") {
       const turn = await this.turnWithTimeline(context.paseo, event);
       // A hand-off quotes the whole conversation, not just this turn. Paseo 0.13 sends none, so the hand-off pages it.
       const conversation = event.timeline.length > 0 ? event.timeline : undefined;
-      const hit = adapter.detectLimit(turn);
+      const hit = azure ? detectAzureLimit(turn) : adapter.detectLimit(turn);
       const problem: Problem | null = hit
         ? { kind: "limit", hit }
-        : adapter.detectSignOut(turn) && (await this.confirmSignedOut(accountId))
+        : (azure ? detectAzureSignOut(turn) : adapter.detectSignOut(turn)) && (await this.confirmSignedOut(accountId))
           ? { kind: "signed_out" }
           : null;
       if (problem) {
@@ -1253,6 +1277,7 @@ export class Service {
             continued: true,
             continuedIn: result.fork,
             outcome: "continued",
+            detail: isLastResort(result.account) ? azureFallbackNote(result.account.label) : null,
           });
           return;
         }
@@ -1297,10 +1322,12 @@ export class Service {
       });
       return;
     }
+    const paid = isLastResort(next);
     const why =
-      reason === "limit"
+      (reason === "limit"
         ? `its ChatGPT account (${account.label}) reached its usage limit`
-        : `its ChatGPT account (${account.label}) was signed out`;
+        : `its ChatGPT account (${account.label}) was signed out`) +
+      (paid ? ` and every other ChatGPT account is at its limit too, so it moved to Azure OpenAI (${next.label}, a paid API billed per token)` : "");
     try {
       const continuation = await this.continueElsewhere(paseo, agentId, next, why, timeline, "auto");
       this.switchGuard.note(agentId, now);
@@ -1311,6 +1338,7 @@ export class Service {
         continued: true,
         continuedIn: continuation,
         outcome: "continued",
+        detail: paid ? azureFallbackNote(next.label) : null,
       });
     } catch (error) {
       log(`could not continue ${agentId} on ${next.label}`, error);
@@ -1776,7 +1804,7 @@ export class Service {
       continuedIn: result.fork,
       toFamily: result.family,
       outcome: "continued",
-      detail: null,
+      detail: isLastResort(result.account) ? azureFallbackNote(result.account.label) : null,
       at: new Date().toISOString(),
     });
     return result.fork;
@@ -2323,6 +2351,8 @@ export class Service {
     const launcherOf = this.launcherFiles ?? launcherNames(piScripts);
     const proxies = new Map<string, ProxyState>();
     const apis = new Map<string, ApiSummary | null>();
+    const azures = new Map<string, AzureSummary>();
+    const azureMonths: AzureUsageFile = await this.azureUsage.read().catch(() => ({ accounts: {}, threads: {} }));
     const external = new Set<string>();
     await Promise.all(
       state.accounts.map(async (account) => {
@@ -2336,6 +2366,11 @@ export class Service {
         if (account.kind !== "managed" || !account.home) return;
         if (adapter.homesInUse && !(await isOwnHome(account.home))) external.add(account.id);
         if (account.auth === "api" && adapter.api) apis.set(account.id, await adapter.api(account.home).catch(() => null));
+        if (isAzureAccount(account)) {
+          // Only the key's hint goes to the app (see azureSummary).
+          const settings = await readAzureAccount(account.home).catch(() => null);
+          if (settings) azures.set(account.id, azureSummary(settings, currentMonth(azureMonths.accounts[account.id], now)));
+        }
       }),
     );
     // A proxy kept in the user's file (Pi's own login's in its settings) is also the one every added
@@ -2370,7 +2405,8 @@ export class Service {
         home: account.home,
         auth: account.auth,
         api: apis.get(account.id) ?? null,
-        apiEditable: account.auth === "api" || (account.kind === "main" && this.adapters[account.family].mainApi === true),
+        // An Azure account's key and endpoint have their own form (see `azure`).
+        apiEditable: (account.auth === "api" && !isAzureAccount(account)) || (account.kind === "main" && this.adapters[account.family].mainApi === true),
         proxy: proxy?.own ? maskProxy(proxy.own) : null,
         proxyEditable: proxy !== undefined,
         proxyBlocked: proxy?.blocked ?? null,
@@ -2381,6 +2417,7 @@ export class Service {
         egress: this.egress.get(account.id) ?? null,
         externalHome: external.has(account.id),
         moving: moving(account),
+        azure: azures.get(account.id) ?? null,
       };
     });
 
@@ -2793,6 +2830,7 @@ export class Service {
     });
     this.setUsage(accountId, null);
     this.egress.delete(accountId);
+    if (isAzureAccount(account)) await this.azureUsage.forget(accountId).catch((error: unknown) => log(`could not forget ${account.label}'s token counts`, error));
     if (account.home && kept) console.log(`[ZeroSub] removed ${account.label} from ZeroSub only: ${account.home} isn't in ${homesDir()}, so its files and script stay`);
     // Its script is released rather than deleted when its home stays (see writeLaunchers).
     await this.refreshLaunchers(account.home && !kept ? [account.home] : []).catch((error: unknown) => log("could not write the Pi scripts", error));
@@ -2802,6 +2840,123 @@ export class Service {
     const moves = await this.answerBy(replyBy, this.reconcile(paseo, "removed", affected, new Map([[account.id, account.label]]), { summary }), summary);
     void this.cleanUpHomes(paseo).catch((error: unknown) => log("cleanup failed", error));
     return { affected: affected.length, moves };
+  }
+
+  // ------------------------------------------------------------------ Azure OpenAI accounts
+
+  /**
+   * Adds an Azure OpenAI account under ChatGPT (Codex): an endpoint and an API key, checked against
+   * the endpoint first. A refused key (401/403) isn't saved; when the endpoint can't be reached the
+   * account is saved anyway and `warning` says so. The key goes only to the home's `azure.json`.
+   */
+  async addAzureAccount(input: { label: string; endpoint: string; key: string }): Promise<{ accountId: string; warning: string | null }> {
+    const endpoint = normalizeAzureEndpoint(input.endpoint);
+    const key = input.key.trim();
+    if (!key) throw new Error("Enter the API key.");
+    const identity = azureIdentity(endpoint, key);
+    const duplicate = accountsOf(await this.store.read(), "codex").find((account) => account.identity === identity);
+    if (duplicate) throw new Error(`That key and endpoint are already added as "${duplicate.label}".`);
+    const check = await checkAzureKey(endpoint, key);
+    if (!check.ok && check.fatal) throw new Error(check.message);
+
+    const id = `codex-${randomBytes(6).toString("hex")}`;
+    const home = join(homesDir(), id);
+    this.creatingHomes.add(home);
+    try {
+      await this.store.update((draft) => {
+        draft.cleanup[home] = { family: "codex", accountId: id, why: "unfinished", at: new Date().toISOString() };
+      });
+      await writeAzureAccount(home, { endpoint, key, prices: {} });
+      await this.adapters.codex.prepareHome(home);
+      await this.store.update((draft) => {
+        const twin = accountsOf(draft, "codex").find((entry) => entry.identity === identity);
+        if (twin) throw new Error(`That key and endpoint are already added as "${twin.label}".`);
+        const account = newAccount({ id, family: "codex", kind: "managed", home, auth: "api" });
+        account.label = input.label.trim();
+        account.autoLabel = false;
+        account.identity = identity;
+        account.plan = "Azure OpenAI";
+        draft.accounts.push(account);
+        delete draft.cleanup[home];
+      });
+    } catch (error) {
+      const removed = await removeHome(home).then(
+        () => true,
+        () => false,
+      );
+      if (removed) await this.store.update((draft) => void delete draft.cleanup[home]).catch(() => undefined);
+      throw error;
+    } finally {
+      this.creatingHomes.delete(home);
+    }
+    console.log(`[ZeroSub] added Azure OpenAI account ${input.label.trim()} (${new URL(endpoint).host})${check.ok ? "" : "; its key couldn't be checked"}`);
+    return { accountId: id, warning: check.ok ? null : `Saved, but the key couldn't be checked: ${check.message}` };
+  }
+
+  /**
+   * Changes an Azure account's endpoint, key (empty keeps it) or price table. A new key or endpoint is
+   * checked as when adding one; a kept key only goes to a new endpoint when it's typed again.
+   */
+  async updateAzureAccount(
+    accountId: string,
+    input: { endpoint?: string; key?: string; prices?: Record<string, AzurePrice> },
+  ): Promise<{ warning: string | null }> {
+    const account = findAccount(await this.store.read(), accountId);
+    if (!account || !account.home) throw new Error("That account no longer exists.");
+    if (!isAzureAccount(account)) throw new Error(`${account.label} isn't an Azure OpenAI account.`);
+    const home = account.home;
+    const current = await readAzureAccount(home);
+    const endpoint = input.endpoint?.trim() ? normalizeAzureEndpoint(input.endpoint) : current.endpoint;
+    const typed = input.key?.trim() || null;
+    if (!typed && endpoint !== current.endpoint) throw new Error("Enter the key again to use it with a different endpoint.");
+    const key = typed ?? current.key;
+    let warning: string | null = null;
+    if (typed || endpoint !== current.endpoint) {
+      const identity = azureIdentity(endpoint, key);
+      const duplicate = accountsOf(await this.store.read(), "codex").find((entry) => entry.id !== accountId && entry.identity === identity);
+      if (duplicate) throw new Error(`That key and endpoint are already added as "${duplicate.label}".`);
+      const check = await checkAzureKey(endpoint, key);
+      if (!check.ok && check.fatal) throw new Error(check.message);
+      if (!check.ok) warning = `Saved, but the key couldn't be checked: ${check.message}`;
+    }
+    const prices = input.prices
+      ? Object.fromEntries(Object.entries(input.prices).map(([model, price]) => [model.trim(), price] as const).filter(([model]) => model !== ""))
+      : current.prices;
+    if (!(await this.stillHas(account)())) throw new Error("That account no longer exists.");
+    await writeAzureAccount(home, { endpoint, key, prices });
+    await this.adapters.codex.prepareHome(home).catch((error: unknown) => log(`could not refresh the home of ${account.label}`, error));
+    await this.store.update((draft) => {
+      const target = findAccount(draft, accountId);
+      if (!target) return;
+      target.identity = azureIdentity(endpoint, key);
+      // A new key or endpoint is worth trying again even if the old one was refused.
+      if (typed || endpoint !== current.endpoint) target.signedIn = true;
+    });
+    return { warning };
+  }
+
+  /**
+   * Counts the tokens an agent's turn on an Azure account used, from its Codex thread's rollout file
+   * (the last `token_count` event's running total, minus what was counted before). Codex writes it
+   * as the turn goes, so this waits a moment after the turn ends. A turn whose file can't be found is
+   * counted as uncounted, so the card says its totals are short.
+   */
+  private async countAzureTurn(paseo: PaseoApi, agentId: string, accountId: string): Promise<void> {
+    await delay(1_500);
+    const agent = (await paseo.agents.ref(agentId).refresh().catch(() => null))?.agent as
+      | { persistence?: { sessionId?: string; nativeHandle?: string } | null; model?: string | null }
+      | undefined;
+    const ids = [agent?.persistence?.nativeHandle, agent?.persistence?.sessionId].filter((id): id is string => typeof id === "string" && id !== "");
+    for (const threadId of ids) {
+      const path = await findRollout(threadId);
+      if (!path) continue;
+      const reading = parseRollout(await readFile(path, "utf8"));
+      if (!reading) continue;
+      await this.azureUsage.countThread(accountId, threadId, reading, agent?.model ?? "unknown");
+      return;
+    }
+    await this.azureUsage.noteUncounted(accountId);
+    console.log(`[ZeroSub] couldn't find the Codex session file of ${agentId}, so its last turn's tokens aren't counted`);
   }
 
   // ------------------------------------------------------------------ Pi accounts
@@ -3032,6 +3187,7 @@ export class Service {
         await this.followMainSettings(account.family);
         return;
       }
+      if (isAzureAccount(account)) throw new Error(`${account.label} is an Azure OpenAI account: change its key from its own form.`);
       if (account.auth !== "api" || !account.home || !adapter.setApi) throw new Error(`${account.label} signs in with a subscription, not an API key.`);
       // A kept key stays on its base URL (the adapter refuses to move it), so its identity holds.
       const identity = key ? apiIdentity(baseUrl, keyDigest(key)) : null;
@@ -3361,6 +3517,7 @@ export class Service {
     const state = await this.store.read();
     const existing = accountId ? findAccount(state, accountId) : undefined;
     if (accountId && (!existing || existing.family !== family)) throw new Error("That account no longer exists.");
+    if (existing && isAzureAccount(existing)) throw new Error(`${existing.label} uses an Azure OpenAI API key: change it from its card.`);
     // A new account's proxy is in place before the CLI starts, so the sign-in itself goes through it.
     const proxy = !existing && proxyInput?.trim() ? normalizeProxy(proxyInput) : null;
     if (proxy && !this.adapters[family].setProxy) throw new Error(`A proxy can't be set for ${FAMILY_LABEL[family]} accounts yet.`);
@@ -3522,6 +3679,11 @@ export class Service {
 }
 
 // -------------------------------------------------------------------- helpers
+
+/** The timeline's word on work that moved onto a paid Azure account by itself. */
+function azureFallbackNote(label: string): string {
+  return `Every ChatGPT subscription account is at its limit, so this runs on ${label}: Azure OpenAI, a paid API billed per token. New agents go back to a ChatGPT account once one has room.`;
+}
 
 /** What tells an API key's account from another: where the key goes, and a short hash of the key. */
 function apiIdentity(baseUrl: string | null, digest: string): string {

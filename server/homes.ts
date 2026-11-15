@@ -2,6 +2,7 @@ import { cp, lstat, mkdir, readFile, readdir, readlink, realpath, rename, rm, rm
 import { randomBytes } from "node:crypto";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { ApiSummary, Family } from "../shared/model";
+import { AZURE_FILE, isAzureHome, syncAzureConfig } from "./azure";
 import { Mutex, readJson } from "./json-file";
 import { NO_PROXY_KEYS, PROXY_KEYS, REQUIRED_NO_PROXY, bypassesProxy, maskProxy, noProxyFromEnv, proxyFromEnv, withClaudeNoProxy, withoutClaudeDomains } from "./proxy";
 import { providerEnv } from "./provider-env";
@@ -785,14 +786,23 @@ function codexPrivate(name: string): boolean {
   );
 }
 
+/**
+ * An Azure OpenAI account's home (see azure.ts) keeps `config.toml` and its `azure.json` to itself:
+ * its config is the shared one with ZeroSub's Azure provider set, remade here and at each session open.
+ */
 export async function prepareCodexHome(home: string, force = false): Promise<void> {
+  const azure = isAzureHome(home);
   const last = lastSync.get(home);
-  if (!force && last && Date.now() - last < SYNC_TTL_MS) return;
+  if (!force && last && Date.now() - last < SYNC_TTL_MS) {
+    if (azure) await syncAzureConfig(home);
+    return;
+  }
   await syncOverlay(home, {
     main: mainCodexHome(),
     shareDirs: ["sessions", "archived_sessions"],
-    isPrivate: codexPrivate,
+    isPrivate: azure ? (name) => codexPrivate(name) || name === "config.toml" || name === AZURE_FILE : codexPrivate,
   });
+  if (azure) await syncAzureConfig(home);
   lastSync.set(home, Date.now());
 }
 

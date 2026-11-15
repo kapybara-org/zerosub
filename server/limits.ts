@@ -142,6 +142,54 @@ export function detectCodexSignOut(event: TurnEvent): string | null {
   return null;
 }
 
+// --------------------------------------------------------------------------- Azure OpenAI (API key)
+
+/** How long an Azure account is set aside after a rate limit (HTTP 429) without a "retry after". */
+export const AZURE_RATE_LIMIT_MS = 60_000;
+/** How long after an exhausted quota or spend limit (`insufficient_quota`), which doesn't lift in seconds. */
+export const AZURE_QUOTA_MS = 30 * 60_000;
+const AZURE_RATE_LIMIT_MAX_MS = 10 * 60_000;
+
+/** Codex's words for an exhausted API quota (`CodexErr::QuotaExceeded`) and the raw error code. */
+const AZURE_QUOTA = /insufficient_quota|quota exceeded|exceeded your current quota/i;
+/** A rate limit, as Codex reports a 429 after its retries ("exceeded retry limit, last status: 429 …") or Azure words it. */
+const AZURE_RATE_LIMIT = /\b429\b|too many requests|rate[ _-]?limit(?:ed|_exceeded)?\b|exceeded (?:the )?(?:token )?rate limit/i;
+/** Azure refusing the key (or the endpoint refusing it): 401/403, or Azure's own wording. */
+const AZURE_REFUSED =
+  /\b401\b|\b403\b|unauthorized|forbidden|invalid subscription key|access denied due to invalid|invalid api key|incorrect api key/i;
+
+/** "Please retry after 20 seconds" / "retry-after: 20", as Azure's 429 bodies say it. */
+function azureRetryAfterMs(text: string): number | null {
+  const match = text.match(/retry[ -]after:?\s*(\d{1,5})\s*(?:s\b|sec|second)?/i);
+  if (!match?.[1]) return null;
+  return Math.min(AZURE_RATE_LIMIT_MAX_MS, Math.max(10_000, Number(match[1]) * 1_000));
+}
+
+/**
+ * A turn on an Azure OpenAI account that failed on the API's quota or rate limit. Azure has no 5-hour
+ * or weekly windows, so either one is a short cooldown (`window` for a rate limit, `budget` for an
+ * exhausted quota), after which the account counts as available again: failover moves on, or stops,
+ * without coming straight back to it.
+ */
+export function detectAzureLimit(event: TurnEvent, now: Date = new Date()): LimitHit | null {
+  for (const text of notices(event, false)) {
+    if (AZURE_QUOTA.test(text)) {
+      return { kind: "budget", message: firstLine(text), resetsAt: new Date(now.getTime() + AZURE_QUOTA_MS).toISOString() };
+    }
+    if (AZURE_RATE_LIMIT.test(text)) {
+      const wait = azureRetryAfterMs(text) ?? AZURE_RATE_LIMIT_MS;
+      return { kind: "window", message: firstLine(text), resetsAt: new Date(now.getTime() + wait).toISOString() };
+    }
+  }
+  return null;
+}
+
+/** A turn on an Azure OpenAI account whose key (or endpoint) was refused. */
+export function detectAzureSignOut(event: TurnEvent): string | null {
+  for (const text of notices(event, false)) if (AZURE_REFUSED.test(text) && !AZURE_RATE_LIMIT.test(text)) return firstLine(text);
+  return null;
+}
+
 // --------------------------------------------------------------------------- reset times
 
 const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];

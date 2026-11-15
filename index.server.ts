@@ -7,6 +7,8 @@ import { Service, describe } from "./server/service";
 import { preferences } from "./shared/preferences";
 import {
   addApiAccount,
+  addAzureAccount,
+  updateAzureAccount,
   cancelLogin,
   clearAccountLimit,
   getState,
@@ -112,6 +114,8 @@ export default function contribute(server: PluginServerContext) {
     await service.updateApiAccount(accountId, input);
     return { ok: true as const };
   });
+  server.handle(addAzureAccount, (input) => service.addAzureAccount(input));
+  server.handle(updateAzureAccount, async ({ accountId, ...input }) => ({ ok: true as const, ...(await service.updateAzureAccount(accountId, input)) }));
   server.handle(setAccountProxy, async ({ accountId, proxy }) => ({ ok: true as const, proxy: await service.setProxy(accountId, proxy) }));
   server.handle(setPiHomesDir, async ({ dir }) => ({ ok: true as const, ...(await service.setPiHomesDir(dir)) }));
   server.handle(importPiAccount, async ({ path }) => ({ accountId: await service.importPiAccount(path) }));
