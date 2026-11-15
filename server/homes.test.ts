@@ -392,6 +392,27 @@ describe("account proxy", () => {
     expect(await readFile(join(home, "settings.account.json"), "utf8")).toBe("{oops");
   });
 
+  it("isn't saved while main's settings don't parse, so the account never shows a proxy it doesn't use", async () => {
+    const main = join(root, "main");
+    const home = join(root, "homes", "claude-main-bad");
+    process.env.CLAUDE_CONFIG_DIR = main;
+    await mkdir(main, { recursive: true });
+    await writeFile(join(main, "settings.json"), '{"model":"opus"}');
+    await prepareClaudeHome(home, true);
+    const before = await readFile(join(home, "settings.json"), "utf8");
+
+    // A trailing comma is enough: the account's settings.json can't be made again until it's fixed.
+    await writeFile(join(main, "settings.json"), '{"model":"opus",}');
+    await expect(writeAccountProxy(home, "http://127.0.0.1:7890")).rejects.toThrow(`${join(main, "settings.json")} isn't valid JSON`);
+    expect(await readAccountProxy(home)).toBeNull();
+    expect(JSON.parse(await readFile(join(home, "settings.account.json"), "utf8"))).toEqual({});
+    expect(await readFile(join(home, "settings.json"), "utf8")).toBe(before);
+
+    await writeFile(join(main, "settings.json"), '{"model":"opus"}');
+    await writeAccountProxy(home, "http://127.0.0.1:7890");
+    expect(await readAccountProxy(home)).toBe("http://127.0.0.1:7890");
+  });
+
   it("says which overrides don't parse without quoting them, as they may hold a key", async () => {
     const home = join(root, "homes", "claude-bad");
     process.env.CLAUDE_CONFIG_DIR = join(root, "main");
@@ -465,6 +486,57 @@ describe("a home's settings.account.json marker", () => {
     expect(JSON.parse(await readFile(join(home, "settings.json"), "utf8")).model).toBe("sonnet");
   });
 
+  it("keeps only the account's own permission rules and hooks from what Claude Code saves, so main's later removals and changes reach it", async () => {
+    const main = join(root, "main");
+    const home = join(root, "homes", "claude-lists");
+    process.env.CLAUDE_CONFIG_DIR = main;
+    await mkdir(main, { recursive: true });
+    const hook = (command: string) => ({ type: "command", command });
+    await writeFile(join(main, "settings.json"), JSON.stringify({ permissions: { allow: ["Bash(rm:*)"], deny: ["WebFetch"] }, hooks: { Stop: [{ hooks: [hook("old")] }] } }));
+    await prepareClaudeHome(home, true);
+
+    // A rule and a hook added there in user settings: Claude Code puts the hook in the group already there for its matcher,
+    // main's, and may write a hook's keys in another order (it's the same hook).
+    const generated = JSON.parse(await readFile(join(home, "settings.json"), "utf8"));
+    generated.permissions.allow.push("Bash(ls)");
+    generated.hooks.Stop[0].hooks = [{ command: "old", type: "command" }, hook("mine")];
+    await writeFile(join(home, "settings.json"), JSON.stringify(generated));
+    await prepareClaudeHome(home, true);
+    expect(JSON.parse(await readFile(join(home, "settings.account.json"), "utf8"))).toEqual({
+      permissions: { allow: ["Bash(ls)"] },
+      hooks: { Stop: [{ hooks: [hook("mine")] }] },
+    });
+
+    // Main takes its rule out and changes its hook: so does the account, which keeps its own.
+    await writeFile(join(main, "settings.json"), JSON.stringify({ permissions: { allow: [], deny: ["WebFetch"] }, hooks: { Stop: [{ hooks: [hook("new")] }] } }));
+    await prepareClaudeHome(home, true);
+    expect(JSON.parse(await readFile(join(home, "settings.json"), "utf8"))).toEqual({
+      permissions: { allow: ["Bash(ls)"], deny: ["WebFetch"] },
+      hooks: { Stop: [{ hooks: [hook("new")] }, { hooks: [hook("mine")] }] },
+    });
+  });
+
+  it("keeps the account's own entries, even ones main has too, and none of main's, even when main changed since the last sync", async () => {
+    const main = join(root, "main");
+    const home = join(root, "homes", "claude-lists-own");
+    process.env.CLAUDE_CONFIG_DIR = main;
+    await mkdir(home, { recursive: true });
+    await mkdir(main, { recursive: true });
+    await writeFile(join(main, "settings.json"), JSON.stringify({ permissions: { allow: ["Bash(rm:*)", "Bash(ls)"] } }));
+    await writeFile(join(home, "settings.account.json"), JSON.stringify({ permissions: { allow: ["Bash(ls)"] } }));
+    await prepareClaudeHome(home, true);
+
+    // Before the next sync, main takes a rule out and gains one, and the account saves that one and one more.
+    await writeFile(join(main, "settings.json"), JSON.stringify({ permissions: { allow: ["Bash(ls)", "Bash(git:*)"] } }));
+    await writeFile(join(home, "settings.json"), JSON.stringify({ permissions: { allow: ["Bash(rm:*)", "Bash(ls)", "Bash(git:*)", "Bash(pwd)"] } }));
+    await prepareClaudeHome(home, true);
+    expect(JSON.parse(await readFile(join(home, "settings.account.json"), "utf8"))).toEqual({ permissions: { allow: ["Bash(ls)", "Bash(pwd)"] } });
+
+    await writeFile(join(main, "settings.json"), "{}");
+    await prepareClaudeHome(home, true);
+    expect(JSON.parse(await readFile(join(home, "settings.json"), "utf8"))).toEqual({ permissions: { allow: ["Bash(ls)", "Bash(pwd)"] } });
+  });
+
   it("is added to a home of ZeroSub's own left without one, keeping what Claude Code wrote there as its overrides", async () => {
     process.env.PASEO_HOME = root;
     const main = join(root, "main");
@@ -493,7 +565,8 @@ describe("merged settings lists", () => {
     };
     const account = {
       permissions: { deny: ["Read(.env)", "WebFetch"], ask: ["Bash(git push:*)"], defaultMode: "plan" },
-      hooks: { Stop: [{ hooks: [{ type: "command", command: "beep" }] }] },
+      // Main's group again, its hook's keys in another order: still there once.
+      hooks: { Stop: [{ hooks: [{ command: "notify", type: "command" }] }, { hooks: [{ type: "command", command: "beep" }] }] },
       enabledMcpjsonServers: ["mine"],
     };
     expect(mergeSettings(main, account)).toEqual({

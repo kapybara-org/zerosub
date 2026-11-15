@@ -7,7 +7,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { formatExtraUsage } from "../shared/format";
 import { UsageSchema } from "../shared/model";
 import { ClaudeAdapter } from "./claude";
+import { proxiedFetch } from "./proxy";
 import { mergeUsage } from "./usage";
+
+// The real one, watched; a test can answer in its place, which then sends nothing anywhere.
+vi.mock("./proxy", async (original) => {
+  const actual = await original<typeof import("./proxy")>();
+  return { ...actual, proxiedFetch: vi.fn(actual.proxiedFetch) };
+});
 
 // A synthetic home with a made-up token; `fetch` is stubbed, so nothing real is read or called.
 let home: string;
@@ -44,6 +51,8 @@ beforeEach(async () => {
 
 afterEach(async () => {
   vi.unstubAllGlobals();
+  // Back to the real one, its calls forgotten.
+  vi.mocked(proxiedFetch).mockReset();
   for (const [key, value] of Object.entries(savedProxy)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
@@ -127,6 +136,29 @@ describe("Claude's calls with an account's token", () => {
     expect((await adapter.redeemReset(home)).outcome).toBe("error");
     expect(seen).toEqual(["api.anthropic.com:443", "api.anthropic.com:443"]);
     // Never straight to Anthropic past the proxy.
+    expect(calls).toEqual([]);
+  });
+
+  it("go through the account's own proxy for the reset itself too", async () => {
+    const through = "http://127.0.0.1:7890";
+    const organization = "00000000-0000-4000-8000-000000000000";
+    await writeFile(join(home, "settings.json"), JSON.stringify({ env: { HTTPS_PROXY: through } }));
+    await writeFile(join(home, ".claude.json"), JSON.stringify({ oauthAccount: { organizationUuid: organization } }));
+    const resets = { eligible: true, at_limit: true, next_grant_id: "grant_1", grants: [{ id: "grant_1", resets_left: 1, usable_now: true }] };
+    // Answered in the proxy's place: the reads find a reset to use, and using it works.
+    vi.mocked(proxiedFetch).mockImplementation(async (_proxy, target) =>
+      target.endsWith("/reset_rate_limits") ? Response.json({ result: "reset", resets_left: 0 }) : Response.json({ ...body, cedar_ember: resets }),
+    );
+    answer([]);
+
+    const adapter = new ClaudeAdapter();
+    expect((await adapter.usage(home)).error).toBeNull();
+    expect((await adapter.redeemReset(home)).outcome).toBe("reset");
+    expect(vi.mocked(proxiedFetch).mock.calls.map(([proxy, target, init]) => [proxy, target, init?.method ?? "GET"])).toEqual([
+      [through, "https://api.anthropic.com/api/oauth/usage?cedar_ember=1", "GET"],
+      [through, "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1", "GET"],
+      [through, `https://api.anthropic.com/api/organizations/${organization}/reset_rate_limits`, "POST"],
+    ]);
     expect(calls).toEqual([]);
   });
 });

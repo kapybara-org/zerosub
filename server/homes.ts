@@ -472,9 +472,20 @@ export function mergeSettings(main: Json, account: Json): Json {
 function joinLists(first: readonly unknown[], second: readonly unknown[]): unknown[] {
   const joined: unknown[] = [];
   for (const entry of [...first, ...second]) {
-    if (!joined.some((existing) => JSON.stringify(existing) === JSON.stringify(entry))) joined.push(entry);
+    if (!joined.some((existing) => sameJson(existing, entry))) joined.push(entry);
   }
   return joined;
+}
+
+/** Whether two JSON values are the same, whatever order their keys are in, as Claude Code compares hooks. */
+function sameJson(a: unknown, b: unknown): boolean {
+  return canonicalJson(a) === canonicalJson(b);
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (isObject(value)) return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  return JSON.stringify(value) ?? "null";
 }
 
 async function readSettings(path: string): Promise<Json | null> {
@@ -514,19 +525,20 @@ async function syncClaudeSettings(home: string): Promise<void> {
     account = {};
     await writeJsonAtomically(overrides, account);
   }
+  // Read before folding: it tells main's entries in a saved list from the account's own.
+  const main = (await readSettings(join(mainClaudeDir(), "settings.json"))) ?? {};
   if (current?.isFile()) {
-    const folded = await foldSavedSettings(home, account);
+    const folded = await foldSavedSettings(home, account, main);
     if (folded) {
       account = folded;
       await writeJsonAtomically(overrides, account);
     }
   }
 
-  const main = await readSettings(join(mainClaudeDir(), "settings.json"));
   // Homes from earlier versions link to main's file; replace the link, never write through it.
   if (current?.isSymbolicLink()) await unlink(target);
   const inherited = { ...process.env, ...providerEnv("claude") };
-  const next = `${JSON.stringify(accountSettings(main ?? {}, account, inherited), null, 2)}\n`;
+  const next = `${JSON.stringify(accountSettings(main, account, inherited), null, 2)}\n`;
   const generated = join(home, GENERATED_SETTINGS);
   if (current?.isFile() && (await readFile(target, "utf8").catch(() => null)) === next) {
     if ((await readFile(generated, "utf8").catch(() => null)) !== next) await writeJsonAtomically(generated, JSON.parse(next));
@@ -542,10 +554,13 @@ async function syncClaudeSettings(home: string): Promise<void> {
  * like there, and regenerating would otherwise take it back out. A setting that changed or was
  * added becomes the account's own (only the keys that changed, for one holding an object such as
  * `enabledPlugins`, so main's others still come through); one taken out leaves the account's own
- * settings, though main's still applies underneath. Null when nothing was saved, or when there's
- * no copy of the last generated file to tell by (a home from an earlier version: it gets one now).
+ * settings, though main's still applies underneath. A list Claude Code joins across its settings
+ * files (see `JOINED_LISTS`) keeps only the account's own entries (see `ownEntries`), never `main`'s,
+ * so one taken out of main or changed there is taken out or changed for the account too. Null when
+ * nothing was saved, or when there's no copy of the last generated file to tell by (a home from an
+ * earlier version: it gets one now).
  */
-async function foldSavedSettings(home: string, account: Json): Promise<Json | null> {
+async function foldSavedSettings(home: string, account: Json, main: Json): Promise<Json | null> {
   const before = await readSettings(join(home, GENERATED_SETTINGS)).catch(() => null);
   const now = await readSettings(join(home, "settings.json")).catch(() => null);
   if (!before || !now) return null;
@@ -561,10 +576,14 @@ async function foldSavedSettings(home: string, account: Json): Promise<Json | nu
       delete next[key];
     } else if (isObject(is) && isObject(was)) {
       const own: Json = isObject(next[key]) ? { ...next[key] } : {};
+      const inherited = isObject(main[key]) ? main[key] : {};
       for (const name of new Set([...Object.keys(was), ...Object.keys(is)])) {
         if (same(was[name], is[name])) continue;
-        if (is[name] === undefined) delete own[name];
-        else own[name] = is[name];
+        const saved = is[name];
+        // Main's entries: those in its settings now, and those of the generated file this was saved over.
+        const value = JOINED_LISTS.has(key) && Array.isArray(saved) ? ownEntries(saved, [inherited[name], was[name]], own[name]) : saved;
+        if (value === undefined) delete own[name];
+        else own[name] = value;
       }
       if (Object.keys(own).length > 0) next[key] = own;
       else delete next[key];
@@ -573,6 +592,47 @@ async function foldSavedSettings(home: string, account: Json): Promise<Json | nu
     }
   }
   return changed ? next : null;
+}
+
+/**
+ * The entries of `list`, a joined list as saved in an account's `settings.json`, that are the
+ * account's own: those in `own`, its list so far, and any that none of the `inherited` lists (main's)
+ * has. A hook group keeps just the hooks that are, since Claude Code adds a hook to the group already
+ * there for its matcher, main's included. Entries are compared whatever order their keys are in.
+ * Undefined when none are.
+ */
+function ownEntries(list: readonly unknown[], inherited: readonly unknown[], own: unknown): unknown[] | undefined {
+  const theirs = inherited.flatMap((entries) => (Array.isArray(entries) ? entries : []));
+  const ours = Array.isArray(own) ? own : [];
+  const isOwn = (entry: unknown, mains: readonly unknown[], owns: readonly unknown[]) =>
+    owns.some((other) => sameJson(other, entry)) || !mains.some((other) => sameJson(other, entry));
+  const kept: unknown[] = [];
+  for (const entry of list) {
+    if (!isHookGroup(entry)) {
+      if (isOwn(entry, theirs, ours)) kept.push(entry);
+      continue;
+    }
+    const mainHooks = hooksFor(theirs, entry);
+    const ownHooks = hooksFor(ours, entry);
+    const hooks = entry.hooks.filter((hook) => isOwn(hook, mainHooks, ownHooks));
+    if (hooks.length > 0) kept.push(hooks.length === entry.hooks.length ? entry : { ...entry, hooks });
+  }
+  return kept.length > 0 ? kept : undefined;
+}
+
+/** An entry of a `hooks` event's list: the hooks to run, and what they match (none is the same as ""). */
+interface HookGroup {
+  matcher?: unknown;
+  hooks: unknown[];
+}
+
+function isHookGroup(value: unknown): value is HookGroup {
+  return isObject(value) && Array.isArray(value.hooks);
+}
+
+/** The hooks of the groups in `groups` with `group`'s matcher. */
+function hooksFor(groups: readonly unknown[], group: HookGroup): unknown[] {
+  return groups.flatMap((other) => (isHookGroup(other) && sameJson(other.matcher ?? "", group.matcher ?? "") ? other.hooks : []));
 }
 
 /**
@@ -637,13 +697,18 @@ async function readOverrides(home: string): Promise<Json> {
   return current?.isFile() ? ((await readSettings(target)) ?? {}) : {};
 }
 
-/** Writes the account's overrides with `edit` applied to their `env`, then regenerates `settings.json`. */
+/**
+ * Writes the account's overrides with `edit` applied to their `env`, then regenerates `settings.json`.
+ * Nothing is written while main's settings don't parse: the account couldn't be regenerated, so its
+ * overrides would show a proxy it doesn't use.
+ */
 async function editOverridesEnv(home: string, edit: (env: Json) => void): Promise<void> {
   const account = await readOverrides(home);
   const env: Json = isObject(account.env) ? { ...account.env } : {};
   edit(env);
   const next: Json = { ...account, env };
   if (Object.keys(env).length === 0) delete next.env;
+  await readSettings(join(mainClaudeDir(), "settings.json"));
   await writeJsonAtomically(join(home, ACCOUNT_SETTINGS), next);
   await syncClaudeSettings(home);
 }

@@ -135,9 +135,20 @@ describe("the CLI login's proxy", () => {
     expect(JSON.parse(await readFile(join(backups, copy!), "utf8"))).toEqual(before);
     expect((await stat(join(backups, copy!))).mode & 0o777).toBe(0o600);
 
+    // ZeroSub's no-proxy list goes with it, and the file's own is back.
     await writeMainProxy(null);
-    expect(JSON.parse(await readFile(real, "utf8"))).toEqual({ model: "opus", env: { NO_PROXY: "localhost,127.0.0.1,::1,downloads.claude.ai", no_proxy: "localhost,127.0.0.1,::1,downloads.claude.ai", FOO: "1" } });
+    expect(JSON.parse(await readFile(real, "utf8"))).toEqual({ model: "opus", env: { NO_PROXY: "localhost", FOO: "1" } });
     expect(await readMainProxy()).toEqual({ proxy: null, file: null });
+  });
+
+  it("takes its no-proxy list out of main's settings with its proxy, but not one changed there by hand since", async () => {
+    const file = join(root, "main", "settings.json");
+    await mainSettings({ HTTPS_PROXY: "http://127.0.0.1:1133" });
+    await writeMainProxy("http://127.0.0.1:7890");
+    const { env } = JSON.parse(await readFile(file, "utf8"));
+    await writeFile(file, JSON.stringify({ env: { ...env, no_proxy: "localhost,intranet.example" } }));
+    await writeMainProxy(null);
+    expect(JSON.parse(await readFile(file, "utf8"))).toEqual({ env: { no_proxy: "localhost,intranet.example" } });
   });
 
   it("keeps the no-proxy lists of the daemon and Paseo's config when it writes one into main's settings, which outranks them", async () => {

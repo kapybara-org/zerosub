@@ -101,10 +101,35 @@ const SETTINGS_BACKUPS = 5;
 const SETTINGS_BACKUP = /^claude-settings-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z\.json$/;
 
 /**
+ * The no-proxy variables main's settings had before ZeroSub put its own list in them with a proxy,
+ * and that list, so they get them back when the proxy is cleared (see `writeProxyToMainSettings`).
+ */
+function noProxyRecordPath(): string {
+  return join(dataDir(), "cli-login-no-proxy.json");
+}
+
+/**
+ * The no-proxy variables main's settings (`env`) had before ZeroSub's list: the recorded ones where
+ * that list still is, else what's there (one changed by hand since, say).
+ */
+async function noProxyBefore(env: Readonly<Record<string, unknown>>): Promise<Record<string, unknown>> {
+  const record = await readJson(noProxyRecordPath()).catch(() => undefined);
+  const wrote = isObject(record) && typeof record.wrote === "string" ? record.wrote : null;
+  const recorded = isObject(record) && isObject(record.before) ? record.before : {};
+  const before: Record<string, unknown> = {};
+  for (const key of NO_PROXY_KEYS) {
+    const had = wrote !== null && env[key] === wrote ? recorded[key] : env[key];
+    if (had !== undefined) before[key] = had;
+  }
+  return before;
+}
+
+/**
  * Sets the proxy variables in main's settings (all four to `proxy`, or none with `null`), leaving
- * the rest as it is. It's written where it really is, so a settings file linked in from elsewhere
- * (dotfiles, say) stays linked, with its permissions; the file as it was is kept in ZeroSub's
- * `backups/` first.
+ * the rest as it is. A proxy comes with ZeroSub's no-proxy list, which goes with it again: the
+ * no-proxy variables the file had before are put back. It's written where it really is, so a
+ * settings file linked in from elsewhere (dotfiles, say) stays linked, with its permissions; the
+ * file as it was is kept in ZeroSub's `backups/` first.
  */
 async function writeProxyToMainSettings(proxy: string | null): Promise<void> {
   const path = await realpath(mainSettingsPath());
@@ -117,15 +142,22 @@ async function writeProxyToMainSettings(proxy: string | null): Promise<void> {
   }
   if (!isObject(settings)) throw new Error(`${mainSettingsName()} is not a JSON object`);
   const env: Record<string, unknown> = isObject(settings.env) ? { ...settings.env } : {};
+  const before = await noProxyBefore(env);
   for (const key of PROXY_KEYS) {
     if (proxy) env[key] = proxy;
     else delete env[key];
   }
+  let noProxy: string | null = null;
   if (proxy) {
     const stringEnv = Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
     // Written here, it outranks the lists Claude Code would otherwise inherit, so they're kept in it.
-    const noProxy = withClaudeNoProxy(withoutClaudeDomains(noProxyFromEnv({ ...process.env, ...providerEnv("claude"), ...stringEnv })));
+    noProxy = withClaudeNoProxy(withoutClaudeDomains(noProxyFromEnv({ ...process.env, ...providerEnv("claude"), ...stringEnv })));
     for (const key of NO_PROXY_KEYS) env[key] = noProxy;
+  } else {
+    for (const key of NO_PROXY_KEYS) {
+      if (key in before) env[key] = before[key];
+      else delete env[key];
+    }
   }
 
   const backups = join(dataDir(), "backups");
@@ -133,7 +165,10 @@ async function writeProxyToMainSettings(proxy: string | null): Promise<void> {
   const kept = (await readdir(backups)).filter((name) => SETTINGS_BACKUP.test(name)).sort();
   for (const name of kept.slice(0, -SETTINGS_BACKUPS)) await rm(join(backups, name), { force: true });
 
+  // Recorded first, so the file never has ZeroSub's list without a note of what it replaced.
+  if (noProxy) await writeJsonAtomic(noProxyRecordPath(), { before, wrote: noProxy });
   await writeJsonAtomic(path, { ...settings, env }, { mode: (await stat(path)).mode & 0o777 });
+  if (!noProxy) await rm(noProxyRecordPath(), { force: true });
   // Every added home's settings are made from main's: have the next sync remake them.
   forgetSyncs();
 }
