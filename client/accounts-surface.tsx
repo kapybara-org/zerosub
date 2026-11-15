@@ -44,8 +44,8 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
   // Keep usage moving while the screen is open.
   useEffect(() => store.watch(VISIBLE_POLL_MS), [store]);
 
-  // An optional provider (Pi, Grok) shows once its CLI login is registered (its CLI is there, and for
-  // Grok a Paseo provider runs it) or an account of it was added.
+  // An optional provider (Pi, Grok, Cursor) shows once its CLI login is registered (its CLI is there,
+  // and for Grok and Cursor a Paseo provider runs it) or an account of it was added.
   const families = shownFamilies(state?.accounts ?? []);
   return (
     <View style={{ flex: 1, backgroundColor: theme.colors.surface0 }}>
@@ -77,7 +77,7 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
             ) : null}
           </View>
           <Text style={text.muted}>
-            Keep several Claude, ChatGPT and Grok accounts signed in, and run Pi on several Anthropic API keys.
+            Keep several Claude, ChatGPT, Grok and Cursor accounts signed in, and run Pi on several Anthropic API keys.
             Each agent uses one; when a Claude or ChatGPT account hits its limit, agents move to another and keep going.
           </Text>
         </View>
@@ -218,7 +218,7 @@ function HostScope({ theme, label }: { theme: Theme; label: string }) {
   );
 }
 
-const SECTION_TITLE: Record<Family, string> = { claude: "Claude", codex: "ChatGPT (Codex)", pi: "Pi", grok: "Grok" };
+const SECTION_TITLE: Record<Family, string> = { claude: "Claude", codex: "ChatGPT (Codex)", pi: "Pi", grok: "Grok", cursor: "Cursor" };
 
 function FamilySection({
   family,

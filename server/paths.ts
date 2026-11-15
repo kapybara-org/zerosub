@@ -1,6 +1,6 @@
 import { lstat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export function paseoHome(): string {
   const configured = process.env.PASEO_HOME?.trim();
@@ -43,6 +43,25 @@ export function mainGrokHome(): string {
   return configured ? resolve(configured) : join(homedir(), ".grok");
 }
 
+/**
+ * Where `cursor-agent` keeps its settings (`cli-config.json` and more), as it works it out:
+ * `CURSOR_CONFIG_DIR`, else `$XDG_CONFIG_HOME/cursor`, else `~/.cursor`.
+ */
+export function mainCursorConfigDir(): string {
+  const configured = process.env.CURSOR_CONFIG_DIR?.trim();
+  if (configured) return resolve(configured);
+  const xdg = process.env.XDG_CONFIG_HOME?.trim();
+  return xdg ? join(resolve(xdg), "cursor") : join(homedir(), ".cursor");
+}
+
+/**
+ * The daemon's XDG config folder, which an added Cursor account's mirrors (see `prepareCursorHome`):
+ * `$XDG_CONFIG_HOME`, else `~/.config`. `cursor-agent` keeps its Linux login in `cursor/auth.json` there.
+ */
+export function mainConfigHome(): string {
+  return resolve(process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), ".config"));
+}
+
 /** Pi's agent directory: `PI_CODING_AGENT_DIR` (a leading `~` is the home folder, as Pi reads it), else `~/.pi/agent`. */
 export function mainPiDir(): string {
   const configured = process.env.PI_CODING_AGENT_DIR?.trim();
@@ -79,6 +98,11 @@ export function inHomesDir(home: string): boolean {
 export async function isOwnHome(home: string): Promise<boolean> {
   const path = resolve(home);
   if (!inHomesDir(path) || path === mainClaudeDir() || path === mainCodexHome() || path === mainPiDir() || path === mainGrokHome()) return false;
+  // What a Cursor account's home mirrors could be pointed inside one: never delete a home holding it.
+  for (const main of [mainCursorConfigDir(), mainConfigHome()]) {
+    const inside = relative(path, main);
+    if (inside === "" || (!inside.startsWith("..") && !isAbsolute(inside))) return false;
+  }
   const entry = await lstat(path).catch(() => null);
   return !entry?.isSymbolicLink();
 }

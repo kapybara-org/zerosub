@@ -41,9 +41,21 @@ const OWN_AUTH_KEYS: Record<Family, readonly string[]> = {
     "GROK_OIDC_SCOPES",
     "GROK_CLI_CHAT_PROXY_BASE_URL",
   ],
+  // An API key or session token (cursor-agent saves either as its login), another endpoint, or a
+  // login or settings folder of the entry's own: any of them means it isn't the usual Cursor login.
+  cursor: [
+    "CURSOR_API_KEY",
+    "CURSOR_AUTH_TOKEN",
+    "CURSOR_API_ENDPOINT",
+    "XDG_CONFIG_HOME",
+    "CURSOR_CONFIG_DIR",
+  ],
 };
 
-/** Families Paseo has a provider of its own for. Grok only runs as a custom ACP provider (see `grokCommand`). */
+/**
+ * Families Paseo has a provider of its own for. Grok and Cursor only run as custom ACP providers (see
+ * `ACP_COMMANDS`).
+ */
 const BUILT_IN: readonly Family[] = ["claude", "codex", "pi"];
 
 const isFamily = (id: unknown): id is Family => typeof id === "string" && (FAMILIES as readonly string[]).includes(id);
@@ -58,26 +70,56 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 }
 
 /**
- * The Grok binary a provider entry runs, when it's Grok Build's agent over ACP: `extends: "acp"` and a
- * command like Paseo's catalog entry, `["grok", "agent", "stdio"]` (a path to `grok` or `grok-<version>`
- * too, with options between). Not one that joins a shared leader (`--leader`): the leader's sessions
- * run on whichever login started it. Null for anything else.
+ * Agents Paseo runs only as custom ACP providers, by the binary a provider entry runs (its base name)
+ * and the arguments that make it the agent:
+ * - Grok Build: `grok` or `grok-<version>`, with `agent` then `stdio` (options between), as in Paseo's
+ *   catalog entry `["grok", "agent", "stdio"]`. Not one that joins a shared leader (`--leader`): the
+ *   leader's sessions run on whichever login started it.
+ * - Cursor: `cursor-agent` (never the generic `agent` alias; Linux only, so no `.exe` or `.cmd`), with
+ *   `acp`, as in Paseo's catalog entry `["cursor-agent", "acp"]`. Not one given its own API key or
+ *   endpoint (`--api-key`, `-e`/`--endpoint`).
  */
-export function grokCommand(entry: Record<string, unknown> | undefined): string | null {
-  if (!entry || entry.extends !== "acp" || entry.enabled === false) return null;
+const ACP_COMMANDS: Partial<Record<Family, { binary: RegExp; args(args: readonly string[]): boolean }>> = {
+  grok: {
+    binary: /^grok(?:-\d[\w.]*)?(?:\.exe)?$/i,
+    args: (args) => {
+      const agent = args.indexOf("agent");
+      return agent >= 0 && args.indexOf("stdio", agent + 1) >= 0 && !args.includes("--leader");
+    },
+  },
+  cursor: {
+    binary: /^cursor-agent$/,
+    args: (args) => args.includes("acp") && !args.some((arg) => /^(?:--api-key|-e|--endpoint)(?:=|$)/.test(arg)),
+  },
+};
+
+/** The families matched by command (see `ACP_COMMANDS`), in the order they're tried. */
+const ACP_FAMILIES = Object.keys(ACP_COMMANDS) as Family[];
+
+/**
+ * The binary a provider entry runs, when it's `family`'s agent over ACP (see `ACP_COMMANDS`):
+ * `extends: "acp"`, not disabled, and a command whose binary and arguments are that agent's. Null for
+ * anything else.
+ */
+export function acpCommand(family: Family, entry: Record<string, unknown> | undefined): string | null {
+  const spec = ACP_COMMANDS[family];
+  if (!spec || !entry || entry.extends !== "acp" || entry.enabled === false) return null;
   const command = entry.command;
   if (!Array.isArray(command) || command.length === 0 || !command.every((part) => typeof part === "string")) return null;
   const [binary, ...args] = command as string[];
-  if (!binary || !/^grok(?:-\d[\w.]*)?(?:\.exe)?$/i.test(basename(binary))) return null;
-  const agent = args.indexOf("agent");
-  if (agent < 0 || args.indexOf("stdio", agent + 1) < 0 || args.includes("--leader")) return null;
+  if (!binary || !spec.binary.test(basename(binary)) || !spec.args(args)) return null;
   return binary;
+}
+
+/** The Grok binary a provider entry runs (see `ACP_COMMANDS`), or null. */
+export function grokCommand(entry: Record<string, unknown> | undefined): string | null {
+  return acpCommand("grok", entry);
 }
 
 /**
  * Maps Paseo provider IDs to the family they run on: the built-in `claude`, `codex` and `pi`
  * providers, custom profiles that extend them without their own credentials, and custom ACP providers
- * that run Grok Build (see `grokCommand`) without their own credentials.
+ * that run Grok Build or Cursor's agent (see `ACP_COMMANDS`) without their own credentials.
  */
 export function familiesFromConfig(providers: Record<string, unknown> | undefined): Record<string, Family> {
   const result: Record<string, Family> = {};
@@ -94,10 +136,12 @@ export function familiesFromConfig(providers: Record<string, unknown> | undefine
     if (bringsOwnAuth(base, asRecord(entry?.env))) continue;
     result[id] = base;
   }
-  for (const [id, value] of Object.entries(entries)) {
-    if (id in result || (isFamily(id) && id !== "grok")) continue;
-    const entry = asRecord(value);
-    if (grokCommand(entry) && !bringsOwnAuth("grok", asRecord(entry?.env))) result[id] = "grok";
+  for (const family of ACP_FAMILIES) {
+    for (const [id, value] of Object.entries(entries)) {
+      if (id in result || (isFamily(id) && id !== family)) continue;
+      const entry = asRecord(value);
+      if (acpCommand(family, entry) && !bringsOwnAuth(family, asRecord(entry?.env))) result[id] = family;
+    }
   }
   return result;
 }

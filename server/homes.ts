@@ -5,7 +5,7 @@ import type { ApiSummary, Family } from "../shared/model";
 import { Mutex, readJson } from "./json-file";
 import { NO_PROXY_KEYS, PROXY_KEYS, REQUIRED_NO_PROXY, bypassesProxy, maskProxy, noProxyFromEnv, proxyFromEnv, withClaudeNoProxy, withoutClaudeDomains } from "./proxy";
 import { providerEnv } from "./provider-env";
-import { homesDir, isOwnHome, mainClaudeDir, mainClaudeGlobalConfig, mainCodexHome, mainGrokHome, mainPiDir } from "./paths";
+import { homesDir, isOwnHome, mainClaudeDir, mainClaudeGlobalConfig, mainCodexHome, mainConfigHome, mainCursorConfigDir, mainGrokHome, mainPiDir } from "./paths";
 
 /**
  * A managed account home is a real directory holding that account's own credentials and account
@@ -848,6 +848,53 @@ export async function prepareGrokHome(home: string, force = false): Promise<void
   const last = lastSync.get(home);
   if (!force && last && Date.now() - last < SYNC_TTL_MS) return;
   await syncOverlay(home, { main: mainGrokHome(), shareDirs: ["sessions"], isPrivate: grokPrivate });
+  lastSync.set(home, Date.now());
+}
+
+// --------------------------------------------------------------------------- Cursor
+
+/**
+ * Per-account entries in Cursor's settings folder: the login (`auth.json`), `cli-config.json` (next to
+ * the user's settings it caches who is signed in, the team requests go to and the team's privacy mode,
+ * so an account gets its own copy, seeded from the CLI login's; see `seedCursorSettings`), and
+ * `statsig-cache.json` (the feature flags fetched for the signed-in user, stored with that user's id,
+ * which `cursor-agent` reports to Statsig ahead of the account's own while the cache is there).
+ */
+const CURSOR_PRIVATE = new Set(["auth.json", "cli-config.json", "statsig-cache.json"]);
+
+/** Keys of `cli-config.json` that belong to the account signed in, never copied to another. */
+function isCursorAccountKey(key: string): boolean {
+  return key === "authInfo" || /privacy|cache|statsig/i.test(key) || /auth|token|secret|credential/i.test(key);
+}
+
+/** A new account's `cli-config.json`: the CLI login's settings (model, permissions, sandbox, …), without its account's. */
+async function seedCursorSettings(settings: string): Promise<void> {
+  const target = join(settings, "cli-config.json");
+  if (await lstat(target).catch(() => null)) return;
+  const main = await readJsonObject(join(mainCursorConfigDir(), "cli-config.json"));
+  if (!main) return;
+  const seed: Json = {};
+  for (const [key, value] of Object.entries(main)) if (!isCursorAccountKey(key)) seed[key] = value;
+  await writeJsonAtomically(target, seed);
+}
+
+/**
+ * Creates or refreshes an added Cursor account's home, which is its agents' `XDG_CONFIG_HOME`. Their
+ * tools (git, gh, …) get that variable too, so it mirrors the daemon's own (`mainConfigHome`): every
+ * entry links back except `cursor/`, where `cursor-agent` keeps its login. With `XDG_CONFIG_HOME` set,
+ * `cursor-agent` keeps its settings in `cursor/` too, instead of `~/.cursor`, so `cursor/` in turn
+ * mirrors Cursor's settings folder (`mainCursorConfigDir`), keeping only `CURSOR_PRIVATE` per account.
+ * Chats and ACP sessions are kept there too (`chats/`, `acp-sessions/`), so those folders are shared up
+ * front, as other families' sessions are, and Paseo reopens a session where it was saved; projects are
+ * in `~/.cursor` (`CURSOR_DATA_DIR`), which neither variable moves.
+ */
+export async function prepareCursorHome(home: string, force = false): Promise<void> {
+  const last = lastSync.get(home);
+  if (!force && last && Date.now() - last < SYNC_TTL_MS) return;
+  await syncOverlay(home, { main: mainConfigHome(), shareDirs: [], isPrivate: (name) => name === "cursor" || isTemporary(name) });
+  const settings = join(home, "cursor");
+  await syncOverlay(settings, { main: mainCursorConfigDir(), shareDirs: ["acp-sessions", "chats"], isPrivate: (name) => CURSOR_PRIVATE.has(name) || isTemporary(name) });
+  await seedCursorSettings(settings);
   lastSync.set(home, Date.now());
 }
 

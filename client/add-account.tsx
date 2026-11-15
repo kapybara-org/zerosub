@@ -89,7 +89,7 @@ export function AddAccountModal({
     onClose();
   }, [loginId, finished, store, onClose]);
 
-  // Claude's flow serves both links at once; ChatGPT and Grok need a fresh flow to switch.
+  // Claude's flow serves both links at once; ChatGPT and Grok need a fresh flow to switch (Cursor has one link).
   const switchMethod = useCallback(
     (next: LoginMethod) => {
       setMethod(next);
@@ -226,7 +226,9 @@ function SignInSteps({
   const [submitting, setSubmitting] = useState(false);
   const [codeError, setCodeError] = useState<string | null>(null);
 
-  // Claude: the browser link completes by itself; the code link works from any device.
+  // Claude: the browser link completes by itself; the code link works from any device. Cursor's one
+  // link works from any device too: cursor-agent asks Cursor whether it was used.
+  const anywhere = family === "cursor";
   const pasteFlow = family === "claude" && (method === "code" || !login.url) && Boolean(login.codeUrl);
   const link = pasteFlow ? login.codeUrl : login.url ?? login.codeUrl;
 
@@ -273,12 +275,12 @@ function SignInSteps({
   );
 
   const service = family === "codex" ? "ChatGPT" : FAMILY_LABEL[family];
-  const canSwitch = browserUsable && (family !== "claude" || (Boolean(login.url) && Boolean(login.codeUrl)));
+  const canSwitch = browserUsable && !anywhere && (family !== "claude" || (Boolean(login.url) && Boolean(login.codeUrl)));
   return (
     <View style={{ gap: 16 }}>
       <Step theme={theme} number={1} title={`Open the ${service} sign-in page`}>
         <Text style={text.muted}>
-          {pasteFlow || login.userCode
+          {pasteFlow || login.userCode || anywhere
             ? "Sign in with the account you want to add. This works on any device, including your phone."
             : "Sign in with the account you want to add, using a browser on the host's own computer. It finishes by itself."}
         </Text>

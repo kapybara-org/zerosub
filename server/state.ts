@@ -121,6 +121,7 @@ export const StoredStateSchema = z.object({
       pi: z.string().nullable().default(null),
       // Families added later than Pi may be absent (none chosen), so registries and fixtures written before them load as they are.
       grok: z.string().nullable().optional(),
+      cursor: z.string().nullable().optional(),
     })
     .default({ claude: null, codex: null, pi: null }),
   /** Per-agent overrides of the default account. */
@@ -139,6 +140,7 @@ export const StoredStateSchema = z.object({
       codex: NextAgentPickSchema.nullable().default(null),
       pi: NextAgentPickSchema.nullable().default(null),
       grok: NextAgentPickSchema.nullable().optional(),
+      cursor: NextAgentPickSchema.nullable().optional(),
     })
     .default({ claude: null, codex: null, pi: null }),
   /** Where added Pi accounts' homes are kept: `dir` (null: `~/.pi-config`), and folders picked before whose accounts still move to it. */
@@ -148,7 +150,7 @@ export const StoredStateSchema = z.object({
 });
 export type StoredState = z.infer<typeof StoredStateSchema>;
 
-export const MAIN_ACCOUNT_ID: Record<Family, string> = { claude: "claude-main", codex: "codex-main", pi: "pi-main", grok: "grok-main" };
+export const MAIN_ACCOUNT_ID: Record<Family, string> = { claude: "claude-main", codex: "codex-main", pi: "pi-main", grok: "grok-main", cursor: "cursor-main" };
 
 export function emptyState(): StoredState {
   return StoredStateSchema.parse({});

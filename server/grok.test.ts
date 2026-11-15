@@ -71,7 +71,8 @@ describe("recognising Grok providers", () => {
       external: { ...CATALOG, env: { GROK_AUTH_PROVIDER_ACCESS_TOKEN: "token" } },
       blank: { ...CATALOG, env: { XAI_API_KEY: "" } },
     });
-    for (const id of ["cursor", "grok", "leader", "tui", "off", "keyed", "homed", "authed", "oidc", "external"]) expect(families[id]).toBeUndefined();
+    for (const id of ["grok", "leader", "tui", "off", "keyed", "homed", "authed", "oidc", "external"]) expect(families[id]).toBeUndefined();
+    expect(families.cursor).not.toBe("grok");
     expect(families.blank).toBe("grok");
     expect(grokCommand(CATALOG)).toBe("grok");
     expect(grokCommand({ ...CATALOG, extends: undefined })).toBeNull();
