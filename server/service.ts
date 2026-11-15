@@ -77,7 +77,7 @@ import {
 type PaseoApi = PluginHookContext["paseo"];
 type TurnEnded = PluginLifecycleEvents["agent.turn_ended"];
 
-const PROVIDER_NAME: Record<Family, string> = { claude: "Claude Code", codex: "Codex", pi: "Pi", grok: "Grok" };
+const PROVIDER_NAME: Record<Family, string> = { claude: "Claude Code", codex: "Codex", pi: "Pi", grok: "Grok", cursor: "Cursor" };
 /** How often to read usage: accounts in use, the defaults, and the rest. Adapters space reads further. */
 const USAGE_BUSY_MS = 60_000;
 const USAGE_DEFAULT_MS = 5 * 60_000;
@@ -208,7 +208,7 @@ interface Opening {
 }
 type Problem = { kind: "limit"; hit: LimitHit } | { kind: "signed_out" };
 
-/** Why a conversation of a provider without hand-off (Grok's) can't be given another account. */
+/** Why a conversation of a provider without hand-off (Grok's, Cursor's) can't be given another account. */
 function stays(family: Family, on: string | null): string {
   return `${FAMILY_LABEL[family]} conversations stay on the account they started on${on ? ` (${on})` : ""}. Start a new agent to use another account; new agents follow your pick and the default.`;
 }
@@ -302,7 +302,7 @@ export class Service {
   private readonly identityCheckedAt = new Map<string, number>();
   private readonly availability = new Map<Family, { ok: boolean; detail: string | null; at: number }>();
   private readonly logins = new Map<string, LoginSession>();
-  private readonly loginLocks: Record<Family, Mutex> = { claude: new Mutex(), codex: new Mutex(), pi: new Mutex(), grok: new Mutex() };
+  private readonly loginLocks: Record<Family, Mutex> = { claude: new Mutex(), codex: new Mutex(), pi: new Mutex(), grok: new Mutex(), cursor: new Mutex() };
   /** Homes of API accounts being set up, which cleanup must leave alone. */
   private readonly creatingHomes = new Set<string>();
   /**
@@ -1800,7 +1800,7 @@ export class Service {
     const info = await lookUpAgent(paseo, agentId);
     if (!info || info.archived) throw new Error("That agent is no longer available.");
     const family = (await this.families.resolve(paseo))[info.provider];
-    if (!family) throw new Error(`${info.provider} agents don't use Claude, ChatGPT or Grok subscription accounts.`);
+    if (!family) throw new Error(`${info.provider} agents don't use Claude, ChatGPT, Grok or Cursor subscription accounts.`);
     if (info.status === "running" || info.status === "initializing") {
       throw new Error("This agent is working right now. Wait for its turn to finish, then continue it elsewhere.");
     }
@@ -2638,7 +2638,7 @@ export class Service {
     const state = await this.store.read();
     for (const family of FAMILIES) {
       const availability = this.availability.get(family);
-      // An optional provider (Pi, Grok) is only missed once an account of it was added.
+      // An optional provider (Pi, Grok, Cursor) is only missed once an account of it was added.
       if (OPTIONAL[family] && !state.accounts.some((account) => account.family === family && account.kind === "managed")) continue;
       if (availability && !availability.ok) {
         warnings.push(
@@ -2659,6 +2659,14 @@ export class Service {
     if (grokSignIn && state.accounts.some((account) => account.family === "grok")) {
       warnings.push(
         "The daemon's environment sets a Grok sign-in (GROK_AUTH_PROVIDER_COMMAND, or GROK_OIDC_ISSUER and GROK_OIDC_CLIENT_ID). Grok agents on your CLI login use it; added Grok accounts don't, so one that can only sign in that way may fail to sign in or stay signed in.",
+      );
+    }
+    // Only once Cursor is on the Accounts screen (its CLI login registered or an account of it added), like `shownFamilies`.
+    const cursorLogin = ["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"].filter((key) => process.env[key]);
+    if (cursorLogin.length > 0 && state.accounts.some((account) => account.family === "cursor")) {
+      const it = cursorLogin.length > 1 ? "them" : "it";
+      warnings.push(
+        `The daemon's environment sets ${cursorLogin.join(" and ")}. Cursor agents on your CLI login use ${it}, and cursor-agent saves ${it} as that login; added Cursor accounts don't.`,
       );
     }
     if (!(await this.canReopen(this.paseo))) {
@@ -2873,7 +2881,7 @@ export class Service {
     const info = await lookUpAgent(paseo, agentId);
     if (!info) throw new Error("That agent is no longer available.");
     const family = (await this.families.resolve(paseo))[info.provider];
-    if (!family) throw new Error(`${info.provider} agents don't use Claude, ChatGPT or Grok subscription accounts.`);
+    if (!family) throw new Error(`${info.provider} agents don't use Claude, ChatGPT, Grok or Cursor subscription accounts.`);
     const adapter = this.adapters[family];
     const state = await this.store.read();
     const target = accountId ? findAccount(state, accountId) : defaultAccount(state, family);
@@ -2966,7 +2974,7 @@ export class Service {
     const account = findAccount(state, accountId);
     if (!account) throw new Error("That account no longer exists.");
     if (account.kind === "main") {
-      throw new Error("Your CLI login can't be removed here. Sign out with `claude auth logout`, `codex logout`, `grok logout` or Pi's /logout instead.");
+      throw new Error("Your CLI login can't be removed here. Sign out with `claude auth logout`, `codex logout`, `grok logout`, `cursor-agent logout` or Pi's /logout instead.");
     }
     if (!this.adapters[account.family].portable) {
       // These conversations can't move to another ChatGPT account, so removing theirs would strand them.
