@@ -41,9 +41,10 @@ import {
 } from "./adapter";
 import { FamilyResolver } from "./families";
 import { sameAccountIdentity, withoutWorkspace } from "./account-identity";
+import { codexHandoffMode, encryptedResumeFailure, sameWorkspace, turnFailedText } from "./codex-same-conversation";
 import { CodexContinuations } from "./continuations";
 import { CONTINUED_FROM_LABEL, continueInNewAgent, type Continuation } from "./handoff";
-import { PI_ACCOUNT_FILE, crossesInheritedProxy, isAccountHome, moveHome, normalizeBaseUrl, plainHttp, readPiAccount, readPiAccountForAgents, removeHome } from "./homes";
+import { PI_ACCOUNT_FILE, codexSessionsShared, crossesInheritedProxy, isAccountHome, moveHome, normalizeBaseUrl, plainHttp, readPiAccount, readPiAccountForAgents, removeHome } from "./homes";
 import { launcherNames, piLauncherDir, writeLaunchers, type LauncherAccount } from "./launchers";
 import { Mutex } from "./json-file";
 import { turnRows } from "./limits";
@@ -138,6 +139,7 @@ const DEFAULT_PREFERENCES: Preferences = {
   autoRedeem: false,
   useCredits: false,
   forkOtherProvider: false,
+  codexSameConversation: false,
 };
 
 interface LoginSession {
@@ -209,6 +211,21 @@ type Problem = { kind: "limit"; hit: LimitHit } | { kind: "signed_out" };
 /** Why a conversation of a provider without hand-off (Grok's) can't be given another account. */
 function stays(family: Family, on: string | null): string {
   return `${FAMILY_LABEL[family]} conversations stay on the account they started on${on ? ` (${on})` : ""}. Start a new agent to use another account; new agents follow your pick and the default.`;
+}
+
+/** What a same-conversation reload has to put back if the other account cannot read the thread. */
+interface ConversationMemberPin {
+  chainId: string;
+  accountId: string;
+  identity: string | null;
+  email: string | null;
+}
+
+interface SameConversationProbe {
+  fromAccountId: string;
+  toAccountId: string;
+  previousBinding: Binding | undefined;
+  members: ConversationMemberPin[];
 }
 
 /**
@@ -311,6 +328,13 @@ export class Service {
   private readonly unrouted = new Set<string>();
   /** When each agent's last turn started or ended; see `noteTurn`. */
   private readonly turnAt = new Map<string, number>();
+  /**
+   * The account a Codex agent reloaded off, until the first turn after that reload ends. A decrypt
+   * or resume failure pins it back and opens today's new tab. Any other ending drops the record.
+   */
+  private readonly sameConversationProbe = new Map<string, SameConversationProbe>();
+  /** This agent already failed to resume on the other account, so the next limit uses a new tab. */
+  private readonly sameConversationBlocked = new Set<string>();
   private aligning = false;
   /**
    * Default changes pinning open agents right now. Until they're pinned, an agent that follows the
@@ -916,8 +940,18 @@ export class Service {
     // meanwhile, and the limit is still this account's.
     const accountId = this.runningOn(await this.store.read(), agentId, family) ?? null;
     if (accountId) this.activeAt.set(accountId, Date.now());
+    if (event.outcome.kind === "completed") this.sameConversationBlocked.delete(agentId);
+    const probe = this.sameConversationProbe.get(agentId);
     if (event.outcome.kind !== "canceled") {
       const turn = await this.turnWithTimeline(context.paseo, event);
+      if (probe && encryptedResumeFailure(turnFailedText(turn))) {
+        this.sameConversationProbe.delete(agentId);
+        this.sameConversationBlocked.add(agentId);
+        await this.revertSameConversation(context.paseo, agentId, family, probe, turn.timeline);
+        if (this.deferred.has(agentId)) await this.finishDeferred(context.paseo, agentId, family);
+        return;
+      }
+      if (probe) this.sameConversationProbe.delete(agentId);
       // A hand-off quotes the whole conversation, not just this turn. Paseo 0.13 sends none, so the hand-off pages it.
       const conversation = event.timeline.length > 0 ? event.timeline : undefined;
       const hit = adapter.detectLimit(turn);
@@ -934,6 +968,7 @@ export class Service {
         return;
       }
     }
+    if (probe && event.outcome.kind === "canceled") this.sameConversationProbe.delete(agentId);
     if (this.deferred.has(agentId)) await this.finishDeferred(context.paseo, agentId, family);
     // The turn just used the account: read its usage again as soon as the provider allows.
     if (accountId) void this.refreshUsage(accountId).catch(() => undefined);
@@ -981,6 +1016,8 @@ export class Service {
     this.alignedAt.delete(agentId);
     this.failedMoves.delete(agentId);
     this.unrouted.delete(agentId);
+    this.sameConversationProbe.delete(agentId);
+    this.sameConversationBlocked.delete(agentId);
     const ended = (session: LiveSession | undefined) => session !== undefined && Date.parse(session.openedAt) < closedAt;
     if (!ended((await this.store.read()).sessions[agentId])) return;
     await this.store.update((draft) => {
@@ -994,6 +1031,8 @@ export class Service {
     this.failedMoves.delete(agentId);
     this.unrouted.delete(agentId);
     this.turnAt.delete(agentId);
+    this.sameConversationProbe.delete(agentId);
+    this.sameConversationBlocked.delete(agentId);
     this.switchGuard.forget(agentId);
     this.guardNoticeAt.delete(agentId);
     this.guardNoticeAt.delete(`${agentId}:elsewhere`);
@@ -1264,6 +1303,8 @@ export class Service {
       await this.appendRow(paseo, agentId, { ...base, to: account.label, reason: "exhausted", outcome: "stayed", detail });
       return;
     }
+
+    if (!adapter.portable && (await this.keptSameConversation(paseo, agentId, account, next, problem, base, reason, endedAt))) return;
 
     if (adapter.portable) {
       if (move?.pin) await this.pin(agentId, next.id, latest.bindings[agentId]);
@@ -1782,6 +1823,174 @@ export class Service {
     return result.fork;
   }
 
+  /**
+   * Reloads this Codex agent on `next` when both accounts are members of one workspace and `next`
+   * really links `sessions/`. One write updates the binding and this agent's continuation record,
+   * so a later handoff still sees one tab. A failed reload puts that write back and returns false,
+   * and the caller opens today's new tab.
+   */
+  private async keptSameConversation(
+    paseo: PaseoApi,
+    agentId: string,
+    account: StoredAccount,
+    next: StoredAccount,
+    problem: Problem,
+    base: Omit<SwitchRow, "to" | "reason" | "outcome">,
+    reason: SwitchRow["reason"],
+    endedAt: number,
+  ): Promise<boolean> {
+    if (problem.kind !== "limit" || account.family !== "codex" || next.family !== "codex") return false;
+    const eligible = codexHandoffMode({
+      enabled: this.prefs.codexSameConversation && !this.sameConversationBlocked.has(agentId),
+      sameWorkspace: sameWorkspace(account.identity, next.identity),
+      // The link is checked below, after the other gates, so a disabled option does not touch homes.
+      sessionsShared: true,
+      limitMessage: problem.hit.message,
+    });
+    if (eligible === "new-tab") return false;
+    await this.prepareSharedSessions(account);
+    await this.prepareSharedSessions(next);
+    if (!(await codexSessionsShared(next.home, account.home))) return false;
+
+    const seen = await this.store.read();
+    const previousBinding = seen.bindings[agentId];
+    const members = this.conversationPins(seen, agentId);
+    await this.store.update((draft) => {
+      draft.bindings[agentId] = { accountId: next.id, source: "auto", at: new Date().toISOString() };
+      for (const chain of Object.values(draft.continuations)) {
+        const member = chain.members[agentId];
+        if (!member) continue;
+        member.accountId = next.id;
+        member.identity = next.identity;
+        member.email = next.email;
+      }
+    });
+    const result = await this.reopenAgent(paseo, agentId, { settle: true, sameConversation: true });
+    const landed = (await this.store.read()).sessions[agentId]?.accountId === next.id;
+    if (result.outcome !== "reopened" || !landed) {
+      this.deferred.delete(agentId);
+      await this.restoreConversationPin(agentId, previousBinding, members);
+      return false;
+    }
+    this.switchGuard.note(agentId, Date.now());
+    this.sameConversationProbe.set(agentId, { fromAccountId: account.id, toAccountId: next.id, previousBinding, members });
+    const continued = this.prefs.autoContinue && (await this.untouchedSince(paseo, agentId, endedAt));
+    await this.appendRow(paseo, agentId, {
+      ...base,
+      to: next.label,
+      reason,
+      continued,
+      outcome: "switched",
+      sameConversation: true,
+    });
+    if (continued) await this.carryOn(paseo, agentId, endedAt);
+    return true;
+  }
+
+  /**
+   * Puts the agent back on the account that can read the thread, then hands off to the other as
+   * today: a new tab there, or only a note while Keep going after a switch is off.
+   */
+  private async revertSameConversation(
+    paseo: PaseoApi,
+    agentId: string,
+    family: Family,
+    probe: SameConversationProbe,
+    timeline: readonly AgentTimelineItem[] | undefined,
+  ): Promise<void> {
+    const release = await this.claim(agentId);
+    try {
+      await this.restoreConversationPin(agentId, probe.previousBinding, probe.members);
+      await this.reopenAgent(paseo, agentId, { settle: true, sameConversation: true });
+      const state = await this.store.read();
+      const from = findAccount(state, probe.fromAccountId);
+      const to = findAccount(state, probe.toAccountId);
+      if (!from || !to || family !== "codex") return;
+      if (!this.prefs.autoContinue) {
+        await this.appendRow(paseo, agentId, {
+          family,
+          from: from.label,
+          to: to.label,
+          reason: "limit",
+          resetsAt: from.limitedUntil,
+          continued: false,
+          continuedIn: null,
+          toFamily: null,
+          outcome: "stayed",
+          detail: `New ${FAMILY_LABEL[family]} agents will use ${to.label}.`,
+          at: new Date().toISOString(),
+        });
+        return;
+      }
+      const why = `its ChatGPT account (${from.label}) reached its usage limit, and ${to.label} could not resume the thread`;
+      try {
+        const continuation = await this.continueElsewhere(paseo, agentId, to, why, timeline, "auto");
+        await this.appendRow(paseo, agentId, {
+          family,
+          from: from.label,
+          to: to.label,
+          reason: "limit",
+          resetsAt: from.limitedUntil,
+          continued: true,
+          continuedIn: continuation,
+          toFamily: null,
+          outcome: "continued",
+          detail: `${to.label} could not resume this thread.`,
+          at: new Date().toISOString(),
+        });
+      } catch (error) {
+        log(`could not continue ${agentId} on ${to.label}`, error);
+        await this.appendRow(paseo, agentId, {
+          family,
+          from: from.label,
+          to: to.label,
+          reason: "limit",
+          resetsAt: from.limitedUntil,
+          continued: false,
+          continuedIn: null,
+          toFamily: null,
+          outcome: "stayed",
+          detail: `Couldn't continue on ${to.label}: ${describe(error)}`,
+          at: new Date().toISOString(),
+        });
+      }
+    } finally {
+      release();
+    }
+  }
+
+  private conversationPins(state: StoredState, agentId: string): ConversationMemberPin[] {
+    const pins: ConversationMemberPin[] = [];
+    for (const [chainId, chain] of Object.entries(state.continuations)) {
+      const member = chain.members[agentId];
+      if (!member) continue;
+      pins.push({ chainId, accountId: member.accountId, identity: member.identity, email: member.email });
+    }
+    return pins;
+  }
+
+  private async restoreConversationPin(agentId: string, binding: Binding | undefined, members: readonly ConversationMemberPin[]): Promise<void> {
+    await this.store.update((draft) => {
+      if (binding) draft.bindings[agentId] = binding;
+      else delete draft.bindings[agentId];
+      for (const pin of members) {
+        const member = draft.continuations[pin.chainId]?.members[agentId];
+        if (!member) continue;
+        member.accountId = pin.accountId;
+        member.identity = pin.identity;
+        member.email = pin.email;
+      }
+    });
+  }
+
+  /** Makes the shared session link before a same-conversation reload. A failed link only warns. */
+  private async prepareSharedSessions(account: StoredAccount): Promise<void> {
+    if (account.kind !== "managed" || !account.home || account.family !== "codex") return;
+    await this.adapters.codex.prepareHome(account.home, this.stillHas(account)).catch((error: unknown) =>
+      log(`could not refresh the home of ${account.label}`, error),
+    );
+  }
+
   private async continueElsewhere(
     paseo: PaseoApi,
     agentId: string,
@@ -1860,7 +2069,7 @@ export class Service {
   private async reopenAgent(
     paseo: PaseoApi,
     agentId: string,
-    options: { row?: SwitchRow | null; settle?: boolean; background?: boolean; unattended?: boolean } = {},
+    options: { row?: SwitchRow | null; settle?: boolean; background?: boolean; unattended?: boolean; sameConversation?: boolean } = {},
   ): Promise<ReopenResult> {
     const { row = null, settle = false, background = false, unattended = background } = options;
     let info: AgentInfo | null;
@@ -1881,7 +2090,9 @@ export class Service {
     const state = await this.store.read();
     // A thread whose session opened without ZeroSub (on the CLI login) belongs to the account it's
     // pinned to, which holds its history, so it reopens there.
-    if (family && !this.adapters[family].portable && info.hasHistory && (state.sessions[agentId] || !state.bindings[agentId])) {
+    // A same-conversation reload already pinned this thread to the other account. This guard would
+    // pin it back to the session it is leaving, so that one reload skips it.
+    if (!options.sameConversation && family && !this.adapters[family].portable && info.hasHistory && (state.sessions[agentId] || !state.bindings[agentId])) {
       // The thread gained history while waiting, so it can no longer change accounts: keep it put.
       const current = this.runningOn(state, agentId, family);
       if (current && findAccount(state, current)) {

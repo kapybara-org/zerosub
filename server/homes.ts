@@ -796,6 +796,30 @@ export async function prepareCodexHome(home: string, force = false): Promise<voi
   lastSync.set(home, Date.now());
 }
 
+/**
+ * The session directory `home` will read. The CLI login (`null`, or the main Codex home) is the
+ * directory itself. Any other home counts only when `sessions` is a symlink or a Windows junction
+ * to that directory: a plain folder, including one left behind when a junction fails, is its own
+ * copy and must not be treated as shared.
+ */
+export async function codexSessionsRoot(home: string | null): Promise<string | null> {
+  const main = mainCodexHome();
+  const homeIsMain = !home || resolve(home) === resolve(main);
+  const sessions = homeIsMain ? join(main, "sessions") : join(home, "sessions");
+  const info = await lstat(sessions).catch(() => null);
+  if (!info) return null;
+  if (!homeIsMain && !info.isSymbolicLink()) return null;
+  if (homeIsMain && !info.isDirectory() && !info.isSymbolicLink()) return null;
+  return realpath(sessions).catch(() => null);
+}
+
+/** Both homes read one session directory, so one agent can reload the thread on the other account. */
+export async function codexSessionsShared(destinationHome: string | null, sourceHome: string | null): Promise<boolean> {
+  const destination = await codexSessionsRoot(destinationHome);
+  const source = await codexSessionsRoot(sourceHome);
+  return destination !== null && destination === source;
+}
+
 /** Where the main Codex home keeps its SQLite state; managed homes point there so thread metadata is shared. */
 export async function codexSqliteHome(): Promise<string | null> {
   if (process.env.CODEX_SQLITE_HOME) return process.env.CODEX_SQLITE_HOME;

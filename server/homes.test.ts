@@ -2,7 +2,7 @@ import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, utime
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { accountSettings, mergeSettings, mergeShared, prepareClaudeHome, prepareCodexHome, readAccountProxy, removeHome, writeAccountProxy } from "./homes";
+import { accountSettings, codexSessionsShared, mergeSettings, mergeShared, prepareClaudeHome, prepareCodexHome, readAccountProxy, removeHome, writeAccountProxy } from "./homes";
 
 let root: string;
 const saved = {
@@ -272,10 +272,33 @@ describe("prepareCodexHome", () => {
 
     expect(await isLinkTo(join(home, "config.toml"), join(main, "config.toml"))).toBe(true);
     expect(await isLinkTo(join(home, "sessions"), join(main, "sessions"))).toBe(true);
+    expect(await codexSessionsShared(home, null)).toBe(true);
     expect(await isLinkTo(join(home, "archived_sessions"), join(main, "archived_sessions"))).toBe(true);
     for (const name of ["auth.json", "models_cache.json", "state_5.sqlite", "state_5.sqlite-wal", "..codex-global-state.json.tmp-1"]) {
       expect(await lstat(join(home, name)).catch(() => null)).toBeNull();
     }
+  });
+
+  it("treats a plain sessions directory as private, including one a failed junction would leave", async () => {
+    const main = join(root, "codex");
+    const home = join(root, "homes", "codex-plain");
+    process.env.CODEX_HOME = main;
+    await mkdir(join(main, "sessions"), { recursive: true });
+    await mkdir(join(home, "sessions"), { recursive: true });
+    expect(await codexSessionsShared(home, null)).toBe(false);
+    expect(await codexSessionsShared(join(root, "homes", "missing"), null)).toBe(false);
+  });
+
+  it("rejects a sessions link that points somewhere else", async () => {
+    const main = join(root, "codex");
+    const home = join(root, "homes", "codex-elsewhere");
+    const elsewhere = join(root, "elsewhere");
+    process.env.CODEX_HOME = main;
+    await mkdir(join(main, "sessions"), { recursive: true });
+    await mkdir(elsewhere, { recursive: true });
+    await mkdir(home, { recursive: true });
+    await symlink(elsewhere, join(home, "sessions"));
+    expect(await codexSessionsShared(home, null)).toBe(false);
   });
 });
 

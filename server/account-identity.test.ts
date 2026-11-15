@@ -23,6 +23,12 @@ describe("account identity compatibility", () => {
       { identity: null, email: "me@example.com" })).toBe(false);
   });
 
+  it("does not treat two members of one workspace as the same account", () => {
+    expect(sameAccountIdentity("codex",
+      { identity: "chatgpt|ws|a@example.com", email: "a@example.com" },
+      { identity: "chatgpt|ws|b@example.com", email: "b@example.com" })).toBe(false);
+  });
+
   it("keeps Claude identity comparison exact", () => {
     expect(sameAccountIdentity("claude", { identity: "org-a|me@example.com", email: "me@example.com" },
       { identity: "org-b|me@example.com", email: "me@example.com" })).toBe(false);
