@@ -4,6 +4,9 @@
  * id is the same, and only for keys shaped `chatgpt|<workspace>|<email>`.
  */
 
+import type { AgentTimelineItem } from "./adapter";
+import { isTurnPrompt } from "./handoff";
+
 /** `chatgpt|<workspace>|<email>`. An email-only key, or a workspace id with no member, is not one. */
 const WORKSPACE_MEMBER = /^chatgpt\|([^|]+)\|([^|]+)$/;
 const WORKSPACE_CREDITS = /^Your workspace is out of credits\b/i;
@@ -44,14 +47,23 @@ export function encryptedResumeFailure(text: string): boolean {
   return RESUME_FAILURE.test(text);
 }
 
-/** The failure notices of one turn, not its ordinary replies. */
+/**
+ * The failure notices of one turn, not its ordinary replies. Paseo 0.12 and earlier send the whole
+ * conversation, so like `notices` in limits.ts the timeline is read back to this turn's prompt, and
+ * a turn that failed before it started has only its failure.
+ */
 export function turnFailedText(event: {
   outcome: { kind: string; error?: { message?: string } | null };
-  timeline?: ReadonlyArray<{ type: string; message?: string; text?: string }>;
+  timeline?: readonly AgentTimelineItem[];
+  turnId?: string | null;
 }): string {
   const parts: string[] = [];
   if (event.outcome.kind === "failed" && event.outcome.error?.message) parts.push(event.outcome.error.message);
-  for (const item of event.timeline ?? []) {
+  const timeline = event.turnId === null ? [] : (event.timeline ?? []);
+  for (let index = timeline.length - 1; index >= 0; index -= 1) {
+    const item = timeline[index];
+    if (!item) continue;
+    if (isTurnPrompt(item)) break;
     if (item.type === "error" && item.message) parts.push(item.message);
     else if (item.type === "assistant_message" && item.text && /^\[System Error\]/.test(item.text)) parts.push(item.text);
   }

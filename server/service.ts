@@ -1887,7 +1887,10 @@ export class Service {
     return true;
   }
 
-  /** Puts the agent back on the account that can read the thread, then opens the new tab on the other. */
+  /**
+   * Puts the agent back on the account that can read the thread, then hands off to the other as
+   * today: a new tab there, or only a note while Keep going after a switch is off.
+   */
   private async revertSameConversation(
     paseo: PaseoApi,
     agentId: string,
@@ -1903,6 +1906,22 @@ export class Service {
       const from = findAccount(state, probe.fromAccountId);
       const to = findAccount(state, probe.toAccountId);
       if (!from || !to || family !== "codex") return;
+      if (!this.prefs.autoContinue) {
+        await this.appendRow(paseo, agentId, {
+          family,
+          from: from.label,
+          to: to.label,
+          reason: "limit",
+          resetsAt: from.limitedUntil,
+          continued: false,
+          continuedIn: null,
+          toFamily: null,
+          outcome: "stayed",
+          detail: `New ${FAMILY_LABEL[family]} agents will use ${to.label}.`,
+          at: new Date().toISOString(),
+        });
+        return;
+      }
       const why = `its ChatGPT account (${from.label}) reached its usage limit, and ${to.label} could not resume the thread`;
       try {
         const continuation = await this.continueElsewhere(paseo, agentId, to, why, timeline, "auto");

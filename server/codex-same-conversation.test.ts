@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { SwitchRowSchema } from "../shared/timeline";
+import type { AgentTimelineItem } from "./adapter";
 import { codexHandoffMode, encryptedResumeFailure, sameWorkspace, turnFailedText, workspaceOutOfCredits } from "./codex-same-conversation";
 
 const WS = "chatgpt|ws|a@example.com";
@@ -58,6 +59,18 @@ describe("codexHandoffMode", () => {
     });
     expect(encryptedResumeFailure(text)).toBe(true);
     expect(text).not.toContain("last turn");
+  });
+
+  it("reads back to this turn's prompt, and only the failure of a turn that never started", () => {
+    const timeline: AgentTimelineItem[] = [
+      { type: "user_message", text: "Repair the build." },
+      { type: "assistant_message", text: "[System Error] invalid_encrypted_content" },
+      { type: "user_message", text: "Carry on." },
+      { type: "assistant_message", text: "The parser has been repaired." },
+    ];
+    expect(turnFailedText({ outcome: { kind: "completed" }, timeline, turnId: "turn-2" })).toBe("");
+    const failed = { kind: "failed", error: { message: "connection reset" } };
+    expect(turnFailedText({ outcome: failed, timeline: timeline.slice(0, 2), turnId: null })).toBe("connection reset");
   });
 });
 

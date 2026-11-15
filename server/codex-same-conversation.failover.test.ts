@@ -60,6 +60,7 @@ async function setup(options: {
   identityB?: string;
   linkSessions?: boolean;
   reload?: "works" | "fails";
+  autoContinue?: boolean;
 } = {}) {
   const dir = await mkdtemp(join(tmpdir(), "zerosub-same-conversation-"));
   dirs.push(dir);
@@ -179,13 +180,13 @@ async function setup(options: {
     reopener as unknown as Reopener,
   );
   services.push(service);
-  service.setPreferences(preferences.schema.parse({ codexSameConversation: options.sameConversation === true }));
+  service.setPreferences(preferences.schema.parse({ codexSameConversation: options.sameConversation === true, autoContinue: options.autoContinue }));
 
-  const endTurn = (message: string, kind: "failed" | "completed" = "failed") => service.onTurnEnded({
+  const endTurn = (message: string, kind: "failed" | "completed" = "failed", timeline: AgentTimelineItem[] = []) => service.onTurnEnded({
     agent: { id: "root", provider: "codex" },
     turnId: `turn-${clock++}`,
     outcome: kind === "failed" ? { kind, error: { message } } : { kind },
-    timeline: [],
+    timeline,
   } as never, { paseo } as never);
 
   return { service, store, paseo, created, sent, notes, reopened, endTurn, a, b };
@@ -297,5 +298,51 @@ describe("Codex same-conversation failover", () => {
     expect(other.created).toEqual([]);
     expect((await other.store.read()).bindings.root?.accountId).toBe("b");
     expect((await other.store.read()).sessions.root?.accountId).toBe("b");
+  });
+
+  // Paseo 0.12 and earlier send the whole conversation with the finished turn.
+  it("ignores a decrypt error from an earlier turn when Paseo sends the whole conversation", async () => {
+    const t = await setup({ sameConversation: true });
+    await t.endTurn(LIMIT);
+    await t.endTurn("done", "completed", [
+      { type: "user_message", text: "Repair the build." },
+      { type: "assistant_message", text: `[System Error] ${DECRYPT}` },
+      { type: "user_message", text: "Carry on." },
+      { type: "assistant_message", text: "The parser has been repaired." },
+    ]);
+    expect(t.reopened).toEqual(["root"]);
+    expect(t.created).toEqual([]);
+    const state = await t.store.read();
+    expect(state.bindings.root?.accountId).toBe("b");
+    expect(state.sessions.root?.accountId).toBe("b");
+  });
+
+  it("still pins the agent back when this turn's own row reports the decrypt failure", async () => {
+    const t = await setup({ sameConversation: true });
+    await t.endTurn(LIMIT);
+    await t.endTurn("Codex stopped", "failed", [
+      { type: "user_message", text: "Repair the build." },
+      { type: "assistant_message", text: "The parser has been repaired." },
+      { type: "user_message", text: "Carry on." },
+      { type: "assistant_message", text: `[System Error] ${DECRYPT}` },
+    ]);
+    expect(t.reopened).toEqual(["root", "root"]);
+    expect(t.created).toHaveLength(1);
+    expect((await t.store.read()).bindings.root?.accountId).toBe("a");
+  });
+
+  it.each([
+    ["on", true, 1, { outcome: "continued", continued: true, detail: "B could not resume this thread." }],
+    ["off", false, 0, { outcome: "stayed", continued: false, detail: "New ChatGPT agents will use B." }],
+  ])("pins the agent back and hands off as today when the resume fails, with Keep going after a switch %s", async (_name, autoContinue, tabs, row) => {
+    const t = await setup({ sameConversation: true, autoContinue });
+    await t.endTurn(LIMIT);
+    await t.endTurn(DECRYPT);
+    expect(t.reopened).toEqual(["root", "root"]);
+    expect(t.created).toHaveLength(tabs);
+    const state = await t.store.read();
+    expect(state.bindings.root).toMatchObject({ accountId: "a", source: "thread" });
+    expect(state.sessions.root?.accountId).toBe("a");
+    expect(t.notes.at(-1)).toMatchObject(row);
   });
 });
