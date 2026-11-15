@@ -2943,6 +2943,7 @@ export class Service {
    */
   private async countAzureTurn(paseo: PaseoApi, agentId: string, accountId: string): Promise<void> {
     await delay(1_500);
+    if (this.stopped) return;
     const agent = (await paseo.agents.ref(agentId).refresh().catch(() => null))?.agent as
       | { persistence?: { sessionId?: string; nativeHandle?: string } | null; model?: string | null }
       | undefined;

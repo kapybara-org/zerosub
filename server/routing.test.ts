@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Usage } from "../shared/model";
 import { applyEnv } from "./adapter";
 import { parseRateLimits } from "./codex";
-import { chooseAccount, fiveHourGated, mostAvailable } from "./routing";
+import { chooseAccount, fiveHourGated, isLastResort, mostAvailable } from "./routing";
 import { emptyState, type StoredAccount, type StoredState } from "./state";
 
 const NOW = Date.parse("2026-09-23T12:00:00Z");
@@ -522,5 +522,63 @@ describe("the 5-hour gate", () => {
             credits: { balance: 500, unlimited: false },
           };
     expect(mostAvailable(stateWith([busy, full]), "codex", usageOf, NOW)?.id).toBe(busy.id);
+  });
+});
+
+describe("Azure OpenAI accounts: last resort", () => {
+  const codex = { ...base, family: "codex" as const, portable: false };
+  const cli = account({ id: "codex-main", family: "codex", kind: "main", home: null });
+  const sub = account({ id: "codex-sub", family: "codex" });
+  const azure = account({ id: "codex-azure", family: "codex", auth: "api", createdAt: "2026-08-01T00:00:00Z" });
+  const out = (entry: StoredAccount) => ({ ...entry, limitedUntil: "2026-09-23T15:00:00Z", limitKind: "window" as const });
+  // Azure has no plan windows, so it would otherwise look like the quietest account there is.
+  const usageOf = (id: string) => (id === azure.id ? null : usage(70));
+
+  it("is never picked while a subscription account has room, even with the most room", () => {
+    expect(isLastResort(azure)).toBe(true);
+    expect(isLastResort(sub)).toBe(false);
+    expect(mostAvailable(stateWith([cli, sub, azure]), "codex", usageOf, NOW)?.id).toBe(cli.id);
+    expect(mostAvailable(stateWith([cli, out(sub), azure]), "codex", usageOf, NOW)?.id).toBe(cli.id);
+    const spread = chooseAccount(stateWith([cli, sub, azure]), { ...codex, reason: "create", balanceNewAgents: true, usageOf });
+    expect(spread?.account.id).not.toBe(azure.id);
+  });
+
+  it("takes over once every subscription account is limited, disabled or signed out", () => {
+    const state = stateWith([out(cli), { ...sub, disabled: true }, azure]);
+    expect(mostAvailable(state, "codex", usageOf, NOW)?.id).toBe(azure.id);
+    expect(mostAvailable(stateWith([{ ...cli, signedIn: false }, out(sub), azure]), "codex", usageOf, NOW)?.id).toBe(azure.id);
+    // A new agent whose default is out lands on Azure, and is pinned there as its thread.
+    const decision = chooseAccount(state, { ...codex, reason: "create", usageOf });
+    expect(decision?.account.id).toBe(azure.id);
+    expect(decision?.skipped?.account.id).toBe(cli.id);
+    expect(decision?.bind).toMatchObject({ accountId: azure.id, source: "thread" });
+  });
+
+  it("isn't used while it's cooling down after a rate limit", () => {
+    expect(mostAvailable(stateWith([out(cli), out(azure)]), "codex", usageOf, NOW)).toBeUndefined();
+  });
+
+  it("gives new agents back to a subscription account once one has room again", () => {
+    const later = NOW + 4 * 60 * 60_000; // After the subscription's limit lifted.
+    const state = stateWith([out(cli), azure]);
+    expect(chooseAccount(state, { ...codex, reason: "create", now: NOW, usageOf })?.account.id).toBe(azure.id);
+    expect(chooseAccount(state, { ...codex, reason: "create", now: later, usageOf })?.account.id).toBe(cli.id);
+  });
+
+  it("can still be chosen by hand, as the default or an agent's own account", () => {
+    const asDefault = stateWith([cli, azure], { defaults: { claude: null, codex: azure.id, pi: null } });
+    expect(chooseAccount(asDefault, { ...codex, reason: "create", usageOf })?.account.id).toBe(azure.id);
+    const bound = stateWith([cli, azure], { bindings: { "agent-1": { accountId: azure.id, source: "user", at: "2026-09-23T00:00:00Z" } } });
+    expect(chooseAccount(bound, { ...codex, reason: "resume", usageOf })?.account.id).toBe(azure.id);
+  });
+
+  it("isn't kept as a stand-in once a subscription account could take over", () => {
+    const state = stateWith([out(cli), sub, azure], {
+      bindings: { "agent-1": { accountId: cli.id, source: "user", at: "2026-09-23T00:00:00Z" } },
+    });
+    const portable = { ...base, family: "codex" as const, portable: true };
+    expect(chooseAccount(state, { ...portable, reason: "refresh", current: azure.id, usageOf })?.account.id).toBe(sub.id);
+    const allOut = stateWith([out(cli), out(sub), azure], state);
+    expect(chooseAccount({ ...allOut, accounts: [out(cli), out(sub), azure] }, { ...portable, reason: "refresh", current: azure.id, usageOf })?.account.id).toBe(azure.id);
   });
 });
