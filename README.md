@@ -75,6 +75,23 @@ A new workspace has no agent yet, so its message box has no account button. To c
   - A sub-agent (one another agent started) keeps its parent: its new tab goes under the same agent, or under the tab where that agent's own task now continues. Like the first tab, it's archived with the parent and sends no notifications of its own. Paseo doesn't tell the parent when the new tab finishes, though: it only reports to an agent on agents it started or prompted itself.
   - ZeroSub never sends a hand-off twice. If a lost connection leaves one unconfirmed, the switch stops and names the tab to check. Continuation agents from earlier versions are picked up on the first switch. New Codex agents simply start on the chosen account.
 
+### Keep a Codex chat in the same conversation (optional)
+
+Off by default. Turn on **Keep a Codex chat in the same conversation** for two ChatGPT accounts that are members of one workspace (`chatgpt|<workspace>|<email>`). A usage limit then reloads the same agent on the other account. That tab is the only one writing the thread: ZeroSub does not resume it from a second tab. Before the reload, it checks that the other account's home links `sessions/` to the same session directory. A plain `sessions` folder does not count. On Windows a failed junction is only a warning, and that account keeps the new tab.
+
+These still open a new tab:
+
+- the option is off
+- the accounts are in different workspaces
+- an account is known only as `chatgpt-email|…`
+- the limit says the workspace is out of credits
+- the other home does not link `sessions/`
+- the first turn after the switch fails because the thread cannot be decrypted or resumed (`invalid_encrypted_content`, `organization_id mismatch`)
+
+That last failure puts the agent back on the previous account, in the same write as its continuation record, and opens today's continuation tab.
+
+On 2026-11-15, my fork continued one conversation from member A to member B of the same workspace on macOS 27.0.1 with Codex 0.167.0. That hop was a workspace credit limit, which this option still opens in a new tab. The run did not cover a second workspace or an email-only identity.
+
 ### Banked resets
 
 Some plans come with banked limit resets: ChatGPT's reset credits, and Claude Code's limit resets. When an account has any, its card shows how many are banked and when they expire, with a **Use reset** button. When an agent is stopped by a limit, its account button offers the reset too, and the agent carries on afterwards.

@@ -139,6 +139,13 @@ export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurface
             onValueChange={(forkOtherProvider) => save({ forkOtherProvider })}
           />
           <SettingsSwitch
+            label="Keep a Codex chat in the same conversation"
+            hint="Off unless you turn it on. Two ChatGPT accounts in one workspace reload this agent on the other account instead of opening a new tab. A different workspace, an email-only account, or a workspace that is out of credits still opens a new tab. If the first turn cannot resume the thread, this agent goes back and the new tab opens."
+            value={settings.values.codexSameConversation}
+            disabled={settings.saving || !settings.values.autoSwitch}
+            onValueChange={(codexSameConversation) => save({ codexSameConversation })}
+          />
+          <SettingsSwitch
             label="Show the account pill in the composer"
             hint="Appears on Claude and Codex agents once a provider has two or more accounts."
             value={settings.values.showComposerPill}

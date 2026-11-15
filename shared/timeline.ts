@@ -40,6 +40,11 @@ export const SwitchRowSchema = z.object({
    * `reset`: a banked reset refilled `from`, and the agent stayed on it.
    */
   outcome: z.enum(["switched", "pending", "continued", "stayed", "reset"]).default("switched"),
+  /**
+   * The agent reloaded on `to` and kept this conversation. Absent on older rows, and on a new-tab
+   * handoff, so a client that does not know the field still parses the row.
+   */
+  sameConversation: z.boolean().optional(),
   detail: z.string().nullable().default(null),
   at: z.string(),
 });

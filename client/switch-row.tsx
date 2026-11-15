@@ -55,6 +55,9 @@ export function describeRow(row: SwitchRow): string {
   const lead = why ? `${why} ` : "";
   switch (row.outcome) {
     case "continued":
+      if (row.continuedIn && row.detail) {
+        return `${lead}${row.detail} This task continues in “${row.continuedIn.title}” on ${row.to}.`;
+      }
       return row.continuedIn
         ? `${lead}ChatGPT conversations can't change accounts, so this task continues in “${row.continuedIn.title}” on ${row.to}.`
         : `${lead}Continuing on ${row.to}.`;
@@ -65,7 +68,8 @@ export function describeRow(row: SwitchRow): string {
     default: {
       const from =
         row.from && row.reason !== "limit" && row.reason !== "signed_out" && row.reason !== "disabled" ? `from ${row.from} ` : "";
-      return `${lead}Switched ${from}to ${row.to}${row.continued ? " and carried on" : ""}.`;
+      const place = row.sameConversation ? " in this conversation" : "";
+      return `${lead}Switched ${from}to ${row.to}${place}${row.continued ? " and carried on" : ""}.`;
     }
   }
 }
