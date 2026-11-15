@@ -15,7 +15,8 @@ import {
   setNextAgentAccount,
 } from "../shared/rpc";
 import { AddAccountModal } from "./add-account";
-import { AzureAccountModal, AzureUsage, azureCardDetails } from "./azure-accounts";
+import { ApiUsage, AzureAccountModal, azureCardDetails } from "./azure-accounts";
+import { BedrockAccountModal, bedrockCardDetails } from "./bedrock-accounts";
 import { AddPiAccountModal, ApiKeyModal, PiSectionNotes, ProxyModal, piCardDetails } from "./pi-accounts";
 import { ResetConfirm, redeemToast, resetBadge } from "./reset-confirm";
 import { describe, stoppedWaiting, useStore, VISIBLE_POLL_MS, type ZeroSubStore } from "./store";
@@ -27,7 +28,7 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
   const { theme, layout, host, store } = props;
   const { state, error, updatedAt } = useStore(store);
   const text = useText(theme);
-  const [adding, setAdding] = useState<{ family: Family; accountId?: string; azure?: boolean } | null>(null);
+  const [adding, setAdding] = useState<{ family: Family; accountId?: string; api?: boolean } | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const refreshUsage = useCallback(async () => {
     setRefreshing(true);
@@ -139,8 +140,10 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
 
       {adding?.family === "pi" ? (
         <AddPiAccountModal theme={theme} store={store} onClose={() => setAdding(null)} />
-      ) : adding?.azure ? (
+      ) : adding?.api && adding.family === "codex" ? (
         <AzureAccountModal theme={theme} store={store} onClose={() => setAdding(null)} />
+      ) : adding?.api && adding.family === "claude" ? (
+        <BedrockAccountModal theme={theme} store={store} defaultRegion={state?.awsRegion ?? null} onClose={() => setAdding(null)} />
       ) : adding ? (
         <AddAccountModal
           theme={theme}
@@ -151,7 +154,7 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
           family={adding.family}
           accountId={adding.accountId}
           onClose={() => setAdding(null)}
-          onChooseAzure={adding.family === "codex" && !adding.accountId ? () => setAdding({ family: "codex", azure: true }) : undefined}
+          onChooseApi={(adding.family === "codex" || adding.family === "claude") && !adding.accountId ? () => setAdding({ family: adding.family, api: true }) : undefined}
         />
       ) : null}
     </View>
@@ -260,6 +263,8 @@ function FamilySection({
               ? "Add a Pi account with an Anthropic API key and its own proxy"
               : family === "codex"
                 ? "Sign in another ChatGPT account, or add an Azure OpenAI API key"
+                : family === "claude"
+                  ? "Sign in another Claude account, or add AWS Bedrock"
                 : `Sign in another ${FAMILY_LABEL[family]} account`
           }
           tooltipAlign="end"
@@ -313,14 +318,17 @@ function AccountCard({
   const [editingProxy, setEditingProxy] = useState(false);
   const api = account.auth === "api";
   const azure = account.azure !== null;
-  const [editingAzure, setEditingAzure] = useState(false);
-  const details = piCardDetails(account) ?? claudeCardDetails(account) ?? azureCardDetails(account);
+  const bedrock = account.bedrock !== null;
+  /** A paid API account standing in for subscriptions: Azure OpenAI or AWS Bedrock. */
+  const paid = azure || bedrock;
+  const [editingPaid, setEditingPaid] = useState(false);
+  const details = bedrock ? bedrockCardDetails(account) : (piCardDetails(account) ?? claudeCardDetails(account) ?? azureCardDetails(account));
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const resets = account.usage?.resets ?? null;
   const credits = account.usage?.credits ?? null;
   const extraUsage = account.usage?.extraUsage ? formatExtraUsage(account.usage.extraUsage) : null;
-  const plan = azure ? null : formatPlan(account.plan);
+  const plan = paid ? null : formatPlan(account.plan);
   const summary = usageSummary(account);
   const subtitle = accountSubtitle(account);
   const signedOut = account.status === "signed_out";
@@ -491,7 +499,9 @@ function AccountCard({
             <IconButton theme={theme} icon="KeyRound" label="API settings" tooltip="API settings: key and base URL" onPress={() => setEditingApi(true)} />
           ) : null}
           {azure ? (
-            <IconButton theme={theme} icon="KeyRound" label="Azure settings" tooltip="Azure settings: endpoint, key and prices" onPress={() => setEditingAzure(true)} />
+            <IconButton theme={theme} icon="KeyRound" label="Azure settings" tooltip="Azure settings: endpoint, key and prices" onPress={() => setEditingPaid(true)} />
+          ) : bedrock ? (
+            <IconButton theme={theme} icon="KeyRound" label="Bedrock settings" tooltip="Bedrock settings: region, credentials, models and prices" onPress={() => setEditingPaid(true)} />
           ) : null}
           {account.proxyEditable ? (
             <IconButton theme={theme} icon="Globe" label="Proxy" tooltip="Proxy: the network this account uses" onPress={() => setEditingProxy(true)} />
@@ -521,7 +531,13 @@ function AccountCard({
         {account.isDefault ? <Badge theme={theme} label="Default" tone="accent" /> : null}
         {disabled ? <Badge theme={theme} label="Disabled" /> : null}
         {plan ? <Badge theme={theme} label={plan} /> : null}
-        {azure ? <Badge theme={theme} label="Azure · API" tone="warning" /> : api ? <Badge theme={theme} label="API" /> : null}
+        {azure ? (
+          <Badge theme={theme} label="Azure · API" tone="warning" />
+        ) : bedrock ? (
+          <Badge theme={theme} label="Bedrock · API" tone="warning" />
+        ) : api ? (
+          <Badge theme={theme} label="API" />
+        ) : null}
         {account.kind === "main" ? <Badge theme={theme} label="CLI login" /> : null}
         {account.status === "limited" ? <Badge theme={theme} label="Limit reached" tone="danger" /> : null}
         {account.status === "signed_out" ? <Badge theme={theme} label="Signed out" tone="warning" /> : null}
@@ -543,9 +559,17 @@ function AccountCard({
 
       <View style={[{ gap: 10 }, faded]}>
         {signedOut ? (
-          <Text style={text.small}>{api ? "The key was refused. Enter a working one to use this account." : "Sign in again to use this account."}</Text>
-        ) : azure ? (
-          <AzureUsage theme={theme} account={account} />
+          <Text style={text.small}>
+            {bedrock
+              ? `AWS refused it${account.apiError ? `: ${account.apiError}` : "."} Fix its credentials, region or models to use this account.`
+              : azure
+                ? `Azure refused the key${account.apiError ? `: ${account.apiError}` : "."} Enter a working one to use this account.`
+                : api
+                  ? "The key was refused. Enter a working one to use this account."
+                  : "Sign in again to use this account."}
+          </Text>
+        ) : paid ? (
+          <ApiUsage theme={theme} account={account} />
         ) : api ? (
           <Text style={text.small}>Billed per use · used only as the default or when picked for an agent</Text>
         ) : windows.length > 0 ? (
@@ -584,10 +608,10 @@ function AccountCard({
             size="small"
             tone="primary"
             icon={api ? "KeyRound" : "LogIn"}
-            label={api ? "Fix key" : "Sign in"}
+            label={bedrock ? "Fix settings" : api ? "Fix key" : "Sign in"}
             tooltip={api ? "Enter a working key for this account" : "Sign this account in again"}
             tooltipAlign="end"
-            onPress={azure ? () => setEditingAzure(true) : api ? () => setEditingApi(true) : onSignIn}
+            onPress={paid ? () => setEditingPaid(true) : api ? () => setEditingApi(true) : onSignIn}
           />
         ) : disabled ? (
           <Button
@@ -637,7 +661,8 @@ function AccountCard({
         <RenameModal theme={theme} account={account} store={store} onClose={() => setRenaming(false)} />
       ) : null}
       {editingApi ? <ApiKeyModal theme={theme} store={store} account={account} onClose={() => setEditingApi(false)} /> : null}
-      {editingAzure ? <AzureAccountModal theme={theme} store={store} account={account} onClose={() => setEditingAzure(false)} /> : null}
+      {editingPaid && azure ? <AzureAccountModal theme={theme} store={store} account={account} onClose={() => setEditingPaid(false)} /> : null}
+      {editingPaid && bedrock ? <BedrockAccountModal theme={theme} store={store} account={account} onClose={() => setEditingPaid(false)} /> : null}
       {editingProxy ? <ProxyModal theme={theme} store={store} account={account} onClose={() => setEditingProxy(false)} /> : null}
       <Modal title={`Remove ${account.label}?`} open={confirmRemove} onOpenChange={setConfirmRemove}>
         <Modal.Content>
@@ -646,6 +671,8 @@ function AccountCard({
               ? `This only removes the account from ZeroSub. Its folder${account.home ? ` (${account.home})` : ""}, its key${account.launcher ? ` and its terminal script ${account.launcher}` : ""} stay as they are, and you can add it back from Add account. Agents using it move to the default account; their conversations are kept.`
               : account.family === "pi"
                 ? "This deletes the account's folder and saved key on this machine. Agents using it move to the default account; their conversations are kept."
+                : bedrock
+                  ? "This deletes the account's folder on this machine, with its AWS settings (and access key, if it has one) and its token counts. Agents using it move to the default account; their conversations are kept."
                 : azure
                   ? "This deletes the account's saved key and endpoint on this machine, and its token counts. New agents use the default account. Existing ChatGPT conversations on it can't move, so archive them or continue them on another account first."
                 : account.family === "claude"

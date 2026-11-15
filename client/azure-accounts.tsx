@@ -2,8 +2,8 @@ import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { Modal, TextInput, useToast } from "@getpaseo/plugin/client/react-native";
 import { useCallback, useState, type ReactNode } from "react";
 import { Text, View } from "react-native";
-import { azureUsageLines } from "../shared/format";
-import type { AccountView, AzurePrice } from "../shared/model";
+import { apiUsageLines } from "../shared/format";
+import type { AccountView, ApiPrice } from "../shared/model";
 import { addAzureAccount, updateAzureAccount } from "../shared/rpc";
 import { useInputStyle } from "./pi-accounts";
 import { describe, type ZeroSubStore } from "./store";
@@ -36,36 +36,48 @@ export function azureCardDetails(account: AccountView): string | null {
   return `${azure.host} · Key${azure.keyHint ? ` …${azure.keyHint}` : ""}`;
 }
 
-/** This month's tokens and estimated cost, in place of the usage bars of a subscription account. */
-export function AzureUsage({ theme, account }: { theme: Theme; account: AccountView }) {
+/**
+ * This month's tokens and estimated cost of a paid API account (Azure, Bedrock), in place of the
+ * usage bars of a subscription account.
+ */
+export function ApiUsage({ theme, account }: { theme: Theme; account: AccountView }) {
   const text = useText(theme);
-  if (!account.azure) return null;
-  const { tokens, cost, note } = azureUsageLines(account.azure);
+  const summary = account.azure ?? account.bedrock;
+  if (!summary) return null;
+  const { tokens, cost, note } = apiUsageLines(summary);
+  const family = account.family === "claude" ? "Claude" : "ChatGPT";
   return (
     <View style={{ gap: 4 }}>
       <Text style={text.small}>{tokens}</Text>
       <Text style={text.small}>{cost}</Text>
       {note ? <Text style={text.small}>{note}</Text> : null}
-      <Text style={text.small}>Paid API · used by itself only when every ChatGPT account is at its limit, or when you pick it</Text>
+      <Text style={text.small}>Paid API · used by itself only when every {family} subscription account is at its limit, or when you pick it</Text>
     </View>
   );
 }
 
-interface PriceRow {
+export interface PriceRow {
   model: string;
   input: string;
   cachedInput: string;
+  cacheWrite: string;
   output: string;
 }
 
-function toRows(prices: Readonly<Record<string, AzurePrice>>): PriceRow[] {
+export function toRows(prices: Readonly<Record<string, ApiPrice>>): PriceRow[] {
   const show = (value: number | null) => (value === null ? "" : String(value));
-  return Object.entries(prices).map(([model, price]) => ({ model, input: show(price.input), cachedInput: show(price.cachedInput), output: show(price.output) }));
+  return Object.entries(prices).map(([model, price]) => ({
+    model,
+    input: show(price.input),
+    cachedInput: show(price.cachedInput),
+    cacheWrite: show(price.cacheWrite),
+    output: show(price.output),
+  }));
 }
 
 /** The table typed in, or the first problem with it. */
-function fromRows(rows: readonly PriceRow[]): Record<string, AzurePrice> | string {
-  const prices: Record<string, AzurePrice> = {};
+export function fromRows(rows: readonly PriceRow[]): Record<string, ApiPrice> | string {
+  const prices: Record<string, ApiPrice> = {};
   for (const row of rows) {
     const model = row.model.trim();
     if (!model) continue;
@@ -76,11 +88,60 @@ function fromRows(rows: readonly PriceRow[]): Record<string, AzurePrice> | strin
     };
     const input = parse(row.input);
     const cachedInput = parse(row.cachedInput);
+    const cacheWrite = parse(row.cacheWrite);
     const output = parse(row.output);
-    if (input === undefined || cachedInput === undefined || output === undefined) return `Prices for ${model} must be numbers (USD per 1M tokens).`;
-    prices[model] = { input, cachedInput, output };
+    if (input === undefined || cachedInput === undefined || cacheWrite === undefined || output === undefined) {
+      return `Prices for ${model} must be numbers (USD per 1M tokens).`;
+    }
+    prices[model] = { input, cachedInput, cacheWrite, output };
   }
   return prices;
+}
+
+/**
+ * The per-model price table (USD per million tokens) of a paid API account. `cacheWrite` adds the
+ * column for Anthropic's cache writes; `used` are the models it has used, offered first.
+ */
+export function PriceTable({ theme, rows, onChange, cacheWrite, used }: { theme: Theme; rows: PriceRow[]; onChange(rows: PriceRow[]): void; cacheWrite: boolean; used: string[] }) {
+  const inputStyle = useInputStyle(theme);
+  const cell = (row: PriceRow, index: number, field: keyof PriceRow, placeholder: string, flex: number) => (
+    <TextInput
+      value={row[field]}
+      onChangeText={(value) => onChange(rows.map((entry, at) => (at === index ? { ...entry, [field]: value } : entry)))}
+      maxLength={field === "model" ? 200 : 12}
+      placeholder={placeholder}
+      placeholderTextColor={theme.colors.foregroundMuted}
+      autoCapitalize="none"
+      autoCorrect={false}
+      style={[inputStyle, { flex, minWidth: 0 }]}
+      accessibilityLabel={field === "model" ? "Model" : `${placeholder} price of ${row.model}`}
+    />
+  );
+  return (
+    <>
+      {rows.map((row, index) => (
+        <View key={index} style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+          {cell(row, index, "model", "Model", 2)}
+          {cell(row, index, "input", "Input", 1)}
+          {cell(row, index, "cachedInput", cacheWrite ? "Cache read" : "Cached", 1)}
+          {cacheWrite ? cell(row, index, "cacheWrite", "Cache write", 1) : null}
+          {cell(row, index, "output", "Output", 1)}
+          <IconButton theme={theme} icon="Trash2" label="Remove price" tooltip="Remove this model's prices" onPress={() => onChange(rows.filter((_, at) => at !== index))} />
+        </View>
+      ))}
+      <View style={{ flexDirection: "row" }}>
+        <Button
+          theme={theme}
+          size="small"
+          icon="Plus"
+          label="Add model"
+          tooltip="Add prices for another model"
+          tooltipAlign="start"
+          onPress={() => onChange([...rows, { model: used.find((model) => !rows.some((row) => row.model === model)) ?? "", input: "", cachedInput: "", cacheWrite: "", output: "" }])}
+        />
+      </View>
+    </>
+  );
 }
 
 /**
@@ -140,7 +201,6 @@ export function AzureAccountModal({ theme, store, account, onClose }: { theme: T
       accessibilityLabel={props.label}
     />
   );
-  const setRow = (index: number, patch: Partial<PriceRow>) => setRows((all) => all.map((row, at) => (at === index ? { ...row, ...patch } : row)));
 
   return (
     <Modal title={editing ? `${account?.label ?? "Azure"} · Azure OpenAI` : "Add Azure OpenAI account"} open onOpenChange={(open) => (open ? undefined : onClose())}>
@@ -171,26 +231,7 @@ export function AzureAccountModal({ theme, store, account, onClose }: { theme: T
                 Per model (deployment name), for the cost estimate on the card. Empty prices show tokens only. Cached input without a price is
                 counted at the input price.
               </Text>
-              {rows.map((row, index) => (
-                <View key={index} style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-                  {input({ value: row.model, onChangeText: (model) => setRow(index, { model }), placeholder: "Model", label: "Model", maxLength: 200, flex: 2 })}
-                  {input({ value: row.input, onChangeText: (value) => setRow(index, { input: value }), placeholder: "Input", label: `Input price of ${row.model}`, maxLength: 12, flex: 1 })}
-                  {input({ value: row.cachedInput, onChangeText: (value) => setRow(index, { cachedInput: value }), placeholder: "Cached", label: `Cached input price of ${row.model}`, maxLength: 12, flex: 1 })}
-                  {input({ value: row.output, onChangeText: (value) => setRow(index, { output: value }), placeholder: "Output", label: `Output price of ${row.model}`, maxLength: 12, flex: 1 })}
-                  <IconButton theme={theme} icon="Trash2" label="Remove price" tooltip="Remove this model's prices" onPress={() => setRows((all) => all.filter((_, at) => at !== index))} />
-                </View>
-              ))}
-              <View style={{ flexDirection: "row" }}>
-                <Button
-                  theme={theme}
-                  size="small"
-                  icon="Plus"
-                  label="Add model"
-                  tooltip="Add prices for another model"
-                  tooltipAlign="start"
-                  onPress={() => setRows((all) => [...all, { model: Object.keys(account?.azure?.usage?.models ?? {}).find((model) => !all.some((row) => row.model === model)) ?? "", input: "", cachedInput: "", output: "" }])}
-                />
-              </View>
+              <PriceTable theme={theme} rows={rows} onChange={setRows} cacheWrite={false} used={Object.keys(account?.azure?.usage?.models ?? {})} />
             </Field>
           ) : null}
           <Text style={text.small}>
@@ -217,15 +258,48 @@ export function AzureAccountModal({ theme, store, account, onClose }: { theme: T
   );
 }
 
-/** Picks what kind of ChatGPT (Codex) account to add: a subscription sign-in, or an Azure OpenAI key. */
-export function CodexKindStep({ theme, onSubscription, onAzure, onCancel }: { theme: Theme; onSubscription(): void; onAzure(): void; onCancel(): void }) {
+/**
+ * Picks what kind of account to add: a subscription sign-in, or a paid API account standing in for
+ * one (an Azure OpenAI key under ChatGPT, AWS Bedrock under Claude).
+ */
+export function AccountKindStep({
+  theme,
+  family,
+  onSubscription,
+  onApi,
+  onCancel,
+}: {
+  theme: Theme;
+  family: "codex" | "claude";
+  onSubscription(): void;
+  onApi(): void;
+  onCancel(): void;
+}) {
   const text = useText(theme);
+  const claude = family === "claude";
   return (
     <View style={{ gap: 12 }}>
       <Text style={text.muted}>What kind of account?</Text>
-      <Button theme={theme} tone="primary" icon="LogIn" label="ChatGPT subscription (sign in)" tooltip="Sign in a ChatGPT Plus, Pro, Team or Business account" tooltipAlign="start" onPress={onSubscription} />
-      <Button theme={theme} icon="KeyRound" label="Azure OpenAI (API key)" tooltip="Run Codex on an Azure OpenAI resource, billed per token, used last" tooltipAlign="start" onPress={onAzure} />
-      <Text style={text.small}>An Azure OpenAI account is only used by itself once every ChatGPT subscription is at its limit.</Text>
+      <Button
+        theme={theme}
+        tone="primary"
+        icon="LogIn"
+        label={claude ? "Claude subscription (sign in)" : "ChatGPT subscription (sign in)"}
+        tooltip={claude ? "Sign in a Claude Pro, Max, Team or Enterprise account" : "Sign in a ChatGPT Plus, Pro, Team or Business account"}
+        tooltipAlign="start"
+        onPress={onSubscription}
+      />
+      <Button
+        theme={theme}
+        icon={claude ? "Cloud" : "KeyRound"}
+        label={claude ? "AWS Bedrock" : "Azure OpenAI (API key)"}
+        tooltip={claude ? "Run Claude Code on Amazon Bedrock, billed per token, used last" : "Run Codex on an Azure OpenAI resource, billed per token, used last"}
+        tooltipAlign="start"
+        onPress={onApi}
+      />
+      <Text style={text.small}>
+        {claude ? "An AWS Bedrock" : "An Azure OpenAI"} account is only used by itself once every {claude ? "Claude" : "ChatGPT"} subscription is at its limit.
+      </Text>
       <View style={{ flexDirection: "row", justifyContent: "flex-end" }}>
         <Button theme={theme} label="Cancel" tooltip="Close without adding an account" tooltipAlign="end" onPress={onCancel} />
       </View>

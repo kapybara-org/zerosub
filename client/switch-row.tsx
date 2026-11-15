@@ -21,6 +21,8 @@ function cause(row: SwitchRow): string | null {
       return `${row.to} is enabled again.`;
     case "default":
       return "The default account changed.";
+    case "room":
+      return `${row.to} has room again, so this agent leaves ${from} (a paid API).`;
     default:
       return null;
   }
