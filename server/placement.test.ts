@@ -273,6 +273,37 @@ describe("moving an account's home", () => {
     }
   });
 
+  it("won't sign an account in again while its folder is moving, or while a move of it is on record", async () => {
+    const { service, store, fake } = start();
+    const home = join(homes(), "claude-aaaaaaaaaaaa");
+    await makeHome(home);
+    fake.keychain.set(home, "token");
+    await seed({ accounts: [main, managed("claude-aaaaaaaaaaaa", "Work", home)] });
+    let release = () => undefined as void;
+    fake.holdCopy = new Promise<void>((resolve) => (release = resolve));
+    const copying = new Promise<void>((resolve) => (fake.copying = resolve));
+
+    const placing = service.placeHomes();
+    await copying;
+    // A new sign-in would land in the folder the account is leaving, and be lost with it.
+    await expect(service.startLogin("claude", "code", "claude-aaaaaaaaaaaa")).rejects.toThrow(/being moved/);
+    release();
+    await placing;
+    expect(await homeOf(store, "claude-aaaaaaaaaaaa")).toBe(join(kept(), "claude-work"));
+
+    // A move a stop left on record that can't be finished yet: nothing makes its old folder again.
+    const from = join(kept(), "claude-work");
+    const to = join(root, "elsewhere", "claude-work");
+    await makeHome(to);
+    await rm(from, { recursive: true });
+    fake.keychain.set(from, "other");
+    fake.keychain.set(to, "clash");
+    await store.update((draft) => void (draft.moves["claude-aaaaaaaaaaaa"] = { from, to, at: "2026-10-29T00:00:00.000Z", family: "claude" }));
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await expect(service.startLogin("claude", "code", "claude-aaaaaaaaaaaa")).rejects.toThrow(/being moved/);
+    expect(await there(from)).toBe(false);
+  });
+
   it("leaves the account where it was when its sign-in can't be copied, and says why", async () => {
     const { service, store, fake } = start();
     const home = join(homes(), "claude-aaaaaaaaaaaa");

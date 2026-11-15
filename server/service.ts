@@ -3680,7 +3680,9 @@ export class Service {
           // Checked again once the folder is there: anything that started on it meanwhile keeps it.
           const started = (await homesInUse([from])).has(from)
             ? `${PROVIDER_NAME[account.family]} started on it (an agent or a terminal); it moves once that stops`
-            : (this.homeCalls.get(from) ?? 0) > 0
+            : [...this.logins.values()].some((login) => login.home === from && !login.finishedAt)
+              ? "it's being signed in"
+              : (this.homeCalls.get(from) ?? 0) > 0
               ? "ZeroSub is working on it"
               : (this.routedAt.get(account.id) ?? 0) >= startedAt
                 ? "an agent has just started on it"
@@ -3812,6 +3814,10 @@ export class Service {
     const existing = accountId ? findAccount(state, accountId) : undefined;
     if (accountId && (!existing || existing.family !== family)) throw new Error("That account no longer exists.");
     if (existing?.auth === "api") throw new Error(`${existing.label} uses an API key. Change the key from its card instead.`);
+    // The CLI would sign in into the folder the account is leaving, and the sign-in go with it.
+    if (existing && (this.moving.has(existing.id) || state.moves[existing.id])) {
+      throw new Error(`${existing.label}'s folder is being moved. Sign it in again once that's done (its card says when).`);
+    }
     // A new account's proxy is in place before the CLI starts, so the sign-in itself goes through it.
     const proxy = !existing && proxyInput?.trim() ? normalizeProxy(proxyInput) : null;
     if (proxy && !this.adapters[family].setProxy) throw new Error(`A proxy can't be set for ${FAMILY_LABEL[family]} accounts yet.`);
@@ -3849,7 +3855,7 @@ export class Service {
         });
       }
       if (home && proxy) await this.adapters[family].setProxy?.(home, proxy);
-      if (home) await this.adapters[family].prepareHome(home);
+      if (home) await this.adapters[family].prepareHome(home, existing ? this.stillHas(existing) : undefined);
       const handle = await this.adapters[family].login(home, method);
       if (session.finishedAt) {
         handle.cancel();
