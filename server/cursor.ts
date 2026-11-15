@@ -110,8 +110,12 @@ export class CursorAdapter implements FamilyAdapter {
     return prepareCursorHome(home);
   }
 
-  /** Runs `cursor-agent status --format json` with the account's folders; never reads its login file. */
+  /**
+   * Runs `cursor-agent status --format json` with the account's folders; never reads its login file.
+   * Off Linux only for the CLI login: `env` leaves an added account on the CLI login's folders there.
+   */
   async identity(home: string | null): Promise<Identity> {
+    if (home && this.platform !== "linux") throw new Error(CURSOR_UNSUPPORTED[this.platform] ?? OTHER_PLATFORM);
     const command = (await cursorBinary()) ?? "cursor-agent";
     const result = await run(command, ["status", "--format", "json"], { env: spawnEnv(await this.env(home), "cursor"), timeoutMs: 30_000 });
     if (result.timedOut) throw new Error("`cursor-agent status` didn't answer in time.");
@@ -147,7 +151,12 @@ export class CursorAdapter implements FamilyAdapter {
     return new CursorLogin(command, ["login"], env);
   }
 
+  /**
+   * Linux only, like an added account's sign-in: elsewhere `env` leaves the account on the CLI
+   * login's folders, so this would sign the CLI login out.
+   */
   async logout(home: string): Promise<void> {
+    if (this.platform !== "linux") throw new Error(CURSOR_UNSUPPORTED[this.platform] ?? OTHER_PLATFORM);
     const command = (await cursorBinary()) ?? "cursor-agent";
     const result = await run(command, ["logout"], { env: spawnEnv(await this.env(home), "cursor"), timeoutMs: 30_000 });
     if (result.code !== 0) throw new Error((result.stderr || result.stdout).trim().split("\n")[0] || "cursor-agent logout failed");

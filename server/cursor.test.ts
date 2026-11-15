@@ -1,7 +1,7 @@
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { shownFamilies } from "../shared/model";
 import type { FamilyAdapter } from "./adapter";
 import { cursorBinary } from "./binaries";
@@ -254,6 +254,18 @@ describe("Cursor outside Linux", () => {
       expect(await missing(join(root, "h"))).toBe(true);
       expect(await missing(ran)).toBe(true);
     });
+
+    it(`never checks or signs out an added account on ${platform}, where cursor-agent would reach the CLI login`, async () => {
+      const ran = join(root, "ran");
+      await fakeCursor(`echo "$*" >> ${ran}\necho '${statusJson({ email: "main@example.com", userId: 1 })}'`);
+      const adapter = new CursorAdapter(platform);
+      await expect(adapter.identity(join(root, "h"))).rejects.toThrow(CURSOR_UNSUPPORTED[platform]);
+      await expect(adapter.logout(join(root, "h"))).rejects.toThrow(CURSOR_UNSUPPORTED[platform]);
+      expect(await missing(ran)).toBe(true);
+      // The CLI login is still checked as the daemon has it.
+      expect((await adapter.identity(null)).identity).toBe("cursor|personal|1");
+      expect((await readFile(ran, "utf8")).trim()).toBe("status --format json");
+    });
   }
 
   it("is available on Linux once a provider runs cursor-agent", async () => {
@@ -471,6 +483,45 @@ describe("Cursor on macOS and Windows", () => {
       await service.stop();
       await rm(join(root, "paseo", "zerosub"), { recursive: true, force: true });
     }
+  });
+
+  it("cleans up a Linux registry's homes without running cursor-agent, so the CLI login is never signed out", async () => {
+    const { config, dotCursor } = await mainFolders();
+    const ran = join(root, "ran");
+    await fakeCursor(`echo "$*" >> ${ran}\necho '${statusJson({ email: "main@example.com", userId: 1 })}'`);
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const logged = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    for (const platform of ["darwin", "win32"] as const) {
+      // A removed account's home, and one an earlier run's sign-in left unfinished.
+      const removed = join(root, "paseo", "zerosub", "homes", "cursor-a");
+      const unfinished = join(root, "paseo", "zerosub", "homes", "cursor-b");
+      for (const home of [removed, unfinished]) await prepareCursorHome(home, true);
+      const { service, store } = await cursorService([], new CursorAdapter(platform));
+      await store.update((draft) => {
+        draft.cleanup[removed] = { family: "cursor", accountId: "cursor-a", why: "removed", at: new Date().toISOString() };
+        draft.cleanup[unfinished] = { family: "cursor", accountId: "cursor-b", why: "unfinished", at: new Date().toISOString() };
+      });
+      await service.cleanUpHomes(paseoWith(false) as never);
+      // Both stay listed, and in place, for a later pass…
+      expect(Object.keys((await store.read()).cleanup).sort()).toEqual([removed, unfinished]);
+      expect(await missing(removed)).toBe(false);
+      for (const home of [removed, unfinished]) expect(errors).toHaveBeenCalledWith(`[ZeroSub] cleaning up ${home} failed`, CURSOR_UNSUPPORTED[platform]);
+      // …until cleanup gives up, as on a sign-out that keeps failing: the removed account's home goes, the other stays.
+      await service.cleanUpHomes(paseoWith(false) as never);
+      await service.cleanUpHomes(paseoWith(false) as never);
+      expect((await store.read()).cleanup).toEqual({});
+      expect(await missing(removed)).toBe(true);
+      expect(await missing(unfinished)).toBe(false);
+      await service.stop();
+      await rm(join(root, "paseo", "zerosub"), { recursive: true, force: true });
+    }
+    // cursor-agent never ran, and the CLI login's folders are as they were.
+    expect(await missing(ran)).toBe(true);
+    expect(JSON.parse(await readFile(join(config, "cursor", "auth.json"), "utf8"))).toMatchObject({ accessToken: "synthetic-main" });
+    expect((await readdir(config)).sort()).toEqual(["cursor", "gh", "git", "mimeapps.list"]);
+    expect(await readdir(dotCursor)).toContain("chats");
+    errors.mockRestore();
+    logged.mockRestore();
   });
 });
 
