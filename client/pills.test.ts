@@ -37,6 +37,8 @@ function account(id: string, isDefault: boolean): AccountView {
     externalHome: false,
     moving: null,
     azure: null,
+    bedrock: null,
+    apiError: null,
   };
 }
 

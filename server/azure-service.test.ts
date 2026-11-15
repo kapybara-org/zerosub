@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FamilyAdapter } from "./adapter";
-import { AZURE_KEY_ENV, AzureUsageStore } from "./azure";
+import { ApiUsageStore } from "./api-usage";
+import { AZURE_KEY_ENV } from "./azure";
 import { CodexAdapter } from "./codex";
 import { absentPi } from "./fakes.test-support";
 import type { FamilyResolver } from "./families";
@@ -68,7 +69,7 @@ function setUp() {
   const store = new StateStore(join(root, "paseo", "zerosub", "state.json"));
   const families = { resolve: async () => ({ codex: "codex" }) } as unknown as FamilyResolver;
   const reopener = { locate: async () => null, reopen: async () => ({ ok: true as const }) } as unknown as Reopener;
-  const azureUsage = new AzureUsageStore(join(root, "paseo", "zerosub", "azure-usage.json"));
+  const azureUsage = new ApiUsageStore(join(root, "paseo", "zerosub", "azure-usage.json"));
   const service = new Service({ claude: claudeAdapter(), codex: new CodexAdapter(), pi: absentPi() }, store, families, reopener, azureUsage);
   services.push(service);
   return { service, store };
@@ -113,7 +114,7 @@ describe("Azure OpenAI accounts in the service", () => {
     expect(config).not.toContain(KEY);
 
     // Editing prices or the endpoint never sends the key back either.
-    const update = await service.updateAzureAccount(accountId, { prices: { "gpt-5": { input: 1.25, cachedInput: 0.125, output: 10 } } });
+    const update = await service.updateAzureAccount(accountId, { prices: { "gpt-5": { input: 1.25, cachedInput: 0.125, cacheWrite: 0, output: 10 } } });
     expect(JSON.stringify(update)).not.toContain(KEY);
     expect(logged.join("\n")).not.toContain(KEY);
   });

@@ -2680,3 +2680,32 @@ describe("the account button's reason row", () => {
     expect((await route())?.selectionReason).toBeUndefined();
   });
 });
+
+describe("AWS Bedrock as the last resort", () => {
+  const window = () => ({ kind: "window" as const, resetsAt: inFuture(), message: "You've hit your session limit" });
+  const bedrock = { ...account("claude-bedrock", "bedrock", "managed"), auth: "api" as const, identity: "bedrock|eu-central-1|host" };
+
+  it("moves a limited agent onto Bedrock in place, says it's a paid API, and doesn't pin it there", async () => {
+    const { store, reopened, notes, limitTurn } = await setUp(
+      { accounts: [account(MAIN, "main", "main"), bedrock] as never, defaults: { claude: MAIN, codex: null, pi: null }, sessions: {} },
+      window,
+    );
+    await limitTurn();
+    const state = await store.read();
+    expect(state.sessions[AGENT]?.accountId).toBe(bedrock.id);
+    expect(reopened).toEqual([AGENT]);
+    // Not pinned: once a subscription account has room again, routing takes the agent back.
+    expect(state.bindings[AGENT]).toBeUndefined();
+    expect(notes.at(-1)).toMatchObject({ to: "bedrock", outcome: "switched" });
+    expect(notes.at(-1)?.detail).toMatch(/AWS Bedrock, a paid API/);
+  });
+
+  it("isn't used while a subscription account has room", async () => {
+    const { store, limitTurn } = await setUp(
+      { accounts: [account(MAIN, "main", "main"), account(HELLO, "hello", "managed"), bedrock] as never, defaults: { claude: MAIN, codex: null, pi: null }, sessions: {} },
+      window,
+    );
+    await limitTurn();
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+  });
+});

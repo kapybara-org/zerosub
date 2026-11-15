@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   accountSubtitle,
-  azureUsageLines,
+  apiUsageLines,
   formatTokens,
   describeReopen,
   formatAge,
@@ -96,6 +96,8 @@ describe("account presentation", () => {
     externalHome: false,
     moving: null,
     azure: null,
+    bedrock: null,
+    apiError: null,
   };
 
   it("summarises the busiest window", () => {
@@ -202,17 +204,17 @@ describe("Azure usage on the card", () => {
     host: "example-resource.openai.azure.com",
     keyHint: "abcd",
     prices: {},
-    usage: { month: "2026-11", models: { "gpt-5": { input: 2_500_000, cachedInput: 1_000_000, output: 42_000 } }, uncounted: 0, updatedAt: null },
+    usage: { month: "2026-11", models: { "gpt-5": { input: 2_500_000, cachedInput: 1_000_000, cacheWrite: 0, output: 42_000 } }, uncounted: 0, updatedAt: null },
   };
   it("shows this month's tokens, and a cost only once there are prices", () => {
     expect(formatTokens(1234)).toBe("1,234");
     expect(formatTokens(56_700)).toBe("56.7K");
     expect(formatTokens(8_900_000)).toBe("8.90M");
-    const unpriced = azureUsageLines(azure, NOW);
+    const unpriced = apiUsageLines(azure, NOW);
     expect(unpriced.tokens).toBe("November: 2.50M input (1.00M cached) · 42.0K output tokens");
     expect(unpriced.cost).toMatch(/^Cost unknown/);
-    const priced = azureUsageLines({ ...azure, prices: { "gpt-5": { input: 1, cachedInput: 0.1, output: 10 } } }, NOW);
+    const priced = apiUsageLines({ ...azure, prices: { "gpt-5": { input: 1, cachedInput: 0.1, cacheWrite: 0, output: 10 } } }, NOW);
     expect(priced.cost).toBe("≈ $2.02 this month");
-    expect(azureUsageLines({ ...azure, usage: null }, NOW).cost).toBe("No tokens used yet this month");
+    expect(apiUsageLines({ ...azure, usage: null }, NOW).cost).toBe("No tokens used yet this month");
   });
 });

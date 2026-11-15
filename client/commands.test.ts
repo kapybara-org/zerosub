@@ -33,6 +33,8 @@ function account(status: AccountView["status"], nextAgentUntil: string | null): 
     externalHome: false,
     moving: null,
     azure: null,
+    bedrock: null,
+    apiError: null,
   };
 }
 

@@ -2,22 +2,19 @@ import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { estimateAzureCost, totalTokens, type AzureMonth } from "../shared/model";
+import { estimateApiCost, totalTokens, type ApiMonth } from "../shared/model";
 import type { TurnEvent } from "./adapter";
 import {
   AZURE_KEY_ENV,
-  AzureUsageStore,
-  addAzureTokens,
   azureConfigToml,
   checkAzureKey,
-  currentMonth,
   findRollout,
   normalizeAzureEndpoint,
   parseRollout,
   syncAzureConfig,
-  tokenDelta,
   writeAzureAccount,
 } from "./azure";
+import { ApiUsageStore, addApiTokens, currentMonth, tokenDelta } from "./api-usage";
 import { CodexAdapter } from "./codex";
 import { AZURE_QUOTA_MS, AZURE_RATE_LIMIT_MS, detectAzureLimit, detectAzureSignOut } from "./limits";
 
@@ -222,50 +219,50 @@ describe("Azure errors", () => {
 });
 
 describe("Azure token counts", () => {
-  const month = (models: AzureMonth["models"]): AzureMonth => ({ month: "2026-11", models, uncounted: 0, updatedAt: null });
+  const month = (models: ApiMonth["models"]): ApiMonth => ({ month: "2026-11", models, uncounted: 0, updatedAt: null });
 
   it("adds a thread's growth, and starts over when the month turns (UTC)", () => {
     const november = Date.parse("2026-11-30T23:59:00Z");
     const december = Date.parse("2026-12-01T00:00:30Z");
-    let totals = addAzureTokens(undefined, "gpt-5", { input: 100, cachedInput: 40, output: 10 }, november);
-    totals = addAzureTokens(totals, "gpt-5", { input: 50, cachedInput: 0, output: 5 }, november);
-    expect(totals).toMatchObject({ month: "2026-11", models: { "gpt-5": { input: 150, cachedInput: 40, output: 15 } } });
+    let totals = addApiTokens(undefined, "gpt-5", { input: 100, cachedInput: 40, cacheWrite: 0, output: 10 }, november);
+    totals = addApiTokens(totals, "gpt-5", { input: 50, cachedInput: 0, cacheWrite: 0, output: 5 }, november);
+    expect(totals).toMatchObject({ month: "2026-11", models: { "gpt-5": { input: 150, cachedInput: 40, cacheWrite: 0, output: 15 } } });
     expect(currentMonth(totals, december)).toBeNull();
-    const next = addAzureTokens(totals, "gpt-5", { input: 7, cachedInput: 0, output: 1 }, december);
-    expect(next).toMatchObject({ month: "2026-12", models: { "gpt-5": { input: 7, cachedInput: 0, output: 1 } } });
+    const next = addApiTokens(totals, "gpt-5", { input: 7, cachedInput: 0, cacheWrite: 0, output: 1 }, december);
+    expect(next).toMatchObject({ month: "2026-12", models: { "gpt-5": { input: 7, cachedInput: 0, cacheWrite: 0, output: 1 } } });
   });
 
   it("counts only what a thread used since it was last counted", () => {
-    expect(tokenDelta(undefined, { input: 10, cachedInput: 2, output: 3 })).toEqual({ input: 10, cachedInput: 2, output: 3 });
-    expect(tokenDelta({ input: 10, cachedInput: 2, output: 3 }, { input: 25, cachedInput: 6, output: 4 })).toEqual({ input: 15, cachedInput: 4, output: 1 });
+    expect(tokenDelta(undefined, { input: 10, cachedInput: 2, cacheWrite: 0, output: 3 })).toEqual({ input: 10, cachedInput: 2, cacheWrite: 0, output: 3 });
+    expect(tokenDelta({ input: 10, cachedInput: 2, cacheWrite: 0, output: 3 }, { input: 25, cachedInput: 6, cacheWrite: 0, output: 4 })).toEqual({ input: 15, cachedInput: 4, cacheWrite: 0, output: 1 });
     // A count that went back (a new thread under the same id, say) counts whole.
-    expect(tokenDelta({ input: 100, cachedInput: 0, output: 9 }, { input: 5, cachedInput: 0, output: 1 })).toEqual({ input: 5, cachedInput: 0, output: 1 });
+    expect(tokenDelta({ input: 100, cachedInput: 0, cacheWrite: 0, output: 9 }, { input: 5, cachedInput: 0, cacheWrite: 0, output: 1 })).toEqual({ input: 5, cachedInput: 0, cacheWrite: 0, output: 1 });
   });
 
   it("keeps per-thread marks and monthly totals in its own file", async () => {
     const root = await mkdtemp(join(tmpdir(), "zerosub-azure-usage-"));
     try {
-      const store = new AzureUsageStore(join(root, "azure-usage.json"));
+      const store = new ApiUsageStore(join(root, "api-usage.json"));
       const now = Date.parse("2026-11-15T12:00:00Z");
-      await store.countThread("codex-a", "thread-1", { model: "gpt-5", total: { input: 1000, cachedInput: 200, output: 50 } }, "x", now);
-      await store.countThread("codex-a", "thread-1", { model: "gpt-5", total: { input: 1500, cachedInput: 300, output: 80 } }, "x", now);
+      await store.countThread("codex-a", "thread-1", { model: "gpt-5", total: { input: 1000, cachedInput: 200, cacheWrite: 0, output: 50 } }, "x", now);
+      await store.countThread("codex-a", "thread-1", { model: "gpt-5", total: { input: 1500, cachedInput: 300, cacheWrite: 0, output: 80 } }, "x", now);
       await store.noteUncounted("codex-a", now);
-      const reread = await new AzureUsageStore(join(root, "azure-usage.json")).read();
-      expect(reread.accounts["codex-a"]).toMatchObject({ month: "2026-11", uncounted: 1, models: { "gpt-5": { input: 1500, cachedInput: 300, output: 80 } } });
-      expect(totalTokens(reread.accounts["codex-a"] ?? null)).toEqual({ input: 1500, cachedInput: 300, output: 80 });
+      const reread = await new ApiUsageStore(join(root, "api-usage.json")).read();
+      expect(reread.accounts["codex-a"]).toMatchObject({ month: "2026-11", uncounted: 1, models: { "gpt-5": { input: 1500, cachedInput: 300, cacheWrite: 0, output: 80 } } });
+      expect(totalTokens(reread.accounts["codex-a"] ?? null)).toEqual({ input: 1500, cachedInput: 300, cacheWrite: 0, output: 80 });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
   it("estimates the cost from the price table, and says when a price is missing", () => {
-    const used = month({ "gpt-5": { input: 2_000_000, cachedInput: 1_000_000, output: 100_000 }, "o4-mini": { input: 10, cachedInput: 0, output: 0 } });
-    const prices = { "gpt-5": { input: 1.25, cachedInput: 0.125, output: 10 } };
-    const cost = estimateAzureCost(used, prices);
+    const used = month({ "gpt-5": { input: 2_000_000, cachedInput: 1_000_000, cacheWrite: 0, output: 100_000 }, "o4-mini": { input: 10, cachedInput: 0, cacheWrite: 0, output: 0 } });
+    const prices = { "gpt-5": { input: 1.25, cachedInput: 0.125, cacheWrite: 0, output: 10 } };
+    const cost = estimateApiCost(used, prices);
     expect(cost.complete).toBe(false);
     expect(cost.usd).toBeCloseTo(1.25 + 0.125 + 1, 6);
-    expect(estimateAzureCost(month({ "gpt-5": { input: 1_000_000, cachedInput: 0, output: 0 } }), prices)).toEqual({ usd: 1.25, complete: true });
-    expect(estimateAzureCost(used, {})).toEqual({ usd: null, complete: false });
+    expect(estimateApiCost(month({ "gpt-5": { input: 1_000_000, cachedInput: 0, cacheWrite: 0, output: 0 } }), prices)).toEqual({ usd: 1.25, complete: true });
+    expect(estimateApiCost(used, {})).toEqual({ usd: null, complete: false });
   });
 
   it("reads a thread's running total and model from its Codex rollout", async () => {
@@ -284,7 +281,7 @@ describe("Azure token counts", () => {
       await writeFile(join(day, `rollout-2026-11-15T10-00-00-${thread}.jsonl`), `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
       const path = await findRollout(thread, root);
       expect(path).toContain(thread);
-      expect(parseRollout(await readFile(path!, "utf8"))).toEqual({ model: "gpt-5.1-codex", total: { input: 1200, cachedInput: 500, output: 70 } });
+      expect(parseRollout(await readFile(path!, "utf8"))).toEqual({ model: "gpt-5.1-codex", total: { input: 1200, cachedInput: 500, cacheWrite: 0, output: 70 } });
       expect(await findRollout("0199ffff-0000-0000-0000-000000000000", root)).toBeNull();
     } finally {
       await rm(root, { recursive: true, force: true });
