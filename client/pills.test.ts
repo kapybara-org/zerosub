@@ -42,10 +42,15 @@ function account(id: string, isDefault: boolean): AccountView {
 }
 
 /** The account button for one ChatGPT agent, routed as `route` says. */
-async function accountButton(
+async function accountButton(route: Partial<AgentRoute>, accounts?: AccountView[]): Promise<PluginButton> {
+  return (await composerPills(route, accounts))[0]!;
+}
+
+/** Every pill one ChatGPT agent gets, routed as `route` says: the account button first. */
+async function composerPills(
   route: Partial<AgentRoute>,
   accounts: AccountView[] = [account("work", true), account("home", false)],
-): Promise<PluginButton> {
+): Promise<PluginButton[]> {
   const state: StateView = {
     accounts,
     agents: [{ agentId: "agent-1", family: "codex", accountId: "work", pinned: true, pendingAccountId: null, waiting: null, movable: false, ...route }],
@@ -82,7 +87,7 @@ async function accountButton(
   // The account pill comes first, beside a usage pill when the current account has a reading.
   await vi.waitFor(() => expect(buttons.length).toBeGreaterThan(0));
   stop();
-  return buttons[0]!;
+  return buttons;
 }
 
 /** The account button's menu, for an agent that can't move in place (a Codex thread with history). */
@@ -104,6 +109,27 @@ describe("the account button", () => {
   it("opens the agent's own accounts panel when it can move in place", async () => {
     const button = await accountButton({ movable: true });
     expect(button).toMatchObject({ title: "Accounts for this agent: work", label: "work", behavior: { kind: "popover" } });
+  });
+
+  it("names the account the session runs on first while a switch waits", async () => {
+    // Routed to "home" from the next session; the open one still runs on "work".
+    const route = { accountId: "home", pendingAccountId: "work", waiting: "turn" as const };
+    expect(await accountButton({ ...route, movable: true })).toMatchObject({
+      title: "Accounts for this agent: work, moving to home when its current turn ends",
+      label: "work → home",
+      icon: "CircleUserRound",
+    });
+    expect(await accountButton({ ...route, movable: false })).toMatchObject({
+      title: "Account: work, moving to home when its current turn ends",
+      label: "work → home",
+    });
+  });
+
+  it("shows the usage of the account the session runs on, not the one it will switch to", async () => {
+    const work = { ...account("work", true), usage: usage([{ id: "secondary", label: "Weekly", usedPercent: 26, resetsAt: later(72), minutes: 10_080 }]) };
+    const home = { ...account("home", false), usage: usage([{ id: "secondary", label: "Weekly", usedPercent: 55, resetsAt: later(48), minutes: 10_080 }]) };
+    const shown = await composerPills({ movable: true, accountId: "home", pendingAccountId: "work" }, [work, home]);
+    expect(shown.map((button) => button.label)).toEqual(["work → home", "26%"]);
   });
 
   it("says an agent waits when every account checked for it is full", async () => {

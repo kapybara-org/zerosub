@@ -3,7 +3,7 @@ import { accountRing, accountRoom, holdsBack, isFull, type AccountRing } from ".
 import { accountGlyph, type AccountGlyph } from "../shared/glyph";
 import type { AccountView, StateView } from "../shared/model";
 import { limitHolds } from "../shared/plan-input";
-import { noteOf, windowLines, type AccountWindowLine } from "./agent-plan";
+import { noteOf, runningAccount, windowLines, type AccountWindowLine } from "./agent-plan";
 
 /** An agent as the pills follow it. */
 export interface TrackedAgent {
@@ -14,18 +14,16 @@ export interface TrackedAgent {
   model: string | null;
 }
 
-/** The account an agent runs on, as its account pill shows it: its route, else the default, else the first. */
+/**
+ * The account an agent runs on, as its account pill shows it: the one its session is open on (still
+ * the old one while a switch waits for the turn to end), else the default, else the first.
+ */
 export function accountOf(state: StateView, agent: Pick<TrackedAgent, "id" | "provider">): AccountView | null {
   const family = state.providers[agent.provider];
   if (!family) return null;
   const accounts = state.accounts.filter((account) => account.family === family);
   const route = state.agents.find((entry) => entry.agentId === agent.id);
-  return (
-    accounts.find((account) => account.id === route?.accountId) ??
-    accounts.find((account) => account.isDefault) ??
-    accounts[0] ??
-    null
-  );
+  return runningAccount(accounts, route) ?? null;
 }
 
 /** The option of the start-screen picker that opens the Accounts screen instead of picking one. */

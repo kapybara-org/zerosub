@@ -13,6 +13,7 @@ import { accountGlyph } from "../shared/glyph";
 import { FAMILY_LABEL, HAND_OFF, OTHER_FAMILY, type AccountView, type StateView } from "../shared/model";
 import { setAgentAccount } from "../shared/rpc";
 import { accountOf, type TrackedAgent } from "./agent-account";
+import { runningAccount } from "./agent-plan";
 import { agentAccounts } from "./agent-accounts";
 import { forkPopover } from "./fork-confirm";
 import { resetPopover } from "./reset-confirm";
@@ -212,11 +213,11 @@ function buttonFor(
   if (!family) return null;
   const accounts = state.accounts.filter((account) => account.family === family);
   const route = state.agents.find((entry) => entry.agentId === agent.id);
-  const current =
-    accounts.find((account) => account.id === route?.accountId) ??
-    accounts.find((account) => account.isDefault) ??
-    accounts[0];
+  // The account the session runs on: its usage, its limit and its resets are the ones that count
+  // now, even while a switch waits for the session to move.
+  const current = runningAccount(accounts, route);
   if (!current) return null;
+  const next = route?.pendingAccountId ? accounts.find((account) => account.id === route.accountId && account.id !== current.id) : undefined;
   // A banked reset is worth offering right where the agent stopped, even with a single account.
   const resets = current.usage?.resets ?? null;
   const offerReset = resets !== null && (current.status === "limited" || resets.usableNow);
@@ -243,17 +244,17 @@ function buttonFor(
   // Codex threads can't change accounts in place; continue in this task's tab for that account.
   const movable = route?.movable ?? true;
   const now = Date.now();
-  const running = route?.pendingAccountId ? state.accounts.find((account) => account.id === route.pendingAccountId) : undefined;
   const moves = route?.waiting ?? (state.canReopen ? "idle" : "restart");
+  // "work → home" while a switch waits: the account it runs on, then the one it goes to.
+  const text = (heading?: string) => (next ? pillText(next, current, moves, heading) : pillText(current, null, moves, heading));
 
   // An agent that moves in place gets its own panel: its accounts, their order, its next turn.
   if (movable && accounts.length >= 2) {
     const atWall = route?.atWall === true;
-    const text = pillText(current, running ?? null, moves, "Accounts for this agent");
     return {
-      title: atWall ? "Accounts for this agent: every checked account is full" : text.title,
+      title: atWall ? "Accounts for this agent: every checked account is full" : text("Accounts for this agent").title,
       icon: current.status === "limited" || atWall ? "CircleAlert" : "CircleUserRound",
-      label: atWall ? `${shortLabel(current)} · waiting` : text.label,
+      label: atWall ? `${shortLabel(current)} · waiting` : text().label,
       behavior: { kind: "popover", Content: panel },
     };
   }
@@ -336,7 +337,7 @@ function buttonFor(
   });
 
   return {
-    ...pillText(current, running ?? null, moves),
+    ...text(),
     icon: current.status === "limited" ? "CircleAlert" : "CircleUserRound",
     behavior: { kind: "menu", items },
   };
