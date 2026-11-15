@@ -2700,6 +2700,26 @@ describe("AWS Bedrock as the last resort", () => {
     expect(notes.at(-1)?.detail).toMatch(/AWS Bedrock, a paid API/);
   });
 
+  it("moves the agent back off Bedrock once its subscription has room again", async () => {
+    const { service, store, reopened, notes, limitTurn, paseo } = await setUp(
+      { accounts: [account(MAIN, "main", "main"), bedrock] as never, defaults: { claude: MAIN, codex: null, pi: null }, sessions: {} },
+      window,
+    );
+    await limitTurn();
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(bedrock.id);
+    await service.clearLimit(MAIN);
+    // Past the minute after its turn that alignment leaves an agent alone for.
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + 2 * 60_000 });
+    try {
+      await service.alignSessions(paseo as never);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+    expect(reopened).toEqual([AGENT, AGENT]);
+    expect(notes.at(-1)).toMatchObject({ reason: "room", to: "main" });
+  });
+
   it("isn't used while a subscription account has room", async () => {
     const { store, limitTurn } = await setUp(
       { accounts: [account(MAIN, "main", "main"), account(HELLO, "hello", "managed"), bedrock] as never, defaults: { claude: MAIN, codex: null, pi: null }, sessions: {} },
