@@ -68,11 +68,15 @@ export async function mainSettingsEnv(): Promise<Record<string, string>> {
   return strings;
 }
 
-/** The no-proxy variables in `settingsEnv` that send Anthropic or Claude traffic past any proxy. */
+/**
+ * The no-proxy variables in `settingsEnv` that send Anthropic or Claude traffic past any proxy. The
+ * entries ZeroSub adds itself (see `withClaudeNoProxy`) don't count: the list it writes there with a
+ * proxy has Claude's updater host on it, and that mustn't stop the proxy being changed.
+ */
 function bypassingClaude(settingsEnv: Readonly<Record<string, string>>): string[] {
   return NO_PROXY_KEYS.filter((key) => {
     const list = settingsEnv[key];
-    return list !== undefined && withoutClaudeDomains(list) !== list.split(/[,\s]+/).filter(Boolean).join(",");
+    return list !== undefined && withClaudeNoProxy(withoutClaudeDomains(list)) !== withClaudeNoProxy(list);
   });
 }
 

@@ -151,6 +151,25 @@ describe("the CLI login's proxy", () => {
     expect(JSON.parse(await readFile(file, "utf8"))).toEqual({ env: { no_proxy: "localhost,intranet.example" } });
   });
 
+  it("can be changed again in main's settings, where its own no-proxy list doesn't count as a way around it", async () => {
+    const file = join(root, "main", "settings.json");
+    await mainSettings({ HTTPS_PROXY: "http://127.0.0.1:1133", NO_PROXY: "localhost,corp.example" });
+    await writeMainProxy("http://127.0.0.1:7890");
+    expect(await mainProxyBlock()).toBeNull();
+    expect(await new ClaudeAdapter().proxyState(null)).toMatchObject({ own: "http://127.0.0.1:7890", file, blocked: null });
+
+    await writeMainProxy("http://127.0.0.1:7891");
+    const now = "http://127.0.0.1:7891";
+    const list = "localhost,127.0.0.1,::1,downloads.claude.ai,corp.example";
+    expect(JSON.parse(await readFile(file, "utf8"))).toEqual({ env: { https_proxy: now, HTTPS_PROXY: now, http_proxy: now, HTTP_PROXY: now, no_proxy: list, NO_PROXY: list } });
+    expect(await mainProxyBlock()).toBeNull();
+    expect(await readMainProxy()).toEqual({ proxy: now, file });
+
+    // Cleared, the file's own list is back, as it was before either proxy.
+    await writeMainProxy(null);
+    expect(JSON.parse(await readFile(file, "utf8"))).toEqual({ env: { NO_PROXY: "localhost,corp.example" } });
+  });
+
   it("keeps the no-proxy lists of the daemon and Paseo's config when it writes one into main's settings, which outranks them", async () => {
     process.env.NO_PROXY = "corp.example";
     rememberProviderEnvs({ claude: "claude" }, { claude: { env: { no_proxy: "intranet.example,.anthropic.com" } } });
@@ -202,6 +221,21 @@ describe("the CLI login's proxy", () => {
     } finally {
       errors.mockRestore();
     }
+  });
+
+  it("still can't be set past any other entry for Anthropic or Claude there, beside ZeroSub's own", async () => {
+    const file = join(root, "main", "settings.json");
+    const block = `${file} sets NO_PROXY in its env with Anthropic or Claude on it, so Claude Code goes around any proxy for them. Take those entries out there first.`;
+    const old = "http://127.0.0.1:1133";
+    for (const entry of ["anthropic.com", ".anthropic.com", "api.anthropic.com", "api.anthropic.com:443", "*.claude.ai", ".claude.ai", "claude.ai", "claude.com", ".com", "*", "*:443"]) {
+      await mainSettings({ HTTPS_PROXY: old, NO_PROXY: `localhost,127.0.0.1,::1,downloads.claude.ai,${entry}` });
+      expect(await mainProxyBlock(), entry).toBe(block);
+      await expect(writeMainProxy("http://127.0.0.1:7890"), entry).rejects.toThrow(block);
+      expect(await readMainProxy(), entry).toEqual({ proxy: old, file });
+    }
+    // ZeroSub's own entry doesn't count in another case, or with spaces between entries, either.
+    await mainSettings({ HTTPS_PROXY: old, no_proxy: "localhost, Downloads.Claude.AI", NO_PROXY: "corp.example downloads.claude.ai" });
+    expect(await mainProxyBlock()).toBeNull();
   });
 });
 
