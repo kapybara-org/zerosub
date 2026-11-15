@@ -34,6 +34,8 @@ export const StoredAccountSchema = z.object({
    * saved by earlier versions, which count as a turn's.
    */
   limitSource: z.enum(["turn", "reading"]).optional(),
+  /** Why a paid API account (Azure, Bedrock) was marked signed out: the provider's refusal, shown on its card. */
+  apiError: z.string().nullable().optional(),
   createdAt: z.string(),
 });
 export type StoredAccount = z.infer<typeof StoredAccountSchema>;

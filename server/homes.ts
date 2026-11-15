@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { ApiSummary, Family } from "../shared/model";
 import { AZURE_FILE, isAzureHome, syncAzureConfig } from "./azure";
+import { BEDROCK_FILE, bedrockSettings, isBedrockHome, readBedrockAccount } from "./bedrock";
 import { Mutex, readJson } from "./json-file";
 import { NO_PROXY_KEYS, PROXY_KEYS, REQUIRED_NO_PROXY, bypassesProxy, maskProxy, noProxyFromEnv, proxyFromEnv, withClaudeNoProxy, withoutClaudeDomains } from "./proxy";
 import { providerEnv } from "./provider-env";
@@ -214,6 +215,7 @@ const GENERATED_SETTINGS = ".settings.generated.json";
  */
 const CLAUDE_PRIVATE = new Set([
   ".credentials.json",
+  BEDROCK_FILE,
   "settings.json",
   ACCOUNT_SETTINGS,
   GENERATED_SETTINGS,
@@ -539,7 +541,10 @@ async function syncClaudeSettings(home: string): Promise<void> {
   // Homes from earlier versions link to main's file; replace the link, never write through it.
   if (current?.isSymbolicLink()) await unlink(target);
   const inherited = { ...process.env, ...providerEnv("claude") };
-  const next = `${JSON.stringify(accountSettings(main, account, inherited), null, 2)}\n`;
+  // An AWS Bedrock account's settings are made to agree with its sessions' environment (see bedrock.ts).
+  const bedrock = isBedrockHome(home) ? await readBedrockAccount(home) : null;
+  const generatedSettings = accountSettings(main, account, inherited);
+  const next = `${JSON.stringify(bedrock ? bedrockSettings(generatedSettings, bedrock) : generatedSettings, null, 2)}\n`;
   const generated = join(home, GENERATED_SETTINGS);
   if (current?.isFile() && (await readFile(target, "utf8").catch(() => null)) === next) {
     if ((await readFile(generated, "utf8").catch(() => null)) !== next) await writeJsonAtomically(generated, JSON.parse(next));

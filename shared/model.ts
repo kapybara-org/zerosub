@@ -135,7 +135,20 @@ export function isAzureAccount(account: { family: Family; auth?: AuthKind }): bo
   return account.family === "codex" && account.auth === "api";
 }
 
-/** Month key (`YYYY-MM`, UTC) Azure token totals are kept under. */
+/** An AWS Bedrock account: the only kind of API account the Claude family has. */
+export function isBedrockAccount(account: { family: Family; auth?: AuthKind }): boolean {
+  return account.family === "claude" && account.auth === "api";
+}
+
+/**
+ * A paid API account that stands in for a subscription (Azure under ChatGPT, Bedrock under Claude):
+ * routing only uses one by itself as a last resort. Pi's API accounts are never used by themselves.
+ */
+export function isPaidFallback(account: { family: Family; auth?: AuthKind }): boolean {
+  return isAzureAccount(account) || isBedrockAccount(account);
+}
+
+/** Month key (`YYYY-MM`, UTC) API token totals are kept under. */
 export function usageMonth(at: number | Date = Date.now()): string {
   return new Date(at).toISOString().slice(0, 7);
 }
@@ -145,18 +158,19 @@ export function usageMonth(at: number | Date = Date.now()): string {
  * when a model that used tokens has no price, or a price it needs is empty; `usd` then counts only
  * what has a price, and is null when nothing does.
  */
-export function estimateAzureCost(month: AzureMonth | null, prices: Readonly<Record<string, AzurePrice>>): { usd: number | null; complete: boolean } {
+export function estimateApiCost(month: ApiMonth | null, prices: Readonly<Record<string, ApiPrice>>): { usd: number | null; complete: boolean } {
   if (!month) return { usd: null, complete: true };
   let usd = 0;
   let priced = false;
   let complete = true;
   for (const [model, count] of Object.entries(month.models)) {
     const price = prices[model];
-    const uncached = Math.max(0, count.input - count.cachedInput);
+    const uncached = Math.max(0, count.input - count.cachedInput - count.cacheWrite);
     const parts: Array<[number, number | null | undefined]> = [
       [uncached, price?.input],
-      // Cached input without a price of its own is billed as input.
+      // Cache reads or writes without a price of their own are counted at the input price.
       [count.cachedInput, price?.cachedInput ?? price?.input],
+      [count.cacheWrite, price?.cacheWrite ?? price?.input],
       [count.output, price?.output],
     ];
     for (const [tokens, perMillion] of parts) {
@@ -173,11 +187,12 @@ export function estimateAzureCost(month: AzureMonth | null, prices: Readonly<Rec
 }
 
 /** A month's tokens over every model. */
-export function totalTokens(month: AzureMonth | null): TokenCount {
-  const total = { input: 0, cachedInput: 0, output: 0 };
+export function totalTokens(month: ApiMonth | null): TokenCount {
+  const total = { input: 0, cachedInput: 0, cacheWrite: 0, output: 0 };
   for (const count of Object.values(month?.models ?? {})) {
     total.input += count.input;
     total.cachedInput += count.cachedInput;
+    total.cacheWrite += count.cacheWrite;
     total.output += count.output;
   }
   return total;
@@ -192,32 +207,40 @@ export const ApiSummarySchema = z.object({
 });
 export type ApiSummary = z.infer<typeof ApiSummarySchema>;
 
-/** USD per million tokens for one model on an Azure OpenAI account; null where the user left it empty. */
-export const AzurePriceSchema = z.object({
+/** USD per million tokens for one model on an API account (Azure, Bedrock); null where the user left it empty. */
+export const ApiPriceSchema = z.object({
   input: z.number().nonnegative().nullable().default(null),
+  /** Cached input (OpenAI), or cache reads (Anthropic). */
   cachedInput: z.number().nonnegative().nullable().default(null),
+  /** Cache writes (Anthropic); Azure has none. */
+  cacheWrite: z.number().nonnegative().nullable().default(null),
   output: z.number().nonnegative().nullable().default(null),
 });
-export type AzurePrice = z.infer<typeof AzurePriceSchema>;
+export type ApiPrice = z.infer<typeof ApiPriceSchema>;
 
-/** Tokens one model used. `input` includes `cachedInput`, as OpenAI and Codex count them. */
+/**
+ * Tokens one model used. `input` is every input token, cached ones included (as OpenAI and Codex
+ * count them; Anthropic's cache reads and writes are added in): `cachedInput` of them were read from
+ * the cache, and `cacheWrite` written to it.
+ */
 export const TokenCountSchema = z.object({
   input: z.number().nonnegative().default(0),
   cachedInput: z.number().nonnegative().default(0),
+  cacheWrite: z.number().nonnegative().default(0),
   output: z.number().nonnegative().default(0),
 });
 export type TokenCount = z.infer<typeof TokenCountSchema>;
 
-/** An Azure OpenAI account's tokens this calendar month (UTC), as Codex counted them, by model. */
-export const AzureMonthSchema = z.object({
+/** An API account's tokens this calendar month (UTC), as Codex or Claude Code counted them, by model. */
+export const ApiMonthSchema = z.object({
   /** `YYYY-MM`, UTC. */
   month: z.string(),
   models: z.record(z.string(), TokenCountSchema).default({}),
-  /** Turns that ended on the account whose tokens couldn't be read (no Codex session file found). */
+  /** Turns that ended on the account whose tokens couldn't be read (no session file found). */
   uncounted: z.number().nonnegative().default(0),
   updatedAt: z.string().nullable().default(null),
 });
-export type AzureMonth = z.infer<typeof AzureMonthSchema>;
+export type ApiMonth = z.infer<typeof ApiMonthSchema>;
 
 /** An Azure OpenAI account (a ChatGPT/Codex account on an API key) as the app sees it. The key never leaves the host. */
 export const AzureSummarySchema = z.object({
@@ -227,11 +250,45 @@ export const AzureSummarySchema = z.object({
   /** The key's last four characters, or empty for a key too short to show any of it. */
   keyHint: z.string(),
   /** USD per million tokens, by model (deployment name). */
-  prices: z.record(z.string(), AzurePriceSchema).default({}),
+  prices: z.record(z.string(), ApiPriceSchema).default({}),
   /** This month's tokens; null before the first counted turn. */
-  usage: AzureMonthSchema.nullable().default(null),
+  usage: ApiMonthSchema.nullable().default(null),
 });
 export type AzureSummary = z.infer<typeof AzureSummarySchema>;
+
+/** Where an AWS Bedrock account's AWS credentials come from. */
+export const BedrockSourceSchema = z.enum([
+  /** The host's own: the AWS default chain (environment, ~/.aws, an instance or task role). Nothing is stored. */
+  "host",
+  /** A named profile in the host's ~/.aws config. */
+  "profile",
+  /** An access key (and secret, optional session token) kept in the account's home. */
+  "keys",
+]);
+export type BedrockSource = z.infer<typeof BedrockSourceSchema>;
+
+/** Model overrides for a Bedrock account (inference-profile IDs); empty uses Claude Code's defaults. */
+export const BedrockModelsSchema = z.object({
+  model: z.string().default(""),
+  opus: z.string().default(""),
+  sonnet: z.string().default(""),
+  haiku: z.string().default(""),
+});
+export type BedrockModels = z.infer<typeof BedrockModelsSchema>;
+
+/** An AWS Bedrock account (a Claude account on AWS) as the app sees it. Secrets never leave the host. */
+export const BedrockSummarySchema = z.object({
+  region: z.string(),
+  source: BedrockSourceSchema,
+  /** The profile's name, for `profile`. */
+  profile: z.string().nullable(),
+  /** The access key ID's last four characters, for `keys`. */
+  keyHint: z.string().nullable(),
+  models: BedrockModelsSchema,
+  prices: z.record(z.string(), ApiPriceSchema).default({}),
+  usage: ApiMonthSchema.nullable().default(null),
+});
+export type BedrockSummary = z.infer<typeof BedrockSummarySchema>;
 
 /** The address an account's requests come from, as the provider's edge sees it. */
 export const EgressSchema = z.object({
@@ -297,6 +354,10 @@ export const AccountViewSchema = z.object({
   externalHome: z.boolean().default(false),
   /** Set for an Azure OpenAI account (a ChatGPT/Codex account on an API key, used last); null for any other. */
   azure: AzureSummarySchema.nullable().default(null),
+  /** Set for an AWS Bedrock account (a Claude account on AWS, used last); null for any other. */
+  bedrock: BedrockSummarySchema.nullable().default(null),
+  /** Why an API account (Azure, Bedrock) was last refused, when it's marked signed out for it. */
+  apiError: z.string().nullable().default(null),
   /** The account's home is due to move to `to`, and hasn't yet: what it waits for, or what went wrong. */
   moving: z.object({ to: z.string(), waiting: z.string().nullable(), error: z.string().nullable() }).nullable().default(null),
 });
@@ -386,6 +447,8 @@ export const StateViewSchema = z.object({
   showComposerPill: z.boolean(),
   /** Accounts at their limit are skipped, so agents can't be moved onto one by hand either. */
   autoSwitch: z.boolean().default(true),
+  /** The AWS region the host's own AWS setup names (environment, ~/.aws/config, or the EC2 instance's), for new Bedrock accounts. */
+  awsRegion: z.string().nullable().optional(),
   warnings: z.array(z.string()),
 });
 export type StateView = z.infer<typeof StateViewSchema>;

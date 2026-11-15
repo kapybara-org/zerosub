@@ -25,6 +25,8 @@ export const SwitchRowSchema = z.object({
     "enabled",
     /** Every account of this provider is at its limit; nothing to switch to. */
     "exhausted",
+    /** `from` is a paid API account (Azure, Bedrock), and a subscription account has room again. */
+    "room",
   ]),
   /** When the exhausted account frees up again, if known. */
   resetsAt: z.string().nullable(),

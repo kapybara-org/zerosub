@@ -1,5 +1,5 @@
 import { accountPeak } from "../shared/format";
-import { isAzureAccount, type Family, type Usage, type UsageWindow } from "../shared/model";
+import { isPaidFallback, type Family, type Usage, type UsageWindow } from "../shared/model";
 import { FIVE_HOUR_MINUTES, WEEK_MINUTES } from "./codex";
 import {
   accountsOf,
@@ -45,12 +45,13 @@ export function canStandIn(account: StoredAccount, now: number): boolean {
 }
 
 /**
- * An Azure OpenAI account: billed per token, so routing only puts agents on it by itself as a last
- * resort, when no subscription account of the family can stand in (see `mostAvailable`). It can always
- * be picked by hand, or made the default.
+ * A paid API account standing in for subscriptions (Azure OpenAI under ChatGPT, AWS Bedrock under
+ * Claude): billed per token, so routing only puts agents on it by itself as a last resort, when no
+ * subscription account of the family can stand in (see `mostAvailable`). It can always be picked by
+ * hand, or made the default.
  */
 export function isLastResort(account: StoredAccount): boolean {
-  return isAzureAccount(account);
+  return isPaidFallback(account);
 }
 
 /**
@@ -101,7 +102,7 @@ export function mostAvailable(
   const open = accountsOf(state, family).filter((account) => !exclude.has(account.id));
   const subscriptions = open.filter((account) => canStandIn(account, now));
   // Only once every subscription account is out (at its limit, signed out, disabled) does routing
-  // put work on a paid Azure account by itself.
+  // put work on a paid API account (Azure, Bedrock) by itself.
   const candidates = subscriptions.length > 0 ? subscriptions : open.filter((account) => isLastResort(account) && isUsable(account, now));
   const rank = (account: StoredAccount) => {
     const usage = usageOf(account.id);
@@ -240,7 +241,7 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   const mayMove = fresh || input.portable;
   if (why && mayMove && (input.autoSwitch || why !== "limited")) {
     const staying = findAccount(state, input.current);
-    // A paid Azure stand-in is only kept while no subscription account could take over from it.
+    // A paid API stand-in is only kept while no subscription account could take over from it.
     const keepsStaying = (stand: StoredAccount) =>
       !isLastResort(stand) || !accountsOf(state, input.family).some((other) => other.id !== account!.id && canStandIn(other, input.now));
     const alternative =
@@ -251,11 +252,12 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
       skipped = { account, why };
       account = alternative;
       // A thread that can't move lives where it starts. Otherwise a disabled account keeps its
-      // agents' bindings, so they return when it's enabled again; a limit re-pins them.
+      // agents' bindings, so they return when it's enabled again; a limit re-pins them, except onto
+      // a paid API account (Bedrock), which they leave again once their own account has room.
       bind =
         !input.portable
           ? { accountId: alternative.id, source: "thread", at }
-          : why === "disabled"
+          : why === "disabled" || isLastResort(alternative)
             ? null
             : { accountId: alternative.id, source: "auto", at };
     }

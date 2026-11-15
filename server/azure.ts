@@ -1,20 +1,11 @@
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { lstat, mkdir, open, readdir, readFile, rename, rm, unlink } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { z } from "zod";
-import {
-  AzureMonthSchema,
-  AzurePriceSchema,
-  TokenCountSchema,
-  usageMonth,
-  type AzureMonth,
-  type AzurePrice,
-  type AzureSummary,
-  type TokenCount,
-} from "../shared/model";
+import { join } from "node:path";
+import type { ApiMonth, ApiPrice, AzureSummary, TokenCount } from "../shared/model";
+import { cleanPrices } from "./api-usage";
 import { Mutex, readJson, writeJsonAtomic } from "./json-file";
-import { dataDir, mainCodexHome } from "./paths";
+import { mainCodexHome } from "./paths";
 import { providerEnv } from "./provider-env";
 import { bypassesProxy, proxiedFetch, proxyFromEnv } from "./proxy";
 
@@ -41,7 +32,7 @@ const KEY_HINT_MIN_LENGTH = 12;
 export interface AzureAccount {
   endpoint: string;
   key: string;
-  prices: Record<string, AzurePrice>;
+  prices: Record<string, ApiPrice>;
 }
 
 /** Whether `home` is an Azure OpenAI account's (it has `azure.json`). */
@@ -78,16 +69,6 @@ export function azureIdentity(endpoint: string, key: string): string {
   return `azure|${endpoint}|${createHash("sha256").update(key).digest("hex").slice(0, 16)}`;
 }
 
-function cleanPrices(value: unknown): Record<string, AzurePrice> {
-  const prices: Record<string, AzurePrice> = {};
-  if (!value || typeof value !== "object" || Array.isArray(value)) return prices;
-  for (const [model, entry] of Object.entries(value)) {
-    const parsed = AzurePriceSchema.safeParse(entry);
-    if (model.trim() && parsed.success) prices[model.trim()] = parsed.data;
-  }
-  return prices;
-}
-
 /** The account's settings; throws when the file is missing or has no endpoint or key. */
 export async function readAzureAccount(home: string): Promise<AzureAccount> {
   const raw = await readJson(join(home, AZURE_FILE)).catch(() => undefined);
@@ -105,7 +86,7 @@ export async function writeAzureAccount(home: string, account: AzureAccount): Pr
 }
 
 /** What the app may see of the account: no key, only its hint. */
-export function azureSummary(account: AzureAccount, usage: AzureMonth | null): AzureSummary {
+export function azureSummary(account: AzureAccount, usage: ApiMonth | null): AzureSummary {
   let host = account.endpoint;
   try {
     host = new URL(account.endpoint).host;
@@ -302,57 +283,6 @@ export async function checkAzureKey(endpoint: string, key: string, fetcher: Fetc
   }
 }
 
-// --------------------------------------------------------------------------- monthly tokens
-
-/** What one thread had used by the last time its tokens were counted (see `countThread`). */
-const ThreadMarkSchema = TokenCountSchema.extend({ at: z.string() });
-
-export interface AzureUsageFile {
-  accounts: Record<string, AzureMonth>;
-  threads: Record<string, TokenCount & { at: string }>;
-}
-
-/** A thread not counted for this long is forgotten (its next turn counts from what it had then). */
-const THREAD_KEEP_MS = 62 * 24 * 60 * 60_000;
-
-/** Adds `delta` tokens of `model` to the account's month, starting a new month (UTC) when it has turned. */
-export function addAzureTokens(month: AzureMonth | undefined, model: string, delta: TokenCount, now: number): AzureMonth {
-  const key = usageMonth(now);
-  const current: AzureMonth = month && month.month === key ? structuredClone(month) : { month: key, models: {}, uncounted: 0, updatedAt: null };
-  const entry = current.models[model] ?? { input: 0, cachedInput: 0, output: 0 };
-  current.models[model] = {
-    input: entry.input + delta.input,
-    cachedInput: entry.cachedInput + delta.cachedInput,
-    output: entry.output + delta.output,
-  };
-  current.updatedAt = new Date(now).toISOString();
-  return current;
-}
-
-/** Notes a turn whose tokens couldn't be read, in the account's month. */
-export function addUncounted(month: AzureMonth | undefined, now: number): AzureMonth {
-  const key = usageMonth(now);
-  const current: AzureMonth = month && month.month === key ? structuredClone(month) : { month: key, models: {}, uncounted: 0, updatedAt: null };
-  current.uncounted += 1;
-  current.updatedAt = new Date(now).toISOString();
-  return current;
-}
-
-/** The month as it shows now: an earlier month's totals don't count any more. */
-export function currentMonth(month: AzureMonth | undefined, now: number): AzureMonth | null {
-  return month && month.month === usageMonth(now) ? month : null;
-}
-
-/** How much more a thread used since `previous`; all of `total` when it's new or its count went back. */
-export function tokenDelta(previous: TokenCount | undefined, total: TokenCount): TokenCount {
-  if (!previous || total.input < previous.input || total.output < previous.output) return { ...total };
-  return {
-    input: total.input - previous.input,
-    cachedInput: Math.max(0, total.cachedInput - previous.cachedInput),
-    output: total.output - previous.output,
-  };
-}
-
 function number(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
 }
@@ -378,7 +308,7 @@ export function parseRollout(text: string): { model: string | null; total: Token
     if (entry.type === "event_msg" && payload.type === "token_count") {
       const info = payload.info as { total_token_usage?: Record<string, unknown> } | null | undefined;
       const usage = info?.total_token_usage;
-      if (usage) total = { input: number(usage.input_tokens), cachedInput: number(usage.cached_input_tokens), output: number(usage.output_tokens) };
+      if (usage) total = { input: number(usage.input_tokens), cachedInput: number(usage.cached_input_tokens), cacheWrite: 0, output: number(usage.output_tokens) };
     }
   }
   return total ? { model, total } : null;
@@ -409,72 +339,4 @@ export async function findRollout(threadId: string, sessions = join(mainCodexHom
     }
   }
   return null;
-}
-
-function usagePath(): string {
-  return join(dataDir(), "azure-usage.json");
-}
-
-/** Azure accounts' monthly token totals, and what each thread had used when last counted. No keys, no text. */
-export class AzureUsageStore {
-  private cached: AzureUsageFile | null = null;
-  private readonly mutex = new Mutex();
-
-  constructor(private readonly path: string = usagePath()) {}
-
-  async read(): Promise<AzureUsageFile> {
-    if (this.cached) return this.cached;
-    const raw = (await readJson(this.path).catch(() => undefined)) as Partial<AzureUsageFile> | undefined;
-    const file: AzureUsageFile = { accounts: {}, threads: {} };
-    for (const [id, value] of Object.entries(raw?.accounts ?? {})) {
-      const parsed = AzureMonthSchema.safeParse(value);
-      if (parsed.success) file.accounts[id] = parsed.data;
-    }
-    for (const [id, value] of Object.entries(raw?.threads ?? {})) {
-      const parsed = ThreadMarkSchema.safeParse(value);
-      if (parsed.success) file.threads[id] = parsed.data;
-    }
-    this.cached ??= file;
-    return this.cached;
-  }
-
-  update(change: (draft: AzureUsageFile) => void): Promise<AzureUsageFile> {
-    return this.mutex.run(async () => {
-      const draft = structuredClone(await this.read());
-      change(draft);
-      const now = Date.now();
-      for (const [id, mark] of Object.entries(draft.threads)) if (now - Date.parse(mark.at) > THREAD_KEEP_MS) delete draft.threads[id];
-      await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
-      await writeJsonAtomic(this.path, draft, { durable: false });
-      this.cached = draft;
-      return draft;
-    });
-  }
-
-  /**
-   * Counts what a thread used since it was last counted, against `accountId`'s month. Each thread
-   * runs on one account (Codex threads can't change accounts), so its whole growth is that account's.
-   */
-  async countThread(accountId: string, threadId: string, reading: { model: string | null; total: TokenCount }, fallbackModel: string, now = Date.now()): Promise<TokenCount> {
-    let delta: TokenCount = { input: 0, cachedInput: 0, output: 0 };
-    await this.update((draft) => {
-      delta = tokenDelta(draft.threads[threadId], reading.total);
-      draft.threads[threadId] = { ...reading.total, at: new Date(now).toISOString() };
-      if (delta.input + delta.output > 0) draft.accounts[accountId] = addAzureTokens(draft.accounts[accountId], reading.model ?? fallbackModel, delta, now);
-    });
-    return delta;
-  }
-
-  async noteUncounted(accountId: string, now = Date.now()): Promise<void> {
-    await this.update((draft) => {
-      draft.accounts[accountId] = addUncounted(draft.accounts[accountId], now);
-    });
-  }
-
-  async forget(accountId: string): Promise<void> {
-    if (!(await this.read()).accounts[accountId]) return;
-    await this.update((draft) => {
-      delete draft.accounts[accountId];
-    });
-  }
 }

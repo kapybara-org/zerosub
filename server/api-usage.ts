@@ -1,0 +1,180 @@
+import { mkdir } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { z } from "zod";
+import { ApiMonthSchema, ApiPriceSchema, TokenCountSchema, usageMonth, type ApiMonth, type ApiPrice, type TokenCount } from "../shared/model";
+import { Mutex, readJson, writeJsonAtomic } from "./json-file";
+import { dataDir } from "./paths";
+
+/**
+ * Monthly token totals of the paid API accounts (Azure under ChatGPT, Bedrock under Claude), counted
+ * per turn from the CLIs' own session files, in `$PASEO_HOME/zerosub/api-usage.json`. No keys, no text.
+ */
+
+/** What one Codex thread had used by the last time its tokens were counted (see `countThread`). */
+const ThreadMarkSchema = TokenCountSchema.extend({ at: z.string() });
+/** The Claude messages of one session already counted (see `countMessages`). */
+const MessageMarkSchema = z.object({ ids: z.array(z.string()).default([]), at: z.string() });
+
+export interface ApiUsageFile {
+  accounts: Record<string, ApiMonth>;
+  threads: Record<string, TokenCount & { at: string }>;
+  messages?: Record<string, { ids: string[]; at: string }>;
+}
+
+/** A thread or session not counted for this long is forgotten. */
+const MARK_KEEP_MS = 62 * 24 * 60 * 60_000;
+/** Message IDs kept per Claude session: far more than one turn writes. */
+const MESSAGE_IDS_KEPT = 2_000;
+
+export const EMPTY_COUNT: TokenCount = { input: 0, cachedInput: 0, cacheWrite: 0, output: 0 };
+
+/** A price table as read back from a file: entries that don't parse, or have no model name, are left out. */
+export function cleanPrices(value: unknown): Record<string, ApiPrice> {
+  const prices: Record<string, ApiPrice> = {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) return prices;
+  for (const [model, entry] of Object.entries(value)) {
+    const parsed = ApiPriceSchema.safeParse(entry);
+    if (model.trim() && parsed.success) prices[model.trim()] = parsed.data;
+  }
+  return prices;
+}
+
+function emptyMonth(now: number): ApiMonth {
+  return { month: usageMonth(now), models: {}, uncounted: 0, updatedAt: null };
+}
+
+/** Adds `delta` tokens of `model` to the account's month, starting a new month (UTC) when it has turned. */
+export function addApiTokens(month: ApiMonth | undefined, model: string, delta: TokenCount, now: number): ApiMonth {
+  const current = month && month.month === usageMonth(now) ? structuredClone(month) : emptyMonth(now);
+  const entry = current.models[model] ?? EMPTY_COUNT;
+  current.models[model] = {
+    input: entry.input + delta.input,
+    cachedInput: entry.cachedInput + delta.cachedInput,
+    cacheWrite: entry.cacheWrite + delta.cacheWrite,
+    output: entry.output + delta.output,
+  };
+  current.updatedAt = new Date(now).toISOString();
+  return current;
+}
+
+/** Notes a turn whose tokens couldn't be read, in the account's month. */
+export function addUncounted(month: ApiMonth | undefined, now: number): ApiMonth {
+  const current = month && month.month === usageMonth(now) ? structuredClone(month) : emptyMonth(now);
+  current.uncounted += 1;
+  current.updatedAt = new Date(now).toISOString();
+  return current;
+}
+
+/** The month as it shows now: an earlier month's totals don't count any more. */
+export function currentMonth(month: ApiMonth | undefined, now: number): ApiMonth | null {
+  return month && month.month === usageMonth(now) ? month : null;
+}
+
+/** How much more a thread used since `previous`; all of `total` when it's new or its count went back. */
+export function tokenDelta(previous: TokenCount | undefined, total: TokenCount): TokenCount {
+  if (!previous || total.input < previous.input || total.output < previous.output) return { ...total };
+  return {
+    input: total.input - previous.input,
+    cachedInput: Math.max(0, total.cachedInput - previous.cachedInput),
+    cacheWrite: Math.max(0, total.cacheWrite - previous.cacheWrite),
+    output: total.output - previous.output,
+  };
+}
+
+function usagePath(): string {
+  return join(dataDir(), "api-usage.json");
+}
+
+export class ApiUsageStore {
+  private cached: ApiUsageFile | null = null;
+  private readonly mutex = new Mutex();
+
+  constructor(private readonly path: string = usagePath()) {}
+
+  async read(): Promise<ApiUsageFile> {
+    if (this.cached) return this.cached;
+    const raw = (await readJson(this.path).catch(() => undefined)) as Partial<ApiUsageFile> | undefined;
+    const file: ApiUsageFile = { accounts: {}, threads: {}, messages: {} };
+    for (const [id, value] of Object.entries(raw?.accounts ?? {})) {
+      const parsed = ApiMonthSchema.safeParse(value);
+      if (parsed.success) file.accounts[id] = parsed.data;
+    }
+    for (const [id, value] of Object.entries(raw?.threads ?? {})) {
+      const parsed = ThreadMarkSchema.safeParse(value);
+      if (parsed.success) file.threads[id] = parsed.data;
+    }
+    for (const [id, value] of Object.entries(raw?.messages ?? {})) {
+      const parsed = MessageMarkSchema.safeParse(value);
+      if (parsed.success) file.messages![id] = parsed.data;
+    }
+    this.cached ??= file;
+    return this.cached;
+  }
+
+  update(change: (draft: ApiUsageFile) => void): Promise<ApiUsageFile> {
+    return this.mutex.run(async () => {
+      const draft = structuredClone(await this.read());
+      draft.messages ??= {};
+      change(draft);
+      const now = Date.now();
+      for (const [id, mark] of Object.entries(draft.threads)) if (now - Date.parse(mark.at) > MARK_KEEP_MS) delete draft.threads[id];
+      for (const [id, mark] of Object.entries(draft.messages)) if (now - Date.parse(mark.at) > MARK_KEEP_MS) delete draft.messages[id];
+      await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
+      await writeJsonAtomic(this.path, draft, { durable: false });
+      this.cached = draft;
+      return draft;
+    });
+  }
+
+  /**
+   * Counts what a Codex thread used since it was last counted, against `accountId`'s month. Each thread
+   * runs on one account (Codex threads can't change accounts), so its whole growth is that account's.
+   */
+  async countThread(accountId: string, threadId: string, reading: { model: string | null; total: TokenCount }, fallbackModel: string, now = Date.now()): Promise<TokenCount> {
+    let delta: TokenCount = EMPTY_COUNT;
+    await this.update((draft) => {
+      delta = tokenDelta(draft.threads[threadId], reading.total);
+      draft.threads[threadId] = { ...reading.total, at: new Date(now).toISOString() };
+      if (delta.input + delta.output > 0) draft.accounts[accountId] = addApiTokens(draft.accounts[accountId], reading.model ?? fallbackModel, delta, now);
+    });
+    return delta;
+  }
+
+  /**
+   * Counts a Claude session's messages against `accountId`'s month, each once: a Claude conversation
+   * can move between accounts, so only the messages of turns run on the account are passed in, and
+   * one counted before (Claude Code writes a message's usage on more than one line) is skipped.
+   * Returns how many were new.
+   */
+  async countMessages(accountId: string, sessionId: string, messages: ReadonlyArray<{ id: string; model: string; count: TokenCount }>, now = Date.now()): Promise<number> {
+    let added = 0;
+    await this.update((draft) => {
+      const mark = draft.messages![sessionId] ?? { ids: [], at: new Date(now).toISOString() };
+      const seen = new Set(mark.ids);
+      for (const message of messages) {
+        if (seen.has(message.id)) continue;
+        seen.add(message.id);
+        mark.ids.push(message.id);
+        draft.accounts[accountId] = addApiTokens(draft.accounts[accountId], message.model, message.count, now);
+        added += 1;
+      }
+      mark.ids = mark.ids.slice(-MESSAGE_IDS_KEPT);
+      mark.at = new Date(now).toISOString();
+      draft.messages![sessionId] = mark;
+    });
+    return added;
+  }
+
+  async noteUncounted(accountId: string, now = Date.now()): Promise<void> {
+    await this.update((draft) => {
+      draft.accounts[accountId] = addUncounted(draft.accounts[accountId], now);
+    });
+  }
+
+  async forget(accountId: string): Promise<void> {
+    if (!(await this.read()).accounts[accountId]) return;
+    await this.update((draft) => {
+      delete draft.accounts[accountId];
+    });
+  }
+}

@@ -1,4 +1,4 @@
-import { estimateAzureCost, totalTokens, type AccountView, type AgentRoute, type AzureSummary, type Credits, type Egress, type ExtraUsage, type UsageWindow } from "./model";
+import { estimateApiCost, totalTokens, type AccountView, type AgentRoute, type AzureSummary, type Credits, type Egress, type ExtraUsage, type UsageWindow } from "./model";
 import type { ReopenSummary } from "./rpc";
 
 /** "in 2h 14m", "in 3d 4h", "now". */
@@ -226,15 +226,16 @@ export function formatTokens(count: number): string {
 }
 
 /**
- * An Azure OpenAI account's month, as its card shows it: its tokens, and the cost estimated from its
+ * A paid API account's month (Azure, Bedrock), as its card shows it: its tokens, and the cost estimated from its
  * price table ("cost unknown" while no model that used tokens has a price).
  */
-export function azureUsageLines(azure: AzureSummary, now: number = Date.now()): { tokens: string; cost: string; note: string | null } {
-  const month = azure.usage;
+export function apiUsageLines(account: Pick<AzureSummary, "prices" | "usage">, now: number = Date.now()): { tokens: string; cost: string; note: string | null } {
+  const month = account.usage;
   const name = new Date(now).toLocaleString("en-US", { month: "long", timeZone: "UTC" });
   const total = totalTokens(month);
-  const tokens = `${name}: ${formatTokens(total.input)} input (${formatTokens(total.cachedInput)} cached) · ${formatTokens(total.output)} output tokens`;
-  const { usd, complete } = estimateAzureCost(month, azure.prices);
+  const cache = total.cacheWrite > 0 ? `${formatTokens(total.cachedInput)} cache read, ${formatTokens(total.cacheWrite)} cache write` : `${formatTokens(total.cachedInput)} cached`;
+  const tokens = `${name}: ${formatTokens(total.input)} input (${cache}) · ${formatTokens(total.output)} output tokens`;
+  const { usd, complete } = estimateApiCost(month, account.prices);
   const cost =
     usd === null
       ? total.input + total.output > 0
@@ -242,6 +243,6 @@ export function azureUsageLines(azure: AzureSummary, now: number = Date.now()): 
         : "No tokens used yet this month"
       : `≈ $${usd.toFixed(usd < 10 ? 2 : 0)} this month${complete ? "" : " (some models have no price yet)"}`;
   const uncounted = month?.uncounted ?? 0;
-  const note = uncounted > 0 ? `${uncounted} turn${uncounted === 1 ? "" : "s"} couldn't be counted (no Codex session file found), so these totals are short.` : null;
+  const note = uncounted > 0 ? `${uncounted} turn${uncounted === 1 ? "" : "s"} couldn't be counted (no session file found), so these totals are short.` : null;
   return { tokens, cost, note };
 }

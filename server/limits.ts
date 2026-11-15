@@ -294,3 +294,50 @@ function nextOccurrence(
   }
   return new Date(at).toISOString();
 }
+
+// --------------------------------------------------------------------------- AWS Bedrock (Claude on AWS)
+
+/** How long a Bedrock account is set aside after throttling (`ThrottlingException`, 429, "Too many tokens"). */
+export const BEDROCK_THROTTLE_MS = 60_000;
+/** How long after a service quota was exceeded, which usually lifts within minutes. */
+export const BEDROCK_QUOTA_MS = 5 * 60_000;
+
+const BEDROCK_QUOTA = /ServiceQuotaExceeded|service quota|quota exceeded/i;
+const BEDROCK_THROTTLED = /ThrottlingException|Too many (?:tokens|requests)|\b429\b|rate (?:exceeded|limit)/i;
+/** Credentials or access refused, or a model the account can't use (not enabled, or a wrong ID). */
+const BEDROCK_REFUSED =
+  /AccessDeniedException|don['’]t have access to the model|not authorized to perform|model identifier is invalid|model (?:is )?not (?:enabled|available|supported)|UnrecognizedClientException|security token included in the request is (?:invalid|expired)|ExpiredToken|Could not load credentials|Unable to locate credentials|\b40[13]\b/i;
+
+/**
+ * Notices from a turn on Bedrock: Claude Code reports an API failure as a reply starting "API Error",
+ * so the final replies count only when they do, and never ordinary prose that mentions a 429.
+ */
+function apiNotices(event: TurnEvent): string[] {
+  const found = notices(event, false);
+  const timeline = event.turnId === null ? [] : event.timeline;
+  let replies = 0;
+  for (let index = timeline.length - 1; index >= 0 && replies < 2; index -= 1) {
+    const item = timeline[index];
+    if (!item) continue;
+    if (isTurnPrompt(item)) break;
+    if (item.type !== "assistant_message") continue;
+    replies += 1;
+    if (/^(?:\[System Error\]\s*)?API Error\b/i.test(item.text)) found.push(clean(item.text));
+  }
+  return found.filter((text) => text.length > 0 && text.length <= MAX_NOTICE);
+}
+
+/** A turn on a Bedrock account throttled or over a quota: a short cooldown, as for Azure (see `detectAzureLimit`). */
+export function detectBedrockLimit(event: TurnEvent, now: Date = new Date()): LimitHit | null {
+  for (const text of apiNotices(event)) {
+    if (BEDROCK_QUOTA.test(text)) return { kind: "budget", message: firstLine(text), resetsAt: new Date(now.getTime() + BEDROCK_QUOTA_MS).toISOString() };
+    if (BEDROCK_THROTTLED.test(text)) return { kind: "window", message: firstLine(text), resetsAt: new Date(now.getTime() + BEDROCK_THROTTLE_MS).toISOString() };
+  }
+  return null;
+}
+
+/** A turn on a Bedrock account whose credentials, access or model were refused; the message says which. */
+export function detectBedrockRefusal(event: TurnEvent): string | null {
+  for (const text of apiNotices(event)) if (BEDROCK_REFUSED.test(text) && !BEDROCK_THROTTLED.test(text)) return firstLine(text);
+  return null;
+}

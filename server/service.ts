@@ -22,7 +22,12 @@ import {
   type StateView,
   type Usage,
   isAzureAccount,
-  type AzurePrice,
+  isBedrockAccount,
+  isPaidFallback,
+  type BedrockModels,
+  type BedrockSource,
+  type BedrockSummary,
+  type ApiPrice,
   type AzureSummary,
 } from "../shared/model";
 import { capsAccount, limitedPick } from "../shared/format";
@@ -46,17 +51,28 @@ import { FamilyResolver } from "./families";
 import { sameAccountIdentity, withoutWorkspace } from "./account-identity";
 import { CodexContinuations } from "./continuations";
 import { CONTINUED_FROM_LABEL, continueInNewAgent, type Continuation } from "./handoff";
-import { PI_ACCOUNT_FILE, crossesInheritedProxy, isAccountHome, moveHome, normalizeBaseUrl, plainHttp, readPiAccount, readPiAccountForAgents, removeHome } from "./homes";
+import { PI_ACCOUNT_FILE, crossesInheritedProxy, prepareClaudeHome, isAccountHome, moveHome, normalizeBaseUrl, plainHttp, readPiAccount, readPiAccountForAgents, removeHome } from "./homes";
 import { launcherNames, piLauncherDir, writeLaunchers, type LauncherAccount } from "./launchers";
 import { Mutex } from "./json-file";
-import { detectAzureLimit, detectAzureSignOut, turnRows } from "./limits";
+import { ApiUsageStore, currentMonth, type ApiUsageFile } from "./api-usage";
+import { detectAzureLimit, detectAzureSignOut, detectBedrockLimit, detectBedrockRefusal, turnRows } from "./limits";
 import {
-  AzureUsageStore,
-  type AzureUsageFile,
+  bedrockIdentity,
+  bedrockSummary,
+  checkBedrock,
+  detectHostRegion,
+  findClaudeSession,
+  isBedrockHome,
+  normalizeRegion,
+  parseClaudeSession,
+  readBedrockAccount,
+  writeBedrockAccount,
+  type BedrockAccount,
+} from "./bedrock";
+import {
   azureIdentity,
   azureSummary,
   checkAzureKey,
-  currentMonth,
   findRollout,
   isAzureHome,
   normalizeAzureEndpoint,
@@ -326,6 +342,8 @@ export class Service {
    * waiting for it), so on the CLI login. Cleared when routing next opens one. See `onSessionOpen`.
    */
   private readonly unrouted = new Set<string>();
+  /** When each agent's current or last turn started, to count a Bedrock turn's messages (see `countApiTurn`). */
+  private readonly turnStartedAt = new Map<string, number>();
   /** When each agent's last turn started or ended; see `noteTurn`. */
   private readonly turnAt = new Map<string, number>();
   private aligning = false;
@@ -395,7 +413,7 @@ export class Service {
     private readonly store = new StateStore(),
     private readonly families = new FamilyResolver(),
     private readonly reopener = new Reopener(),
-    private readonly azureUsage = new AzureUsageStore(),
+    private readonly apiUsage = new ApiUsageStore(),
   ) {
     this.adapters = Object.fromEntries(FAMILIES.map((family) => [family, adapters[family] ?? missingAdapter(family)])) as Record<Family, FamilyAdapter>;
     this.continuations = new CodexContinuations(store);
@@ -429,6 +447,8 @@ export class Service {
       // The last readings show right away; fresh ones replace them as they arrive.
       for (const [accountId, reading] of await loadReadings()) if (!this.usage.has(accountId)) this.usage.set(accountId, reading);
       await Promise.all(FAMILIES.map((family) => this.ensureFamily(family)));
+      // Read once, for new AWS Bedrock accounts' region (an EC2 host's takes a metadata request).
+      void detectHostRegion();
       this.started = true;
       await this.reportStrayHomes().catch(() => undefined);
     })().finally(() => {
@@ -676,8 +696,8 @@ export class Service {
     // sign-in that has since become an account the registry no longer knows.
     // A Pi account is saved, and its entry dropped, in one write (see `addApiAccount`): an entry left
     // means it never became an account, so its home goes, key and all.
-    // So is an Azure OpenAI account's (its home holds azure.json): nothing in it is signed in.
-    const earlier = entry.why === "unfinished" && entry.family !== "pi" && !isAzureHome(home) && !this.endedHere(home);
+    // So is an Azure OpenAI or AWS Bedrock account's (its home holds azure.json or bedrock.json): nothing in it is signed in.
+    const earlier = entry.why === "unfinished" && entry.family !== "pi" && !isAzureHome(home) && !isBedrockHome(home) && !this.endedHere(home);
     let deleteFolder = true;
     let outcome: string;
     try {
@@ -916,7 +936,7 @@ export class Service {
 
   /** A turn uses the account from its first token, so a long one keeps its usage fresh too. */
   async onTurnStarted(agent: { id: string; provider: string }, context: PluginHookContext): Promise<void> {
-    this.noteTurn(agent.id);
+    this.turnStartedAt.set(agent.id, this.noteTurn(agent.id));
     this.attach(context.paseo);
     const family = (await this.families.resolve(context.paseo))[agent.provider];
     if (!family) return;
@@ -936,18 +956,23 @@ export class Service {
     const ranOn = await this.store.read();
     const accountId = this.runningOn(ranOn, agentId, family) ?? null;
     if (accountId) this.activeAt.set(accountId, Date.now());
-    // An Azure OpenAI account fails on the API's errors, not the ChatGPT plan's notices.
+    // A paid API account (Azure, Bedrock) fails on the API's errors, not the subscription's notices.
     const ranAccount = findAccount(ranOn, accountId);
     const azure = ranAccount !== undefined && isAzureAccount(ranAccount);
-    if (azure && accountId) void this.countAzureTurn(context.paseo, agentId, accountId).catch((error: unknown) => log(`could not count the tokens of ${agentId}'s turn`, error));
+    const bedrock = ranAccount !== undefined && isBedrockAccount(ranAccount);
+    const startedAt = this.turnStartedAt.get(agentId) ?? endedAt - 60 * 60_000;
+    if ((azure || bedrock) && accountId) {
+      void this.countApiTurn(context.paseo, agentId, accountId, bedrock ? "claude" : "codex", startedAt).catch((error: unknown) => log(`could not count the tokens of ${agentId}'s turn`, error));
+    }
     if (event.outcome.kind !== "canceled") {
       const turn = await this.turnWithTimeline(context.paseo, event);
       // A hand-off quotes the whole conversation, not just this turn. Paseo 0.13 sends none, so the hand-off pages it.
       const conversation = event.timeline.length > 0 ? event.timeline : undefined;
-      const hit = azure ? detectAzureLimit(turn) : adapter.detectLimit(turn);
+      const hit = azure ? detectAzureLimit(turn) : bedrock ? detectBedrockLimit(turn) : adapter.detectLimit(turn);
+      const refusal = azure ? detectAzureSignOut(turn) : bedrock ? detectBedrockRefusal(turn) : adapter.detectSignOut(turn);
       const problem: Problem | null = hit
         ? { kind: "limit", hit }
-        : (azure ? detectAzureSignOut(turn) : adapter.detectSignOut(turn)) && (await this.confirmSignedOut(accountId))
+        : refusal && (await this.confirmSignedOut(accountId, refusal))
           ? { kind: "signed_out" }
           : null;
       if (problem) {
@@ -1028,15 +1053,16 @@ export class Service {
   }
 
   /** Re-checks the account an agent was using; true when it really is signed out now. */
-  private async confirmSignedOut(accountId: string | null): Promise<boolean> {
+  private async confirmSignedOut(accountId: string | null, refusal?: string): Promise<boolean> {
     if (!accountId) return false;
     const state = await this.store.read();
     if (findAccount(state, accountId)?.auth === "api") {
-      // Nothing to re-check against: the refusal itself is the answer.
+      // Nothing to re-check against: the refusal itself is the answer, and its card says what it was.
       await this.store.update((draft) => {
         const target = findAccount(draft, accountId);
         if (target) {
           target.signedIn = false;
+          if (refusal && isPaidFallback(target)) target.apiError = refusal.slice(0, 300);
           dropNextPick(draft, target);
         }
       });
@@ -1277,7 +1303,7 @@ export class Service {
             continued: true,
             continuedIn: result.fork,
             outcome: "continued",
-            detail: isLastResort(result.account) ? azureFallbackNote(result.account.label) : null,
+            detail: isLastResort(result.account) ? paidFallbackNote(result.account) : null,
           });
           return;
         }
@@ -1291,7 +1317,9 @@ export class Service {
     }
 
     if (adapter.portable) {
-      if (move?.pin) await this.pin(agentId, next.id, latest.bindings[agentId]);
+      // Not pinned to a paid API account: it's only there until a subscription account has room, and
+      // routing (and alignment) take it back then.
+      if (move?.pin && !isLastResort(next)) await this.pin(agentId, next.id, latest.bindings[agentId]);
       this.switchGuard.note(agentId, now);
       const result = await this.reopenAgent(paseo, agentId, { settle: true });
       const continued = result.outcome === "reopened" && this.prefs.autoContinue && (await this.untouchedSince(paseo, agentId, endedAt));
@@ -1302,7 +1330,7 @@ export class Service {
           reason,
           continued,
           outcome: result.outcome === "reopened" ? "switched" : "pending",
-          detail: result.outcome === "failed" ? failureDetail(result) : null,
+          detail: result.outcome === "failed" ? failureDetail(result) : isLastResort(next) ? paidFallbackNote(next) : null,
         },
         agentId,
       );
@@ -1338,7 +1366,7 @@ export class Service {
         continued: true,
         continuedIn: continuation,
         outcome: "continued",
-        detail: paid ? azureFallbackNote(next.label) : null,
+        detail: paid ? paidFallbackNote(next) : null,
       });
     } catch (error) {
       log(`could not continue ${agentId} on ${next.label}`, error);
@@ -1653,7 +1681,7 @@ export class Service {
         const move = this.nextAccount(latest, agentId, family, accountId);
         if (!move) return;
         const next = move.account;
-        if (move.pin) await this.pin(agentId, next.id, latest.bindings[agentId]);
+        if (move.pin && !isLastResort(next)) await this.pin(agentId, next.id, latest.bindings[agentId]);
         this.switchGuard.note(agentId, now);
         const row: SwitchRow = {
           family,
@@ -1804,7 +1832,7 @@ export class Service {
       continuedIn: result.fork,
       toFamily: result.family,
       outcome: "continued",
-      detail: isLastResort(result.account) ? azureFallbackNote(result.account.label) : null,
+      detail: isLastResort(result.account) ? paidFallbackNote(result.account) : null,
       at: new Date().toISOString(),
     });
     return result.fork;
@@ -2181,6 +2209,17 @@ export class Service {
     return stranded || (reason !== "manual" && reason !== "default");
   }
 
+  /**
+   * An agent a failover put on a paid API account (Bedrock) whose own account, or the default it
+   * follows, has room again: alignment moves it back, so it doesn't stay on the bill. Never one the
+   * user put there (picked for it, or made the default): routing then sends it there anyway.
+   */
+  private leavesPaid(state: StoredState, current: string, target: string): boolean {
+    const from = findAccount(state, current);
+    const to = findAccount(state, target);
+    return Boolean(from && to && isLastResort(from) && !isLastResort(to));
+  }
+
   /** Why an agent's session no longer runs on the account it's routed to, for its timeline note. */
   private driftReason(state: StoredState, agentId: string, current: string, target: string, now: number): SwitchRow["reason"] {
     const from = findAccount(state, current);
@@ -2188,6 +2227,7 @@ export class Service {
     if (!from.signedIn) return "signed_out";
     if (from.disabled) return "disabled";
     if (isLimited(from, now)) return "limit";
+    if (this.leavesPaid(state, current, target)) return "room";
     return state.bindings[agentId]?.accountId === target ? "manual" : "default";
   }
 
@@ -2352,7 +2392,8 @@ export class Service {
     const proxies = new Map<string, ProxyState>();
     const apis = new Map<string, ApiSummary | null>();
     const azures = new Map<string, AzureSummary>();
-    const azureMonths: AzureUsageFile = await this.azureUsage.read().catch(() => ({ accounts: {}, threads: {} }));
+    const bedrocks = new Map<string, BedrockSummary>();
+    const apiMonths: ApiUsageFile = await this.apiUsage.read().catch(() => ({ accounts: {}, threads: {} }));
     const external = new Set<string>();
     await Promise.all(
       state.accounts.map(async (account) => {
@@ -2369,7 +2410,12 @@ export class Service {
         if (isAzureAccount(account)) {
           // Only the key's hint goes to the app (see azureSummary).
           const settings = await readAzureAccount(account.home).catch(() => null);
-          if (settings) azures.set(account.id, azureSummary(settings, currentMonth(azureMonths.accounts[account.id], now)));
+          if (settings) azures.set(account.id, azureSummary(settings, currentMonth(apiMonths.accounts[account.id], now)));
+        }
+        if (isBedrockAccount(account)) {
+          // Never the secret or session token (see bedrockSummary).
+          const settings = await readBedrockAccount(account.home).catch(() => null);
+          if (settings) bedrocks.set(account.id, bedrockSummary(settings, currentMonth(apiMonths.accounts[account.id], now)));
         }
       }),
     );
@@ -2405,8 +2451,8 @@ export class Service {
         home: account.home,
         auth: account.auth,
         api: apis.get(account.id) ?? null,
-        // An Azure account's key and endpoint have their own form (see `azure`).
-        apiEditable: (account.auth === "api" && !isAzureAccount(account)) || (account.kind === "main" && this.adapters[account.family].mainApi === true),
+        // Azure and Bedrock accounts have forms of their own (see `azure`, `bedrock`).
+        apiEditable: (account.auth === "api" && !isPaidFallback(account)) || (account.kind === "main" && this.adapters[account.family].mainApi === true),
         proxy: proxy?.own ? maskProxy(proxy.own) : null,
         proxyEditable: proxy !== undefined,
         proxyBlocked: proxy?.blocked ?? null,
@@ -2418,6 +2464,8 @@ export class Service {
         externalHome: external.has(account.id),
         moving: moving(account),
         azure: azures.get(account.id) ?? null,
+        bedrock: bedrocks.get(account.id) ?? null,
+        apiError: !account.signedIn && isPaidFallback(account) ? (account.apiError ?? null) : null,
       };
     });
 
@@ -2430,6 +2478,7 @@ export class Service {
       browserSignIn: this.browserSignIn,
       showComposerPill: this.prefs.showComposerPill,
       autoSwitch: this.prefs.autoSwitch,
+      awsRegion: await detectHostRegion(),
       warnings: await this.warnings(),
       piLaunchers: piScripts.length > 0 ? piLauncherDir() : null,
       piHomes: this.adapters.pi.homesInUse ? { dir: shownPath(piHomesNow), isDefault: state.piHomes.dir === null } : null,
@@ -2830,7 +2879,7 @@ export class Service {
     });
     this.setUsage(accountId, null);
     this.egress.delete(accountId);
-    if (isAzureAccount(account)) await this.azureUsage.forget(accountId).catch((error: unknown) => log(`could not forget ${account.label}'s token counts`, error));
+    if (isPaidFallback(account)) await this.apiUsage.forget(accountId).catch((error: unknown) => log(`could not forget ${account.label}'s token counts`, error));
     if (account.home && kept) console.log(`[ZeroSub] removed ${account.label} from ZeroSub only: ${account.home} isn't in ${homesDir()}, so its files and script stay`);
     // Its script is released rather than deleted when its home stays (see writeLaunchers).
     await this.refreshLaunchers(account.home && !kept ? [account.home] : []).catch((error: unknown) => log("could not write the Pi scripts", error));
@@ -2899,7 +2948,7 @@ export class Service {
    */
   async updateAzureAccount(
     accountId: string,
-    input: { endpoint?: string; key?: string; prices?: Record<string, AzurePrice> },
+    input: { endpoint?: string; key?: string; prices?: Record<string, ApiPrice> },
   ): Promise<{ warning: string | null }> {
     const account = findAccount(await this.store.read(), accountId);
     if (!account || !account.home) throw new Error("That account no longer exists.");
@@ -2930,34 +2979,147 @@ export class Service {
       if (!target) return;
       target.identity = azureIdentity(endpoint, key);
       // A new key or endpoint is worth trying again even if the old one was refused.
-      if (typed || endpoint !== current.endpoint) target.signedIn = true;
+      if (typed || endpoint !== current.endpoint) {
+        target.signedIn = true;
+        target.apiError = null;
+      }
     });
     return { warning };
   }
 
   /**
-   * Counts the tokens an agent's turn on an Azure account used, from its Codex thread's rollout file
-   * (the last `token_count` event's running total, minus what was counted before). Codex writes it
-   * as the turn goes, so this waits a moment after the turn ends. A turn whose file can't be found is
-   * counted as uncounted, so the card says its totals are short.
+   * Counts the tokens an agent's turn on a paid API account used, from the CLI's own session file,
+   * which it writes as the turn goes, so this waits a moment after the turn ends. Azure (Codex): the
+   * thread rollout's running total, minus what was counted before. Bedrock (Claude Code): the session's
+   * assistant messages written since the turn started, each counted once (a Claude conversation can
+   * move between accounts, so earlier messages may have run elsewhere). A turn whose file can't be
+   * found is noted as uncounted, so the card says its totals are short.
    */
-  private async countAzureTurn(paseo: PaseoApi, agentId: string, accountId: string): Promise<void> {
+  private async countApiTurn(paseo: PaseoApi, agentId: string, accountId: string, cli: "codex" | "claude", startedAt: number): Promise<void> {
     await delay(1_500);
     if (this.stopped) return;
     const agent = (await paseo.agents.ref(agentId).refresh().catch(() => null))?.agent as
       | { persistence?: { sessionId?: string; nativeHandle?: string } | null; model?: string | null }
       | undefined;
     const ids = [agent?.persistence?.nativeHandle, agent?.persistence?.sessionId].filter((id): id is string => typeof id === "string" && id !== "");
-    for (const threadId of ids) {
-      const path = await findRollout(threadId);
+    for (const id of [...new Set(ids)]) {
+      if (cli === "codex") {
+        const path = await findRollout(id);
+        if (!path) continue;
+        const reading = parseRollout(await readFile(path, "utf8"));
+        if (!reading) continue;
+        await this.apiUsage.countThread(accountId, id, reading, agent?.model ?? "unknown");
+        return;
+      }
+      const path = await findClaudeSession(id);
       if (!path) continue;
-      const reading = parseRollout(await readFile(path, "utf8"));
-      if (!reading) continue;
-      await this.azureUsage.countThread(accountId, threadId, reading, agent?.model ?? "unknown");
+      // A little slack for the clocks of the hook and of Claude Code's own timestamps.
+      await this.apiUsage.countMessages(accountId, id, parseClaudeSession(await readFile(path, "utf8"), startedAt - 5_000));
       return;
     }
-    await this.azureUsage.noteUncounted(accountId);
-    console.log(`[ZeroSub] couldn't find the Codex session file of ${agentId}, so its last turn's tokens aren't counted`);
+    await this.apiUsage.noteUncounted(accountId);
+    console.log(`[ZeroSub] couldn't find the ${cli === "codex" ? "Codex" : "Claude Code"} session file of ${agentId}, so its last turn's tokens aren't counted`);
+  }
+
+  // ------------------------------------------------------------------ AWS Bedrock accounts
+
+  /**
+   * Adds an AWS Bedrock account under Claude: a region, where its AWS credentials come from (the host's
+   * own default chain, a named profile, or an access key kept in its home), and optional model
+   * overrides. The credentials are checked first (see `checkBedrock`): refused ones aren't saved, and
+   * `warning` says when they couldn't be checked.
+   */
+  async addBedrockAccount(input: BedrockInput & { label: string }): Promise<{ accountId: string; warning: string | null }> {
+    const account = bedrockFromInput(input, null);
+    const identity = bedrockIdentity(account);
+    const duplicate = accountsOf(await this.store.read(), "claude").find((entry) => entry.identity === identity);
+    if (duplicate) throw new Error(`Those AWS credentials in ${account.region} are already added as "${duplicate.label}".`);
+    const check = await checkBedrock(account);
+    if (!check.ok && check.fatal) throw new Error(check.message);
+
+    const id = `claude-${randomBytes(6).toString("hex")}`;
+    const home = join(homesDir(), id);
+    this.creatingHomes.add(home);
+    try {
+      await this.store.update((draft) => {
+        draft.cleanup[home] = { family: "claude", accountId: id, why: "unfinished", at: new Date().toISOString() };
+      });
+      await writeBedrockAccount(home, account);
+      await this.adapters.claude.prepareHome(home);
+      await this.store.update((draft) => {
+        const twin = accountsOf(draft, "claude").find((entry) => entry.identity === identity);
+        if (twin) throw new Error(`Those AWS credentials in ${account.region} are already added as "${twin.label}".`);
+        const stored = newAccount({ id, family: "claude", kind: "managed", home, auth: "api" });
+        stored.label = input.label.trim();
+        stored.autoLabel = false;
+        stored.identity = identity;
+        stored.plan = "AWS Bedrock";
+        draft.accounts.push(stored);
+        delete draft.cleanup[home];
+      });
+    } catch (error) {
+      const removed = await removeHome(home).then(
+        () => true,
+        () => false,
+      );
+      if (removed) await this.store.update((draft) => void delete draft.cleanup[home]).catch(() => undefined);
+      throw error;
+    } finally {
+      this.creatingHomes.delete(home);
+    }
+    console.log(`[ZeroSub] added AWS Bedrock account ${input.label.trim()} (${account.region}, ${account.source} credentials)${check.ok ? "" : "; its credentials couldn't be checked"}`);
+    return { accountId: id, warning: check.ok ? null : `Saved, but ${check.message.charAt(0).toLowerCase()}${check.message.slice(1)}` };
+  }
+
+  /**
+   * Changes a Bedrock account's region, credentials (an access key's secret left empty keeps it, for
+   * the same key ID), model overrides or price table. Changed credentials are checked as when adding.
+   */
+  async updateBedrockAccount(accountId: string, input: Partial<BedrockInput> & { prices?: Record<string, ApiPrice> }): Promise<{ warning: string | null }> {
+    const stored = findAccount(await this.store.read(), accountId);
+    if (!stored || !stored.home) throw new Error("That account no longer exists.");
+    if (!isBedrockAccount(stored)) throw new Error(`${stored.label} isn't an AWS Bedrock account.`);
+    const home = stored.home;
+    const current = await readBedrockAccount(home);
+    const account = bedrockFromInput(
+      {
+        region: input.region ?? current.region,
+        source: input.source ?? current.source,
+        profile: input.profile ?? current.profile ?? undefined,
+        accessKeyId: input.accessKeyId ?? current.accessKeyId ?? undefined,
+        secretAccessKey: input.secretAccessKey,
+        sessionToken: input.sessionToken,
+        models: input.models ?? current.models,
+      },
+      current,
+    );
+    if (input.prices) {
+      account.prices = Object.fromEntries(Object.entries(input.prices).map(([model, price]) => [model.trim(), price] as const).filter(([model]) => model !== ""));
+    }
+    const identity = bedrockIdentity(account);
+    const credentialsChanged =
+      identity !== bedrockIdentity(current) || account.secretAccessKey !== current.secretAccessKey || account.sessionToken !== current.sessionToken;
+    let warning: string | null = null;
+    if (credentialsChanged) {
+      const duplicate = accountsOf(await this.store.read(), "claude").find((entry) => entry.id !== accountId && entry.identity === identity);
+      if (duplicate) throw new Error(`Those AWS credentials in ${account.region} are already added as "${duplicate.label}".`);
+      const check = await checkBedrock(account);
+      if (!check.ok && check.fatal) throw new Error(check.message);
+      if (!check.ok) warning = `Saved, but ${check.message.charAt(0).toLowerCase()}${check.message.slice(1)}`;
+    }
+    if (!(await this.stillHas(stored)())) throw new Error("That account no longer exists.");
+    await writeBedrockAccount(home, account);
+    // Its settings.json follows bedrock.json (see bedrockSettings): remade now, not at the next sync.
+    await prepareClaudeHome(home, true, this.stillHas(stored)).catch((error: unknown) => log(`could not refresh the home of ${stored.label}`, error));
+    await this.store.update((draft) => {
+      const target = findAccount(draft, accountId);
+      if (!target) return;
+      target.identity = identity;
+      // New credentials, a region or models are worth trying again even if the last ones were refused.
+      target.signedIn = true;
+      target.apiError = null;
+    });
+    return { warning };
   }
 
   // ------------------------------------------------------------------ Pi accounts
@@ -3188,7 +3350,7 @@ export class Service {
         await this.followMainSettings(account.family);
         return;
       }
-      if (isAzureAccount(account)) throw new Error(`${account.label} is an Azure OpenAI account: change its key from its own form.`);
+      if (isPaidFallback(account)) throw new Error(`${account.label} is an ${isAzureAccount(account) ? "Azure OpenAI" : "AWS Bedrock"} account: change it from its own form.`);
       if (account.auth !== "api" || !account.home || !adapter.setApi) throw new Error(`${account.label} signs in with a subscription, not an API key.`);
       // A kept key stays on its base URL (the adapter refuses to move it), so its identity holds.
       const identity = key ? apiIdentity(baseUrl, keyDigest(key)) : null;
@@ -3518,7 +3680,7 @@ export class Service {
     const state = await this.store.read();
     const existing = accountId ? findAccount(state, accountId) : undefined;
     if (accountId && (!existing || existing.family !== family)) throw new Error("That account no longer exists.");
-    if (existing && isAzureAccount(existing)) throw new Error(`${existing.label} uses an Azure OpenAI API key: change it from its card.`);
+    if (existing && isPaidFallback(existing)) throw new Error(`${existing.label} uses ${isAzureAccount(existing) ? "an Azure OpenAI API key" : "AWS credentials"}: change ${isAzureAccount(existing) ? "it" : "them"} from its card.`);
     // A new account's proxy is in place before the CLI starts, so the sign-in itself goes through it.
     const proxy = !existing && proxyInput?.trim() ? normalizeProxy(proxyInput) : null;
     if (proxy && !this.adapters[family].setProxy) throw new Error(`A proxy can't be set for ${FAMILY_LABEL[family]} accounts yet.`);
@@ -3681,9 +3843,55 @@ export class Service {
 
 // -------------------------------------------------------------------- helpers
 
-/** The timeline's word on work that moved onto a paid Azure account by itself. */
-function azureFallbackNote(label: string): string {
-  return `Every ChatGPT subscription account is at its limit, so this runs on ${label}: Azure OpenAI, a paid API billed per token. New agents go back to a ChatGPT account once one has room.`;
+/** What the add and edit forms send for a Bedrock account. */
+interface BedrockInput {
+  region: string;
+  source: BedrockSource;
+  profile?: string;
+  accessKeyId?: string;
+  /** Empty keeps the stored one, for the same access key ID. */
+  secretAccessKey?: string;
+  /** Empty keeps the stored one along with the secret; send the secret again to drop it. */
+  sessionToken?: string;
+  models?: Partial<BedrockModels>;
+}
+
+/** A Bedrock account's settings from a form, checked; `current` supplies a kept secret (same key ID only). */
+function bedrockFromInput(input: BedrockInput, current: BedrockAccount | null): BedrockAccount {
+  const region = normalizeRegion(input.region);
+  const trim = (value: string | undefined) => value?.trim() || null;
+  const models: BedrockModels = { model: "", opus: "", sonnet: "", haiku: "" };
+  for (const field of Object.keys(models) as Array<keyof BedrockModels>) {
+    const model = input.models?.[field]?.trim() ?? "";
+    if (model && !/^[\w.:/-]{3,200}$/.test(model)) throw new Error(`"${model}" doesn't look like a Bedrock model or inference-profile ID`);
+    models[field] = model;
+  }
+  const account: BedrockAccount = { region, source: input.source, profile: null, accessKeyId: null, secretAccessKey: null, sessionToken: null, models, prices: current?.prices ?? {} };
+  if (input.source === "profile") {
+    const profile = trim(input.profile);
+    if (!profile || !/^[\w.+@=,-]{1,128}$/.test(profile)) throw new Error("Enter the name of an AWS profile in the host's ~/.aws config");
+    account.profile = profile;
+  } else if (input.source === "keys") {
+    const keyId = trim(input.accessKeyId);
+    if (!keyId || !/^[A-Z0-9]{16,128}$/.test(keyId)) throw new Error("Enter the access key ID (like AKIA… or ASIA…)");
+    const typed = trim(input.secretAccessKey);
+    const kept = current?.source === "keys" && current.accessKeyId === keyId;
+    const secret = typed ?? (kept ? current.secretAccessKey : null);
+    if (!secret) throw new Error(kept ? "Enter the secret access key" : "Enter the secret access key again for a new access key ID");
+    account.accessKeyId = keyId;
+    account.secretAccessKey = secret;
+    // A session token belongs to its secret: kept only with a kept secret.
+    account.sessionToken = trim(input.sessionToken) ?? (typed ? null : (current?.sessionToken ?? null));
+  }
+  return account;
+}
+
+/** The timeline's word on work that moved onto a paid API account (Azure, Bedrock) by itself. */
+function paidFallbackNote(account: StoredAccount): string {
+  if (isBedrockAccount(account)) {
+    return `Every Claude subscription account is at its limit, so this moved to ${account.label}: AWS Bedrock, a paid API billed per token. It moves back to a Claude account once one has room.`;
+  }
+  return `Every ChatGPT subscription account is at its limit, so this runs on ${account.label}: Azure OpenAI, a paid API billed per token. New agents go back to a ChatGPT account once one has room.`;
 }
 
 /** What tells an API key's account from another: where the key goes, and a short hash of the key. */
