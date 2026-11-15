@@ -7,12 +7,14 @@ import type {
   PluginSessionOpenRequest,
 } from "@getpaseo/plugin/server";
 import {
+  AgentAccountsSchema,
   FAMILIES,
   FAMILY_LABEL,
   HAND_OFF,
   OPTIONAL,
   OTHER_FAMILY,
   type AccountView,
+  type AgentAccounts,
   type ApiSummary,
   ApiSummarySchema,
   type AgentRoute,
@@ -26,6 +28,9 @@ import {
   type Usage,
 } from "../shared/model";
 import { capsAccount, limitedPick } from "../shared/format";
+import { kindOf, scopeOf } from "../shared/glance";
+import { limitHolds, modelClass, planAccounts } from "../shared/plan-input";
+import { fmtIn, K as PLAN, plan as planWeek, shouldMove, type MoveReason, type Plan } from "../shared/planner";
 import { DEFAULT_CONTINUE_PROMPT, type Preferences } from "../shared/preferences";
 import type { RedeemResult, ReopenSummary } from "../shared/rpc";
 import { SWITCH_ROW_KIND, SWITCH_ROW_VERSION, type SwitchRow } from "../shared/timeline";
@@ -59,7 +64,20 @@ import { maskProxy, normalizeProxy } from "./proxy";
 import { Reopener, hostCanReload } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
-import { chooseAccount, isLimited, isUsable, mostAvailable, type RouteDecision, type RouteInput } from "./routing";
+import {
+  chooseAccount,
+  isLimited,
+  isUsable,
+  mostAvailable,
+  planSources,
+  plannedOrder,
+  plannedPick,
+  servesModel,
+  type PlannedPick,
+  type Planning,
+  type RouteDecision,
+  type RouteInput,
+} from "./routing";
 import {
   MAIN_ACCOUNT_ID,
   StateStore,
@@ -131,6 +149,22 @@ const USAGE_REPLY_MS = 15_000;
 const EGRESS_MS = 30 * 60_000;
 /** A home an agent was routed to this recently isn't moved yet: its session may only now be starting. */
 const ROUTED_SETTLE_MS = 30_000;
+/** How long routing waits to learn an agent's model before routing without it. */
+const MODEL_LOOKUP_MS = 800;
+/** The week's plan is re-run this often, on fresh readings. */
+const PLAN_MS = 60 * 60_000;
+/** Each account's pace is learned from this much of its reading history. */
+const PACE_HISTORY_MS = 24 * 60 * 60_000;
+/** A reading this recent may move an agent before it meets a wall. */
+const MOVE_READING_MS = 30 * 60_000;
+/** Why an agent moved between turns, in its timeline. */
+const MOVE_ROW_REASON: Record<MoveReason, SwitchRow["reason"]> = {
+  model: "model",
+  wall: "planned",
+  "wall-soon": "planned",
+  unchecked: "unchecked",
+  order: "order",
+};
 
 const DEFAULT_PREFERENCES: Preferences = {
   autoSwitch: true,
@@ -183,6 +217,8 @@ interface AgentInfo {
   lastMessageAt: number;
   /** Shells and monitors it left running after its turn (Paseo 0.16+; 0 before). A reload cancels them. */
   backgroundWork: number;
+  /** The model it runs, as Paseo reports it ("claude-fable-5-2"); null when Paseo doesn't say. */
+  model: string | null;
 }
 
 /** `unchecked`: Paseo couldn't say how the agent was doing, so it wasn't reloaded at all. */
@@ -383,6 +419,16 @@ export class Service {
   private readonly redeeming = new Set<string>();
   private readonly browserSignIn = canSignInWithBrowser();
   private agentCache: { at: number; agents: Promise<AgentInfo[]> } | null = null;
+  /** The last listing of agents, for each account's load. */
+  private lastAgents: AgentInfo[] = [];
+  /** Each agent's model, as Paseo last reported it. */
+  private readonly models = new Map<string, string>();
+  /** Each account's weekly readings over the last day, to learn how fast it burns its week. */
+  private readonly weekly = new Map<string, Array<{ at: number; used: number }>>();
+  /** The week's plan, re-run every hour. */
+  private weekPlan: (Plan & { at: number }) | null = null;
+  /** Agents stopped at a wall, waiting for one of the accounts checked for them. */
+  private readonly waiting = new Map<string, string | null>();
   private lastPrune = 0;
   private cleaning: Promise<void> | null = null;
   /** Failed cleanup attempts this run, by home. */
@@ -521,6 +567,11 @@ export class Service {
     }
     await this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
     await this.refreshLaunchers().catch((error: unknown) => log("could not write the Pi scripts", error));
+    try {
+      this.replan(state, now);
+    } catch (error) {
+      log("planning the week failed", error);
+    }
     if (this.paseo) {
       await this.forgetEndedSessions(this.paseo).catch((error: unknown) => log("could not check which agents closed while ZeroSub was off", error));
       void this.alignSessions(this.paseo).catch((error: unknown) => log("aligning agents failed", error));
@@ -600,6 +651,8 @@ export class Service {
         .filter(([id, at]) => !known.has(id) && old(at))
         .map(([id]) => id),
     );
+    // The accounts checked for an agent carry no date, so any one Paseo doesn't list is looked up.
+    for (const id of Object.keys(state.agentAccounts)) if (!known.has(id)) unlisted.add(id);
     const gone = new Set<string>();
     for (const id of unlisted) {
       const agent = await paseo.agents
@@ -613,6 +666,7 @@ export class Service {
     }
     const staleSessions = Object.entries(state.sessions).filter(([id, session]) => gone.has(id) && old(session.openedAt));
     const staleBindings = Object.entries(state.bindings).filter(([id, binding]) => gone.has(id) && old(binding.at));
+    const staleChoices = Object.keys(state.agentAccounts).filter((id) => gone.has(id));
     const active = new Set(agents.filter((agent) => !agent.archived).map((agent) => agent.id));
     // A hand-off that may have sent its prompt stays on record while its tab could come back. A
     // failed creation sent nothing, so it doesn't keep the task's record alive.
@@ -620,10 +674,11 @@ export class Service {
     const staleChains = Object.entries(state.continuations).filter(([, chain]) =>
       !unsettled(chain.pending) && Object.keys(chain.members).every((id) => !active.has(id) && !this.switching.has(id)),
     );
-    if (staleSessions.length === 0 && staleBindings.length === 0 && staleChains.length === 0) return;
+    if (staleSessions.length === 0 && staleBindings.length === 0 && staleChains.length === 0 && staleChoices.length === 0) return;
     await this.store.update((draft) => {
       for (const [id] of staleSessions) delete draft.sessions[id];
       for (const [id] of staleBindings) delete draft.bindings[id];
+      for (const id of staleChoices) delete draft.agentAccounts[id];
       for (const [id] of staleChains) delete draft.continuations[id];
     });
   }
@@ -838,6 +893,7 @@ export class Service {
     const family = (await this.families.resolve(context.paseo))[request.provider];
     if (!family) return undefined;
     const adapter = this.adapters[family];
+    const model = request.purpose === "interactive" ? await this.modelFor(context.paseo, request.agentId) : null;
     const now = Date.now();
     const interactive = request.purpose === "interactive";
     // The first session a reload of ours opens is the one it rolls back if the reload fails.
@@ -857,6 +913,7 @@ export class Service {
       // Alignment and the account button decide with the same stand-in rule, so a reopen lands where they expect.
       current: request.reason === "create" ? undefined : this.standingIn(state, request.agentId, family, request.reason === "refresh"),
       allowNextPick: takesNextPick(request),
+      planning: this.planningFor(state, request.agentId, model),
     };
     const first = chooseAccount(state, input);
     if (!first) return undefined;
@@ -932,6 +989,8 @@ export class Service {
     if (!family) return;
     const accountId = this.runningOn(await this.store.read(), agent.id, family);
     if (accountId) this.activeAt.set(accountId, Date.now());
+    this.waiting.delete(agent.id);
+    void this.learnModel(context.paseo, agent.id);
   }
 
   async onTurnEnded(event: TurnEnded, context: PluginHookContext): Promise<void> {
@@ -974,9 +1033,13 @@ export class Service {
       }
     }
     if (probe && event.outcome.kind === "canceled") this.sameConversationProbe.delete(agentId);
-    if (this.deferred.has(agentId)) await this.finishDeferred(context.paseo, agentId, family);
+    const deferred = this.deferred.has(agentId);
+    if (deferred) await this.finishDeferred(context.paseo, agentId, family);
     // The turn just used the account: read its usage again as soon as the provider allows.
     if (accountId) void this.refreshUsage(accountId).catch(() => undefined);
+    if (!deferred && event.outcome.kind !== "canceled") {
+      void this.moveBetweenTurns(context.paseo, agentId, family).catch((error: unknown) => log(`could not plan ${agentId}'s next account`, error));
+    }
   }
 
   /**
@@ -1147,7 +1210,8 @@ export class Service {
       release();
     }
     if (exhausted && this.prefs.autoSwitch && this.adapters[family].portable) {
-      void this.moveIdleAgentsOff(paseo, exhausted, family, agentId, problem.kind).catch((error: unknown) =>
+      const scope = problem.kind === "limit" ? modelScopeOf(problem.hit.message) : null;
+      void this.moveIdleAgentsOff(paseo, exhausted, family, agentId, problem.kind, scope).catch((error: unknown) =>
         log("moving idle agents failed", error),
       );
     }
@@ -1195,7 +1259,27 @@ export class Service {
       return;
     }
     let resetsAt: string | null = null;
-    if (problem.kind === "limit") {
+    const scope = problem.kind === "limit" && adapter.portable ? modelScopeOf(problem.hit.message) : null;
+    if (problem.kind === "limit" && scope) {
+      // One model's limit ("You've hit your Fable limit", "Fable requires usage credits"): the account
+      // still serves every other model, so only that model is marked, and only its agents move.
+      const { hit } = problem;
+      resetsAt = hit.resetsAt ?? new Date(now + (hit.kind === "budget" ? BUDGET_LIMIT_MS : WINDOW_LIMIT_MS)).toISOString();
+      await this.markModelLimited(account.id, scope, resetsAt, hit.kind);
+      if (hit.kind === "window") {
+        await withTimeout(this.refreshUsage(account.id, true), 12_000);
+        const exact = this.scopedReset(account.id, scope);
+        if (exact && Date.parse(exact) > now) {
+          resetsAt = exact;
+          await this.markModelLimited(account.id, scope, exact, "window");
+        }
+      }
+      // The notice names the model the agent runs, whatever Paseo last said.
+      if (!limitHolds({ scope, until: resetsAt, kind: hit.kind, at: "" }, this.models.get(agentId))) {
+        this.models.set(agentId, `claude-${scope}`);
+      }
+      console.log(`[ZeroSub] ${account.label} hit its ${scope} ${hit.kind} limit (agent ${agentId}): ${hit.message}`);
+    } else if (problem.kind === "limit") {
       const { hit } = problem;
       resetsAt = hit.resetsAt ?? new Date(now + (hit.kind === "budget" ? BUDGET_LIMIT_MS : WINDOW_LIMIT_MS)).toISOString();
       await this.markLimited(account.id, resetsAt, hit.kind, "turn");
@@ -1249,7 +1333,7 @@ export class Service {
       return;
     }
     const move = adapter.portable ? this.nextAccount(latest, agentId, family, account.id) : null;
-    const next = adapter.portable ? move?.account : mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]));
+    const next = adapter.portable ? move?.account : this.pickFor(latest, agentId, family, new Set([account.id]))?.account;
     if (!next) {
       if (problem.kind === "limit" && problem.hit.kind === "window" && this.prefs.autoRedeem && !account.disabled && account.auth !== "api") {
         // Opt-in: every account is out, so spend a banked reset rather than stop.
@@ -1280,6 +1364,13 @@ export class Service {
         console.log(`[ZeroSub] no automatic reset for ${account.label}: ${reply.message}`);
       }
       if (reason !== "limit") return;
+      // The user asked this agent to wait for its own accounts rather than use the others.
+      const wait = this.waitNotice(latest, agentId, family, now);
+      if (wait) {
+        this.waiting.set(agentId, wait.until);
+        await this.appendRow(paseo, agentId, { ...base, to: account.label, reason: "limit", outcome: "stayed", detail: wait.detail });
+        return;
+      }
       let detail: string | null = null;
       const otherFamily = OTHER_FAMILY[family];
       if (this.prefs.forkOtherProvider && otherFamily) {
@@ -1312,7 +1403,7 @@ export class Service {
     if (!adapter.portable && (await this.keptSameConversation(paseo, agentId, account, next, problem, base, reason, endedAt))) return;
 
     if (adapter.portable) {
-      if (move?.pin) await this.pin(agentId, next.id, latest.bindings[agentId]);
+      if (move?.pin) await this.pin(agentId, next.id, latest.bindings[agentId], move.reason);
       this.switchGuard.note(agentId, now);
       const result = await this.reopenAgent(paseo, agentId, { settle: true });
       const continued = result.outcome === "reopened" && this.prefs.autoContinue && (await this.untouchedSince(paseo, agentId, endedAt));
@@ -1320,7 +1411,7 @@ export class Service {
         {
           ...base,
           to: next.label,
-          reason,
+          reason: scope ? "model" : reason,
           continued,
           outcome: result.outcome === "reopened" ? "switched" : "pending",
           detail: result.outcome === "failed" ? failureDetail(result) : null,
@@ -1618,19 +1709,28 @@ export class Service {
   /**
    * Where an agent moves off an `exhausted` account: where it's routed now when that's another
    * account as chosen (one picked for it, perhaps while its turn ran, or the default it follows),
-   * else the roomiest other one, which it's then pinned to. Undefined when there's none.
+   * else the next one the week's plan picks (see `pickFor`), which it's then pinned to, with why.
+   * Undefined when there's none.
    */
-  private nextAccount(state: StoredState, agentId: string, family: Family, exhausted: string): { account: StoredAccount; pin: boolean } | undefined {
+  private nextAccount(
+    state: StoredState,
+    agentId: string,
+    family: Family,
+    exhausted: string,
+  ): { account: StoredAccount; pin: boolean; reason?: "plan" | "overflow" } | undefined {
     const routed = this.routeFor(state, agentId, family, exhausted);
     if (routed && routed.account.id !== exhausted && !routed.skipped) return { account: routed.account, pin: false };
-    const roomiest = mostAvailable(state, family, (id) => this.usage.get(id), Date.now(), new Set([exhausted]));
-    return roomiest && { account: roomiest, pin: true };
+    const picked = this.pickFor(state, agentId, family, new Set([exhausted]));
+    if (!picked) return undefined;
+    return { account: picked.account, pin: true, reason: picked.outside ? "overflow" : state.agentAccounts[agentId] ? "plan" : undefined };
   }
 
   /** Pins an agent to the account an automatic switch moved it to, unless the user picked one since `seen`. */
-  private async pin(agentId: string, accountId: string, seen: Binding | undefined): Promise<void> {
+  private async pin(agentId: string, accountId: string, seen: Binding | undefined, selectionReason?: "plan" | "overflow"): Promise<void> {
     await this.store.update((draft) => {
-      if (sameBinding(draft.bindings[agentId], seen)) draft.bindings[agentId] = { accountId, source: "auto", at: new Date().toISOString() };
+      if (sameBinding(draft.bindings[agentId], seen)) {
+        draft.bindings[agentId] = { accountId, source: "auto", at: new Date().toISOString(), ...(selectionReason ? { selectionReason } : {}) };
+      }
     });
   }
 
@@ -1641,11 +1741,14 @@ export class Service {
     family: Family,
     except: string,
     reason: "limit" | "signed_out",
+    scope: string | null = null,
   ): Promise<void> {
     const state = await this.store.read();
     const from = findAccount(state, accountId);
-    // One a reset refilled just before this turn's limit came in still has room (see `failover`).
-    if (!from || isUsable(from, Date.now())) return;
+    const limit = scope ? from?.modelLimits?.find((entry) => entry.scope === scope) : undefined;
+    // One a reset refilled just before this turn's limit came in still has room (see `failover`). A
+    // model's limit leaves the account open to the other models, so only that model's agents move.
+    if (!from || (!limit && isUsable(from, Date.now()))) return;
     const families = await this.families.resolve(paseo);
     const candidates = (await this.cachedAgents(paseo))
       .filter(
@@ -1653,7 +1756,9 @@ export class Service {
           agent.id !== except &&
           !agent.archived &&
           families[agent.provider] === family &&
-          this.runningOn(state, agent.id, family) === accountId,
+          this.runningOn(state, agent.id, family) === accountId &&
+          // One model's limit only moves the agents running that model.
+          (!limit || limitHolds(limit, agent.model ?? this.models.get(agent.id))),
       )
       .map((agent) => agent.id);
     for (const agentId of candidates) {
@@ -1672,14 +1777,14 @@ export class Service {
         const move = this.nextAccount(latest, agentId, family, accountId);
         if (!move) return;
         const next = move.account;
-        if (move.pin) await this.pin(agentId, next.id, latest.bindings[agentId]);
+        if (move.pin) await this.pin(agentId, next.id, latest.bindings[agentId], move.reason);
         this.switchGuard.note(agentId, now);
         const row: SwitchRow = {
           family,
           from: from?.label ?? null,
           to: next.label,
-          reason,
-          resetsAt: findAccount(latest, accountId)?.limitedUntil ?? null,
+          reason: limit ? "model" : reason,
+          resetsAt: limit?.until ?? findAccount(latest, accountId)?.limitedUntil ?? null,
           continued: false,
           continuedIn: null,
           toFamily: null,
@@ -2033,6 +2138,330 @@ export class Service {
     });
   }
 
+  // ------------------------------------------------------------------ planning
+
+  /** What routing needs to plan for this agent: its model, its checked accounts, the week's plan. */
+  private planningFor(state: StoredState, agentId: string, model?: string | null): Planning {
+    const plan = this.weekPlan;
+    return {
+      model: model ?? this.models.get(agentId) ?? null,
+      accounts: state.agentAccounts[agentId] ?? null,
+      plan: plan ? { horizonH: plan.horizonH, keepFable: plan.keepFable, paceH: plan.paceH } : null,
+      load: (accountId) => this.loadOn(state, accountId),
+      rate: (accountId) => this.rateOf(accountId),
+    };
+  }
+
+  /** The planner's pick for an agent leaving `exclude`; the plain rules for ChatGPT agents without checked accounts. */
+  private pickFor(state: StoredState, agentId: string, family: Family, exclude: ReadonlySet<string>): PlannedPick | undefined {
+    const planning = this.planningFor(state, agentId);
+    const now = Date.now();
+    if (family === "claude" || planning.accounts) {
+      return plannedPick(state, family, (id) => this.usage.get(id), planning, now, { exclude, kind: "move" });
+    }
+    const account = mostAvailable(state, family, (id) => this.usage.get(id), now, exclude);
+    return account ? { account, outside: false, why: "" } : undefined;
+  }
+
+  /**
+   * When an agent waits for its own accounts (the user chose "Wait"), what its timeline says, and
+   * until when. Nothing when it may use others, or when no other account could take it anyway.
+   */
+  private waitNotice(state: StoredState, agentId: string, family: Family, now: number): { detail: string; until: string | null } | null {
+    const chosen = state.agentAccounts[agentId];
+    if (!chosen || chosen.overflow !== "wait") return null;
+    const planning = this.planningFor(state, agentId);
+    const usageOf = (id: string) => this.usage.get(id);
+    const outside = plannedPick(state, family, usageOf, planning, now, { kind: "move", overflow: true });
+    if (!outside?.outside) return null;
+    const first = plannedOrder(state, family, usageOf, planning, now, { kind: "move", overflow: false })[0];
+    const back = first && Number.isFinite(first.back) && first.back > 0 ? first.back : null;
+    const until = back !== null ? new Date(now + back * 3_600_000).toISOString() : null;
+    const when = first ? `${first.name}${back !== null ? ` (back in ${fmtIn(back)})` : ""}` : "one of them";
+    return {
+      detail: `Every account checked for this agent is full, so it waits for ${when}. To carry on now, choose “Use others once” from the account button.`,
+      until,
+    };
+  }
+
+  /** The agent's model, from the last listing or a quick look; null when Paseo doesn't answer in time. */
+  private async modelFor(paseo: PaseoApi, agentId: string): Promise<string | null> {
+    const known = this.models.get(agentId);
+    if (known) return known;
+    const info = await deadline(agentInfo(paseo, agentId), MODEL_LOOKUP_MS, "slow").catch(() => null);
+    if (info?.model) this.models.set(agentId, info.model);
+    return info?.model ?? null;
+  }
+
+  /** Notes the model an agent runs now, which may have changed since its session opened. */
+  private async learnModel(paseo: PaseoApi, agentId: string): Promise<void> {
+    const info = await agentInfo(paseo, agentId);
+    if (info?.model) this.models.set(agentId, info.model);
+  }
+
+  /** Agents running a turn on this account now, from the last listing. */
+  private loadOn(state: StoredState, accountId: string): number {
+    let load = 0;
+    for (const agent of this.lastAgents) {
+      if (agent.status === "running" && state.sessions[agent.id]?.accountId === accountId) load += 1;
+    }
+    return load;
+  }
+
+  /** % of its week this account burnt per hour over its last day of live readings, here and on other Macs. */
+  private rateOf(accountId: string): number {
+    const points = this.weekly.get(accountId);
+    if (!points || points.length < 2) return 0;
+    let used = 0;
+    let hours = 0;
+    for (let index = 1; index < points.length; index += 1) {
+      const before = points[index - 1]!;
+      const after = points[index]!;
+      const span = (after.at - before.at) / 3_600_000;
+      // A drop is the week resetting, not negative use.
+      if (span <= 0 || after.used < before.used) continue;
+      used += after.used - before.used;
+      hours += span;
+    }
+    return hours >= 1 ? used / hours : 0;
+  }
+
+  private noteWeekly(accountId: string, usage: Usage): void {
+    const week = usage.windows.find((window) => capsAccount(window) && kindOf(window) === "weekly");
+    const at = Date.parse(usage.fetchedAt);
+    if (!week || !Number.isFinite(at)) return;
+    const points = (this.weekly.get(accountId) ?? []).filter((point) => point.at < at && at - point.at < PACE_HISTORY_MS);
+    points.push({ at, used: week.usedPercent });
+    this.weekly.set(accountId, points);
+  }
+
+  /** A live reading recent enough to move an agent before it meets a wall. */
+  private freshReading(accountId: string, now: number): boolean {
+    const usage = this.usage.get(accountId);
+    return !!usage && this.usageLive.has(accountId) && now - Date.parse(usage.fetchedAt) <= MOVE_READING_MS;
+  }
+
+  /** Re-runs the week's plan every hour: how far ahead room counts as at risk, and whether to keep Fable's room. */
+  private replan(state: StoredState, now: number): void {
+    if (this.weekPlan && now - this.weekPlan.at < PLAN_MS) return;
+    const accounts = accountsOf(state, "claude");
+    if (accounts.length < 2) {
+      this.weekPlan = null;
+      return;
+    }
+    const planning: Planning = { model: null, accounts: null, plan: null, load: (id) => this.loadOn(state, id), rate: (id) => this.rateOf(id) };
+    const view = planAccounts(planSources(state, "claude", (id) => this.usage.get(id), planning), null, now);
+    const learned = accounts.reduce((sum, account) => sum + this.rateOf(account.id), 0);
+    const known = [...this.models.values()].filter((model) => /claude|fable|opus|sonnet|haiku/i.test(model));
+    const fableShare = known.length > 0 ? known.filter((model) => modelClass(model) === "fable").length / known.length : 0.3;
+    this.weekPlan = { ...planWeek(view, { pace: learned > 0.1 ? learned : PLAN.PACE, fableShare, prefer: "safe" }), at: now };
+    console.log(
+      `[ZeroSub] week plan: ${this.weekPlan.regime}, use-first horizon ${Number.isFinite(this.weekPlan.horizonH) ? `${this.weekPlan.horizonH}h` : "none"}, ` +
+        `${this.weekPlan.keepFable ? "keeping" : "not keeping"} Fable's room, pace ${this.weekPlan.paceH.toFixed(1)}%/h`,
+    );
+  }
+
+  /**
+   * Between two turns, moves an agent whose account won't serve its next one: its model's room is used
+   * up, or (for an agent the user checked accounts for) a wall is near, the account was unchecked, or
+   * another comes first in the order the user dragged. Only to an account that does better.
+   */
+  private async moveBetweenTurns(paseo: PaseoApi, agentId: string, family: Family): Promise<void> {
+    if (!this.prefs.autoSwitch || !this.adapters[family].portable) return;
+    if (this.switching.has(agentId) || this.deferred.has(agentId)) return;
+    const info = await agentInfo(paseo, agentId);
+    if (!info || info.archived || info.status !== "idle") return;
+    if (info.model) this.models.set(agentId, info.model);
+    const current = this.runningOn(await this.store.read(), agentId, family);
+    if (!current) return;
+    await withTimeout(this.refreshUsage(current), 8_000);
+    const state = await this.store.read();
+    const planning = this.planningFor(state, agentId, info.model);
+    const chosen = planning.accounts;
+    // Without checked accounts, only ChatGPT-free Claude agents plan ahead, and only for their model.
+    if (!chosen && family !== "claude") return;
+    const now = Date.now();
+    const usageOf = (id: string) => this.usage.get(id);
+    // The agent itself runs its next turn here: its load counts, though it's idle between turns.
+    const accounts = planAccounts(planSources(state, family, usageOf, planning), planning.model, now).map((account) =>
+      account.id === current ? { ...account, load: account.load + 1 } : account,
+    );
+    const order = plannedOrder(state, family, usageOf, planning, now, { kind: "move" }).map((row) => row.id);
+    const move = shouldMove({ account: current, model: modelClass(planning.model) }, accounts, {
+      pool: chosen?.pool ?? null,
+      manual: chosen?.mode === "manual" ? chosen.order.filter((id) => chosen.pool.includes(id)) : null,
+      overflow: chosen ? chosen.overflow === "others" : true,
+      keepFable: planning.plan?.keepFable ?? false,
+      paceH: planning.plan?.paceH,
+      horizonH: planning.plan?.horizonH,
+      prev: order,
+    });
+    if (!move?.target || move.target === current) return;
+    const here = findAccount(state, current);
+    if (!here) return;
+    // A wall is left to the turn that meets it, unless the user checked accounts for this agent.
+    if (!chosen && move.reason !== "model") return;
+    // Only what was read (or a limit a turn ran into) moves an agent for its model, never a guess.
+    if (move.reason === "model" && servesModel(state, here, usageOf, planning, now)) return;
+    // A near wall is read from a live, recent reading only.
+    if ((move.reason === "wall" || move.reason === "wall-soon") && !this.freshReading(current, now)) return;
+    if (!this.switchGuard.allows(agentId, now)) return;
+    const target = findAccount(state, move.target);
+    if (!target) return;
+    const release = this.tryClaim(agentId);
+    if (!release) return;
+    try {
+      const latest = await this.store.read();
+      if (this.runningOn(latest, agentId, family) !== current) return;
+      const at = new Date(now).toISOString();
+      await this.pin(agentId, target.id, latest.bindings[agentId], move.outside ? "overflow" : "plan");
+      this.switchGuard.note(agentId, now);
+      const row: SwitchRow = {
+        family,
+        from: here.label,
+        to: target.label,
+        reason: MOVE_ROW_REASON[move.reason],
+        resetsAt: null,
+        continued: false,
+        continuedIn: null,
+        toFamily: null,
+        outcome: "switched",
+        detail: move.why ?? null,
+        at,
+      };
+      console.log(`[ZeroSub] moving ${agentId} from ${here.label} to ${target.label} before its next turn (${move.reason})`);
+      // Its turn has just ended, so it isn't left for alignment as one in use a moment ago would be;
+      // nobody asked for the move, so background work it left running still holds it.
+      await this.noteOutcome(paseo, agentId, row, await this.reopenAgent(paseo, agentId, { row, settle: true, unattended: true }));
+    } finally {
+      release();
+    }
+  }
+
+  private async markModelLimited(accountId: string, scope: string, until: string, kind: LimitKind): Promise<void> {
+    await this.store.update((draft) => {
+      const account = findAccount(draft, accountId);
+      if (!account) return;
+      const now = Date.now();
+      const kept = (account.modelLimits ?? []).filter((limit) => limit.scope !== scope && Date.parse(limit.until) > now);
+      account.modelLimits = [...kept, { scope, until, kind, at: new Date(now).toISOString() }];
+    });
+  }
+
+  /** The reset of one model's full window, from the freshest live reading. */
+  private scopedReset(accountId: string, scope: string): string | null {
+    const usage = this.usage.get(accountId);
+    if (!usage || usage.cached) return null;
+    const full = usage.windows.find(
+      (window) => !capsAccount(window) && window.usedPercent >= 99 && window.resetsAt && (scopeOf(window) ?? "").toLowerCase().includes(scope),
+    );
+    return full?.resetsAt ?? null;
+  }
+
+  /**
+   * One model's window limit lifts once a live reading shows that model's window with room again;
+   * a limit a turn just ran into is trusted for a while. Budget limits ("requires usage credits")
+   * don't show in readings and lift when they expire.
+   */
+  private async clearModelLimits(account: StoredAccount, usage: Usage, now: number): Promise<void> {
+    const limits = account.modelLimits ?? [];
+    if (limits.length === 0) return;
+    const lifted = (limit: (typeof limits)[number]) => {
+      if (Date.parse(limit.until) <= now) return true;
+      if (limit.kind !== "window" || now - Date.parse(limit.at) <= LIMIT_TRUST_MS) return false;
+      const window = usage.windows.find((entry) => !capsAccount(entry) && (scopeOf(entry) ?? "").toLowerCase().includes(limit.scope));
+      return !!window && window.usedPercent < 90;
+    };
+    if (!limits.some(lifted)) return;
+    await this.store.update((draft) => {
+      const target = findAccount(draft, account.id);
+      if (target) target.modelLimits = (target.modelLimits ?? []).filter((limit) => !lifted(limit));
+    });
+  }
+
+  // ------------------------------------------------------------------ RPC: an agent's accounts
+
+  /**
+   * Sets the accounts an agent may use (or clears them with `null`), then moves it right away when
+   * its account is no longer one of them, or another now comes first in the order the user dragged.
+   */
+  async setAgentAccounts(paseo: PaseoApi, agentId: string, chosen: AgentAccounts | null): Promise<ReopenSummary> {
+    this.attach(paseo);
+    const info = await agentInfo(paseo, agentId);
+    if (!info) throw new Error("That agent is no longer available.");
+    if (info.model) this.models.set(agentId, info.model);
+    const family = (await this.families.resolve(paseo))[info.provider];
+    if (!family) throw new Error(`${info.provider} agents don't use Claude or ChatGPT subscription accounts.`);
+    const state = await this.store.read();
+    let value: AgentAccounts | null = null;
+    if (chosen) {
+      const ids = new Set(accountsOf(state, family).map((account) => account.id));
+      const pool = [...new Set(chosen.pool)].filter((id) => ids.has(id));
+      if (pool.length === 0) throw new Error("Keep at least one account checked for this agent.");
+      const order = [...new Set(chosen.order)].filter((id) => ids.has(id));
+      value = AgentAccountsSchema.parse({ ...chosen, pool, order });
+    }
+    await this.store.update((draft) => {
+      if (value) draft.agentAccounts[agentId] = value;
+      else delete draft.agentAccounts[agentId];
+    });
+    this.waiting.delete(agentId);
+    if (!value || !this.adapters[family].portable) return emptySummary();
+    // Where it should be now: the first usable checked account (in the dragged order, if any).
+    const latest = await this.store.read();
+    const current = this.runningOn(latest, agentId, family);
+    const bound = latest.bindings[agentId]?.accountId ?? current;
+    const planning = this.planningFor(latest, agentId, info.model);
+    const now = Date.now();
+    const best = plannedPick(latest, family, (id) => this.usage.get(id), planning, now, { kind: "move", overflow: false });
+    const unchecked = !!bound && !value.pool.includes(bound);
+    const reorder = value.mode === "manual" && !!best && best.account.id !== bound;
+    if (!best || (!unchecked && !reorder)) return emptySummary();
+    await this.store.update((draft) => {
+      draft.bindings[agentId] = { accountId: best.account.id, source: "auto", at: new Date(now).toISOString(), selectionReason: "plan" };
+    });
+    return this.reconcile(paseo, unchecked ? "unchecked" : "order", [agentId]);
+  }
+
+  /**
+   * Every account checked for this agent is full and it waits: carry on now on the best other account,
+   * once. It returns to its own accounts after a turn once one of them has room.
+   */
+  async useOthersOnce(paseo: PaseoApi, agentId: string): Promise<ReopenSummary> {
+    this.attach(paseo);
+    const info = await agentInfo(paseo, agentId);
+    if (!info) throw new Error("That agent is no longer available.");
+    const family = (await this.families.resolve(paseo))[info.provider];
+    if (!family) throw new Error(`${info.provider} agents don't use Claude or ChatGPT subscription accounts.`);
+    if (!this.adapters[family].portable) throw new Error("A ChatGPT conversation can't move to another account; continue it in a new agent instead.");
+    const state = await this.store.read();
+    const current = this.runningOn(state, agentId, family);
+    const planning = this.planningFor(state, agentId, info.model);
+    const picked = plannedPick(state, family, (id) => this.usage.get(id), planning, Date.now(), {
+      kind: "move",
+      overflow: true,
+      exclude: new Set(current ? [current] : []),
+    });
+    if (!picked) throw new Error("No other account has room right now either.");
+    await this.store.update((draft) => {
+      draft.bindings[agentId] = {
+        accountId: picked.account.id,
+        source: "auto",
+        at: new Date().toISOString(),
+        selectionReason: picked.outside ? "overflow" : "plan",
+      };
+    });
+    this.waiting.delete(agentId);
+    const summary = await this.reconcile(paseo, "overflow", [agentId]);
+    if (summary.reopened.includes(agentId) && this.prefs.autoContinue && (await this.lastTurnHitLimit(paseo, agentId, family))) {
+      await paseo.agents
+        .ref(agentId)
+        .send(this.prefs.continuePrompt)
+        .catch((error: unknown) => log(`could not continue ${agentId}`, error));
+    }
+    return summary;
+  }
+
   // ------------------------------------------------------------------ reopening sessions
 
   /**
@@ -2050,6 +2479,7 @@ export class Service {
       portable: this.adapters[family].portable,
       usageOf: (id) => this.usage.get(id),
       current,
+      planning: this.planningFor(state, agentId),
     });
   }
 
@@ -2441,6 +2871,8 @@ export class Service {
       }
       this.usageLive.add(accountId);
       const now = Date.now();
+      this.noteWeekly(accountId, usage);
+      await this.clearModelLimits(account, usage, now);
       // With "Use ChatGPT credits when a limit is reached" on, credits keep an account going past a
       // full window, so a full window alone isn't a limit then.
       const creditsCover = this.prefs.useCredits && usage.credits != null;
@@ -2542,6 +2974,9 @@ export class Service {
         pendingAccountId: pending,
         waiting: !pending ? null : this.movesWhen(state, agent, family, pending, accountId, canReopen, now),
         movable: this.adapters[family].portable || !agent.hasHistory,
+        model: agent.model ?? this.models.get(agent.id) ?? null,
+        accounts: state.agentAccounts[agent.id] ?? null,
+        atWall: this.waiting.has(agent.id),
       });
     }
 
@@ -2591,8 +3026,12 @@ export class Service {
         isDefault: defaultAccount(state, account.family)?.id === account.id,
         nextAgentUntil: nextPickUntil(state, account.id, account.family, now),
         limitedUntil: limited ? account.limitedUntil : null,
+        limitKind: limited ? (account.limitKind ?? null) : null,
+        modelLimits: (account.modelLimits ?? []).filter((limit) => Date.parse(limit.until) > now),
         usage: this.usage.get(account.id) ?? null,
         agentCount: counts.get(account.id) ?? 0,
+        load: this.loadOn(state, account.id),
+        paceH: this.rateOf(account.id),
         home: account.home,
         auth: account.auth,
         api: apiView(apis.get(account.id)),
@@ -2609,6 +3048,7 @@ export class Service {
         moving: moving(account),
       };
     });
+    const plan = this.weekPlan;
 
     return {
       accounts,
@@ -2622,6 +3062,9 @@ export class Service {
       warnings: await this.warnings(),
       piLaunchers: piScripts.length > 0 ? piLauncherDir() : null,
       piHomes: this.adapters.pi.homesInUse ? { dir: shownPath(piHomesNow), isDefault: state.piHomes.dir === null } : null,
+      plan: plan
+        ? { horizonH: Number.isFinite(plan.horizonH) ? plan.horizonH : null, keepFable: plan.keepFable, paceH: plan.paceH, regime: plan.regime }
+        : null,
     };
   }
 
@@ -2640,7 +3083,11 @@ export class Service {
 
   private cachedAgents(paseo: PaseoApi): Promise<AgentInfo[]> {
     if (this.agentCache && Date.now() - this.agentCache.at < AGENT_LIST_MS) return this.agentCache.agents;
-    const agents = listAgents(paseo, false).then((result) => result.agents);
+    const agents = listAgents(paseo, false).then((result) => {
+      this.lastAgents = result.agents;
+      for (const agent of result.agents) if (agent.model) this.models.set(agent.id, agent.model);
+      return result.agents;
+    });
     this.agentCache = { at: Date.now(), agents };
     agents.catch(() => {
       this.agentCache = null;
@@ -2964,7 +3411,11 @@ export class Service {
     await this.store.update((draft) => {
       if (accountId) draft.bindings[agentId] = { accountId, source: adapter.portable ? "user" : "thread", at: new Date().toISOString() };
       else delete draft.bindings[agentId];
+      // An account picked for the agent counts as checked for it.
+      const chosen = draft.agentAccounts[agentId];
+      if (accountId && chosen && !chosen.pool.includes(accountId)) chosen.pool.push(accountId);
     });
+    this.waiting.delete(agentId);
     const summary = emptySummary();
     return this.answerBy(replyBy, this.reconcile(paseo, "manual", [agentId], undefined, { summary }), summary);
   }
@@ -3943,6 +4394,8 @@ function toAgentInfo(agent: AgentSnapshot): AgentInfo {
     continuedFrom: agent.labels?.[CONTINUED_FROM_LABEL] ?? null,
     lastMessageAt: Date.parse(agent.lastUserMessageAt ?? "") || 0,
     backgroundWork: (agent as { backgroundWork?: { count?: number } }).backgroundWork?.count ?? 0,
+    // The model it really runs, once its session has started; else the one it was created with.
+    model: (agent as { runtimeInfo?: { model?: string | null } }).runtimeInfo?.model ?? agent.model ?? null,
   };
 }
 
@@ -3976,6 +4429,18 @@ async function listAgents(paseo: PaseoApi, includeArchived: boolean): Promise<{ 
     cursor = result.pageInfo.nextCursor;
   }
   return { agents, complete: false };
+}
+
+/**
+ * The one model a limit notice is about ("fable" for "You've hit your Fable limit" or "Fable 5.2
+ * requires usage credits"), or null when the notice is about the whole account.
+ */
+export function modelScopeOf(message: string): string | null {
+  const text = message.trim();
+  const reached = /^You\W{0,2}ve (?:hit|reached) your (Fable|Opus|Sonnet|Haiku)\b/i.exec(text);
+  const credits = /^(Fable)(?: [^·\n]{1,40})? requires usage credits\./.exec(text);
+  const name = reached?.[1] ?? credits?.[1];
+  return name ? name.toLowerCase() : null;
 }
 
 function delay(ms: number): Promise<void> {

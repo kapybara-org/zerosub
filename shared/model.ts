@@ -179,6 +179,29 @@ export type Egress = z.infer<typeof EgressSchema>;
 export const AccountStatusSchema = z.enum(["ready", "signed_out", "limited", "checking", "disabled"]);
 export type AccountStatus = z.infer<typeof AccountStatusSchema>;
 
+/** A limit on one model only (Claude's "Fable requires usage credits", "You've hit your Fable limit"). */
+export const ModelLimitSchema = z.object({
+  /** The model it holds back, lower case: `fable`, `opus`. */
+  scope: z.string(),
+  until: z.string(),
+  kind: z.enum(["window", "budget"]),
+  at: z.string(),
+});
+export type ModelLimit = z.infer<typeof ModelLimitSchema>;
+
+/** The accounts one agent may use, and in which order. */
+export const AgentAccountsSchema = z.object({
+  /** Checked accounts. Never empty. */
+  pool: z.array(z.string()).min(1),
+  /** `smart`: the planner orders them. `manual`: the order the user dragged. */
+  mode: z.enum(["smart", "manual"]).default("smart"),
+  /** The dragged order, checked or not, so unchecking and checking again keeps a place. */
+  order: z.array(z.string()).default([]),
+  /** When every checked account is full: `wait` for the first to free up, or use `others`. */
+  overflow: z.enum(["wait", "others"]).default("wait"),
+});
+export type AgentAccounts = z.infer<typeof AgentAccountsSchema>;
+
 export const AccountViewSchema = z.object({
   id: z.string(),
   family: FamilySchema,
@@ -226,6 +249,12 @@ export const AccountViewSchema = z.object({
   externalHome: z.boolean().default(false),
   /** The account's home is due to move to `to`, and hasn't yet: what it waits for, or what went wrong. */
   moving: z.object({ to: z.string(), waiting: z.string().nullable(), error: z.string().nullable() }).nullable().default(null),
+  limitKind: z.enum(["window", "budget"]).nullable().optional(),
+  modelLimits: z.array(ModelLimitSchema).optional(),
+  /** Agents running a turn on it now. */
+  load: z.number().optional(),
+  /** % of its week it burns per hour, learned from its last day of readings (here and elsewhere). */
+  paceH: z.number().optional(),
 });
 export type AccountView = z.infer<typeof AccountViewSchema>;
 
@@ -253,6 +282,12 @@ export const AgentRouteSchema = z.object({
   movable: z.boolean(),
   /** The agent started on this account because its weekly reset was near, and is still on it. */
   selectionReason: z.literal("weekly_reset").optional(),
+  /** The model it last ran, as Paseo reports it ("claude-fable-5-2"). */
+  model: z.string().nullable().optional(),
+  /** The accounts the user checked for this agent, if any. */
+  accounts: AgentAccountsSchema.nullable().optional(),
+  /** It stopped at a wall and waits, because every checked account is full. */
+  atWall: z.boolean().optional(),
 });
 export type AgentRoute = z.infer<typeof AgentRouteSchema>;
 
@@ -314,5 +349,16 @@ export const StateViewSchema = z.object({
   /** Accounts at their limit are skipped, so agents can't be moved onto one by hand either. */
   autoSwitch: z.boolean().default(true),
   warnings: z.array(z.string()),
+  /** The plan the server re-runs every hour, so the screen orders accounts as it does. */
+  plan: z
+    .object({
+      /** How far ahead room counts as at risk; `null`: side by side only. */
+      horizonH: z.number().nullable(),
+      keepFable: z.boolean(),
+      paceH: z.number(),
+      regime: z.enum(["scarce", "surplus"]),
+    })
+    .nullable()
+    .optional(),
 });
 export type StateView = z.infer<typeof StateViewSchema>;

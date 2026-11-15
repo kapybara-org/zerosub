@@ -7,7 +7,7 @@ import type { FamilyResolver } from "./families";
 import { detectClaudeLimit } from "./limits";
 import type { Reopener } from "./reopen";
 import type { SwitchGuard } from "./switch-guard";
-import { Service } from "./service";
+import { Service, modelScopeOf } from "./service";
 import { MAIN_ACCOUNT_ID, StateStore, type StoredAccount, type StoredState } from "./state";
 import { saveReadings } from "./usage";
 import { preferences } from "../shared/preferences";
@@ -458,6 +458,45 @@ describe("failover", () => {
       expect(notes.at(-1)).toMatchObject({ from: "marketing", to: "hello", outcome: "switched" });
       expect(sent).toHaveLength(0);
     }
+  });
+
+  it("moves a Fable agent off an account whose Fable room ran out, and leaves the account open for others", async () => {
+    const { store, reopened, sent, notes, limitTurn } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+        sessions: {},
+      },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your Fable limit · resets 9pm" }),
+    );
+    await limitTurn();
+    const state = await store.read();
+    const main = state.accounts.find((a) => a.id === MAIN);
+    expect(main?.limitedUntil).toBeNull();
+    expect(main?.modelLimits?.map((limit) => limit.scope)).toEqual(["fable"]);
+    expect(state.sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(reopened).toEqual([AGENT]);
+    expect(notes.at(-1)).toMatchObject({ from: "marketing", to: "hello", outcome: "switched" });
+    expect(sent).toHaveLength(1);
+  });
+
+  it("keeps a Fable agent on its checked accounts and says it waits when they're all full", async () => {
+    const { store, reopened, sent, notes, limitTurn } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+        sessions: {},
+        agentAccounts: { [AGENT]: { pool: [MAIN], mode: "smart", order: [], overflow: "wait" } },
+      },
+      () => ({ kind: "budget", resetsAt: inFuture(), message: "Fable 5.2 requires usage credits. Turn on usage credits to keep using it." }),
+    );
+    await limitTurn();
+    const state = await store.read();
+    expect(state.accounts.find((a) => a.id === MAIN)?.modelLimits?.[0]).toMatchObject({ scope: "fable", kind: "budget" });
+    expect(reopened).toEqual([]);
+    expect(sent).toHaveLength(0);
+    expect(notes.at(-1)).toMatchObject({ to: "marketing", outcome: "stayed" });
+    expect(notes.at(-1)?.detail).toMatch(/Use others once/);
   });
 
   it("moves on again when the next account runs out too", async () => {
@@ -1038,17 +1077,48 @@ describe("usage readings", () => {
     expect(await newAgentOpensOn(service, store, paseo)).toBe(MAIN);
   });
 
-  it("leaves a limit a turn ran into while one model's window is full", async () => {
-    // The turn may have hit that model's limit: the account's room says nothing about it.
-    const { service, store, limitTurn } = await setUp(
+  /** Dates the limits turns ran into on one model an hour back, so readings may lift them. */
+  const ageModelLimits = (store: StateStore) =>
+    store.update((draft) => {
+      for (const limit of draft.accounts.find((a) => a.id === MAIN)?.modelLimits ?? []) {
+        limit.at = new Date(Date.now() - 60 * 60_000).toISOString();
+      }
+    });
+
+  it("keeps a Fable limit a turn ran into on Fable, while Fable's window is full", async () => {
+    // Fable's limit says nothing about the account's own room: Opus still runs there.
+    const { service, store, limitTurn, paseo } = await setUp(
       state(),
       () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your Fable limit" }),
       { usage: fableFull },
     );
     await limitTurn();
-    await settle(store);
+    await ageModelLimits(store);
     await service.refreshUsage(MAIN, true);
-    expect(await limitedUntil(store)).not.toBeNull();
+    const main = (await store.read()).accounts.find((a) => a.id === MAIN);
+    expect(main?.limitedUntil ?? null).toBeNull();
+    expect(main?.modelLimits?.map((limit) => limit.scope)).toEqual(["fable"]);
+    expect(await newAgentOpensOn(service, store, paseo)).toBe(MAIN);
+  });
+
+  it("lifts a Fable limit once a reading shows Fable's window with room", async () => {
+    let fable = 100;
+    const reading = (): UsageRead => ({
+      ...fableFull(),
+      windows: fableFull().windows.map((window) => (window.id === "weekly_fable" ? { ...window, usedPercent: fable } : window)),
+    });
+    const { service, store, limitTurn } = await setUp(
+      state(),
+      () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your Fable limit" }),
+      { usage: reading },
+    );
+    await limitTurn();
+    await service.refreshUsage(MAIN, true);
+    expect((await store.read()).accounts.find((a) => a.id === MAIN)?.modelLimits).toHaveLength(1); // trusted for a while
+    fable = 40;
+    await ageModelLimits(store);
+    await service.refreshUsage(MAIN, true);
+    expect((await store.read()).accounts.find((a) => a.id === MAIN)?.modelLimits).toEqual([]);
   });
 
   it("takes a full window without credits for a limit, whatever the setting", async () => {
@@ -2100,9 +2170,10 @@ describe("aligning agents with their accounts", () => {
 
   it("reopens a closed agent on the roomiest stand-in, not on the CLI login it no longer runs on", async () => {
     const WORK = "claude-work";
+    // A 5-hour window under way has a reset time; without one the planner reads it as not started yet.
     const used = (percent: number): UsageRead => ({
       fetchedAt: new Date().toISOString(),
-      windows: [{ id: "five_hour", label: "5-hour", usedPercent: percent, resetsAt: null }],
+      windows: [{ id: "five_hour", label: "5-hour", usedPercent: percent, resetsAt: new Date(Date.now() + 2 * 3_600_000).toISOString() }],
       error: null,
       cached: false,
       resets: null,
@@ -2781,5 +2852,100 @@ describe("an API account at a limit with every other account out", () => {
     service.setPreferences(preferences.schema.parse({ autoRedeem: true }));
     await limitTurn();
     expect(redeemed).toEqual([]);
+  });
+});
+
+describe("an agent's accounts", () => {
+  const accounts = [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never;
+  const onMain = () => ({ [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt: new Date().toISOString() } });
+  const unused = () => ({ kind: "window" as const, resetsAt: inFuture(), message: "" });
+
+  it("moves an agent off an account the user unchecked for it", async () => {
+    const { service, store, reopened, paseo } = await setUp({ accounts, defaults: { claude: MAIN, codex: null, pi: null }, sessions: onMain() }, unused);
+    const summary = await service.setAgentAccounts(paseo as never, AGENT, { pool: [HELLO], mode: "smart", order: [], overflow: "wait" });
+    expect(summary.reopened).toEqual([AGENT]);
+    expect(reopened).toEqual([AGENT]);
+    const state = await store.read();
+    expect(state.sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(state.agentAccounts[AGENT]?.pool).toEqual([HELLO]);
+  });
+
+  it("leaves an agent where it is when its account stays checked, and forgets the choice on null", async () => {
+    const { service, store, reopened, paseo } = await setUp({ accounts, defaults: { claude: MAIN, codex: null, pi: null }, sessions: onMain() }, unused);
+    await service.setAgentAccounts(paseo as never, AGENT, { pool: [MAIN, HELLO], mode: "smart", order: [], overflow: "wait" });
+    expect(reopened).toEqual([]);
+    await service.setAgentAccounts(paseo as never, AGENT, null);
+    expect((await store.read()).agentAccounts[AGENT]).toBeUndefined();
+  });
+
+  it("won't uncheck an agent's last account", async () => {
+    const { service, paseo } = await setUp({ accounts, defaults: { claude: MAIN, codex: null, pi: null }, sessions: onMain() }, unused);
+    await expect(
+      service.setAgentAccounts(paseo as never, AGENT, { pool: ["claude-gone"], mode: "smart", order: [], overflow: "wait" }),
+    ).rejects.toThrow(/at least one account/);
+  });
+
+  it("carries on once on another account when every checked one is full", async () => {
+    const { service, store, reopened, paseo } = await setUp(
+      {
+        accounts: [{ ...account(MAIN, "marketing", "main"), limitedUntil: inFuture(), limitKind: "window", limitedAt: inPast() }, account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+        sessions: onMain(),
+        agentAccounts: { [AGENT]: { pool: [MAIN], mode: "smart", order: [], overflow: "wait" } },
+      },
+      unused,
+    );
+    const summary = await service.useOthersOnce(paseo as never, AGENT);
+    expect(summary.reopened).toEqual([AGENT]);
+    expect(reopened).toEqual([AGENT]);
+    const state = await store.read();
+    expect(state.sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(state.bindings[AGENT]).toMatchObject({ accountId: HELLO, selectionReason: "overflow" });
+  });
+});
+
+describe("between turns", () => {
+  const fableLimited = () =>
+    [
+      { ...account(MAIN, "marketing", "main"), modelLimits: [{ scope: "fable", until: inFuture(), kind: "window", at: new Date().toISOString() }] },
+      account(HELLO, "hello", "managed"),
+    ] as never;
+  const onMain = () => ({ [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt: new Date().toISOString() } });
+  const unused = () => ({ kind: "window" as const, resetsAt: inFuture(), message: "" });
+  const turnEnds = (service: Service, paseo: unknown) =>
+    service.onTurnEnded(
+      { agent: { id: AGENT, provider: "claude" }, turnId: "t", outcome: { kind: "completed" }, timeline: [] } as never,
+      { paseo } as never,
+    );
+  const runs = async (paseo: { agents: { ref: () => { refresh: () => Promise<{ agent: Record<string, unknown> }> } } }, model: string) => {
+    (await paseo.agents.ref().refresh()).agent.model = model;
+  };
+
+  it("moves a Fable agent before its next turn when its account can't run Fable", async () => {
+    const { service, store, reopened, notes, paseo } = await setUp({ accounts: fableLimited(), defaults: { claude: MAIN, codex: null, pi: null }, sessions: onMain() }, unused);
+    await runs(paseo as never, "claude-fable-5-2");
+    await turnEnds(service, paseo);
+    await vi.waitFor(() => expect(reopened).toEqual([AGENT]));
+    await vi.waitFor(async () => expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO));
+    await vi.waitFor(() => expect(notes.at(-1)).toMatchObject({ from: "marketing", to: "hello", outcome: "switched" }));
+  });
+
+  it("leaves an Opus agent there", async () => {
+    const { service, store, reopened, paseo } = await setUp({ accounts: fableLimited(), defaults: { claude: MAIN, codex: null, pi: null }, sessions: onMain() }, unused);
+    await runs(paseo as never, "claude-opus-5-5");
+    await turnEnds(service, paseo);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(reopened).toEqual([]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+  });
+});
+
+describe("modelScopeOf", () => {
+  it("names the one model a limit notice is about", () => {
+    expect(modelScopeOf("You've hit your Fable limit · resets 9pm")).toBe("fable");
+    expect(modelScopeOf("You’ve reached your Opus limit")).toBe("opus");
+    expect(modelScopeOf("Fable 5.2 requires usage credits. Turn them on to keep using it.")).toBe("fable");
+    expect(modelScopeOf("You've hit your session limit")).toBeNull();
+    expect(modelScopeOf("You've hit your weekly limit")).toBeNull();
   });
 });

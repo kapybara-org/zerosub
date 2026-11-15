@@ -1,7 +1,7 @@
 import { chmod, copyFile, readdir, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { z } from "zod";
-import { AccountKindSchema, AuthKindSchema, FamilySchema, type Family } from "../shared/model";
+import { AccountKindSchema, AgentAccountsSchema, AuthKindSchema, FamilySchema, ModelLimitSchema, type Family } from "../shared/model";
 import { Mutex, readJson, readText, writeJsonAtomic } from "./json-file";
 import { statePath } from "./paths";
 
@@ -34,6 +34,8 @@ export const StoredAccountSchema = z.object({
    * saved by earlier versions, which count as a turn's.
    */
   limitSource: z.enum(["turn", "reading"]).optional(),
+  /** Limits on one model only: the account still serves the others. */
+  modelLimits: z.array(ModelLimitSchema).optional(),
   createdAt: z.string(),
 });
 export type StoredAccount = z.infer<typeof StoredAccountSchema>;
@@ -47,7 +49,11 @@ export const BindingSchema = z.object({
    */
   source: z.enum(["user", "auto", "balance", "thread"]),
   at: z.string(),
-  selectionReason: z.enum(["weekly_reset", "headroom"]).optional(),
+  /**
+   * `plan`: the planner picked it among the agent's checked accounts. `overflow`: every checked
+   * account was full and the user let it use another one, once.
+   */
+  selectionReason: z.enum(["weekly_reset", "headroom", "plan", "overflow"]).optional(),
 });
 export type Binding = z.infer<typeof BindingSchema>;
 
@@ -147,6 +153,8 @@ export const StoredStateSchema = z.object({
   piHomes: PiHomesSchema.default({ dir: null, from: [] }),
   /** Homes being moved, by account (see `Service.placeHomes`). */
   moves: z.record(z.string(), MoveSchema).default({}),
+  /** The accounts the user checked for each agent, and their order. */
+  agentAccounts: z.record(z.string(), AgentAccountsSchema).default({}),
 });
 export type StoredState = z.infer<typeof StoredStateSchema>;
 
@@ -195,6 +203,7 @@ export function salvageState(raw: unknown): { state: StoredState; dropped: boole
       nextAgent: { claude: null, codex: null, pi: null },
       piHomes: keep(PiHomesSchema, source.piHomes ?? {}) ?? { dir: null, from: [] },
       moves: records(MoveSchema, source.moves),
+      agentAccounts: records(AgentAccountsSchema, source.agentAccounts),
     },
     dropped: true,
   };

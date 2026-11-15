@@ -1,81 +1,107 @@
 import type {
   PluginButton,
+  PluginButtonContentProps,
+  PluginButtonIcon,
   PluginButtonMenuEntry,
   PluginButtonRegistration,
   PluginClientContext,
 } from "@getpaseo/plugin/client";
-import { accountPeak, formatCredits, formatPercent, moveProblem, pillText } from "../shared/format";
+import type { ComponentType } from "react";
+import { moveProblem, pillText, shortLabel } from "../shared/format";
+import { accountRoom, glance, glanceLabel, glanceTitle } from "../shared/glance";
+import { accountGlyph } from "../shared/glyph";
 import { FAMILY_LABEL, HAND_OFF, OTHER_FAMILY, type AccountView, type StateView } from "../shared/model";
 import { setAgentAccount } from "../shared/rpc";
+import { accountOf, type TrackedAgent } from "./agent-account";
+import { agentAccounts } from "./agent-accounts";
 import { forkPopover } from "./fork-confirm";
 import { resetPopover } from "./reset-confirm";
 import { stoppedWaiting, type ZeroSubStore } from "./store";
+import { usageCard } from "./usage-card";
+import { glyphIcon } from "./usage-icon";
 
 /** The most agents Paseo returns per page. */
 const PAGE_SIZE = 200;
 const MAX_PAGES = 10;
 
-interface TrackedAgent {
+/** An agent as Paseo lists it; `runtimeInfo` arrived after the SDK this builds against. */
+interface ListedAgent {
   id: string;
-  workspaceId: string;
+  workspaceId?: string | null;
   provider: string;
+  model?: string | null;
+  runtimeInfo?: { model?: string | null } | null;
+}
+
+interface WantedPill {
+  id: string;
+  button: PluginButton;
+  key: string;
 }
 
 /**
  * One composer pill per Claude/Codex agent showing the account it runs on. Tapping it opens a menu
  * of that provider's accounts. Pills only appear once a provider has more than one account, so a
  * single-account setup looks exactly like stock Paseo.
+ *
+ * An agent that can move between accounts in place opens "Accounts for this agent" instead: which
+ * accounts this conversation may use, in which order, and where its next turn runs.
+ *
+ * Next to it, the agent's usage at a glance (see `glance`): the window that holds it back the most,
+ * and a second one while the 5-hour window is nearly spent. Either opens the usage card.
  */
 export function contributePills(client: PluginClientContext, store: ZeroSubStore): () => void {
   const agents = new Map<string, TrackedAgent>();
-  const pills = new Map<string, { registration: PluginButtonRegistration; key: string }>();
+  const pills = new Map<string, { agentId: string; registration: PluginButtonRegistration; key: string }>();
   const lifetime = new AbortController();
   let stopped = false;
+  const card = usageCard(store, (agentId) => agents.get(agentId), () => client.openSurface("accounts"));
+  const panel = agentAccounts(store, (agentId) => agents.get(agentId), () => client.openSurface("accounts"));
 
   function sync(): void {
     if (stopped) return;
     const state = store.current.state;
-    for (const [agentId, pill] of pills) {
-      if (!agents.has(agentId)) {
-        pill.registration.remove();
-        pills.delete(agentId);
+    const wanted = new Map<string, { agent: TrackedAgent; pill: WantedPill }>();
+    for (const agent of agents.values()) {
+      for (const pill of state ? pillsFor(client, store, state, agent, card, panel) : []) {
+        wanted.set(`${agent.id}\u0000${pill.id}`, { agent, pill });
       }
     }
-    for (const agent of agents.values()) {
-      const button = state ? buttonFor(client, store, state, agent) : null;
-      const existing = pills.get(agent.id);
-      if (!button) {
-        existing?.registration.remove();
-        pills.delete(agent.id);
-        continue;
+    for (const [slot, pill] of pills) {
+      if (!wanted.has(slot)) {
+        pill.registration.remove();
+        pills.delete(slot);
       }
-      const key = JSON.stringify([button.label, button.title, button.icon, menuKey(button)]);
+    }
+    for (const [slot, { agent, pill }] of wanted) {
+      const existing = pills.get(slot);
       if (existing) {
-        if (existing.key !== key) {
-          existing.registration.update(button);
-          existing.key = key;
+        if (existing.key !== pill.key) {
+          existing.registration.update(pill.button);
+          existing.key = pill.key;
         }
         continue;
       }
       try {
         const registration = client.addComposerPill({
-          id: "account",
+          id: pill.id,
           workspaceId: agent.workspaceId,
           agentId: agent.id,
-          button,
+          button: pill.button,
         });
-        pills.set(agent.id, { registration, key });
+        pills.set(slot, { agentId: agent.id, registration, key: pill.key });
       } catch (error) {
-        console.warn("[ZeroSub] could not add account pill", error);
+        console.warn(`[ZeroSub] could not add ${pill.id} pill`, error);
       }
     }
   }
 
   const unsubscribeStore = store.subscribe(sync);
 
-  const track = (agent: { id: string; workspaceId?: string | null; provider: string }) => {
+  const track = (agent: ListedAgent) => {
     if (!agent.workspaceId) return;
-    agents.set(agent.id, { id: agent.id, workspaceId: agent.workspaceId, provider: agent.provider });
+    const model = agent.runtimeInfo?.model ?? agent.model ?? null;
+    agents.set(agent.id, { id: agent.id, workspaceId: agent.workspaceId, provider: agent.provider, model });
   };
 
   // The subscription covers the newest page and every later change. Older agents come from the
@@ -90,7 +116,7 @@ export function contributePills(client: PluginClientContext, store: ZeroSubStore
         page: { limit: PAGE_SIZE, cursor },
       });
       if (stopped || generation !== snapshots) return;
-      for (const { agent } of result.entries) track(agent);
+      for (const { agent } of result.entries) track(agent as ListedAgent);
       sync();
       cursor = result.pageInfo.hasMore ? (result.pageInfo.nextCursor ?? null) : null;
     }
@@ -103,7 +129,7 @@ export function contributePills(client: PluginClientContext, store: ZeroSubStore
         snapshot: ({ entries, pageInfo }) => {
           const generation = ++snapshots;
           agents.clear();
-          for (const { agent } of entries) track(agent);
+          for (const { agent } of entries) track(agent as ListedAgent);
           sync();
           const next = pageInfo.hasMore ? (pageInfo.nextCursor ?? null) : null;
           void loadOlder(next, generation).catch((error: unknown) => {
@@ -116,7 +142,7 @@ export function contributePills(client: PluginClientContext, store: ZeroSubStore
           if (update.kind === "remove") agents.delete(update.agentId);
           else {
             const known = agents.has(update.agent.id);
-            track(update.agent);
+            track(update.agent as ListedAgent);
             // A new agent may have been routed by the daemon a moment ago; fetch its account.
             if (!known) void store.refresh();
           }
@@ -138,11 +164,48 @@ export function contributePills(client: PluginClientContext, store: ZeroSubStore
   };
 }
 
+function pillsFor(
+  client: PluginClientContext,
+  store: ZeroSubStore,
+  state: StateView,
+  agent: TrackedAgent,
+  card: ComponentType<PluginButtonContentProps>,
+  panel: ComponentType<PluginButtonContentProps>,
+): WantedPill[] {
+  const pills: WantedPill[] = [];
+  const button = buttonFor(client, store, state, agent, panel);
+  if (button) pills.push({ id: "account", button, key: JSON.stringify([button.label, button.title, iconKey(button.icon), menuKey(button)]) });
+  pills.push(...usagePills(state, agent, card));
+  return pills;
+}
+
+/**
+ * "54% week", "87% 5h", "64% Fable": how much of the window that holds the agent back is used, with
+ * that window's own glyph (a clock for 5 hours, a calendar for the week, a sparkle for Fable) filling
+ * alike and turning amber, then red, near the end. Once full, the wait: "5h full ·
+ * 1h 37m". Hovering says it in a sentence; tapping opens the usage card. Nothing without a reading,
+ * so no guess ever shows.
+ */
+function usagePills(state: StateView, agent: TrackedAgent, card: ComponentType<PluginButtonContentProps>, now: number = Date.now()): WantedPill[] {
+  if (!state.showComposerPill) return [];
+  const account = accountOf(state, agent);
+  if (!account?.usage || account.status === "signed_out" || account.status === "disabled") return [];
+  return glance(account.usage.windows, agent.model, now).map((entry, index) => {
+    const label = glanceLabel(entry, now);
+    const title = glanceTitle(entry, now);
+    const { window: limit, tone } = entry;
+    const icon = glyphIcon(entry.kind, limit.usedPercent, tone);
+    const button: PluginButton = { title, icon, label, behavior: { kind: "popover", Content: card } };
+    return { id: index === 0 ? "usage" : "usage-next", button, key: JSON.stringify([label, title, icon.displayName]) };
+  });
+}
+
 function buttonFor(
   client: PluginClientContext,
   store: ZeroSubStore,
   state: StateView,
   agent: TrackedAgent,
+  panel: ComponentType<PluginButtonContentProps>,
 ): PluginButton | null {
   if (!state.showComposerPill) return null;
   const family = state.providers[agent.provider];
@@ -179,22 +242,38 @@ function buttonFor(
 
   // Codex threads can't change accounts in place; continue in this task's tab for that account.
   const movable = route?.movable ?? true;
+  const now = Date.now();
+  const running = route?.pendingAccountId ? state.accounts.find((account) => account.id === route.pendingAccountId) : undefined;
+  const moves = route?.waiting ?? (state.canReopen ? "idle" : "restart");
+
+  // An agent that moves in place gets its own panel: its accounts, their order, its next turn.
+  if (movable && accounts.length >= 2) {
+    const atWall = route?.atWall === true;
+    const text = pillText(current, running ?? null, moves, "Accounts for this agent");
+    return {
+      title: atWall ? "Accounts for this agent: every checked account is full" : text.title,
+      icon: current.status === "limited" || atWall ? "CircleAlert" : "CircleUserRound",
+      label: atWall ? `${shortLabel(current)} · waiting` : text.label,
+      behavior: { kind: "popover", Content: panel },
+    };
+  }
+
   // Grok conversations stay on their account: the others are listed, not offered.
   const stays = !movable && !HAND_OFF[family];
-  const items: PluginButtonMenuEntry[] = accounts.map((account, index) => ({
-    kind: "item",
-    id: `account-${index}`,
-    title: account.id === current.id || movable || stays ? menuTitle(account) : `Continue on ${account.label}`,
-    icon: account.id === current.id ? "CircleCheck" : movable || stays ? "Circle" : "ArrowRightLeft",
-    // With automatic switching on, an account at its limit would only pass the agent on (the server refuses it too).
-    disabled:
-      stays ||
-      account.status === "signed_out" ||
-      account.status === "disabled" ||
-      (state.autoSwitch && account.status === "limited") ||
-      account.id === current.id,
-    behavior: { kind: "action", onPress: choose(account.id, account.label) },
-  }));
+  const items: PluginButtonMenuEntry[] = accounts.map((account, index) => {
+    const picked = account.id === current.id;
+    const inPlace = picked || movable || stays;
+    return {
+      kind: "item",
+      id: `account-${index}`,
+      title: inPlace ? menuTitle(account, now) : `Continue on ${menuTitle(account, now)}`,
+      icon: inPlace ? menuIcon(account, agent.model, now) : "ArrowRightLeft",
+      // With automatic switching on, an account at its limit would only pass the agent on (the server refuses it too).
+      disabled:
+        stays || account.status === "signed_out" || account.status === "disabled" || (state.autoSwitch && account.status === "limited") || picked,
+      behavior: { kind: "action", onPress: choose(account.id, account.label) },
+    };
+  });
   // When the agent is stuck on a limit, a way out is the most useful thing in the menu.
   const wayOut: PluginButtonMenuEntry[] = [];
   if (offerReset && resets) {
@@ -256,29 +335,38 @@ function buttonFor(
     },
   });
 
-  const running = route?.pendingAccountId ? state.accounts.find((account) => account.id === route.pendingAccountId) : undefined;
   return {
-    ...pillText(current, running ?? null, route?.waiting ?? (state.canReopen ? "idle" : "restart")),
+    ...pillText(current, running ?? null, moves),
     icon: current.status === "limited" ? "CircleAlert" : "CircleUserRound",
     behavior: { kind: "menu", items },
   };
 }
 
-function menuTitle(account: AccountView): string {
-  if (account.status === "signed_out") return `${account.label} — signed out`;
-  if (account.status === "disabled") return `${account.label} — disabled`;
-  if (account.status === "limited") return `${account.label} — limit reached`;
-  // A full window of one model only (Claude's "Weekly · Opus") isn't the account's room.
-  const peak = account.usage ? accountPeak(account.usage.windows) : null;
-  if (!peak) return account.label;
-  const credits = account.usage?.credits;
-  return `${account.label} — ${formatPercent(peak.usedPercent)} used${credits ? ` · ${formatCredits(credits)}` : ""}`;
+/**
+ * An account in the menu, by the room it has, since that is what picking one weighs: "work · 46%
+ * left · week", "personal · full, back in 1h 37m". Its own windows only: a model's full window
+ * (Claude's "Weekly · Opus") leaves the account usable for the rest.
+ */
+function menuTitle(account: AccountView, now: number): string {
+  const room = accountRoom(account, now);
+  return room ? `${account.label} · ${room}` : account.label;
+}
+
+/** The glyph of the window that holds the agent's model back the most on that account. */
+function menuIcon(account: AccountView, model: string | null, now: number): PluginButtonIcon {
+  const glyph = accountGlyph(account, model, now);
+  return glyphIcon(glyph.kind, glyph.usedPercent, glyph.tone, { dashed: glyph.dashed });
+}
+
+function iconKey(icon: PluginButtonIcon | undefined): string {
+  if (!icon) return "";
+  return typeof icon === "string" ? icon : (icon.displayName ?? icon.name);
 }
 
 function menuKey(button: PluginButton): string {
   return button.behavior.kind === "menu"
     ? button.behavior.items
-        .map((item) => (item.kind === "item" ? `${item.id}:${item.title}:${String(item.icon)}:${item.disabled}` : item.id))
+        .map((item) => (item.kind === "item" ? `${item.id}:${item.title}:${iconKey(item.icon)}:${item.disabled}` : item.id))
         .join("|")
     : "";
 }

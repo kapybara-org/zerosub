@@ -19,6 +19,32 @@ export function formatResetIn(resetsAt: string | null, now: number = Date.now())
   return restHours === 0 ? `in ${days}d` : `in ${days}d ${restHours}h`;
 }
 
+/** "2h 14m", "3d 4h", "now": `formatResetIn` without its "in", for a countdown beside other words. */
+export function formatCountdown(resetsAt: string | null, now: number = Date.now()): string | null {
+  const text = formatResetIn(resetsAt, now);
+  return text === null ? null : text.replace(/^in /, "");
+}
+
+/**
+ * When a window resets, on the clock: "04:28" within a day, "Fri 14:00" after. In the user's own
+ * time zone, written the way the rest of the (English) interface is.
+ */
+export function formatResetMoment(resetsAt: string | null, now: number = Date.now()): string | null {
+  if (!resetsAt) return null;
+  const at = Date.parse(resetsAt);
+  if (!Number.isFinite(at) || at <= now) return null;
+  const time = new Date(at).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+  if (at - now < 24 * 3_600_000) return time;
+  const day = new Date(at).toLocaleDateString("en-GB", { weekday: "short" });
+  return `${day} ${time}`;
+}
+
+/** A reset moment after "back": "at 04:32", or "Thu at 05:12" beyond a day. */
+export function backMoment(moment: string): string {
+  const space = moment.indexOf(" ");
+  return space < 0 ? `at ${moment}` : `${moment.slice(0, space)} at ${moment.slice(space + 1)}`;
+}
+
 export function formatPercent(value: number): string {
   return `${Math.round(Math.min(100, Math.max(0, value)))}%`;
 }
@@ -125,18 +151,19 @@ const MOVES_WHEN: Record<NonNullable<AgentRoute["waiting"]>, string> = {
 /**
  * A composer pill's label and tooltip for an agent routed to `account`. While its session still
  * runs on another account, both are named, so the pill never claims an account the agent isn't
- * using yet, and the tooltip says when the move happens.
+ * using yet, and the tooltip says when the move happens. No e-mail: the tooltip is read aloud and
+ * shows on shared screens. `heading` names what the pill opens ("Account", "Accounts for this agent").
  */
 export function pillText(
-  account: Pick<AccountView, "label" | "email">,
+  account: Pick<AccountView, "label">,
   running: Pick<AccountView, "label"> | null,
   waiting: AgentRoute["waiting"],
+  heading = "Account",
 ): { label: string; title: string } {
-  const named = `${account.label}${account.email && account.email !== account.label ? ` (${account.email})` : ""}`;
-  if (!running) return { label: shortLabel(account), title: `Account: ${named}` };
+  if (!running) return { label: shortLabel(account), title: `${heading}: ${account.label}` };
   return {
     label: `${shortLabel(running, 12)} → ${shortLabel(account, 12)}`,
-    title: `Account: ${running.label}, moving to ${named} ${MOVES_WHEN[waiting ?? "idle"]}`,
+    title: `${heading}: ${running.label}, moving to ${account.label} ${MOVES_WHEN[waiting ?? "idle"]}`,
   };
 }
 

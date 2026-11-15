@@ -3,10 +3,12 @@ import {
   accountSubtitle,
   describeReopen,
   formatAge,
+  formatCountdown,
   formatCredits,
   formatExtraUsage,
   formatPlan,
   formatResetIn,
+  formatResetMoment,
   moveProblem,
   peakUsage,
   pillText,
@@ -133,26 +135,26 @@ describe("staleNotice", () => {
 });
 
 describe("pillText", () => {
-  const work = { label: "work", email: "ada@example.com" };
+  const work = { label: "work" };
 
-  it("names the account an agent runs on", () => {
-    expect(pillText(work, null, null)).toEqual({ label: "work", title: "Account: work (ada@example.com)" });
+  it("names the account an agent runs on, without its e-mail: the tooltip is read aloud and shows on shared screens", () => {
+    expect(pillText(work, null, null)).toEqual({ label: "work", title: "Account: work" });
+    expect(pillText(work, null, null, "Accounts for this agent").title).toBe("Accounts for this agent: work");
   });
 
   it("names both accounts while the session hasn't moved yet, and says when it will", () => {
     expect(pillText(work, { label: "lovelace@analytical.example" }, "idle")).toEqual({
       label: "lovelace@an… → work",
-      title: "Account: lovelace@analytical.example, moving to work (ada@example.com) once it's idle",
+      title: "Account: lovelace@analytical.example, moving to work once it's idle",
     });
-    expect(pillText(work, { label: "personal" }, "turn").title).toBe(
-      "Account: personal, moving to work (ada@example.com) when its current turn ends",
-    );
+    expect(pillText(work, { label: "personal" }, "turn").title).toBe("Account: personal, moving to work when its current turn ends");
     expect(pillText(work, { label: "personal" }, "background").title).toBe(
-      "Account: personal, moving to work (ada@example.com) once the background work it left running stops",
+      "Account: personal, moving to work once the background work it left running stops",
     );
     // Not moved unattended, a reload that didn't work, or no CLI to reload with: not "once it's idle", which won't happen.
-    expect(pillText(work, { label: "personal" }, "restart").title).toBe(
-      "Account: personal, moving to work (ada@example.com) when its session next starts",
+    expect(pillText(work, { label: "personal" }, "restart").title).toBe("Account: personal, moving to work when its session next starts");
+    expect(pillText(work, { label: "personal" }, "turn", "Accounts for this agent").title).toBe(
+      "Accounts for this agent: personal, moving to work when its current turn ends",
     );
   });
 });
@@ -189,5 +191,20 @@ describe("formatExtraUsage", () => {
   it("says only that it's on when the spend isn't known, and nothing when it's off", () => {
     expect(formatExtraUsage({ enabled: true, spend: null, limit: 5000, currency: "USD" })).toBe("Extra usage on");
     expect(formatExtraUsage({ enabled: false, spend: 0, limit: 5000, currency: "USD" })).toBeNull();
+  });
+});
+
+describe("formatCountdown and formatResetMoment", () => {
+  const now = Date.parse("2026-11-14T12:00:00Z");
+  it("count down without the 'in'", () => {
+    expect(formatCountdown("2026-11-14T13:37:00Z", now)).toBe("1h 37m");
+    expect(formatCountdown("2026-11-17T16:00:00Z", now)).toBe("3d 4h");
+    expect(formatCountdown(null, now)).toBeNull();
+  });
+
+  it("give the clock time within a day, and the weekday after", () => {
+    expect(formatResetMoment("2026-11-14T16:28:00Z", now)).toMatch(/^\d{2}:\d{2}$/);
+    expect(formatResetMoment("2026-11-17T16:00:00Z", now)).toMatch(/^[A-Z][a-z]{2} \d{2}:\d{2}$/);
+    expect(formatResetMoment("2026-11-14T11:00:00Z", now)).toBeNull();
   });
 });

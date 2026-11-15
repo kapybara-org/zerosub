@@ -15,6 +15,7 @@ import {
   removeAccount,
   renameAccount,
   setAgentAccount,
+  setAgentAccounts,
   setDefaultAccount,
   setNextAgentAccount,
   setAccountEnabled,
@@ -25,6 +26,7 @@ import {
   startLogin,
   submitLoginCode,
   updateApiAccount,
+  useOthersOnce,
 } from "./shared/rpc";
 
 export default function contribute(server: PluginServerContext) {
@@ -106,6 +108,8 @@ export default function contribute(server: PluginServerContext) {
   });
   server.handle(redeemReset, ({ accountId, agentId }, { paseo }) => service.redeem(paseo, accountId, agentId));
   server.handle(setAgentAccount, ({ agentId, accountId }, { paseo }) => service.setAgentAccount(paseo, agentId, accountId));
+  server.handle(setAgentAccounts, ({ agentId, accounts }, { paseo }) => service.setAgentAccounts(paseo, agentId, accounts));
+  server.handle(useOthersOnce, ({ agentId }, { paseo }) => service.useOthersOnce(paseo, agentId));
   server.handle(forkAgent, ({ agentId }, { paseo }) => service.forkAgent(paseo, agentId));
   server.handle(setAccountEnabled, ({ accountId, enabled }, { paseo }) => service.setAccountEnabled(paseo, accountId, enabled));
   server.handle(addApiAccount, async (input) => ({ accountId: await service.addApiAccount(input) }));
