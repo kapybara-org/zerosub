@@ -499,8 +499,13 @@ export class Service {
         void this.ensureFamily(family).catch(() => undefined);
       }
     }
+    // Moves a stop cut short are finished first: the checks below read an account's folder, and the
+    // sync further down would make the old one again.
+    if (this.hasRecordedMoves(await this.store.read())) await this.finishRecordedMoves();
     const state = await this.store.read();
     for (const account of state.accounts) {
+      // One still on record (both folders there, say) waits: its folder isn't settled.
+      if (state.moves[account.id]) continue;
       const attempted = this.usageAttemptAt.get(account.id) ?? 0;
       const busy = now - (this.activeAt.get(account.id) ?? 0) < ACTIVE_WINDOW_MS;
       const isDefault = defaultAccount(state, account.family)?.id === account.id;
@@ -517,8 +522,6 @@ export class Service {
       if (login.finishedAt && now - login.finishedAt > LOGIN_TTL_MS) this.logins.delete(id);
       else if (!login.finishedAt && now - Date.parse(login.view.startedAt) > LOGIN_TTL_MS) void this.cancelLogin(id);
     }
-    // Moves a stop cut short are finished first: the sync below would make their old folders again.
-    if (this.hasRecordedMoves(state)) await this.finishRecordedMoves();
     // Keep added Claude and Pi homes in step with main (shared entries, generated settings; a Pi home's
     // sign-ins too) even when they're only used from a terminal, which ZeroSub never sees start.
     for (const account of (await this.store.read()).accounts) {

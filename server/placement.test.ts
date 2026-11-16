@@ -8,7 +8,7 @@ import { claudeHomeHoldsAccount } from "./homes";
 import { chooseHomesDir } from "./placement";
 import type { Reopener } from "./reopen";
 import { Service } from "./service";
-import { MAIN_ACCOUNT_ID, StateStore, type StoredState } from "./state";
+import { MAIN_ACCOUNT_ID, StateStore, findAccount, type StoredState } from "./state";
 import { absentPi } from "./fakes.test-support";
 
 // Added Claude accounts are signed in inside ZeroSub's own homes/, then kept in a folder of the
@@ -423,6 +423,27 @@ describe("moving an account's home", () => {
     } finally {
       await service.stop();
     }
+  });
+
+  it("finishes a move on record before an upkeep checks the account, which stays signed in", async () => {
+    const { service, store, fake } = start();
+    const from = join(homes(), "claude-aaaaaaaaaaaa");
+    const to = join(kept(), "claude-work");
+    // Stopped after the rename, before the registry was saved: the sign-in is in `to` now.
+    await makeHome(to);
+    fake.keychain.set(from, "token");
+    fake.signedIn.add(to);
+    await seed({
+      accounts: [main, { ...managed("claude-aaaaaaaaaaaa", "Work", from), signedIn: true, email: "ada@example.com" }],
+      moves: { "claude-aaaaaaaaaaaa": { from, to, at: "2026-10-29T00:00:00.000Z", family: "claude" } },
+    });
+
+    await (service as unknown as { tick(): Promise<void> }).tick();
+    // The checks it set off in the background read the folder the account is in by then.
+    await vi.waitFor(() => expect(fake.calls).toContain(`identity ${to}`));
+    expect(fake.calls).not.toContain(`identity ${from}`);
+    expect(await homeOf(store, "claude-aaaaaaaaaaaa")).toBe(to);
+    expect(findAccount(await store.read(), "claude-aaaaaaaaaaaa")?.signedIn).toBe(true);
   });
 
   it("keeps the account on the old folder, and says to delete the new one, when only the old one holds the sign-in", async () => {
