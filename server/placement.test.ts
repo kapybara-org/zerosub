@@ -19,7 +19,7 @@ let root: string;
 const saved: Record<string, string | undefined> = {};
 /** The services a test started, whose moves run on after it unless they're waited for. */
 const started: Service[] = [];
-const VARIABLES = ["PASEO_HOME", "ZEROSUB_LAUNCHER_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME"];
+const VARIABLES = ["PASEO_HOME", "ZEROSUB_LAUNCHER_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "GROK_HOME", "CURSOR_CONFIG_DIR", "XDG_CONFIG_HOME"];
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "zerosub-placement-"));
@@ -28,6 +28,9 @@ beforeEach(async () => {
   process.env.ZEROSUB_LAUNCHER_DIR = join(root, "claude-config");
   process.env.CLAUDE_CONFIG_DIR = join(root, "main");
   process.env.CODEX_HOME = join(root, "codex");
+  process.env.GROK_HOME = join(root, "grok");
+  process.env.XDG_CONFIG_HOME = join(root, "xdg");
+  delete process.env.CURSOR_CONFIG_DIR;
   vi.spyOn(console, "log").mockImplementation(() => undefined);
 });
 
@@ -231,6 +234,29 @@ describe("moving an account's home", () => {
     await service.placeHomes();
     expect(await homeOf(store, "claude-aaaaaaaaaaaa")).toBe(join(kept(), "claude-work"));
     expect((await service.view(paseo)).accounts.find((account) => account.id === "claude-aaaaaaaaaaaa")?.moving).toBeNull();
+  });
+
+  it("leaves Grok and Cursor accounts in homes/, with no move, script or outside folder", async () => {
+    const { service, store } = start();
+    const home = join(homes(), "claude-aaaaaaaaaaaa");
+    const grok = join(homes(), "grok-bbbbbbbbbbbb");
+    const cursor = join(homes(), "cursor-cccccccccccc");
+    await makeHome(home);
+    for (const other of [grok, cursor]) await mkdir(other, { recursive: true });
+    const other = (id: string, family: "grok" | "cursor", at: string) => ({ ...managed(id, family === "grok" ? "Grok work" : "Cursor work", at), family });
+    await seed({ accounts: [main, managed("claude-aaaaaaaaaaaa", "Work", home), other("grok-bbbbbbbbbbbb", "grok", grok), other("cursor-cccccccccccc", "cursor", cursor)] });
+
+    await service.placeHomes();
+    expect(await homeOf(store, "claude-aaaaaaaaaaaa")).toBe(join(kept(), "claude-work"));
+    expect(await homeOf(store, "grok-bbbbbbbbbbbb")).toBe(grok);
+    expect(await homeOf(store, "cursor-cccccccccccc")).toBe(cursor);
+    expect(await there(grok)).toBe(true);
+    expect(await there(cursor)).toBe(true);
+    expect((await store.read()).moves).toEqual({});
+    expect((await readdir(kept())).filter((name) => name.endsWith(".sh"))).toEqual(["claude-work.sh"]);
+    const others = (await service.view(paseo)).accounts.filter((account) => account.family === "grok" || account.family === "cursor");
+    expect(others).toHaveLength(2);
+    for (const view of others) expect(view).toMatchObject({ moving: null, launcher: null, externalHome: false, proxyEditable: false });
   });
 
   it("gives way to a session routed to the home while it was moving, which opens where the account is, and moves at a later pass", async () => {
@@ -526,6 +552,15 @@ describe("changing where accounts are kept", () => {
     expect(await chooseHomesDir(` ${kept()} `, accounts)).toBeNull();
     expect(await chooseHomesDir(join(root, "new", "place"), accounts)).toBe(join(root, "new", "place"));
     expect(await there(join(root, "new", "place"))).toBe(true);
+  });
+
+  it("refuses Grok's and Cursor's own folders, which their accounts mirror or share", async () => {
+    // Claude accounts kept in ~/.config would be linked into every Cursor account's XDG_CONFIG_HOME, sign-ins and all.
+    for (const dir of [join(root, "grok", "accounts"), join(root, "xdg", "claude-accounts"), join(root, "xdg", "cursor", "accounts")]) {
+      await expect(chooseHomesDir(dir, [])).rejects.toThrow("a CLI's own folder");
+    }
+    process.env.CURSOR_CONFIG_DIR = join(root, "cursor-settings");
+    await expect(chooseHomesDir(join(root, "cursor-settings", "accounts"), [])).rejects.toThrow("a CLI's own folder");
   });
 
   it("leaves accounts kept anywhere else where they are", async () => {

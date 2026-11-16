@@ -2,7 +2,7 @@ import { access, constants, lstat, mkdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { idSuffix, kindName, slug, type LauncherKind } from "./launchers";
-import { dataDir, homesDir, inHomesDir, launcherDir, mainClaudeDir, mainCodexHome, mainPiDir, piLauncherDir, shownPath } from "./paths";
+import { dataDir, homesDir, inHomesDir, launcherDir, mainClaudeDir, mainCodexHome, mainConfigHome, mainCursorConfigDir, mainGrokHome, mainPiDir, piLauncherDir, shownPath } from "./paths";
 import type { Homes, StoredAccount } from "./state";
 
 /** The families whose added accounts' homes ZeroSub keeps outside its own folder: Claude's and Pi's. */
@@ -44,7 +44,8 @@ export async function chooseHomesDir(input: string, accounts: readonly StoredAcc
   const dir = typedPath(typed, family === "pi" ? "~/.pi-config or /Volumes/Data/pi-accounts" : "~/.claude-config or /Volumes/Data/claude-accounts");
   if (dir === resolve(homedir()) || dir === resolve("/")) throw new Error(`Pick a folder of their own for the accounts, not ${shownPath(dir)} itself.`);
   if (within(dir, dataDir())) throw new Error(`${shownPath(dir)} is inside ZeroSub's own folder (${shownPath(dataDir())}). Pick one outside it.`);
-  for (const main of [mainClaudeDir(), mainCodexHome(), mainPiDir()]) {
+  // ~/.config and Cursor's folder are mirrored into every Cursor account's home: accounts kept there would be too.
+  for (const main of [mainClaudeDir(), mainCodexHome(), mainPiDir(), mainGrokHome(), mainCursorConfigDir(), mainConfigHome()]) {
     if (within(dir, main)) throw new Error(`${shownPath(dir)} is inside ${shownPath(main)}, a CLI's own folder. Pick one outside it.`);
   }
   const holder = accounts.find((account) => account.home && within(dir, account.home));
