@@ -48,7 +48,7 @@ import { codexHandoffMode, encryptedResumeFailure, sameWorkspace, turnFailedText
 import { CodexContinuations } from "./continuations";
 import { CONTINUED_FROM_LABEL, continueInNewAgent, type Continuation } from "./handoff";
 import { PI_ACCOUNT_FILE, codexSessionsShared, crossesInheritedProxy, isAccountHome, moveHome, normalizeBaseUrl, plainHttp, readPiAccount, readPiAccountForAgents, removeHome, sentInTheClear } from "./homes";
-import { launcherNames, piLauncherDir, writeLaunchers, type LauncherAccount } from "./launchers";
+import { launcherDir, launcherNames, piLauncherDir, writeLaunchers, type LauncherAccount, type LauncherKind } from "./launchers";
 import { Mutex } from "./json-file";
 import { turnRows } from "./limits";
 import { canSignInWithBrowser } from "./machine";
@@ -522,7 +522,7 @@ export class Service {
       }
     }
     await this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
-    await this.refreshLaunchers().catch((error: unknown) => log("could not write the Pi scripts", error));
+    await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
     if (this.paseo) {
       await this.forgetEndedSessions(this.paseo).catch((error: unknown) => log("could not check which agents closed while ZeroSub was off", error));
       void this.alignSessions(this.paseo).catch((error: unknown) => log("aligning agents failed", error));
@@ -2577,8 +2577,9 @@ export class Service {
       });
     }
 
-    const piScripts = this.launcherAccounts(state);
-    const launcherOf = this.launcherFiles ?? launcherNames(piScripts);
+    const claudeScripts = this.launcherAccounts(state);
+    const piScripts = this.launcherAccounts(state, "pi");
+    const launcherOf = this.launcherFiles ?? new Map([...launcherNames(claudeScripts), ...launcherNames(piScripts, new Map(), "pi")]);
     const proxies = new Map<string, ProxyState>();
     const apis = new Map<string, ApiSummary | null>();
     const external = new Set<string>();
@@ -2652,6 +2653,7 @@ export class Service {
       showComposerPill: this.prefs.showComposerPill,
       autoSwitch: this.prefs.autoSwitch,
       warnings: await this.warnings(),
+      launchers: claudeScripts.length > 0 ? launcherDir() : null,
       piLaunchers: piScripts.length > 0 ? piLauncherDir() : null,
       piHomes: this.adapters.pi.homesInUse ? { dir: shownPath(piHomesNow), isDefault: state.piHomes.dir === null } : null,
     };
@@ -3010,7 +3012,7 @@ export class Service {
     });
     if (!findAccount(state, accountId)) throw new Error("That account no longer exists.");
     // A Pi account's script is named after it.
-    await this.refreshLaunchers().catch((error: unknown) => log("could not write the Pi scripts", error));
+    await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
   }
 
   /** Removes an account. Moving its agents can outlast the RPC: see `answerBy`. */
@@ -3061,7 +3063,7 @@ export class Service {
     this.egress.delete(accountId);
     if (account.home && kept) console.log(`[ZeroSub] removed ${account.label} from ZeroSub only: ${account.home} isn't in ${homesDir()}, so its files and script stay`);
     // Its script is released rather than deleted when its home stays (see writeLaunchers).
-    await this.refreshLaunchers(account.home && !kept ? [account.home] : []).catch((error: unknown) => log("could not write the Pi scripts", error));
+    await this.refreshLaunchers(account.home && !kept ? [account.home] : []).catch((error: unknown) => log("could not write the shell launchers", error));
     // Idle agents move now and busy ones after their turn. The home is signed out and deleted by the
     // cleanup pass only once nothing runs on it any more.
     const summary = emptySummary();
@@ -3115,25 +3117,31 @@ export class Service {
     }
   }
 
-  /** Added Pi accounts, which each get a `pi-<account>.sh` script. */
-  private launcherAccounts(state: StoredState): LauncherAccount[] {
+  /** Added accounts of `kind`, which each get a `<kind>-<account>.sh` script. */
+  private launcherAccounts(state: StoredState, kind: LauncherKind = "claude"): LauncherAccount[] {
     return state.accounts.flatMap((account) =>
-      account.family === "pi" && account.kind === "managed" && account.home ? [{ id: account.id, label: account.label, home: account.home }] : [],
+      account.family === kind && account.kind === "managed" && account.home ? [{ id: account.id, label: account.label, home: account.home }] : [],
     );
   }
 
   /**
    * Rewrites the account scripts when the accounts or their names changed. A removed account's
    * script goes when its home does (`leaving`, or gone); one whose home stays is released to the user.
-   * Nothing is written while no Pi account is added.
+   * Each kind only touches its own scripts; Pi's are written only where Pi accounts are kept
+   * outside `homes/` (the real adapter, not test doubles).
    */
   private async refreshLaunchers(leaving: readonly string[] = []): Promise<void> {
-    // Only where Pi accounts are kept outside `homes/` (the real adapter; not test doubles).
-    if (!this.adapters.pi.homesInUse) return;
     const state = await this.store.read();
     // A home that's moving keeps its account's script, rewritten for where it's gone.
     const moved = new Map(Object.values(state.moves).map((move) => [resolve(move.from), move.to]));
-    this.launcherFiles = await writeLaunchers(this.launcherAccounts(state), piLauncherDir(), leaving, moved);
+    const files = new Map<string, string>();
+    const kinds: [LauncherKind, string][] = [["claude", launcherDir()]];
+    if (this.adapters.pi.homesInUse) kinds.push(["pi", piLauncherDir()]);
+    for (const [kind, directory] of kinds) {
+      const written = await writeLaunchers(this.launcherAccounts(state, kind), directory, leaving, moved, kind);
+      for (const [accountId, name] of written) files.set(accountId, name);
+    }
+    this.launcherFiles = files;
   }
 
   /**
@@ -3336,7 +3344,7 @@ export class Service {
       this.creatingHomes.delete(home);
     }
     await this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
-    await this.refreshLaunchers().catch((error: unknown) => log("could not write the Pi scripts", error));
+    await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
     const added = findAccount(await this.store.read(), id);
     if (added) void this.checkEgress(added);
     return id;
@@ -3420,7 +3428,7 @@ export class Service {
     await this.adapters.pi.prepareHome(home, this.stillHas(added)).catch((error: unknown) => log(`could not refresh the home of ${added.label}`, error));
     console.log(`[ZeroSub] added the Pi account in ${home} back as ${added.label}`);
     await this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
-    await this.refreshLaunchers().catch((error: unknown) => log("could not write the Pi scripts", error));
+    await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
     void this.checkEgress(added);
     return added.id;
   }
@@ -3510,7 +3518,7 @@ export class Service {
         log(`could not move the home of ${account.label} to ${to}`, error);
       }
     }
-    if (moved) await this.refreshLaunchers().catch((error: unknown) => log("could not write the Pi scripts", error));
+    if (moved) await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
   }
 
   /**
@@ -3834,6 +3842,8 @@ export class Service {
     if (accountId) this.identityCheckedAt.set(accountId, Date.now());
     if (accountId && handedOver) this.forgetReading(accountId);
     session.accountId = accountId;
+    // A new account's script is there by the time the app says it's added.
+    await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
     session.view = { ...session.view, step: "done", accountId, message: null };
     if (accountId) void this.refreshUsage(accountId, true).catch(() => undefined);
   }

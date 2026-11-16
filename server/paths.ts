@@ -71,6 +71,15 @@ export function mainPiDir(): string {
 }
 
 /**
+ * Where each added Claude account's script goes (`claude-<account>.sh`, see server/launchers.ts):
+ * `~/.claude-config`, or `ZEROSUB_LAUNCHER_DIR`.
+ */
+export function launcherDir(): string {
+  const configured = process.env.ZEROSUB_LAUNCHER_DIR?.trim();
+  return configured ? resolve(configured) : join(homedir(), ".claude-config");
+}
+
+/**
  * Where each added Pi account's script goes (`pi-<account>.sh`), and where added Pi accounts' homes
  * are kept unless the user picks another folder: `~/.pi-config`, or `ZEROSUB_PI_DIR`.
  */
