@@ -2318,7 +2318,9 @@ export class Service {
       for (const agent of await this.liveAgents(paseo)) {
         const agentId = agent.id;
         const family = families[agent.provider];
-        if (!family || routing.has(agentId) || this.switching.has(agentId) || this.recentlyActive(agent, now)) continue;
+        // A reload can't move an agent of a family that isn't available here: its session opens on
+        // the CLI login again (see `route`).
+        if (!family || this.availability.get(family)?.ok === false || routing.has(agentId) || this.switching.has(agentId) || this.recentlyActive(agent, now)) continue;
         if (this.deferred.has(agentId)) {
           // Its switch waited for a turn that never came (it was only starting), or ended without it.
           if (settled(agent.status)) waiting.push({ agentId, family });
@@ -2361,7 +2363,7 @@ export class Service {
     canReopen: boolean,
     now: number,
   ): NonNullable<AgentRoute["waiting"]> {
-    if (!canReopen || this.failedMoves.get(agent.id) === target) return "restart";
+    if (!canReopen || this.failedMoves.get(agent.id) === target || this.availability.get(family)?.ok === false) return "restart";
     const deferred = this.deferred.get(agent.id);
     // Only a move left for its turn, or one alignment tries, happens before the session next starts.
     // One left for its turn goes ahead as `finishDeferred` checks: always when asked for, and when

@@ -7,7 +7,7 @@ import type { FamilyAdapter } from "./adapter";
 import { CursorAdapter } from "./cursor";
 import { absentPi } from "./fakes.test-support";
 import type { FamilyResolver } from "./families";
-import type { Reopener } from "./reopen";
+import { Reopener } from "./reopen";
 import { Service } from "./service";
 import { type Binding, StateStore, type StoredAccount } from "./state";
 
@@ -91,7 +91,7 @@ function fakeAdapter(family: "claude" | "codex", availability: { ok: boolean }):
  * A service with the CLI login and an added account of `family`, and agent 1 bound to the added
  * account, whose last session was recorded there (the registry was last used where it worked).
  */
-async function setUp(family: Family, adapters: Partial<Record<Family, FamilyAdapter>>) {
+async function setUp(family: Family, adapters: Partial<Record<Family, FamilyAdapter>>, reopener = { locate: async () => null } as unknown as Reopener) {
   const store = new StateStore(join(root, "paseo", "zerosub", "state.json"));
   const binding: Binding = { accountId: `${family}-a`, source: "user", at: EARLIER };
   await store.update((draft) => {
@@ -103,7 +103,7 @@ async function setUp(family: Family, adapters: Partial<Record<Family, FamilyAdap
     { claude: fakeAdapter("claude", { ok: false }), codex: fakeAdapter("codex", { ok: false }), pi: absentPi(), ...adapters },
     store,
     { resolve: async () => ({ [family]: family }) } as unknown as FamilyResolver,
-    { locate: async () => null } as unknown as Reopener,
+    reopener,
   );
   const paseo = { agents: { ref: () => ({ refresh: async () => ({ agent: { id: AGENT, provider: family, status: "idle", labels: {} } }) }) } };
   const open = (purpose: "interactive" | "title" = "interactive") =>
@@ -174,5 +174,48 @@ describe("routing a session of a family that isn't available", () => {
     expect(state.sessions[AGENT]).toMatchObject({ accountId: "claude-a" });
     expect(state.bindings[AGENT]).toEqual(binding);
     await service.stop();
+  });
+});
+
+describe("aligning agents of a family that isn't available", () => {
+  it("doesn't reload a Cursor agent with history bound to an added account after its session opens on darwin, nor 30 minutes later", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const { service, open, check } = await setUp("cursor", { cursor: new CursorAdapter("darwin") }, new Reopener());
+      const agent = { id: AGENT, provider: "cursor", status: "idle", archivedAt: null, lastUserMessageAt: EARLIER, labels: {} };
+      const reloads: string[] = [];
+      // Paseo 0.16's own reload, which opens the session again through the session-open hook.
+      const reopen = (agentId: string) =>
+        service.onSessionOpen({ agentId, provider: "cursor", reason: "refresh", purpose: "interactive", env: {} } as never, { paseo } as never);
+      const paseo = {
+        agents: {
+          list: async () => ({ entries: [{ agent }], pageInfo: { hasMore: false, nextCursor: null } }),
+          ref: (agentId: string) => ({
+            refresh: async () => ({ agent }),
+            reload: async () => {
+              reloads.push(agentId);
+              await reopen(agentId);
+            },
+            timeline: { append: async () => undefined },
+          }),
+        },
+      };
+      await check();
+      expect(await open()).toBeUndefined();
+      // It runs on the CLI login, bound to an account a reload can't open it on, so its account button
+      // doesn't say it moves once it's idle…
+      const waiting = async () => (await service.view(paseo as never)).agents.find((route) => route.agentId === AGENT)?.waiting;
+      expect(await waiting()).toBe("restart");
+      // …and the 30-second check doesn't reload it, now or 30 minutes on, when it would retry a move
+      // that didn't land.
+      await service.alignSessions(paseo as never);
+      vi.setSystemTime(Date.now() + 31 * 60_000);
+      expect(await waiting()).toBe("restart");
+      await service.alignSessions(paseo as never);
+      expect(reloads).toEqual([]);
+      await service.stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
