@@ -1,5 +1,5 @@
 import { accountPeak } from "../shared/format";
-import { isAzureAccount, type Family, type Usage, type UsageWindow } from "../shared/model";
+import { isAzureAccount, isBedrockAccount, type Family, type Usage, type UsageWindow } from "../shared/model";
 import { FIVE_HOUR_MINUTES, WEEK_MINUTES } from "./codex";
 import {
   accountsOf,
@@ -45,13 +45,13 @@ export function canStandIn(account: StoredAccount, now: number): boolean {
 }
 
 /**
- * A paid API account that stands in for a subscription (an Azure OpenAI account), marked so when it
- * was added. Like any API account it's billed per use, so routing never puts agents on it by itself
+ * A paid API account that stands in for a subscription (an Azure OpenAI account under ChatGPT, an AWS
+ * Bedrock account under Claude), marked so when it was added. Like any API account it's billed per use, so routing never puts agents on it by itself
  * unless `paidApiFallback` is on, and then only as a last resort: once no subscription account of the
  * family can stand in (see `mostAvailable`). It can always be picked by hand, or made the default.
  */
 export function isLastResort(account: StoredAccount): boolean {
-  return isAzureAccount(account);
+  return isAzureAccount(account) || isBedrockAccount(account);
 }
 
 /**
@@ -281,7 +281,11 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
     if (account && isLastResort(account) && input.autoRedeem) {
       account = withBankedReset(state, input.family, input.usageOf, input.now) ?? account;
     }
-    if (account) bind = { accountId: account.id, source: "balance", at, selectionReason: nearReset ? "weekly_reset" : "headroom" };
+    // An agent that can move isn't bound to a paid stand-in (Bedrock): it's only there until a
+    // subscription account has room. A thread that can't move (Azure's) is, as it lives there.
+    if (account && !(input.portable && isLastResort(account))) {
+      bind = { accountId: account.id, source: "balance", at, selectionReason: nearReset ? "weekly_reset" : "headroom" };
+    }
   }
   if (!account) {
     // An existing Codex thread ZeroSub never routed (imported from the user's own CLI, or started
@@ -316,11 +320,12 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
       skipped = { account, why };
       account = alternative;
       // A thread that can't move lives where it starts. Otherwise a disabled account keeps its
-      // agents' bindings, so they return when it's enabled again; a limit re-pins them.
+      // agents' bindings, so they return when it's enabled again; a limit re-pins them, except onto
+      // a paid stand-in (Bedrock), which they leave again once a subscription account has room.
       bind =
         !input.portable
           ? { accountId: alternative.id, source: "thread", at }
-          : why === "disabled"
+          : why === "disabled" || isLastResort(alternative)
             ? null
             : { accountId: alternative.id, source: "auto", at };
     }

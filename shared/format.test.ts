@@ -96,6 +96,8 @@ describe("account presentation", () => {
     externalHome: false,
     moving: null,
     azure: null,
+    bedrock: null,
+    apiError: null,
   };
 
   it("summarises the busiest window", () => {

@@ -199,6 +199,78 @@ export function detectAzureSignOut(event: TurnEvent): string | null {
   return null;
 }
 
+// --------------------------------------------------------------------------- AWS Bedrock (Claude on AWS)
+
+/** How long a Bedrock account is set aside after throttling (`ThrottlingException`, 429, "Too many tokens"). */
+export const BEDROCK_THROTTLE_MS = 60_000;
+/** How long after an exceeded service quota, which usually lifts within minutes. */
+export const BEDROCK_QUOTA_MS = 5 * 60_000;
+
+const BEDROCK_QUOTA = /ServiceQuotaExceeded|service quota|quota exceeded/i;
+const BEDROCK_THROTTLED = /ThrottlingException|Too many (?:tokens|requests)|\b429\b|rate (?:exceeded|limit)/i;
+/**
+ * Bedrock naming the model as one the account can't use: not enabled for it ("You don't have access
+ * to the model with the specified model ID"), a wrong ID ("The provided model identifier is invalid")
+ * or one that needs an inference profile. AWS's own wording, which no other service in a turn prints,
+ * so the account is marked without asking AWS about its credentials again.
+ */
+const BEDROCK_MODEL_REFUSED =
+  /don['’]t have access to the model with the specified model ID|provided model identifier is invalid|Invocation of model ID .{1,200} with on-demand throughput isn['’]t supported/i;
+/**
+ * Credentials or access refused. Only a hint: an AccessDenied or a 403 can be another service's (an
+ * MCP server's, a tool's), so the service asks AWS about the credentials before taking the account
+ * for signed out (see `confirmSignedOut`).
+ */
+const BEDROCK_REFUSED =
+  /AccessDeniedException|not authorized to perform|UnrecognizedClientException|InvalidSignatureException|security token included in the request is (?:invalid|expired)|ExpiredToken|Could not load credentials|Unable to locate credentials|\b40[13]\b/i;
+/** How Claude Code words an API failure in its reply: "API Error: 429 …", "API Error (model): 400 …". */
+const API_ERROR = /^(?:\[System Error\]\s*)?API Error\b/i;
+
+/**
+ * Notices from a failed turn on Bedrock: the failure, error rows and, as Claude Code reports an API
+ * failure as a reply starting "API Error", final replies that do, never ordinary prose that mentions
+ * a 429. A completed turn has none: its warnings (an MCP server's "HTTP 401 Unauthorized" while it
+ * starts, an AccessDenied in a tool's output) are other services', not Bedrock's.
+ */
+function apiNotices(event: TurnEvent): string[] {
+  if (event.outcome.kind !== "failed") return [];
+  const found = notices(event, false);
+  const timeline = event.turnId === null ? [] : event.timeline;
+  let replies = 0;
+  for (let index = timeline.length - 1; index >= 0 && replies < 2; index -= 1) {
+    const item = timeline[index];
+    if (!item) continue;
+    if (isTurnPrompt(item)) break;
+    if (item.type !== "assistant_message") continue;
+    replies += 1;
+    if (API_ERROR.test(item.text)) found.push(clean(item.text));
+  }
+  return found.filter((text) => text.length > 0 && text.length <= MAX_NOTICE);
+}
+
+/**
+ * A failed turn on an AWS Bedrock account, throttled or over a service quota. Bedrock has no 5-hour
+ * or weekly windows, so either is a short cooldown, as for Azure (see `detectAzureLimit`).
+ */
+export function detectBedrockLimit(event: TurnEvent, now: Date = new Date()): LimitHit | null {
+  for (const text of apiNotices(event)) {
+    if (BEDROCK_QUOTA.test(text)) return { kind: "budget", message: firstLine(text), resetsAt: new Date(now.getTime() + BEDROCK_QUOTA_MS).toISOString() };
+    if (BEDROCK_THROTTLED.test(text)) return { kind: "window", message: firstLine(text), resetsAt: new Date(now.getTime() + BEDROCK_THROTTLE_MS).toISOString() };
+  }
+  return null;
+}
+
+/**
+ * A failed turn on an AWS Bedrock account whose credentials, access or model were refused: what AWS
+ * said, and whether it named the model (`model`), which needs no check of the credentials.
+ */
+export function detectBedrockRefusal(event: TurnEvent): { message: string; model: boolean } | null {
+  const texts = apiNotices(event).filter((text) => !BEDROCK_THROTTLED.test(text) && !BEDROCK_QUOTA.test(text));
+  for (const text of texts) if (BEDROCK_MODEL_REFUSED.test(text)) return { message: firstLine(text), model: true };
+  for (const text of texts) if (BEDROCK_REFUSED.test(text)) return { message: firstLine(text), model: false };
+  return null;
+}
+
 // --------------------------------------------------------------------------- reset times
 
 const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];

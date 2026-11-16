@@ -48,6 +48,8 @@ function account(id: string, fields: Partial<AccountView> = {}): AccountView {
     externalHome: false,
     moving: null,
     azure: null,
+    bedrock: null,
+    apiError: null,
     ...fields,
   };
 }

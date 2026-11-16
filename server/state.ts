@@ -16,7 +16,8 @@ export const StoredAccountSchema = z.object({
   auth: AuthKindSchema.default("subscription"),
   /**
    * The paid API an `api` account stands in for a subscription on (an Azure OpenAI account's
-   * `azure`), set when it's added. Missing for every other account, API-key ones included.
+   * `azure`, an AWS Bedrock account's `bedrock`), set when it's added. Missing for every other
+   * account, API-key ones included.
    */
   provider: ApiProviderSchema.optional(),
   /** Credential home (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`). `null` for the CLI's own login. */
@@ -39,6 +40,8 @@ export const StoredAccountSchema = z.object({
    * saved by earlier versions, which count as a turn's.
    */
   limitSource: z.enum(["turn", "reading"]).optional(),
+  /** What the provider said when it refused an Azure or Bedrock account, shown on its card while it's signed out. */
+  apiError: z.string().nullable().optional(),
   createdAt: z.string(),
 });
 export type StoredAccount = z.infer<typeof StoredAccountSchema>;
