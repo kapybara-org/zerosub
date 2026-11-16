@@ -2218,6 +2218,20 @@ describe("forking to the other provider", () => {
       expect(notes.at(-1)).toMatchObject({ outcome: "stayed" });
       expect(notes.at(-1)?.detail).toMatch(/no mode as careful as this agent's \(“Bypass”\)/);
   });
+
+    it("never picks an OpenCode mode whose colorTier is an agent's color", async () => {
+      // Paseo 0.16 reports a colored OpenCode agent's hex color as its colorTier, in place of the tier.
+      const { created, notes, limitTurn } = await setUpFork("bypassPermissions", [], {}, [], {
+        prefs: PREFS,
+        opencodeModes: [
+          { id: "build", label: "Build", colorTier: "#f97316" },
+          { id: "plan", label: "Plan", colorTier: "#3b82f6" },
+        ],
+      });
+      await limitTurn();
+      expect(created).toHaveLength(0);
+      expect(notes.at(-1)?.detail).toMatch(/no mode as careful as this agent's/);
+    });
   });
 
   describe("a continuation of the other kind", () => {
