@@ -1179,6 +1179,28 @@ describe("forking to the other provider", () => {
       });
     });
 
+    it("sends an agent's or a schedule's prompt after the fork as an instruction, not as progress", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await setup.limitTurn();
+      expect(setup.created).toHaveLength(1);
+      const toolPrompt = (callId: string, name: string, text: string, agentMessage?: object) =>
+        ({ type: "tool_call", callId, name, status: "completed", error: null, ...(agentMessage ? { agentMessage } : {}), detail: { type: "plain_text", text, icon: "bot" } }) as AgentTimelineItem;
+      setup.addTurn(AGENT, toolPrompt("paseo-agent-message:m9", "agent_message", "STOP: do not push anything", {
+        event: "message",
+        sender: { id: "lead", title: "Lead" },
+        text: "STOP: do not push anything",
+      }));
+      setup.addTurn(AGENT, toolPrompt("paseo-system:nightly", "heartbeat", "Run the nightly regression check"));
+      await setup.limitTurn();
+      const update = setup.sends.at(-1)!.text;
+      const users = update.slice(update.indexOf("<user-updates>"), update.indexOf("</user-updates>"));
+      const progress = update.slice(update.indexOf("<progress-updates>"), update.indexOf("</progress-updates>"));
+      expect(users).toContain("STOP: do not push anything");
+      expect(users).toContain("Run the nightly regression check");
+      expect(progress).not.toContain("STOP: do not push anything");
+      expect(progress).not.toContain("Run the nightly regression check");
+    });
+
     /** A settled fork whose source gained only a plugin note, with `act` run once as its watermark is saved. */
     const duringWatermarkWrite = async (act: (setup: Awaited<ReturnType<typeof setUpFork>>) => void) => {
       const setup = await setUpReuse({}, { seen: MARK });

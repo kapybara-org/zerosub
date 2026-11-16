@@ -48,7 +48,7 @@ import { FamilyResolver } from "./families";
 import { sameAccountIdentity, withoutWorkspace } from "./account-identity";
 import { codexHandoffMode, encryptedResumeFailure, sameWorkspace, turnFailedText } from "./codex-same-conversation";
 import { CodexContinuations, MESSAGE_PREFIX, UnresolvableEpochError, fitInstructions, matchesTransfer, readUpdates, ready, sentDigestOf, snapshot, transferMarker, waitForCreated, waitForSource, type Agent } from "./continuations";
-import { CONTINUED_FROM_LABEL, PARENT_LABEL, buildTranscript, continueInNewAgent, continuationPrompt, updatePrompt, type Continuation } from "./handoff";
+import { CONTINUED_FROM_LABEL, PARENT_LABEL, buildTranscript, continueInNewAgent, continuationPrompt, promptInstruction, updatePrompt, type Continuation } from "./handoff";
 import { PI_ACCOUNT_FILE, codexSessionsShared, crossesInheritedProxy, isAccountHome, moveHome, normalizeBaseUrl, plainHttp, readPiAccount, readPiAccountForAgents, removeHome, sentInTheClear } from "./homes";
 import { launcherDir, launcherNames, piLauncherDir, writeLaunchers, type LauncherAccount, type LauncherKind } from "./launchers";
 import { Mutex } from "./json-file";
@@ -2250,8 +2250,12 @@ export class Service {
         detail: UP_TO_DATE_DETAIL,
       };
     }
-    const instructions = fitInstructions(items.filter((item) => item.type === "user_message").map((item) => item.text));
-    const progress = buildTranscript(items.filter((item) => item.type !== "user_message"));
+    // Instructions are prompts from a human, another agent or a schedule, as in a Codex continuation.
+    const instructions = fitInstructions(items.flatMap((item) => {
+      const text = promptInstruction(item);
+      return text?.trim() ? [text] : [];
+    }));
+    const progress = buildTranscript(items.filter((item) => promptInstruction(item) === null));
     const messageId = `${MESSAGE_PREFIX}${randomUUID()}`;
     const prompt = updatePrompt(instructions, progress, PROVIDER_NAME.claude, transferMarker(messageId));
     const checked = await this.freshOpenCodeTarget(paseo, agentId, fork.id, delta.mark);
