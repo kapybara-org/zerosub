@@ -35,6 +35,13 @@ export interface AgentAccountRow {
   why: string;
   /** It can't take the agent's next turn (full, or out for its model). */
   full: boolean;
+  /**
+   * Not even when asked: signed out, turned off, at a wall, or full for the agent's model. A "full"
+   * account that is only running short (its 5 hours nearly out) can still take a turn.
+   */
+  closed: boolean;
+  /** Why no turn can run on it at all, said in a phrase: "signed out", "turned off". */
+  off: "signed out" | "turned off" | null;
   /** The figure the row shows: the share used of the glyph's window ("45%"), or once full the wait ("2h 28m"). */
   meta: string;
   /** The account's limits still worth reading, in the reading's order: what hovering the row shows. */
@@ -227,6 +234,7 @@ export function agentPlan(
     const off = account.status === "signed_out" ? "Signed out" : account.status === "disabled" ? "Off" : null;
     const back = Number.isFinite(row.back) && row.back > 0 ? fmtIn(row.back) : "";
     const lines = off ? [] : windowLines(account, model, now);
+    const closed = off !== null || row.tier >= 2 || lines.some((line) => line.applies && line.full);
     return {
       id,
       label: shortLabel(account),
@@ -235,6 +243,8 @@ export function agentPlan(
       glyph,
       why: full && checked && draft.mode === "manual" ? `Skipped · ${why}` : why,
       full,
+      closed,
+      off: account.status === "signed_out" ? "signed out" : account.status === "disabled" ? "turned off" : null,
       meta: off ?? (full ? back || "Full" : formatPercent(glyph.usedPercent)),
       lines,
       note: noteOf(account, lines),
@@ -293,20 +303,39 @@ export function statusLine(next: NextTurn, byHand: boolean, label: (id: string) 
 }
 
 /**
- * Whether a row offers "Use now": somewhere else the agent can run its next turn. Not where it runs
- * already, nor a full, signed-out or turned-off account (the planner ranks those last, as full).
+ * What pressing an account's row does. Pressing an account means "run this agent there", so it
+ * moves there now (`use`). Where it can't go (signed out, turned off, full for its model) or has
+ * nothing to do (it runs there and stays), the panel says so instead (`say`); `refused` shakes the
+ * row. `leaving`: the session runs on its account but is set to move elsewhere, so pressing that
+ * account keeps it there.
  */
-export function canUse(row: Pick<AgentAccountRow, "now" | "full">): boolean {
-  return !row.now && !row.full;
+export type RowPress = { kind: "use" } | { kind: "say"; message: string; refused: boolean };
+
+export function rowPress(row: Pick<AgentAccountRow, "label" | "now" | "closed" | "off" | "meta">, leaving: boolean, modelShort: string): RowPress {
+  if (row.off) return { kind: "say", refused: true, message: `${row.label} is ${row.off}` };
+  if (row.closed) {
+    // The wait when known ("2h 28m"), else for what it is full.
+    const back = /\d/.test(row.meta) ? ` · back in ${row.meta}` : ` for ${modelShort}`;
+    return { kind: "say", refused: true, message: `${row.label} is full${back}` };
+  }
+  if (row.now && !leaving) return { kind: "say", refused: false, message: `Already on ${row.label}` };
+  return { kind: "use" };
 }
 
-/** What moving the agent to `label` came to, as the panel says it once the server answers. */
-export function describeUse(label: string, summary: Pick<ReopenSummary, "reopened" | "deferred" | "failed" | "continuedIn">): string {
-  if (summary.continuedIn) return `Continuing in “${summary.continuedIn.title}” on ${label}`;
-  if (summary.reopened.length > 0) return `Now on ${label}`;
-  if (summary.deferred.length > 0) return `Moves to ${label} once this turn ends`;
-  if (summary.failed.length > 0) return `Moves to ${label} when its session restarts`;
-  return `Runs on ${label}`;
+type UseSummary = Pick<ReopenSummary, "reopened" | "deferred" | "failed" | "continuedIn">;
+
+/**
+ * What moving the agent to `label` came to, once the server answers: `sentence` for the toast, and
+ * `short` for the panel's top line, which has room for little. `staying`: it was asked to stay on
+ * the account it runs on.
+ */
+export function describeUse(label: string, summary: UseSummary, staying = false): { sentence: string; short: string } {
+  if (summary.continuedIn) return { sentence: `Continuing in “${summary.continuedIn.title}” on ${label}`, short: "Continues in a new agent" };
+  if (summary.reopened.length > 0) return { sentence: `Now on ${label}`, short: `Now on ${label}` };
+  if (summary.deferred.length > 0) return { sentence: `Moves to ${label} once this turn ends`, short: `On ${label} after this turn` };
+  if (summary.failed.length > 0) return { sentence: `Moves to ${label} when its session restarts`, short: `On ${label} at next restart` };
+  const done = staying ? `Stays on ${label}` : `Runs on ${label}`;
+  return { sentence: done, short: done };
 }
 
 /** Checks or unchecks an account; the last checked one stays. Null: refused. */

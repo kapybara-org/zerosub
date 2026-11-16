@@ -20,10 +20,10 @@ import { FAMILY_LABEL, OTHER_FAMILY, type AccountView, type Family } from "../sh
 import { setAgentAccount, setAgentAccounts, useOthersOnce } from "../shared/rpc";
 import {
   agentPlan,
-  canUse,
   describeUse,
   draftOf,
   moved,
+  rowPress,
   smartOrder,
   detailReason,
   spokenDetails,
@@ -34,6 +34,7 @@ import {
   type AgentDraft,
   type AgentPlan,
   type NextTurn,
+  type RowPress,
 } from "./agent-plan";
 import type { TrackedAgent } from "./agent-account";
 import { forkPopover } from "./fork-confirm";
@@ -233,6 +234,7 @@ export function agentAccounts(
     }
 
     const shown = plan.checked.map((row) => row.id);
+    // The check alone checks or unchecks; the row itself means "run it there" (`onPressRow`).
     const onToggle = (id: string) => {
       const next = toggled(draft, id);
       if (!next) {
@@ -241,6 +243,7 @@ export function agentAccounts(
         return;
       }
       change(next);
+      say(`${next.pool.includes(id) ? "Checked" : "Unchecked"} ${labelOf(accounts, id)}`);
     };
     const onMove = (id: string, index: number) => {
       const next = moved(draft, shown, id, index);
@@ -281,10 +284,32 @@ export function agentAccounts(
       const next = draft.pool.includes(id) ? draft : (toggled(draft, id) ?? draft);
       if (next !== draft) setLocal(next);
       const label = labelOf(accounts, id);
+      const staying = id === plan.nowOn.id;
+      say(staying ? `Keeping ${label}…` : `Moving to ${label}…`);
       store
         .rpc(setAgentAccount, { agentId, accountId: id, accounts: unsent || next !== draft ? next : undefined })
-        .then((summary) => toast.show(describeUse(label, summary), { variant: "success", durationMs: 3_000 }))
-        .catch((error: unknown) => toast.error(error instanceof Error ? error.message : `Could not move this agent to ${label}.`));
+        .then((summary) => {
+          const done = describeUse(label, summary, staying);
+          say(done.short);
+          toast.show(done.sentence, { variant: "success", durationMs: 3_000 });
+          return undefined;
+        })
+        .catch((error: unknown) => {
+          setHint(null);
+          toast.error(error instanceof Error ? error.message : `Could not move this agent to ${label}.`);
+        });
+    };
+    // The session runs on one account but is set to move to another: pressing the first keeps it.
+    const leaving = route?.pendingAccountId != null && route.pendingAccountId !== route.accountId;
+    const pressOf = (row: AgentAccountRow): RowPress => rowPress(row, leaving, plan.modelShort);
+    const onPressRow = (row: AgentAccountRow) => {
+      const press = pressOf(row);
+      if (press.kind === "use") {
+        onUse(row.id);
+        return;
+      }
+      if (press.refused) setShakeId({ id: row.id, at: Date.now() });
+      say(press.message);
     };
     const onUndo = () => {
       if (!undo) return;
@@ -350,7 +375,8 @@ export function agentAccounts(
           panelHeight={panelHeight}
           onToggle={onToggle}
           onMove={onMove}
-          onUse={onUse}
+          pressOf={pressOf}
+          onPressRow={onPressRow}
         />
         {quiet ? null : (
           <Status
@@ -541,7 +567,8 @@ function AccountList({
   panelHeight,
   onToggle,
   onMove,
-  onUse,
+  pressOf,
+  onPressRow,
 }: {
   theme: Theme;
   plan: AgentPlan;
@@ -553,8 +580,10 @@ function AccountList({
   panelHeight: number;
   onToggle(id: string): void;
   onMove(id: string, index: number): void;
-  /** Moves the agent to this account now. */
-  onUse(id: string): void;
+  /** What pressing a row would do, so hovering it can say so. */
+  pressOf(row: AgentAccountRow): RowPress;
+  /** The row itself was pressed (not its check): run the agent there, or say why not. */
+  onPressRow(row: AgentAccountRow): void;
 }) {
   const rowH = size.row;
   const motions = useRef(new Map<string, Motion>()).current;
@@ -690,7 +719,8 @@ function AccountList({
           shakeAt={shake?.id === row.id ? shake.at : 0}
           peek={peeks(row.id)}
           onToggle={() => onToggle(row.id)}
-          onUse={canUse(row) ? () => onUse(row.id) : undefined}
+          onPress={() => onPressRow(row)}
+          useLabel={pressOf(row).kind === "use" ? (row.now ? "Stay here" : "Use now") : null}
           onDrag={(over) => {
             if (over !== null && drag === null) peeks(row.id).hide();
             setDrag(over === null ? null : { id: row.id, over });
@@ -903,7 +933,7 @@ interface Live {
 
 /**
  * Lifts a checked row and carries it. "row": the whole row, once a press moves a few points up or
- * down (a still click toggles it). "handle": a handle that takes the touch at once and lifts after
+ * down (a still click presses it). "handle": a handle that takes the touch at once and lifts after
  * a long press, so the sheet still scrolls under a finger that only passes.
  */
 function dragResponder(motion: Motion, live: { current: Live }, mode: "row" | "handle") {
@@ -990,7 +1020,8 @@ function AccountRowView({
   shakeAt,
   peek,
   onToggle,
-  onUse,
+  onPress,
+  useLabel,
   onDrag,
   onDrop,
   onStep,
@@ -1007,9 +1038,12 @@ function AccountRowView({
   lifted: boolean;
   shakeAt: number;
   peek: Peek;
+  /** Its check was pressed. */
   onToggle(): void;
-  /** Moves the agent here now; absent where it can't go (it runs here, or the account is full or off). */
-  onUse?: () => void;
+  /** The row was pressed: run the agent here, or say why not. */
+  onPress(): void;
+  /** What pressing the row does, said at its right while the pointer is on it ("Use now"); null: nothing to offer. */
+  useLabel: string | null;
   onDrag(over: number | null): void;
   onDrop(over: number): void;
   onStep(delta: -1 | 1): void;
@@ -1033,19 +1067,35 @@ function AccountRowView({
   const onSettled = () => {
     droppedAt.current = Date.now();
   };
+  // The pointer on the check: the check lights up, not the row, and the row says what it does.
+  const [onCheck, setOnCheck] = useState(false);
+  const notJustDropped = () => Date.now() - droppedAt.current > DROP_CLICK_MS;
+  // The check's target runs from the row's edge to the glyph: a finger gets 44 points across.
+  const checkReach = compact ? 44 - size.pad - size.check : size.gap - 2;
   const live = useRef<Live>({ index, count, rowH, compact, reduceMotion, onDrag, onDrop, onSettled });
   live.current = { index, count, rowH, compact, reduceMotion, onDrag, onDrop, onSettled };
   // A mouse carries the whole row; a finger, the handle.
   const byRow = useMemo(() => dragResponder(motion, live, "row"), [motion]);
   const byHandle = useMemo(() => dragResponder(motion, live, "handle"), [motion]);
 
+  type KeyEvent = { key?: string; repeat?: boolean; nativeEvent?: { key?: string; repeat?: boolean }; preventDefault?(): void };
   const keys = {
-    onKeyDown: (event: { key?: string; nativeEvent?: { key?: string }; preventDefault?(): void }) => {
+    onKeyDown: (event: KeyEvent) => {
       const key = event.key ?? event.nativeEvent?.key;
       if (movable && (key === "ArrowUp" || key === "ArrowDown")) {
         event.preventDefault?.();
         onStep(key === "ArrowUp" ? -1 : 1);
       }
+    },
+  };
+  // A checkbox takes the space bar (a web pressable only answers Enter on one), and the arrows like its row.
+  const checkKeys = {
+    onKeyDown: (event: KeyEvent) => {
+      const key = event.key ?? event.nativeEvent?.key;
+      if (key === " " || key === "Spacebar") {
+        event.preventDefault?.();
+        if (!(event.repeat ?? event.nativeEvent?.repeat)) onToggle();
+      } else keys.onKeyDown(event);
     },
   };
 
@@ -1064,13 +1114,11 @@ function AccountRowView({
     >
       <Pressable
         {...(keys as object)}
-        accessibilityRole="checkbox"
-        accessibilityState={{ checked }}
-        aria-checked={checked}
-        accessibilityLabel={`Use ${row.label} for this agent${row.now ? ", runs here now" : ""}`}
-        accessibilityHint={spokenDetails(row) || undefined}
+        accessibilityRole="button"
+        accessibilityLabel={`${row.label}${row.now ? ", runs this agent now" : ""}${checked ? "" : ", not checked"}`}
+        accessibilityHint={[useLabel ? `Moves this agent to ${row.label} now` : "", spokenDetails(row)].filter(Boolean).join(". ") || undefined}
         accessibilityActions={[
-          ...(onUse ? [{ name: "useNow", label: "Use now" }] : []),
+          { name: "toggle", label: checked ? `Uncheck ${row.label}` : `Check ${row.label}` },
           ...(movable
             ? [
                 { name: "moveUp", label: "Move up" },
@@ -1080,7 +1128,7 @@ function AccountRowView({
         ]}
         onAccessibilityAction={(event) => {
           const action = event.nativeEvent.actionName;
-          if (action === "useNow") onUse?.();
+          if (action === "toggle") onToggle();
           else if (action === "moveUp") onStep(-1);
           else if (action === "moveDown") onStep(1);
         }}
@@ -1093,56 +1141,107 @@ function AccountRowView({
         onLongPress={compact ? peek.show : undefined}
         onPressOut={compact ? peek.hide : undefined}
         onPress={() => {
-          if (Date.now() - droppedAt.current > DROP_CLICK_MS) onToggle();
+          if (notJustDropped()) onPress();
         }}
         style={{ flex: 1 }}
       >
-        {({ hovered, pressed }: { pressed: boolean; hovered?: boolean }) => (
-          <View
-            style={{
-              flex: 1,
-              flexDirection: "row",
-              alignItems: "center",
-              gap: size.gap,
-              paddingLeft: size.pad,
-              paddingRight: compact ? 0 : size.pad,
-              borderRadius: 7,
-              backgroundColor: lifted ? colors.surface0 : pressed ? colors.surface2 : hovered ? withAlpha(colors.surface2, 0.7) : withAlpha(colors.surface2, 0),
-              ...({ boxShadow: lifted ? "0px 8px 24px rgba(0, 0, 0, 0.12), 0px 0px 0px 0.5px rgba(0, 0, 0, 0.06)" : "none" } as object),
-              ...FADE,
-            }}
-          >
-            <Check theme={theme} size={size.check} checked={checked} hovered={hovered === true} reduceMotion={reduceMotion} />
-            <View style={{ opacity: checked ? 1 : 0.5 }}>
-              <Glyph theme={theme} kind={row.glyph.kind} usedPercent={row.glyph.usedPercent} tone={row.glyph.tone} dashed={row.glyph.dashed} size={size.glyph} color={colors.foregroundMuted} />
-            </View>
-            <View style={{ flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 7 }}>
-              <Text numberOfLines={1} style={{ flexShrink: 1, color: checked ? colors.foreground : colors.foregroundMuted, fontSize: size.text }}>
-                {row.label}
-              </Text>
-              {row.now ? <View style={{ width: 5, height: 5, borderRadius: 2.5, backgroundColor: colors.accent }} /> : null}
-            </View>
-            {/* A mouse on the row offers to move the agent there now, in place of the figure the details repeat. */}
-            {onUse && hovered && !compact && !lifted ? (
-              <TextButton theme={theme} size={size} label="Use now" spoken={`Move this agent to ${row.label} now`} onPress={onUse} />
-            ) : (
-              <Text style={{ color: colors.foregroundMuted, fontSize: size.small, fontVariant: TABULAR, opacity: checked ? 1 : 0.7 }}>{row.meta}</Text>
-            )}
-            {compact && movable ? (
-              <View
-                {...byHandle.panHandlers}
-                accessible={false}
-                importantForAccessibility="no-hide-descendants"
-                style={{ width: size.grip, height: rowH, alignItems: "center", justifyContent: "center", opacity: lifted ? 0.8 : 0.4 }}
-              >
-                <Icon name="GripVertical" size={16} color={colors.foregroundMuted} />
+        {({ hovered, pressed }: { pressed: boolean; hovered?: boolean }) => {
+          const onRow = hovered === true;
+          // On the check, what the check does; elsewhere on the row, what the row does; else the figure.
+          const aside = compact || lifted ? null : onCheck ? (checked ? "Uncheck" : "Check") : onRow ? useLabel : null;
+          return (
+            <View
+              style={{
+                flex: 1,
+                flexDirection: "row",
+                alignItems: "center",
+                gap: size.gap,
+                paddingLeft: size.pad,
+                paddingRight: compact ? 0 : size.pad,
+                borderRadius: 7,
+                backgroundColor: lifted ? colors.surface0 : pressed ? colors.surface2 : onRow ? withAlpha(colors.surface2, 0.7) : withAlpha(colors.surface2, 0),
+                ...({ boxShadow: lifted ? "0px 8px 24px rgba(0, 0, 0, 0.12), 0px 0px 0px 0.5px rgba(0, 0, 0, 0.06)" : "none" } as object),
+                ...FADE,
+              }}
+            >
+              {/* The check's place: it lies over the row, since a button can't hold another control. */}
+              <View style={{ width: size.check }} />
+              <View style={{ opacity: checked ? 1 : 0.5 }}>
+                <Glyph theme={theme} kind={row.glyph.kind} usedPercent={row.glyph.usedPercent} tone={row.glyph.tone} dashed={row.glyph.dashed} size={size.glyph} color={colors.foregroundMuted} />
               </View>
-            ) : compact ? (
-              // Keeps the figures of unchecked rows in line with the checked ones'.
-              <View style={{ width: size.grip }} />
-            ) : null}
-          </View>
-        )}
+              <View style={{ flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 7 }}>
+                <Text numberOfLines={1} style={{ flexShrink: 1, color: checked ? colors.foreground : colors.foregroundMuted, fontSize: size.text }}>
+                  {row.label}
+                </Text>
+                {row.now ? <View style={{ width: 5, height: 5, borderRadius: 2.5, backgroundColor: colors.accent }} /> : null}
+              </View>
+              {aside ? (
+                <Text numberOfLines={1} style={{ color: colors.foreground, fontSize: size.small, fontWeight: "500" }}>
+                  {aside}
+                </Text>
+              ) : (
+                <Text style={{ color: colors.foregroundMuted, fontSize: size.small, fontVariant: TABULAR, opacity: checked ? 1 : 0.7 }}>{row.meta}</Text>
+              )}
+              {compact && movable ? (
+                <View
+                  {...byHandle.panHandlers}
+                  accessible={false}
+                  importantForAccessibility="no-hide-descendants"
+                  style={{ width: size.grip, height: rowH, alignItems: "center", justifyContent: "center", opacity: lifted ? 0.8 : 0.4 }}
+                >
+                  <Icon name="GripVertical" size={16} color={colors.foregroundMuted} />
+                </View>
+              ) : compact ? (
+                // Keeps the figures of unchecked rows in line with the checked ones'.
+                <View style={{ width: size.grip }} />
+              ) : null}
+            </View>
+          );
+        }}
+      </Pressable>
+      <Pressable
+        {...(checkKeys as object)}
+        accessibilityRole="checkbox"
+        accessibilityState={{ checked }}
+        aria-checked={checked}
+        accessibilityLabel={`Let this agent use ${row.label}`}
+        // The row's details stay open on its check.
+        onHoverIn={() => {
+          setOnCheck(true);
+          peek.enter();
+        }}
+        onHoverOut={() => {
+          setOnCheck(false);
+          peek.leave();
+        }}
+        onPressIn={peek.hide}
+        onPress={() => {
+          if (notJustDropped()) onToggle();
+        }}
+        style={{
+          position: "absolute",
+          left: 0,
+          top: 0,
+          bottom: 0,
+          width: size.pad + size.check + checkReach,
+          justifyContent: "center",
+          paddingLeft: size.pad,
+        }}
+      >
+        <View
+          style={{
+            width: size.check + 10,
+            height: size.check + 10,
+            margin: -5,
+            borderRadius: (size.check + 10) / 2,
+            alignItems: "center",
+            justifyContent: "center",
+            backgroundColor: onCheck ? withAlpha(colors.foreground, 0.07) : withAlpha(colors.foreground, 0),
+            ...FADE,
+          }}
+        >
+          <Check theme={theme} size={size.check} checked={checked} hovered={onCheck} reduceMotion={reduceMotion} />
+        </View>
       </Pressable>
     </Animated.View>
   );

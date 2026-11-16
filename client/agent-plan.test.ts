@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { formatResetMoment } from "../shared/format";
 import type { AccountView, AgentRoute, StateView, UsageWindow } from "../shared/model";
-import { agentPlan, canUse, describeUse, detailReason, draftOf, moved, smartOrder, spokenDetails, statusLine, toggled } from "./agent-plan";
+import { agentPlan, describeUse, detailReason, draftOf, moved, rowPress, smartOrder, spokenDetails, statusLine, toggled } from "./agent-plan";
 
 const NOW = Date.parse("2026-11-14T12:00:00Z");
 const IN_2H = "2026-11-14T14:00:00Z";
@@ -201,17 +201,32 @@ describe("editing an agent's accounts", () => {
 });
 
 describe("using an account now", () => {
-  it("offers every account the agent can run on next, but not the one it runs on", () => {
+  it("moves the agent where a row is pressed, and says why not where it can't go", () => {
     const stopped = account("stopped", [fiveHour(100), weekly(40)], { isDefault: true, kind: "main" });
     const free = account("free", [fiveHour(5), weekly(30)]);
+    const short = account("short", [fiveHour(97), weekly(30)]);
     const out = account("out", [], { status: "signed_out" });
     const off = account("off", [fiveHour(0), weekly(0)], { status: "disabled" });
-    const s = state([stopped, free, out, off], [route("stopped", { model: "claude-opus-5-5" })]);
-    const r = s.agents[0];
-    const draft = { pool: ["free"], mode: "manual" as const, order: ["free", "stopped", "out", "off"], overflow: "wait" as const };
-    const plan = agentPlan(s, r, "claude", "claude-opus-5-5", draft, true, NOW)!;
-    const offered = [...plan.checked, ...plan.others].filter(canUse).map((row) => row.id);
-    expect(offered).toEqual(["free"]);
+    const s = state([stopped, free, short, out, off], [route("stopped", { model: OPUS })]);
+    const draft = { pool: ["free"], mode: "manual" as const, order: ["free", "stopped", "short", "out", "off"], overflow: "wait" as const };
+    const plan = agentPlan(s, s.agents[0], "claude", OPUS, draft, true, NOW)!;
+    const press = Object.fromEntries([...plan.checked, ...plan.others].map((row) => [row.id, rowPress(row, false, plan.modelShort)]));
+    expect(press.free).toEqual({ kind: "use" });
+    // Running short is no wall: asked for, it still takes the agent.
+    expect([...plan.checked, ...plan.others].find((row) => row.id === "short")).toMatchObject({ full: true, closed: false });
+    expect(press.short).toEqual({ kind: "use" });
+    const stoppedPress = press.stopped;
+    expect(stoppedPress).toMatchObject({ kind: "say", refused: true });
+    expect(stoppedPress?.kind === "say" ? stoppedPress.message : "").toMatch(/^stopped is full · back in \S/);
+    expect(press.out).toEqual({ kind: "say", refused: true, message: "out is signed out" });
+    expect(press.off).toEqual({ kind: "say", refused: true, message: "off is turned off" });
+  });
+
+  it("keeps the agent on its account when pressed, only if it was set to leave it", () => {
+    const here = { label: "work", now: true, closed: false, off: null, meta: "40%" };
+    expect(rowPress(here, false, "Fable")).toEqual({ kind: "say", refused: false, message: "Already on work" });
+    expect(rowPress(here, true, "Fable")).toEqual({ kind: "use" });
+    expect(rowPress({ ...here, closed: true, meta: "Full" }, true, "Fable")).toEqual({ kind: "say", refused: true, message: "work is full for Fable" });
   });
 
   it("offers the better account instead of announcing it when automatic switching is off", () => {
@@ -226,12 +241,20 @@ describe("using an account now", () => {
     expect(statusLine({ kind: "stay", on: "work", detail: "" }, true, label).offer).toBeNull();
   });
 
-  it("says where the agent went", () => {
+  it("says where the agent went, in a sentence and in a few words", () => {
     const none = { reopened: [], deferred: [], failed: [], continuedIn: null };
-    expect(describeUse("home", { ...none, reopened: ["agent"] })).toBe("Now on home");
-    expect(describeUse("home", { ...none, deferred: ["agent"] })).toBe("Moves to home once this turn ends");
-    expect(describeUse("home", { ...none, failed: [{ agentId: "agent", error: "x" }] })).toBe("Moves to home when its session restarts");
-    expect(describeUse("home", none)).toBe("Runs on home");
-    expect(describeUse("home", { ...none, continuedIn: { agentId: "b", title: "Fix" } })).toBe("Continuing in “Fix” on home");
+    expect(describeUse("home", { ...none, reopened: ["agent"] })).toEqual({ sentence: "Now on home", short: "Now on home" });
+    expect(describeUse("home", { ...none, deferred: ["agent"] })).toEqual({ sentence: "Moves to home once this turn ends", short: "On home after this turn" });
+    expect(describeUse("home", { ...none, failed: [{ agentId: "agent", error: "x" }] })).toEqual({
+      sentence: "Moves to home when its session restarts",
+      short: "On home at next restart",
+    });
+    expect(describeUse("home", none).sentence).toBe("Runs on home");
+    expect(describeUse("work", none, true).short).toBe("Stays on work");
+    expect(describeUse("home", { ...none, continuedIn: { agentId: "b", title: "Fix" } }).sentence).toBe("Continuing in “Fix” on home");
+    // The panel's top line has room for about thirty characters.
+    for (const summary of [{ ...none, deferred: ["a"] }, { ...none, failed: [{ agentId: "a", error: "x" }] }, { ...none, continuedIn: { agentId: "b", title: "x" } }]) {
+      expect(describeUse("personal", summary).short.length).toBeLessThanOrEqual(30);
+    }
   });
 });
