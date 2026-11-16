@@ -790,6 +790,8 @@ describe("forking to the other provider", () => {
       onModes?: (provider: string) => void;
       send?: (id: string, text: string, messageId: string | undefined) => void;
       createdStatus?: string;
+      /** Paseo 0.9.1 to 0.10.3: refreshing an agent it doesn't know throws instead of answering null. */
+      unknownThrows?: boolean;
     } = {};
     await store.update((draft) =>
       Object.assign(draft, {
@@ -889,6 +891,7 @@ describe("forking to the other provider", () => {
         ref: (id: string) => ({
           refresh: async () => {
             hooks.onRefresh?.(id);
+            if (hooks.unknownThrows && !byId.has(id)) throw new Error(`Agent not found: ${id}`);
             return { agent: byId.get(id) ?? null };
           },
           send: async (text: string, options: { messageId?: string } = {}) => {
@@ -1290,6 +1293,18 @@ describe("forking to the other provider", () => {
       expect(setup.sends).toHaveLength(1);
       expect(setup.sends[0]!.messageId).toBe(RESERVED.messageId);
       expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
+    });
+
+    it("retries a lost create on Paseo 0.9.1 to 0.10.3, where refreshing the absent target throws", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      setup.hooks.unknownThrows = true;
+      await setup.store.update((draft) => {
+        draft.opencodeForks[AGENT] = reservedCreation();
+      });
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.agentId).toBe(RESERVED.targetId);
+      expect(setup.created).toHaveLength(1);
+      expect(setup.sends.map((send) => send.messageId)).toEqual([RESERVED.messageId]);
     });
 
     it("retries a failed create with a new model pick and a renamed source, under the same target ID", async () => {
@@ -1757,6 +1772,20 @@ describe("forking to the other provider", () => {
       expect(record.pending).toBeUndefined();
     });
 
+    it("continues on OpenCode again once the fork of an unconfirmed send is gone on Paseo 0.9.1 to 0.10.3", async () => {
+      const sent = "The reserved initial handoff.\nzerosub transfer zerosub-handoff-m1";
+      const setup = await setUpReuse(
+        {},
+        seededPending({ stage: "sending", targetId: RESERVED.targetId, messageId: "zerosub-handoff-m1", seen: MARK, sentDigest: digestOf(sent) }),
+      );
+      setup.hooks.unknownThrows = true;
+      setup.byId.delete(RESERVED.targetId);
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("sent");
+      expect(done.agentId).not.toBe(RESERVED.targetId);
+      expect(setup.created).toHaveLength(1);
+    });
+
     it("reuses the same message ID when an update's acknowledgement was lost", async () => {
       const sent = "The update text.\nzerosub transfer zerosub-handoff-u1";
       const setup = await setUpReuse(
@@ -2189,6 +2218,19 @@ describe("forking to the other provider", () => {
       await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/already continued in “Fix the build \(continued on ChatGPT\)”/);
       expect(setup.created).toHaveLength(1);
       expect(setup.sends).toHaveLength(0);
+    });
+
+    it("forks to ChatGPT after a failed OpenCode create on Paseo 0.9.1 to 0.10.3, where refreshing the absent target throws", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: { autoSwitch: false } });
+      setup.hooks.unknownThrows = true;
+      const paseo = setup.paseo as { workspaces: { ref: unknown } };
+      const workspaces = paseo.workspaces.ref;
+      paseo.workspaces.ref = () => ({ agents: { create: async () => { throw new Error("OpenCode couldn't start"); } } });
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/couldn't start/);
+      paseo.workspaces.ref = workspaces;
+      await setup.service.forkAgent(setup.paseo, AGENT);
+      expect(setup.created.map((agent) => agent.config.provider.split("/")[0])).toEqual(["codex"]);
+      expect((await setup.store.read()).opencodeForks[AGENT]).toBeUndefined();
     });
 
     it("keeps an OpenCode reservation when a later ChatGPT fork is refused before it starts", async () => {

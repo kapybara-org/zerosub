@@ -64,8 +64,17 @@ function chainOf(state: StoredState, agentId: string): string | undefined {
   return Object.keys(state.continuations).find((id) => state.continuations[id]?.members[agentId]);
 }
 
-async function snapshot(paseo: PaseoApi, agentId: string): Promise<Agent | undefined> {
-  return (await paseo.agents.ref(agentId).refresh())?.agent;
+/**
+ * The agent, or undefined when Paseo doesn't know it. Paseo 0.9.1 to 0.10.3 throw "Agent not found"
+ * for an unknown ID where later versions answer null; any other error still throws.
+ */
+export async function snapshot(paseo: PaseoApi, agentId: string): Promise<Agent | undefined> {
+  try {
+    return (await paseo.agents.ref(agentId).refresh())?.agent ?? undefined;
+  } catch (error) {
+    if (error instanceof Error && /Agent not found/.test(error.message)) return undefined;
+    throw error;
+  }
 }
 
 /** Commit exactly the reserved context, whether the acknowledgement arrived normally or on retry. */

@@ -47,7 +47,7 @@ import {
 import { FamilyResolver } from "./families";
 import { sameAccountIdentity, withoutWorkspace } from "./account-identity";
 import { codexHandoffMode, encryptedResumeFailure, sameWorkspace, turnFailedText } from "./codex-same-conversation";
-import { CodexContinuations, MESSAGE_PREFIX, UnresolvableEpochError, fitInstructions, matchesTransfer, readUpdates, ready, sentDigestOf, transferMarker, waitForCreated, waitForSource, type Agent } from "./continuations";
+import { CodexContinuations, MESSAGE_PREFIX, UnresolvableEpochError, fitInstructions, matchesTransfer, readUpdates, ready, sentDigestOf, snapshot, transferMarker, waitForCreated, waitForSource, type Agent } from "./continuations";
 import { CONTINUED_FROM_LABEL, PARENT_LABEL, buildTranscript, continueInNewAgent, continuationPrompt, updatePrompt, type Continuation } from "./handoff";
 import { PI_ACCOUNT_FILE, codexSessionsShared, crossesInheritedProxy, isAccountHome, moveHome, normalizeBaseUrl, plainHttp, readPiAccount, readPiAccountForAgents, removeHome, sentInTheClear } from "./homes";
 import { launcherDir, launcherNames, piLauncherDir, writeLaunchers, type LauncherAccount, type LauncherKind } from "./launchers";
@@ -1870,7 +1870,7 @@ export class Service {
     // or whose fork was archived, is dropped here: nothing more is ever sent to it without its record.
     const reservation = state.opencodeForks[agentId]?.pending;
     if (reservation) {
-      const target = (await paseo.agents.ref(reservation.targetId).refresh())?.agent;
+      const target = await snapshot(paseo, reservation.targetId);
       if (target && !target.archivedAt) return { skipped: alreadyContinued(forkRef(target)) };
     }
 
@@ -1957,7 +1957,7 @@ export class Service {
     );
     if (!available) return { skipped: `${OPENCODE_LABEL} isn't available in Paseo on this host.` };
 
-    const first = (await paseo.agents.ref(agentId).refresh())?.agent;
+    const first = await snapshot(paseo, agentId);
     if (!first) throw new Error("That agent is no longer available.");
     // turn_ended can arrive just before the source reports idle: an automatic fork waits a moment,
     // refusing if a newer message arrives meanwhile.
@@ -1979,7 +1979,7 @@ export class Service {
       (await listAgents(paseo, false)).agents.find((agent) => agent.continuedFrom === agentId && agent.provider === OPENCODE_PROVIDER)?.id;
     if (!forkId) return this.createOpenCodeFork(paseo, agentId, original, source);
 
-    let fork = (await paseo.agents.ref(forkId).refresh())?.agent;
+    let fork = await snapshot(paseo, forkId);
     // Reconcile a reservation an earlier call left behind, before anything else happens.
     if (record?.pending) {
       const pending = record.pending;
@@ -2013,7 +2013,7 @@ export class Service {
       }
       if (pending.sentDigest !== undefined && (await this.hasReceipt(paseo, forkId, pending.messageId, pending.sentDigest))) {
         await this.settleOpenCode(agentId, pending.messageId);
-        fork = (await paseo.agents.ref(forkId).refresh())?.agent;
+        fork = await snapshot(paseo, forkId);
         record = (await this.store.read()).opencodeForks[agentId];
       } else {
         return this.openCodeUncertain(forkId, fork.title, pending.messageId);
@@ -2081,7 +2081,7 @@ export class Service {
     agentId: string,
     config?: OpenCodeCreateConfig,
   ): Promise<{ original: Agent; parentId: string | undefined } | undefined> {
-    const original = (await paseo.agents.ref(agentId).refresh())?.agent;
+    const original = await snapshot(paseo, agentId);
     if (!original || !ready(original)) return undefined;
     const parentId = await this.continuations.parentFor(paseo, agentId);
     if (config) {
@@ -2125,8 +2125,8 @@ export class Service {
     // The parent is resolved again after the catalog reads, then the snapshots come last.
     const parentId = await this.continuations.parentFor(paseo, agentId);
     const [original, fork] = await Promise.all([
-      paseo.agents.ref(agentId).refresh().then((result) => result?.agent),
-      paseo.agents.ref(forkId).refresh().then((result) => result?.agent),
+      snapshot(paseo, agentId),
+      snapshot(paseo, forkId),
     ]);
     if (!original || !ready(original)) return { refused: MOVED_REFUSAL };
     if (original.lastUserMessageAt !== source.original.lastUserMessageAt) return { refused: NEWER_REFUSAL };
@@ -2232,7 +2232,7 @@ export class Service {
       const since = await this.sourceSince(paseo, agentId, delta.mark);
       if (since === "newer") return { skipped: NEWER_REFUSAL };
       if (since !== "same") return this.openCodeFound(fork, since === "epoch" ? FOUND_DETAIL : HISTORY_GAP_DETAIL);
-      const now = (await paseo.agents.ref(agentId).refresh())?.agent;
+      const now = await snapshot(paseo, agentId);
       if (!now || !ready(now)) return { skipped: SOURCE_BUSY_REFUSAL };
       // A message that landed after the history read shows only in the source's own timestamp.
       if (now.lastUserMessageAt !== sourceAt) return { skipped: NEWER_REFUSAL };
