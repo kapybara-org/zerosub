@@ -16,6 +16,7 @@ import {
 } from "../shared/rpc";
 import { AddAccountModal } from "./add-account";
 import { ApiAccountModal } from "./api-account";
+import { ForkDestinationRows, OpenCodeForkRows } from "./fork-settings";
 import { AddPiAccountModal, ApiKeyModal, HomesHint, PiSectionNotes, ProxyModal, ShellHint, piCardDetails } from "./pi-accounts";
 import { ResetConfirm, redeemToast, resetBadge } from "./reset-confirm";
 import { describe, stoppedWaiting, useStore, VISIBLE_POLL_MS, type ZeroSubStore } from "./store";
@@ -828,11 +829,12 @@ function AutomationSettings({ theme }: { theme: Theme }) {
         />
         <SettingsSwitch
           label="When every account is out, fork the chat to the other provider"
-          hint="A stopped Claude chat carries on in a new ChatGPT agent, or the other way round, with the conversation so far. The new agent gets no more permissions than the original; the original stays as it was."
+          hint="A stopped Claude chat carries on in a new ChatGPT or OpenCode agent (pick the destination below) with the conversation so far. ChatGPT gets a mode no looser than this agent's. OpenCode gets Plan or Build under the host's own permission policy, which can allow more than Claude does. The original stays as it was."
           value={settings.values.forkOtherProvider}
           disabled={settings.saving || !settings.values.autoSwitch}
           onValueChange={(forkOtherProvider) => save({ forkOtherProvider })}
         />
+        <ForkDestinationRows values={settings.values} saving={settings.saving} onSave={save} />
         <SettingsSwitch
           label="Keep a Codex chat in the same conversation"
           hint="Off unless you turn it on. Two ChatGPT accounts in one workspace reload this agent on the other account instead of opening a new tab. A different workspace, an email-only account, or a workspace that is out of credits still opens a new tab. If the first turn cannot resume the thread, this agent goes back and the new tab opens."
@@ -840,6 +842,12 @@ function AutomationSettings({ theme }: { theme: Theme }) {
           disabled={settings.saving || !settings.values.autoSwitch}
           onValueChange={(codexSameConversation) => save({ codexSameConversation })}
         />
+      </SettingsCard>
+      <Text style={text.heading} accessibilityRole="header">
+        Continue on OpenCode
+      </Text>
+      <SettingsCard>
+        <OpenCodeForkRows values={settings.values} saving={settings.saving} onSave={save} />
       </SettingsCard>
       {settings.saveError ? <Text style={text.danger}>{settings.saveError}</Text> : null}
     </View>

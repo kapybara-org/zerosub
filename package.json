@@ -37,7 +37,9 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.server.json",
-    "test": "vitest run",
+    "guard:context": "node scripts/guard-context.mjs",
+    "guard:history": "node scripts/guard-context.mjs --history origin/main",
+    "test": "npm run guard:context && vitest run",
     "audit:mobile": "! grep -rnE \"\\\\b(document|window|localStorage|navigator)\\\\.|<(div|span|p|a|button|input|img|ul|ol|li|section|header|footer|main|nav|form|label|h[1-6]|table|tr|td|svg|path|br|hr)[ >/]|className=|onClick=\" client/"
   },
   "devDependencies": {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { equivalentMode } from "./modes";
+import { equivalentMode, withinMode } from "./modes";
 
 // As Paseo 0.9.1 lists them.
 const CLAUDE = [
@@ -36,5 +36,16 @@ describe("equivalentMode", () => {
     expect(equivalentMode(CLAUDE, null, CODEX)).toBeNull();
     expect(equivalentMode(CLAUDE, "mystery", CODEX)).toBeNull();
     expect(equivalentMode([{ id: "x" }], "x", CODEX)).toBeNull();
+  });
+});
+
+describe("withinMode", () => {
+  it("accepts the same or a more careful tier and refuses a broader or unknown one", () => {
+    expect(withinMode(CLAUDE, "bypassPermissions", CODEX, "full-access")).toBe(true);
+    expect(withinMode(CLAUDE, "bypassPermissions", CODEX, "auto")).toBe(true);
+    expect(withinMode(CLAUDE, "plan", CODEX, "auto")).toBe(false);
+    expect(withinMode(CLAUDE, "acceptEdits", CODEX, "full-access")).toBe(false);
+    expect(withinMode(CLAUDE, "bypassPermissions", CODEX, "mystery")).toBe(false);
+    expect(withinMode(CLAUDE, "mystery", CODEX, "auto")).toBe(false);
   });
 });
