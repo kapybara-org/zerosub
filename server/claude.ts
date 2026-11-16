@@ -70,6 +70,12 @@ export class ClaudeAdapter implements FamilyAdapter {
   private readonly renewing = new Map<string, Promise<Credentials | null>>();
   private readonly resetNotes = new Map<string, string>();
 
+  constructor() {
+    // Off macOS and Linux, which processes run on a home can't be told (see `eachProcessEnvironment`),
+    // so `homesInUse` isn't offered: the service then keeps the accounts in `homes/`, without an error.
+    if (process.platform !== "darwin" && process.platform !== "linux") Object.defineProperty(this, "homesInUse", { value: undefined });
+  }
+
   async env(home: string | null): Promise<EnvPatch> {
     // The CLI login's proxy set here, unless main's settings set one (see `mainProxyEnv`).
     if (!home) return { CLAUDE_CONFIG_DIR: null, CLAUDE_SECURESTORAGE_CONFIG_DIR: null, ...(await mainProxyEnv()) };

@@ -103,4 +103,16 @@ describe("which homes Claude Code runs on", () => {
     expect(homesInEnvironment(line(`CLAUDE_CONFIG_DIR=${homes[0]}/sub`), homes)).toEqual([]);
     expect(homesInEnvironment(line(`XCLAUDE_CONFIG_DIR=${homes[0]}`), homes)).toEqual([]);
   });
+
+  it("isn't asked where processes can't be listed, so accounts stay in homes/ there", () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    try {
+      for (const [name, offered] of [["darwin", true], ["linux", true], ["win32", false]] as const) {
+        Object.defineProperty(process, "platform", { ...platform, value: name });
+        expect(typeof new ClaudeAdapter().homesInUse === "function").toBe(offered);
+      }
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+    }
+  });
 });
