@@ -2311,7 +2311,8 @@ export class Service {
       return { skipped: "The saved OpenCode model is no longer in this host's catalog. Pick one in ZeroSub's settings." };
     }
     if (!model) return { skipped: `No OpenCode model is marked default on this host. Pick one in ZeroSub's settings.` };
-    const thinking = this.prefs.forkOpenCodeThinking;
+    // A "default" saved from Paseo 0.16's own Default option sends no variant, as the model default does.
+    const thinking = this.prefs.forkOpenCodeThinking === "default" ? "" : this.prefs.forkOpenCodeThinking;
     if (thinking && !model.thinkingOptions?.some((option) => option.id === thinking)) {
       return { skipped: `“${model.label}” no longer offers the saved thinking option. Pick one in ZeroSub's settings.` };
     }

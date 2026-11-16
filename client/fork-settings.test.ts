@@ -34,6 +34,7 @@ interface Row {
     label: string;
     hint?: string;
     disabled?: boolean;
+    value?: string;
     options?: Array<{ label: string; value: string }>;
     onValueChange?: (value: string) => void;
   };
@@ -75,6 +76,16 @@ describe("Paseo 0.16 thinking catalog", () => {
       { label: "Model default", value: "" },
       { label: "High", value: "high" },
     ]);
+  });
+
+  it("shows and keeps a saved Default as Model default", async () => {
+    const withDefault = { id: "opencode/glm-5p3-flash", label: "GLM 5.3 Flash", isDefault: true, thinkingOptions: [{ id: "default", label: "Default", isDefault: true }, { id: "high", label: "High" }] };
+    catalog = [withDefault, { ...withDefault, id: "opencode/kimi-k3", label: "Kimi K3", isDefault: false }];
+    const view = await render({ forkOpenCodeThinking: "default" });
+    expect(view.byLabel("OpenCode thinking").props.value).toBe("");
+    // Another model that also lists Default: the saved value becomes Model default rather than staying.
+    view.byLabel("OpenCode model").props.onValueChange!("opencode/kimi-k3");
+    expect(view.saved).toEqual([{ forkOpenCodeModel: "opencode/kimi-k3", forkOpenCodeThinking: "" }]);
   });
 });
 

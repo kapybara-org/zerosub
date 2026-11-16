@@ -1067,6 +1067,16 @@ describe("forking to the other provider", () => {
       forkOpenCodeThinking: "high",
     };
 
+    it("treats a saved Paseo 0.16 Default thinking option as the model default", async () => {
+      const catalog = [
+        { id: "opencode/glm-5p3-flash", label: "GLM 5.3 Flash", isDefault: true, thinkingOptions: [{ id: "default", label: "Default", isDefault: true }, { id: "high", label: "High" }] },
+      ];
+      const { created, limitTurn } = await setUpFork("bypassPermissions", [], {}, [], { prefs: { ...PREFS, forkOpenCodeThinking: "default" }, catalog });
+      await limitTurn();
+      expect(created).toHaveLength(1);
+      expect(created[0]?.config).toEqual({ provider: "opencode/opencode/glm-5p3-flash", modeId: "build" });
+    });
+
     it("continues a stopped Claude chat on OpenCode with the saved model, thinking, and no account", async () => {
       const { store, created, notes, sends, limitTurn } = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
       await limitTurn();

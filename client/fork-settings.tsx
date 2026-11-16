@@ -99,6 +99,8 @@ export function OpenCodeForkRows({
   const saved = values.forkOpenCodeModel ? catalog.models.find((entry) => entry.id === values.forkOpenCodeModel) : undefined;
   // The model a fork would use: the saved one, else the one the host marks default. Never a guess.
   const model = values.forkOpenCodeModel ? saved : hostDefault;
+  // A "default" saved from Paseo 0.16's own Default option means Model default.
+  const thinking = values.forkOpenCodeThinking === "default" ? "" : values.forkOpenCodeThinking;
   const rows = [
     <SettingsSelect
       key="model"
@@ -119,7 +121,7 @@ export function OpenCodeForkRows({
       onValueChange={(forkOpenCodeModel) => {
         // A thinking option the newly chosen model doesn't offer can't stand.
         const next = forkOpenCodeModel ? catalog.models.find((entry) => entry.id === forkOpenCodeModel) : hostDefault;
-        const keep = next?.thinkingOptions?.some((option) => option.id === values.forkOpenCodeThinking);
+        const keep = next?.thinkingOptions?.some((option) => option.id === thinking);
         onSave(keep ? { forkOpenCodeModel } : { forkOpenCodeModel, forkOpenCodeThinking: "" });
       }}
     />,
@@ -133,7 +135,7 @@ export function OpenCodeForkRows({
             ? "How hard the model thinks on the fork. Empty uses the model's default."
             : `How hard the host default, “${model.label}”, thinks on the fork. Empty uses the model's default.`
       }
-      value={values.forkOpenCodeThinking}
+      value={thinking}
       options={[
         { label: "Model default", value: "" },
         ...pickable(model?.thinkingOptions).map((option) => ({ label: option.label, value: option.id })),
