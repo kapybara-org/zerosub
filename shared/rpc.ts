@@ -79,6 +79,23 @@ export const setAccountProxy = defineRpc({
 });
 
 /**
+ * Changes the folder added Claude accounts' homes are kept in (empty: the default, `~/.claude-config`);
+ * the accounts kept before move there. `moving`: how many are due to move.
+ */
+export const setClaudeHomesDir = defineRpc({
+  name: "zerosub.accounts.homes",
+  input: z.object({ dir: z.string().trim().max(1024) }),
+  output: z.object({ ok: z.literal(true), dir: z.string(), moving: z.number() }),
+});
+
+/** Adds a folder Claude Code is signed in with already as a Claude account, where it is. */
+export const importAccount = defineRpc({
+  name: "zerosub.accounts.import",
+  input: z.object({ path: z.string().trim().min(1).max(1024) }),
+  output: z.object({ accountId: z.string() }),
+});
+
+/**
  * Changes the folder added Pi accounts' homes are kept in (empty: the default, `~/.pi-config`); the
  * accounts kept before move there. `moving`: how many are due to move.
  */

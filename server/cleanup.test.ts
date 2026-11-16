@@ -43,7 +43,7 @@ class FakeLogin extends ProgressEmitter implements LoginHandle {
   }
 }
 
-async function setUp(state: Partial<StoredState>, options: { signedIn?: (home: string | null) => boolean; apiKey?: (home: string) => boolean } = {}) {
+async function setUp(state: Partial<StoredState>, options: { signedIn?: (home: string | null) => boolean; apiKey?: (home: string) => boolean; signingOut?: (store: StateStore) => Promise<void> } = {}) {
   const store = new StateStore(join(root, "zerosub", "state.json"));
   await store.update((draft) => Object.assign(draft, state));
   const loggedOut: string[] = [];
@@ -64,7 +64,10 @@ async function setUp(state: Partial<StoredState>, options: { signedIn?: (home: s
       logins.push(login);
       return login;
     },
-    logout: async (path: string) => void loggedOut.push(path),
+    logout: async (path: string) => {
+      loggedOut.push(path);
+      await options.signingOut?.(store);
+    },
     detectLimit: () => null,
     detectSignOut: () => null,
   };
@@ -106,6 +109,49 @@ describe("cleaning up homes", () => {
     await service.cleanUpHomes(paseo);
     expect(loggedOut).toEqual([home("claude-aaaaaaaaaaaa")]);
     expect(await exists(home("claude-aaaaaaaaaaaa"))).toBe(false);
+    expect((await store.read()).cleanup).toEqual({});
+  });
+
+  it.each([
+    ["an account uses it again", (draft: StoredState): void => void draft.accounts.push(account("claude-aaaaaaaaaaaa") as never)],
+    ["its entry is gone", (draft: StoredState): void => void delete draft.cleanup[home("claude-aaaaaaaaaaaa")]],
+  ] as const)("never signs out or deletes a home when, while it waited, %s", async (_, change) => {
+    await mkdir(home("claude-aaaaaaaaaaaa"), { recursive: true });
+    const { service, store, loggedOut } = await setUp({
+      cleanup: { [home("claude-aaaaaaaaaaaa")]: { family: "claude", accountId: "claude-aaaaaaaaaaaa", why: "removed", at: "x" } },
+      sessions: { "agent-1": { accountId: "claude-aaaaaaaaaaaa", family: "claude", openedAt: "x" } } as never,
+    });
+    // Asking Paseo whether the account's last agent still runs takes a while; the registry changes meanwhile.
+    const paseo = {
+      agents: {
+        list: async () => ({ entries: [], pageInfo: { hasMore: false, nextCursor: null } }),
+        ref: () => ({
+          refresh: async (): Promise<null> => {
+            await store.update(change);
+            return null;
+          },
+        }),
+      },
+    };
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    await service.cleanUpHomes(paseo as never);
+    expect(loggedOut).toEqual([]);
+    expect(await exists(home("claude-aaaaaaaaaaaa"))).toBe(true);
+  });
+
+  it("never deletes a home an account uses again by the time it's signed out", async () => {
+    await mkdir(home("claude-aaaaaaaaaaaa"), { recursive: true });
+    const { service, store, paseo } = await setUp(
+      { cleanup: { [home("claude-aaaaaaaaaaaa")]: { family: "claude", accountId: "claude-aaaaaaaaaaaa", why: "removed", at: "x" } } },
+      {
+        signingOut: async (store) => {
+          await store.update((draft) => void draft.accounts.push(account("claude-aaaaaaaaaaaa") as never));
+        },
+      },
+    );
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    await service.cleanUpHomes(paseo);
+    expect(await exists(home("claude-aaaaaaaaaaaa"))).toBe(true);
     expect((await store.read()).cleanup).toEqual({});
   });
 

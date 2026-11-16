@@ -156,6 +156,27 @@ export interface FamilyAdapter {
    * it (see `Service.placeHomes`). Providers that have it keep added accounts' homes outside `homes/`.
    */
   homesInUse?(homes: readonly string[]): Promise<Set<string>>;
+  /**
+   * Whether `home` holds an account's sign-in or key: what a folder made again by a sync, or by the
+   * CLI started on it, lacks. Tells which of two folders an interrupted move left is the account.
+   */
+  holdsAccount?(home: string): Promise<boolean>;
+  /**
+   * Before a home's folder moves from `from` to `to`: copies what the CLI keeps for it outside the
+   * folder (Claude's Keychain entry on macOS) to where it looks for `to`'s, and checks the copy.
+   * Nothing to do where the sign-in lives in the folder. Repeating it after it worked does nothing.
+   */
+  copyCredentials?(from: string, to: string): Promise<void>;
+  /**
+   * Undoes `copyCredentials` for a move that didn't happen: removes `to`'s copy, but only while it's
+   * the same as `from`'s, so an entry that was there before is never touched.
+   */
+  dropCopiedCredentials?(from: string, to: string): Promise<void>;
+  /**
+   * Once the account's home is saved as `to`: removes `from`'s copy, but only while `to` holds a
+   * sign-in of its own, so the account's login is never left nowhere. False when it left `from`'s.
+   */
+  dropOldCredentials?(from: string, to: string): Promise<boolean>;
   /** Looks for a subscription usage-limit failure in a finished turn. */
   detectLimit(event: TurnEvent): LimitHit | null;
   /** Looks for a turn that failed because the account's login is no longer valid. */

@@ -312,6 +312,8 @@ export const StateViewSchema = z.object({
   piLaunchers: z.string().nullable().default(null),
   /** The folder added Pi accounts' homes are kept in (`~/.pi-config`, say), and whether it's the default. */
   piHomes: z.object({ dir: z.string(), isDefault: z.boolean() }).nullable().default(null),
+  /** The folder added Claude accounts' homes are kept in (`~/.claude-config`, say), and whether it's the default. */
+  claudeHomes: z.object({ dir: z.string(), isDefault: z.boolean() }).nullable().default(null),
   showComposerPill: z.boolean(),
   /** Accounts at their limit are skipped, so agents can't be moved onto one by hand either. */
   autoSwitch: z.boolean().default(true),

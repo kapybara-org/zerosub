@@ -27,7 +27,7 @@ const BLANK_ANTHROPIC = {
   ANTHROPIC_SERVICE_ACCOUNT_ID: "",
   ANTHROPIC_WORKSPACE_ID: "",
 };
-const SAVED = ["PASEO_HOME", "ZEROSUB_PI_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID", "ANTHROPIC_IDENTITY_TOKEN_FILE", "ANTHROPIC_SERVICE_ACCOUNT_ID", "ANTHROPIC_WORKSPACE_ID", "OPENROUTER_API_KEY", "QWEN_TOKEN_PLAN_API_KEY", "QWEN_TOKEN_PLAN_TEAM_API_KEY", "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "NO_PROXY", "no_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] as const;
+const SAVED = ["PASEO_HOME", "ZEROSUB_PI_DIR", "ZEROSUB_LAUNCHER_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID", "ANTHROPIC_IDENTITY_TOKEN_FILE", "ANTHROPIC_SERVICE_ACCOUNT_ID", "ANTHROPIC_WORKSPACE_ID", "OPENROUTER_API_KEY", "QWEN_TOKEN_PLAN_API_KEY", "QWEN_TOKEN_PLAN_TEAM_API_KEY", "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "NO_PROXY", "no_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] as const;
 
 let root: string;
 let main: string;
@@ -45,6 +45,8 @@ beforeEach(async () => {
   process.env.PASEO_HOME = join(root, "paseo");
   // Never ~/.pi-config: added accounts' folders and scripts are kept there.
   process.env.ZEROSUB_PI_DIR = join(root, "pi-config");
+  // Never ~/.claude-config either: added Claude accounts' scripts go there.
+  process.env.ZEROSUB_LAUNCHER_DIR = join(root, "claude-config");
   await mkdir(join(main, "sessions"), { recursive: true });
   await mkdir(join(main, "extensions"), { recursive: true });
   await writeFile(join(main, "settings.json"), JSON.stringify({ defaultProvider: "anthropic" }));
@@ -1020,6 +1022,8 @@ describe("Pi accounts in the service", () => {
       expect(findAccount(state, moved)?.home).toBe(movedTo);
       expect(findAccount(state, stayed)?.home).toBe(join(homes, stayed));
       expect(state.moves).toEqual({});
+      // Finished before anything synced the homes, so the old folder wasn't made again, empty.
+      await expect(stat(join(homes, moved))).rejects.toThrow();
       expect(await readFile(join(root, "pi-config", "pi-moved.sh"), "utf8")).toContain(`export PI_CODING_AGENT_DIR='${movedTo}'`);
       // Pi still runs on the one left behind, so it moves later.
       expect((await second.view(paseo as never)).accounts.find((account) => account.id === stayed)?.moving?.waiting).toMatch(/Pi runs on it/);
@@ -1125,3 +1129,72 @@ describe("Pi accounts in the service", () => {
     }
   });
 });
+
+describe("the account scripts", () => {
+  /** A service with a Claude and a Pi account kept outside `homes/`; `broken` names the kind whose script folder can't be made. */
+  async function setUp(broken: "claude" | "pi") {
+    // A file where the folder's parent should be, so making the folder fails (ENOTDIR).
+    await writeFile(join(root, "a-file"), "");
+    if (broken === "claude") process.env.ZEROSUB_LAUNCHER_DIR = join(root, "a-file", "claude-config");
+    else process.env.ZEROSUB_PI_DIR = join(root, "a-file", "pi-config");
+    const claudeHome = join(root, "elsewhere", "claude-work");
+    const piHome = join(root, "elsewhere", "pi-work");
+    await mkdir(claudeHome, { recursive: true });
+    await preparePiHome(piHome);
+    await writePiAccountApi(piHome, { key: KEY, baseUrl: null });
+    const store = new StateStore(join(root, "state.json"));
+    await store.update((draft) => {
+      draft.accounts.push(
+        { id: "claude-aaaaaaaaaaaa", family: "claude", kind: "managed", label: "Work", home: claudeHome, createdAt: "2026-11-16T00:00:00.000Z" } as never,
+        { id: "pi-bbbbbbbbbbbb", family: "pi", kind: "managed", auth: "api", label: "Work key", home: piHome, createdAt: "2026-11-16T00:00:00.000Z" } as never,
+      );
+    });
+    const errors: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => void errors.push(args.map(String).join(" ")));
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const service = piService(new InstalledPi(), store);
+    return { service, errors };
+  }
+  const failed = (errors: string[], kind: string) => errors.some((line) => line.includes(`could not write the ${kind} account scripts`));
+
+  it("still writes Pi's when Claude's folder can't be made, and says it was Claude's", async () => {
+    const { service, errors } = await setUp("claude");
+    try {
+      await (service as unknown as { tick(): Promise<void> }).tick();
+      expect(await readFile(join(root, "pi-config", "pi-work-key.sh"), "utf8")).toContain('exec pi "$@"');
+      expect(failed(errors, "Claude")).toBe(true);
+      expect(failed(errors, "Pi")).toBe(false);
+    } finally {
+      await service.stop();
+    }
+  });
+
+  it("still writes Claude's when Pi's folder can't be made, and says it was Pi's", async () => {
+    const { service, errors } = await setUp("pi");
+    try {
+      await (service as unknown as { tick(): Promise<void> }).tick();
+      expect(await readFile(join(root, "claude-config", "claude-work.sh"), "utf8")).toContain('exec claude "$@"');
+      expect(failed(errors, "Pi")).toBe(true);
+      expect(failed(errors, "Claude")).toBe(false);
+    } finally {
+      await service.stop();
+    }
+  });
+
+  it("keeps showing the script an account had while its folder can't be written", async () => {
+    const { service } = await setUp("pi");
+    const paseo = { agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false } }) } };
+    try {
+      const tick = () => (service as unknown as { tick(): Promise<void> }).tick();
+      await tick();
+      const launcher = async () => (await service.view(paseo as never)).accounts.find((account) => account.id === "claude-aaaaaaaaaaaa")?.launcher;
+      expect(await launcher()).toBe("claude-work.sh");
+      process.env.ZEROSUB_LAUNCHER_DIR = join(root, "a-file", "claude-config");
+      await tick();
+      expect(await launcher()).toBe("claude-work.sh");
+    } finally {
+      await service.stop();
+    }
+  });
+});
+

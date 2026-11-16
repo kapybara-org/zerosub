@@ -4,7 +4,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import type { ApiSummary, LoginMethod } from "../shared/model";
 import type { EnvPatch, FamilyAdapter, Identity, LoginHandle, ProxyState, RedeemReply, TurnEvent, UsageRead } from "./adapter";
 import { providerCommand } from "./binaries";
-import { clearTextProviders, forgetSyncs, normalizeBaseUrl, piLiteral, preparePiHome, readPiAccount, readPiOwnJson, readPiAccountApi, readPiAccountForAgents, writePiAccountApi, writePiAccountProxy } from "./homes";
+import { clearTextProviders, forgetSyncs, normalizeBaseUrl, piHomeHoldsAccount, piLiteral, preparePiHome, readPiAccount, readPiOwnJson, readPiAccountApi, readPiAccountForAgents, writePiAccountApi, writePiAccountProxy } from "./homes";
 import { PI_LAUNCH_ENV } from "./launchers";
 import { Mutex, readJson, writeJsonAtomic } from "./json-file";
 import { eachProcessEnvironment, homesInEnvironment, parseTrace } from "./processes";
@@ -443,6 +443,11 @@ export class PiAdapter implements FamilyAdapter {
       for (const home of homesInEnvironment(line, homes, ["PI_CODING_AGENT_DIR"])) found.add(home);
     });
     return found;
+  }
+
+  /** Everything a Pi account has is in its folder, so only the folder moves; its key says which one it is. */
+  holdsAccount(home: string): Promise<boolean> {
+    return piHomeHoldsAccount(home);
   }
 
   /**
