@@ -27,6 +27,7 @@ import {
   smartOrder,
   detailReason,
   spokenDetails,
+  statusLine,
   toggled,
   type AccountWindowLine,
   type AgentAccountRow,
@@ -351,7 +352,17 @@ export function agentAccounts(
           onMove={onMove}
           onUse={onUse}
         />
-        {quiet ? null : <Status theme={theme} size={size} next={plan.next} label={(id) => labelOf(accounts, id)} onOnce={onOnce} />}
+        {quiet ? null : (
+          <Status
+            theme={theme}
+            size={size}
+            next={plan.next}
+            byHand={state.autoSwitch === false}
+            label={(id) => labelOf(accounts, id)}
+            onOnce={onOnce}
+            onUse={onUse}
+          />
+        )}
         <View style={{ flexDirection: "row", alignItems: "center", gap: 8, minHeight: size.choice + 4 }}>
           <Text
             numberOfLines={1}
@@ -1176,24 +1187,43 @@ function Check({ theme, size, checked, hovered, reduceMotion }: { theme: Theme; 
 
 /**
  * The next turn, said only when it matters: it moves ("Next turn on work"), or everything checked
- * is full ("All full for Fable", the wait, and "Use others once").
+ * is full ("All full for Fable", the wait, and "Use others once"). With automatic switching off
+ * nothing moves on its own: the better account is offered instead ("Better on work", "Move now").
  */
-function Status({ theme, size, next, label, onOnce }: { theme: Theme; size: Size; next: NextTurn; label(id: string): string; onOnce(): void }) {
+function Status({
+  theme,
+  size,
+  next,
+  byHand,
+  label,
+  onOnce,
+  onUse,
+}: {
+  theme: Theme;
+  size: Size;
+  next: NextTurn;
+  /** Automatic switching is off: only the user moves the agent. */
+  byHand: boolean;
+  label(id: string): string;
+  onOnce(): void;
+  onUse(id: string): void;
+}) {
   const colors = theme.colors;
-  const title = next.kind === "stay" ? `Stays on ${label(next.on)}` : next.kind === "go" ? `Next turn on ${label(next.to)}` : `All full for ${next.model}`;
+  const { title, detail, offer } = statusLine(next, byHand, label);
   return (
     <View style={{ flexDirection: "row", alignItems: "flex-start", gap: 8, paddingTop: 2 }}>
-      <View accessible accessibilityLiveRegion="polite" aria-live="polite" accessibilityLabel={[title, next.detail].filter(Boolean).join(". ")} style={{ flex: 1, minWidth: 0, gap: 1 }}>
+      <View accessible accessibilityLiveRegion="polite" aria-live="polite" accessibilityLabel={[title, detail].filter(Boolean).join(". ")} style={{ flex: 1, minWidth: 0, gap: 1 }}>
         <Text numberOfLines={1} style={{ color: next.kind === "full" ? colors.statusWarning : colors.foreground, fontSize: size.small, lineHeight: size.small + 4 }}>
           {title}
         </Text>
-        {next.detail ? (
+        {detail ? (
           <Text numberOfLines={2} style={{ color: colors.foregroundMuted, fontSize: size.small, lineHeight: size.small + 4 }}>
-            {next.detail}
+            {detail}
           </Text>
         ) : null}
       </View>
       {next.kind === "full" && next.canOverflow ? <TextButton theme={theme} size={size} label="Use others once" onPress={onOnce} /> : null}
+      {offer ? <TextButton theme={theme} size={size} label="Move now" spoken={`Move this agent to ${label(offer)} now`} onPress={() => onUse(offer)} /> : null}
     </View>
   );
 }

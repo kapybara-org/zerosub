@@ -282,6 +282,17 @@ export function agentPlan(
 }
 
 /**
+ * The line about the next turn. With automatic switching off (`byHand`) nothing moves on its own, so
+ * a better account is offered (`offer`: its id) rather than announced as the next turn's.
+ */
+export function statusLine(next: NextTurn, byHand: boolean, label: (id: string) => string): { title: string; detail: string; offer: string | null } {
+  if (next.kind === "stay") return { title: `Stays on ${label(next.on)}`, detail: next.detail, offer: null };
+  if (next.kind === "full") return { title: `All full for ${next.model}`, detail: next.detail, offer: null };
+  if (!byHand) return { title: `Next turn on ${label(next.to)}`, detail: next.detail, offer: null };
+  return { title: `Better on ${label(next.to)}`, detail: [next.detail, "auto-switch off"].filter(Boolean).join(" · "), offer: next.to };
+}
+
+/**
  * Whether a row offers "Use now": somewhere else the agent can run its next turn. Not where it runs
  * already, nor a full, signed-out or turned-off account (the planner ranks those last, as full).
  */

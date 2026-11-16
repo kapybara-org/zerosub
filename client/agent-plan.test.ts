@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { formatResetMoment } from "../shared/format";
 import type { AccountView, AgentRoute, StateView, UsageWindow } from "../shared/model";
-import { agentPlan, canUse, describeUse, detailReason, draftOf, moved, smartOrder, spokenDetails, toggled } from "./agent-plan";
+import { agentPlan, canUse, describeUse, detailReason, draftOf, moved, smartOrder, spokenDetails, statusLine, toggled } from "./agent-plan";
 
 const NOW = Date.parse("2026-11-14T12:00:00Z");
 const IN_2H = "2026-11-14T14:00:00Z";
@@ -212,6 +212,18 @@ describe("using an account now", () => {
     const plan = agentPlan(s, r, "claude", "claude-opus-5-5", draft, true, NOW)!;
     const offered = [...plan.checked, ...plan.others].filter(canUse).map((row) => row.id);
     expect(offered).toEqual(["free"]);
+  });
+
+  it("offers the better account instead of announcing it when automatic switching is off", () => {
+    const go = { kind: "go" as const, to: "home", detail: "Leaves work, which you unchecked" };
+    const label = (id: string) => id;
+    expect(statusLine(go, false, label)).toEqual({ title: "Next turn on home", detail: go.detail, offer: null });
+    expect(statusLine(go, true, label)).toEqual({
+      title: "Better on home",
+      detail: "Leaves work, which you unchecked · auto-switch off",
+      offer: "home",
+    });
+    expect(statusLine({ kind: "stay", on: "work", detail: "" }, true, label).offer).toBeNull();
   });
 
   it("says where the agent went", () => {

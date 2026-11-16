@@ -2942,8 +2942,11 @@ describe("an agent's accounts", () => {
 
     it("shows where it really runs, so the panel doesn't claim it moved", async () => {
       const { service, store, paseo } = await stuckAgent({ bindings: { [AGENT]: { accountId: HELLO, source: "auto", at: new Date().toISOString() } } });
-      const route = (await service.view(paseo as never)).agents.find((entry) => entry.agentId === AGENT);
+      const view = await service.view(paseo as never);
+      const route = view.agents.find((entry) => entry.agentId === AGENT);
       expect(route).toMatchObject({ accountId: HELLO, pendingAccountId: MAIN });
+      // Nothing moves it on its own: the panel offers the move instead of announcing it.
+      expect(view.autoSwitch).toBe(false);
       expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
     });
 

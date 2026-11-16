@@ -346,7 +346,11 @@ export const StateViewSchema = z.object({
   /** The folder added Pi accounts' homes are kept in (`~/.pi-config`, say), and whether it's the default. */
   piHomes: z.object({ dir: z.string(), isDefault: z.boolean() }).nullable().default(null),
   showComposerPill: z.boolean(),
-  /** Accounts at their limit are skipped, so agents can't be moved onto one by hand either. */
+  /**
+   * Agents move to a better account between turns on their own, and accounts at their limit are
+   * skipped, so agents can't be moved onto one by hand either. Off, only the user moves them, so the
+   * panel offers the move instead of announcing it.
+   */
   autoSwitch: z.boolean().default(true),
   warnings: z.array(z.string()),
   /** The plan the server re-runs every hour, so the screen orders accounts as it does. */
