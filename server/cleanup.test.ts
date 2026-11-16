@@ -43,7 +43,7 @@ class FakeLogin extends ProgressEmitter implements LoginHandle {
   }
 }
 
-async function setUp(state: Partial<StoredState>, options: { signedIn?: (home: string | null) => boolean } = {}) {
+async function setUp(state: Partial<StoredState>, options: { signedIn?: (home: string | null) => boolean; apiKey?: (home: string) => boolean } = {}) {
   const store = new StateStore(join(root, "zerosub", "state.json"));
   await store.update((draft) => Object.assign(draft, state));
   const loggedOut: string[] = [];
@@ -56,6 +56,7 @@ async function setUp(state: Partial<StoredState>, options: { signedIn?: (home: s
     prepareHome: async (path: string) => void (await mkdir(path, { recursive: true })),
     env: async () => ({}),
     identity: async (path: string | null) => ({ signedIn: options.signedIn?.(path) ?? false, email: null, plan: null, organization: null, identity: null }),
+    api: async (path: string | null) => (path && options.apiKey?.(path) ? { keyHint: "abcd", baseUrl: null } : null),
     usage: async () => ({ fetchedAt: new Date().toISOString(), windows: [], error: null, cached: false, resets: null }),
     redeemReset: async () => ({ outcome: "none", message: "none", left: 0 }),
     login: async () => {
@@ -158,6 +159,18 @@ describe("cleaning up homes", () => {
     expect(await exists(home("claude-aaaaaaaaaaaa"))).toBe(false);
     // Signed in: it may be an account the registry lost, so it stays.
     expect(await exists(home("claude-bbbbbbbbbbbb"))).toBe(true);
+    expect((await store.read()).cleanup).toEqual({});
+  });
+
+  it("deletes an earlier run's unfinished API account, key and all, though Claude Code calls a key signed in", async () => {
+    await mkdir(home("claude-cccccccccccc"), { recursive: true });
+    const { service, store, paseo } = await setUp(
+      { cleanup: { [home("claude-cccccccccccc")]: { family: "claude", accountId: "claude-cccccccccccc", why: "unfinished", at: "x" } } },
+      { signedIn: () => true, apiKey: (path) => path === home("claude-cccccccccccc") },
+    );
+    await service.cleanUpHomes(paseo);
+    // Saved, its entry would have gone in the same write: it never became an account.
+    expect(await exists(home("claude-cccccccccccc"))).toBe(false);
     expect((await store.read()).cleanup).toEqual({});
   });
 

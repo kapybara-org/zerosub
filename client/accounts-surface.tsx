@@ -15,6 +15,7 @@ import {
   setNextAgentAccount,
 } from "../shared/rpc";
 import { AddAccountModal } from "./add-account";
+import { ApiAccountModal } from "./api-account";
 import { AddPiAccountModal, ApiKeyModal, PiSectionNotes, ProxyModal, piCardDetails } from "./pi-accounts";
 import { ResetConfirm, redeemToast, resetBadge } from "./reset-confirm";
 import { describe, stoppedWaiting, useStore, VISIBLE_POLL_MS, type ZeroSubStore } from "./store";
@@ -619,7 +620,13 @@ function AccountCard({
       {renaming ? (
         <RenameModal theme={theme} account={account} store={store} onClose={() => setRenaming(false)} />
       ) : null}
-      {editingApi ? <ApiKeyModal theme={theme} store={store} account={account} onClose={() => setEditingApi(false)} /> : null}
+      {editingApi ? (
+        account.family === "claude" ? (
+          <ApiAccountModal theme={theme} store={store} account={account} onClose={() => setEditingApi(false)} />
+        ) : (
+          <ApiKeyModal theme={theme} store={store} account={account} onClose={() => setEditingApi(false)} />
+        )
+      ) : null}
       {editingProxy ? <ProxyModal theme={theme} store={store} account={account} onClose={() => setEditingProxy(false)} /> : null}
       <Modal title={`Remove ${account.label}?`} open={confirmRemove} onOpenChange={setConfirmRemove}>
         <Modal.Content>
@@ -830,10 +837,18 @@ function AutomationSettings({ theme }: { theme: Theme }) {
 }
 
 /** Paseo stopped waiting for a change that moves agents; the daemon carries on with it. */
-/** A Claude card's line about its network: its own proxy and the address Anthropic sees its requests come from. */
+/**
+ * A Claude card's line about its key (an API account's) and its network: its own proxy and the
+ * address Anthropic sees its requests come from.
+ */
 function claudeCardDetails(account: AccountView): string | null {
   if (account.family !== "claude") return null;
-  const parts = [account.proxy ? `Via ${account.proxy}` : null, egressText(account.egress)].filter(Boolean);
+  const api = account.api;
+  const parts = [
+    api ? `${api.keyKind === "api_key" ? "Key" : "Token"}${api.keyHint ? ` …${api.keyHint}` : ""} · ${api.baseUrl ?? "Anthropic API"}` : null,
+    account.proxy ? `Via ${account.proxy}` : null,
+    egressText(account.egress),
+  ].filter(Boolean);
   return parts.length > 0 ? parts.join(" · ") : null;
 }
 

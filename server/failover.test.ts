@@ -2680,3 +2680,106 @@ describe("the account button's reason row", () => {
     expect((await route())?.selectionReason).toBeUndefined();
   });
 });
+
+describe("an API account's refused key", () => {
+  const API = "claude-api";
+
+  it("marks the account and moves the agent to a subscription account", async () => {
+    const refused = () => "Invalid API key · Fix external API key";
+    const { store, reopened, notes, limitTurn } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), { ...account(API, "gateway", "managed"), auth: "api" }] as never,
+        defaults: { claude: API, codex: null, pi: null },
+        sessions: { [AGENT]: { accountId: API, family: "claude", openedAt: new Date().toISOString() } },
+      },
+      () => {
+        throw new Error("unused: no limit in this turn");
+      },
+      { detectLimit: () => null, detectSignOut: refused },
+    );
+    await limitTurn();
+    const state = await store.read();
+    // `claude auth status` would still say "logged in" for any key, so the refusal is what counts.
+    expect(state.accounts.find((a) => a.id === API)?.signedIn).toBe(false);
+    expect(reopened).toEqual([AGENT]);
+    expect(notes.at(-1)).toMatchObject({ from: "gateway", to: "marketing", outcome: "switched" });
+  });
+
+  it("leaves a subscription account alone when its login still checks out", async () => {
+    const { store, reopened, limitTurn } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: HELLO, codex: null, pi: null },
+        sessions: { [AGENT]: { accountId: HELLO, family: "claude", openedAt: new Date().toISOString() } },
+      },
+      () => {
+        throw new Error("unused: no limit in this turn");
+      },
+      { detectLimit: () => null, detectSignOut: () => "Not logged in · Please run /login" },
+    );
+    await limitTurn();
+    expect((await store.read()).accounts.find((a) => a.id === HELLO)?.signedIn).toBe(true);
+    expect(reopened).toEqual([]);
+  });
+});
+
+describe("forking to the other provider by hand", () => {
+  /** A ChatGPT agent out of room, and Claude accounts as given; the fork never gets as far as starting an agent. */
+  async function refusal(claude: Array<Record<string, unknown>>) {
+    const CODEX_MAIN = MAIN_ACCOUNT_ID.codex;
+    const store = new StateStore(join(root, "state.json"));
+    await store.update((draft) =>
+      Object.assign(draft, {
+        accounts: [{ ...account(CODEX_MAIN, "hello", "main"), family: "codex", limitedUntil: inFuture(), limitKind: "window" }, ...claude],
+        defaults: { claude: MAIN, codex: CODEX_MAIN, pi: null },
+      }),
+    );
+    const agent = { id: AGENT, provider: "codex", status: "idle", title: "Fix the build", archivedAt: null, labels: {} };
+    const paseo = {
+      config: { get: async () => ({ config: { providers: {} } }) },
+      providers: { listAvailable: async () => ({ providers: [{ provider: "claude", available: true }, { provider: "codex", available: true }] }) },
+      agents: {
+        list: async () => ({ entries: [{ agent }], pageInfo: { hasMore: false, nextCursor: null } }),
+        ref: () => ({ refresh: async () => ({ agent }) }),
+      },
+    };
+    const service = new Service(
+      {
+        claude: claudeAdapter(() => ({ kind: "window", resetsAt: inFuture(), message: "" })),
+        codex: { ...claudeAdapter(() => ({ kind: "window", resetsAt: null, message: "" })), family: "codex", portable: false } as FamilyAdapter,
+        pi: absentPi(),
+      },
+      store,
+      { resolve: async () => ({ claude: "claude" as const, codex: "codex" as const }) } as unknown as FamilyResolver,
+      { locate: async () => "/usr/local/bin/paseo", reopen: async () => ({ ok: true as const }) } as unknown as Reopener,
+    );
+    return service.forkAgent(paseo as never, AGENT);
+  }
+
+  it("says an API account won't take the work over, rather than that every account is at its limit", async () => {
+    const limited = { ...account(MAIN, "marketing", "main"), limitedUntil: inFuture(), limitKind: "window" };
+    const api = { ...account("claude-api", "gateway", "managed"), auth: "api" };
+    await expect(refusal([limited, api])).rejects.toThrow(/only Claude accounts with room use an API key/);
+    await expect(refusal([limited])).rejects.toThrow("Every Claude account is at its limit too.");
+  });
+});
+
+describe("an API account at a limit with every other account out", () => {
+  it("is never spent a banked reset on automatically, which it doesn't have", async () => {
+    const redeemed: Array<string | null> = [];
+    const api = { ...account("claude-api", "Gateway", "managed"), auth: "api" as const };
+    const main = { ...account(MAIN, "main", "main"), limitedUntil: inFuture(), limitKind: "window" as const };
+    const { service, limitTurn } = await setUp(
+      {
+        accounts: [main as never, api as never],
+        defaults: { claude: "claude-api", codex: null, pi: null },
+        sessions: { [AGENT]: { accountId: "claude-api", family: "claude", openedAt: "2026-09-23T07:00:00.000Z" } },
+      },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "429 from the gateway" }),
+      { claude: { redeemReset: async (home: string | null) => (redeemed.push(home), { outcome: "reset", message: "Limits reset.", left: 0 }) } },
+    );
+    service.setPreferences(preferences.schema.parse({ autoRedeem: true }));
+    await limitTurn();
+    expect(redeemed).toEqual([]);
+  });
+});

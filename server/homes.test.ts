@@ -2,13 +2,30 @@ import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, utime
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { accountSettings, codexSessionsShared, mergeSettings, mergeShared, prepareClaudeHome, prepareCodexHome, readAccountProxy, removeHome, writeAccountProxy } from "./homes";
+import {
+  accountSettings,
+  codexSessionsShared,
+  mergeSettings,
+  mergeShared,
+  normalizeBaseUrl,
+  prepareClaudeHome,
+  prepareCodexHome,
+  readAccountApi,
+  readAccountProxy,
+  removeHome,
+  writeAccountApi,
+  writeAccountProxy,
+} from "./homes";
 
 let root: string;
 const saved = {
   CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
   CODEX_HOME: process.env.CODEX_HOME,
   PASEO_HOME: process.env.PASEO_HOME,
+  ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
+  ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+  ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN,
+  CLAUDE_CODE_OAUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN,
   NO_PROXY: process.env.NO_PROXY,
   no_proxy: process.env.no_proxy,
 };
@@ -210,7 +227,6 @@ describe("prepareClaudeHome", () => {
     expect(await readFile(join(home, "settings.json"), "utf8")).toBe(before);
   });
 
-
   it("keeps MCP servers in step with main without clobbering the account", async () => {
     const main = join(root, "main");
     const home = join(root, "homes", "claude-b");
@@ -387,6 +403,8 @@ describe("account proxy", () => {
     process.env.CLAUDE_CONFIG_DIR = join(root, "main");
     const gone = async () => false;
     await expect(writeAccountProxy(home, "http://127.0.0.1:7890", gone)).rejects.toThrow("That account no longer exists.");
+    const api = { keyKind: "auth_token" as const, key: "secret-token", baseUrl: null, disableTelemetry: false, disableErrorReporting: false, disableNonessentialTraffic: false };
+    await expect(writeAccountApi(home, api, gone)).rejects.toThrow("That account no longer exists.");
     expect(await lstat(home).catch(() => null)).toBeNull();
   });
 
@@ -448,7 +466,6 @@ describe("account proxy", () => {
   });
 });
 
-
 describe("mergeSettings", () => {
   it("lets the account win and merges objects one level deep", () => {
     expect(mergeSettings({ env: { A: "1", B: "2" }, model: "opus", list: ["x"] }, { env: { B: "3" }, list: ["y"] })).toEqual({
@@ -458,7 +475,6 @@ describe("mergeSettings", () => {
     });
   });
 });
-
 
 describe("a home's settings.account.json marker", () => {
   it("is written at the first sync even without main settings, so main's later settings still reach the home", async () => {
@@ -575,9 +591,8 @@ describe("a home's settings.account.json marker", () => {
   });
 });
 
-
 describe("merged settings lists", () => {
-  it("join permissions and hooks the way Claude Code does, as Claude Code merges them across its settings files", () => {
+  it("join permissions and hooks the way Claude Code does, and keep an API account's pinned env on top", () => {
     const stop = { hooks: [{ type: "command", command: "notify" }] };
     const lint = { matcher: "Edit", hooks: [{ type: "command", command: "lint" }] };
     const main = {
@@ -598,6 +613,10 @@ describe("merged settings lists", () => {
       env: { ANTHROPIC_API_KEY: "sk-main", SHARED: "1" },
       enabledMcpjsonServers: ["mine"],
     });
+
+    const api = accountSettings(main, { ...account, env: { ANTHROPIC_AUTH_TOKEN: "token" } });
+    expect(api.permissions).toEqual(mergeSettings(main, account).permissions);
+    expect(api.env).toMatchObject({ ANTHROPIC_AUTH_TOKEN: "token", ANTHROPIC_API_KEY: "", ANTHROPIC_BASE_URL: "https://api.anthropic.com", SHARED: "1" });
   });
 });
 
@@ -629,3 +648,241 @@ describe("an account's own proxy and the no-proxy list", () => {
   });
 });
 
+describe("account API settings", () => {
+  const OFF = { disableTelemetry: false, disableErrorReporting: false, disableNonessentialTraffic: false };
+  const KEY = "sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-1111";
+  const NEXT = "sk-ant-api03-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-2222";
+
+  /** Main's settings sending everything to a company gateway with main's own credentials. */
+  const CORPORATE = {
+    model: "opus",
+    apiKeyHelper: "~/bin/corp-key",
+    env: {
+      SHARED: "1",
+      ANTHROPIC_BASE_URL: "https://corp-gateway.example",
+      ANTHROPIC_API_KEY: "sk-ant-MAIN",
+      ANTHROPIC_AUTH_TOKEN: "corp-token",
+      CLAUDE_CODE_OAUTH_TOKEN: "main-oauth",
+      ANTHROPIC_CUSTOM_HEADERS: "x-corp: secret",
+      CLAUDE_CODE_USE_BEDROCK: "1",
+    },
+  };
+  /** Everything an API account's generated `env` blanks unless the account sets it itself. */
+  const BLANKED = {
+    ANTHROPIC_API_KEY: "",
+    ANTHROPIC_AUTH_TOKEN: "",
+    CLAUDE_CODE_OAUTH_TOKEN: "",
+    ANTHROPIC_CUSTOM_HEADERS: "",
+    CLAUDE_CODE_USE_BEDROCK: "",
+    CLAUDE_CODE_USE_VERTEX: "",
+    CLAUDE_CODE_USE_FOUNDRY: "",
+    CLAUDE_CODE_USE_ANTHROPIC_AWS: "",
+    CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD: "",
+    CLAUDE_CODE_USE_MANTLE: "",
+  };
+
+  async function setUpHome(id: string, mainSettings: Record<string, unknown> = { env: { DISABLE_TELEMETRY: "0", SHARED: "1" } }) {
+    const main = join(root, "main");
+    const home = join(root, "homes", id);
+    process.env.CLAUDE_CONFIG_DIR = main;
+    await mkdir(main, { recursive: true });
+    await writeFile(join(main, "settings.json"), JSON.stringify(mainSettings));
+    await writeFile(
+      join(main, ".claude.json"),
+      JSON.stringify({ theme: "dark", customApiKeyResponses: { approved: ["main-own-key-approval"], rejected: [] } }),
+    );
+    const overrides = async () => JSON.parse(await readFile(join(home, "settings.account.json"), "utf8")).env;
+    const global = async () => JSON.parse(await readFile(join(home, ".claude.json"), "utf8"));
+    const generated = async () => JSON.parse(await readFile(join(home, "settings.json"), "utf8"));
+    const setMain = (value: Record<string, unknown>) => writeFile(join(main, "settings.json"), JSON.stringify(value));
+    return { home, overrides, global, generated, setMain };
+  }
+
+  it("stores the key, base URL and switches, and approves the key in a seeded .claude.json", async () => {
+    const { home, overrides, global } = await setUpHome("claude-api");
+    await writeAccountApi(home, { keyKind: "api_key", key: ` ${KEY} `, baseUrl: "https://gw.example.com/v1/", ...OFF, disableTelemetry: true });
+
+    expect(await overrides()).toEqual({ ANTHROPIC_API_KEY: KEY, ANTHROPIC_BASE_URL: "https://gw.example.com/v1", DISABLE_TELEMETRY: "1" });
+    // The account's switch beats main's "0"; main's other variables still apply.
+    expect(JSON.parse(await readFile(join(home, "settings.json"), "utf8")).env).toMatchObject({ DISABLE_TELEMETRY: "1", SHARED: "1" });
+    // Seeded from main (preferences, not main's own key approvals), then this key approved.
+    expect(await global()).toMatchObject({ theme: "dark", customApiKeyResponses: { approved: [KEY.slice(-20)], rejected: [] } });
+    expect(await readAccountApi(home)).toEqual({
+      keyKind: "api_key",
+      keyHint: "1111",
+      baseUrl: "https://gw.example.com/v1",
+      disableTelemetry: true,
+      disableErrorReporting: false,
+      disableNonessentialTraffic: false,
+    });
+
+    // Keeping the home in sync with main later doesn't drop the approval.
+    await prepareClaudeHome(home, true);
+    expect((await global()).customApiKeyResponses.approved).toEqual([KEY.slice(-20)]);
+  });
+
+  it("keeps the key when none is typed, and retires the old approval when it's replaced", async () => {
+    const { home, overrides, global } = await setUpHome("claude-keep");
+    await writeAccountApi(home, { keyKind: "api_key", key: KEY, baseUrl: "https://gw.example.com", ...OFF, disableNonessentialTraffic: true });
+
+    await writeAccountApi(home, { keyKind: "api_key", key: null, baseUrl: "https://gw.example.com", ...OFF, disableErrorReporting: true });
+    expect(await overrides()).toEqual({ ANTHROPIC_API_KEY: KEY, ANTHROPIC_BASE_URL: "https://gw.example.com", DISABLE_ERROR_REPORTING: "1" });
+
+    await writeAccountApi(home, { keyKind: "api_key", key: NEXT, baseUrl: null, ...OFF });
+    expect(await overrides()).toEqual({ ANTHROPIC_API_KEY: NEXT });
+    expect((await global()).customApiKeyResponses.approved).toEqual([NEXT.slice(-20)]);
+  });
+
+  it("won't send a kept key to a different base URL", async () => {
+    const { home, overrides } = await setUpHome("claude-move");
+    await writeAccountApi(home, { keyKind: "api_key", key: KEY, baseUrl: "https://gw.example.com", ...OFF });
+    for (const baseUrl of ["https://evil.example.com", null]) {
+      await expect(writeAccountApi(home, { keyKind: "api_key", key: null, baseUrl, ...OFF })).rejects.toThrow(/key again/);
+    }
+    expect(await overrides()).toEqual({ ANTHROPIC_API_KEY: KEY, ANTHROPIC_BASE_URL: "https://gw.example.com" });
+    // The same address written differently is still the same place, and a typed key may go anywhere.
+    await writeAccountApi(home, { keyKind: "api_key", key: null, baseUrl: "https://GW.example.com/", ...OFF, disableTelemetry: true });
+    await writeAccountApi(home, { keyKind: "api_key", key: KEY, baseUrl: "https://other.example.com", ...OFF });
+    expect(await overrides()).toEqual({ ANTHROPIC_API_KEY: KEY, ANTHROPIC_BASE_URL: "https://other.example.com" });
+  });
+
+  it("switches between an API key and a bearer token without leaving the other behind", async () => {
+    const { home, overrides } = await setUpHome("claude-kind");
+    await writeAccountApi(home, { keyKind: "api_key", key: KEY, baseUrl: "https://gw.example.com", ...OFF });
+    await writeAccountApi(home, { keyKind: "auth_token", key: null, baseUrl: "https://gw.example.com", ...OFF });
+    expect(await overrides()).toEqual({ ANTHROPIC_AUTH_TOKEN: KEY, ANTHROPIC_BASE_URL: "https://gw.example.com" });
+    expect((await readAccountApi(home))?.keyKind).toBe("auth_token");
+  });
+
+  it("keeps the account's proxy and other overrides", async () => {
+    const { home, overrides } = await setUpHome("claude-mixed");
+    await writeAccountProxy(home, "http://127.0.0.1:7890");
+    await writeAccountApi(home, { keyKind: "auth_token", key: KEY, baseUrl: null, ...OFF });
+    expect(await overrides()).toMatchObject({ ANTHROPIC_AUTH_TOKEN: KEY, HTTPS_PROXY: "http://127.0.0.1:7890" });
+    expect(await readAccountProxy(home)).toBe("http://127.0.0.1:7890");
+  });
+
+  it("sends a key without a base URL to Anthropic's own API, not to main's gateway", async () => {
+    const { home, overrides, generated } = await setUpHome("claude-official", CORPORATE);
+    await writeAccountApi(home, { keyKind: "api_key", key: KEY, baseUrl: null, ...OFF });
+
+    const settings = await generated();
+    expect(settings.env).toEqual({ SHARED: "1", ...BLANKED, ANTHROPIC_BASE_URL: "https://api.anthropic.com", ANTHROPIC_API_KEY: KEY });
+    expect(settings.apiKeyHelper).toBeUndefined();
+    expect(settings.model).toBe("opus");
+    // Only the generated file spells the endpoint out: the card still shows no base URL.
+    expect(await overrides()).toEqual({ ANTHROPIC_API_KEY: KEY });
+    expect((await readAccountApi(home))?.baseUrl).toBeNull();
+  });
+
+  it("sends a gateway's token alone: none of main's key, token, helper, headers or provider", async () => {
+    const { home, generated } = await setUpHome("claude-third-party", CORPORATE);
+    await writeAccountApi(home, { keyKind: "auth_token", key: KEY, baseUrl: "https://gw.example.com", ...OFF });
+
+    const settings = await generated();
+    expect(settings.env).toEqual({ SHARED: "1", ...BLANKED, ANTHROPIC_BASE_URL: "https://gw.example.com", ANTHROPIC_AUTH_TOKEN: KEY });
+    expect(settings.apiKeyHelper).toBeUndefined();
+  });
+
+  it("keeps a saved key where it went when main's settings change later", async () => {
+    const { home, generated, setMain } = await setUpHome("claude-later");
+    await writeAccountApi(home, { keyKind: "api_key", key: KEY, baseUrl: null, ...OFF });
+    const gateway = join(root, "homes", "claude-later-gw");
+    await writeAccountApi(gateway, { keyKind: "auth_token", key: NEXT, baseUrl: "https://gw.example.com", ...OFF });
+
+    await setMain(CORPORATE);
+    await prepareClaudeHome(home, true);
+    await prepareClaudeHome(gateway, true);
+    expect((await generated()).env).toMatchObject({ ANTHROPIC_BASE_URL: "https://api.anthropic.com", ANTHROPIC_API_KEY: KEY, ANTHROPIC_AUTH_TOKEN: "" });
+    const other = JSON.parse(await readFile(join(gateway, "settings.json"), "utf8"));
+    expect(other.env).toMatchObject({ ANTHROPIC_BASE_URL: "https://gw.example.com", ANTHROPIC_AUTH_TOKEN: NEXT, ANTHROPIC_API_KEY: "" });
+
+    // Saving without retyping the key is still the same place, so it's allowed and stays put.
+    await writeAccountApi(home, { keyKind: "api_key", key: null, baseUrl: null, ...OFF, disableTelemetry: true });
+    expect((await generated()).env).toMatchObject({ ANTHROPIC_BASE_URL: "https://api.anthropic.com", ANTHROPIC_API_KEY: KEY });
+  });
+
+  it("writes out every variable the daemon or a shell could otherwise slip in", async () => {
+    // Claude Code applies settings `env` over the environment it starts with, so stating each one
+    // in the account's settings is what beats an export in the daemon or in a launcher's shell.
+    process.env.ANTHROPIC_BASE_URL = "https://shell-gateway.example";
+    process.env.ANTHROPIC_API_KEY = "sk-ant-SHELL";
+    process.env.ANTHROPIC_AUTH_TOKEN = "shell-token";
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = "shell-oauth";
+    const { home, generated } = await setUpHome("claude-shell");
+    await writeAccountApi(home, { keyKind: "auth_token", key: KEY, baseUrl: null, ...OFF });
+    expect((await generated()).env).toMatchObject({
+      ANTHROPIC_BASE_URL: "https://api.anthropic.com",
+      ANTHROPIC_AUTH_TOKEN: KEY,
+      ANTHROPIC_API_KEY: "",
+      CLAUDE_CODE_OAUTH_TOKEN: "",
+    });
+  });
+
+  it("corrects an API account generated before the endpoint was pinned, without asking for the key", async () => {
+    const { home, overrides, generated } = await setUpHome("claude-before", CORPORATE);
+    // What an earlier version left behind: the account as entered, and main's gateway and key merged in.
+    const entered = { env: { ANTHROPIC_API_KEY: KEY, DISABLE_TELEMETRY: "1" } };
+    await mkdir(home, { recursive: true });
+    await writeFile(join(home, "settings.account.json"), JSON.stringify(entered));
+    await writeFile(join(home, "settings.json"), JSON.stringify(mergeSettings(CORPORATE, entered)));
+    expect((await generated()).env.ANTHROPIC_BASE_URL).toBe("https://corp-gateway.example");
+
+    await prepareClaudeHome(home, true);
+    const settings = await generated();
+    expect(settings.env).toEqual({ SHARED: "1", ...BLANKED, ANTHROPIC_BASE_URL: "https://api.anthropic.com", ANTHROPIC_API_KEY: KEY, DISABLE_TELEMETRY: "1" });
+    expect(settings.apiKeyHelper).toBeUndefined();
+    expect(await overrides()).toEqual(entered.env);
+  });
+
+  it("leaves a subscription account with main's settings plus its own, as before", async () => {
+    const { home, generated } = await setUpHome("claude-subscription", CORPORATE);
+    await writeAccountProxy(home, "http://127.0.0.1:7890");
+    const own = JSON.parse(await readFile(join(home, "settings.account.json"), "utf8"));
+    const merged = mergeSettings(CORPORATE, own);
+    expect(await generated()).toEqual({ ...merged, env: { ...(merged.env as object), ...NO_PROXY_PINNED } });
+    expect(await readAccountApi(home)).toBeNull();
+  });
+
+  it("refuses a missing key or a bad base URL without writing anything", async () => {
+    const { home } = await setUpHome("claude-bad-api");
+    await expect(writeAccountApi(home, { keyKind: "api_key", key: " ", baseUrl: null, ...OFF })).rejects.toThrow(/key/);
+    await expect(writeAccountApi(home, { keyKind: "api_key", key: KEY, baseUrl: "ftp://gw", ...OFF })).rejects.toThrow(/http/);
+    await expect(lstat(join(home, "settings.account.json"))).rejects.toThrow();
+    expect(await readAccountApi(home)).toBeNull();
+  });
+
+  it("checks base URLs", () => {
+    expect(normalizeBaseUrl(" https://GW.example.com:8443/anthropic// ")).toBe("https://gw.example.com:8443/anthropic");
+    expect(normalizeBaseUrl("http://127.0.0.1:3000")).toBe("http://127.0.0.1:3000");
+    expect(() => normalizeBaseUrl("gw.example.com")).toThrow();
+    expect(() => normalizeBaseUrl("https://user:pass@gw.example.com")).toThrow(/credentials/);
+    expect(() => normalizeBaseUrl("https://gw.example.com/?key=1")).toThrow(/query/);
+  });
+});
+
+describe("accountSettings", () => {
+  it("pins an API account's endpoint under its own overrides and leaves other accounts to the plain merge", () => {
+    const main = { apiKeyHelper: "main-helper", env: { A: "1", ANTHROPIC_BASE_URL: "https://corp.example" } };
+    const proxy = { env: { HTTPS_PROXY: "http://127.0.0.1:7890" } };
+    expect(accountSettings(main, { env: { DISABLE_TELEMETRY: "1" } })).toEqual(mergeSettings(main, { env: { DISABLE_TELEMETRY: "1" } }));
+    expect(accountSettings(main, proxy)).toEqual({ ...main, env: { ...main.env, ...proxy.env, ...NO_PROXY_PINNED } });
+
+    // The account's own values win, its own helper included; an empty base URL means Anthropic's.
+    const own = accountSettings(main, { apiKeyHelper: "own-helper", env: { ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: " ", ANTHROPIC_CUSTOM_HEADERS: "x-own: 1" } });
+    expect(own.apiKeyHelper).toBe("own-helper");
+    expect(own.env).toMatchObject({ A: "1", ANTHROPIC_API_KEY: "k", ANTHROPIC_AUTH_TOKEN: "", ANTHROPIC_BASE_URL: "https://api.anthropic.com", ANTHROPIC_CUSTOM_HEADERS: "x-own: 1" });
+  });
+});
+
+describe("an API key's hint", () => {
+  it("is left out for a short key", async () => {
+    const home = join(root, "homes", "claude-short");
+    process.env.CLAUDE_CONFIG_DIR = join(root, "main");
+    await mkdir(home, { recursive: true });
+    await writeFile(join(home, "settings.account.json"), JSON.stringify({ env: { ANTHROPIC_API_KEY: "sk-12345678" } }));
+    expect((await readAccountApi(home))?.keyHint).toBe("");
+    await writeFile(join(home, "settings.account.json"), JSON.stringify({ env: { ANTHROPIC_API_KEY: "sk-ant-api03-abcdefgh" } }));
+    expect((await readAccountApi(home))?.keyHint).toBe("efgh");
+  });
+});
