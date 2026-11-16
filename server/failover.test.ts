@@ -794,6 +794,8 @@ describe("forking to the other provider", () => {
       unknownThrows?: boolean;
       /** Makes every create fail with this message, after Paseo has recorded its request. */
       createError?: string;
+      /** Makes every create throw this client-side error, with no answer from Paseo. */
+      clientError?: string;
     } = {};
     /** Paseo's creation receipts: each idempotency key's first request fingerprint. */
     const receipts = new Map<string, string>();
@@ -876,7 +878,9 @@ describe("forking to the other provider", () => {
       workspaces: {
         ref: (workspaceId: string) => ({
           agents: {
-            create: async (request: (typeof created)[number]) => {
+            create: async ({ onEvent, ...request }: (typeof created)[number] & { onEvent?: (snapshot: { phase: string; error: string | null }) => void }) => {
+              // The client fails on its own, as on "Daemon client closed": Paseo's answer is never seen.
+              if (hooks.clientError) throw new Error(hooks.clientError);
               // Paseo ties an idempotency key to its first request, failed or not: the same key with
               // another request is refused, and the same request again doesn't make a second agent.
               if (request.idempotencyKey) {
@@ -887,7 +891,11 @@ describe("forking to the other provider", () => {
                 receipts.set(request.idempotencyKey, fingerprint);
                 if (byId.has(request.agentId)) return;
               }
-              if (hooks.createError) throw new Error(hooks.createError);
+              if (hooks.createError) {
+                // Paseo answers with its failed creation result, which the client throws as its error.
+                onEvent?.({ phase: "failed", error: hooks.createError });
+                throw new Error(hooks.createError);
+              }
               created.push({ ...request, workspaceId });
               const agent = {
                 id: request.agentId,
@@ -1390,6 +1398,35 @@ describe("forking to the other provider", () => {
       expect(setup.created).toHaveLength(1);
       expect(setup.created[0]).toMatchObject({ agentId: reserved.targetId, idempotencyKey: reserved.targetId });
       expect(setup.sends.map((send) => send.messageId)).toEqual([reserved.messageId]);
+    });
+
+    it("keeps a create's outcome unknown when the client fails before Paseo answers", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS, catalog: KIMI_CATALOG });
+      setup.hooks.clientError = "Daemon client closed";
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/Daemon client closed/);
+      delete setup.hooks.clientError;
+      const reserved = (await setup.store.read()).opencodeForks[AGENT]!.pending!;
+      expect(reserved.createFailed).toBeUndefined();
+      // The daemon may still finish that create, so a changed pick must not mint new IDs.
+      setup.service.setPreferences(preferences.schema.parse({ ...PREFS, forkOpenCodeModel: "opencode/kimi-k3" }));
+      await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(setup.created).toHaveLength(1);
+      expect(setup.created[0]).toMatchObject({ agentId: reserved.targetId, config: { provider: "opencode/opencode/glm-5p3-flash" } });
+    });
+
+    it("marks a create failed when Paseo refuses its key for another request", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      setup.hooks.createError = "GLM is down";
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/GLM is down/);
+      delete setup.hooks.createError;
+      // An outcome-unknown reservation whose frozen request no longer matches Paseo's record of the key.
+      await setup.store.update((draft) => {
+        const pending = draft.opencodeForks[AGENT]!.pending!;
+        delete pending.createFailed;
+        pending.config!.title = "Another title";
+      });
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/agent_request_key_conflict/);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending!.createFailed).toBe(true);
     });
 
     it("retries a create interrupted before its outcome was seen with the reserved request, not the new model pick", async () => {

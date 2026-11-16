@@ -326,7 +326,11 @@ export async function continueInNewAgent(options: {
    * same request, and a source no longer at its frozen location refuses instead.
    */
   reserved?: { title: string; workspaceId: string | null; cwd: string | null };
-  /** Called when Paseo rejects the create itself, before the error is thrown on. */
+  /**
+   * Called when Paseo answered the create with a failure, before the error is thrown on: its failed
+   * creation result, or its key bound to another request. A client-side error such as "Daemon client
+   * closed" isn't Paseo's answer, so the create may still land.
+   */
   onCreateRejected?: () => Promise<unknown>;
 }): Promise<Continuation> {
   const { paseo, sourceAgentId, reserved } = options;
@@ -372,6 +376,7 @@ export async function continueInNewAgent(options: {
         ...(source.thinkingOptionId ? { thinkingOptionId: source.thinkingOptionId } : {}),
         ...(source.features ? { featureValues: Object.fromEntries(source.features.map((feature) => [feature.id, feature.value])) } : {}),
       };
+  let failed = false;
   const request = {
     agentId,
     ...(options.agentId ? { idempotencyKey: options.agentId } : {}),
@@ -381,13 +386,15 @@ export async function continueInNewAgent(options: {
       ? { prompt: continuationPrompt(buildTranscript(timeline ?? []), options.why, options.previous) }
       : {}),
     labels: { [CONTINUED_FROM_LABEL]: sourceAgentId, ...(options.parentId ? { [PARENT_LABEL]: options.parentId } : {}) },
+    // Paseo's creation snapshots; the client throws a failed result as a plain error.
+    ...(options.onCreateRejected ? { onEvent: (snapshot: { phase: string }) => { failed = snapshot.phase === "failed"; } } : {}),
   };
   // A reserved request's location was checked against this snapshot above, so the two agree.
   try {
     if (source.workspaceId) await paseo.workspaces.ref(source.workspaceId).agents.create(request);
     else await paseo.agents.create({ ...request, cwd: source.cwd });
   } catch (error) {
-    await options.onCreateRejected?.();
+    if (failed || (error instanceof Error && error.message === "agent_request_key_conflict")) await options.onCreateRejected?.();
     throw error;
   }
   return { agentId, title };
