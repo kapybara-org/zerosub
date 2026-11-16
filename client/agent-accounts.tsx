@@ -20,6 +20,8 @@ import { FAMILY_LABEL, OTHER_FAMILY, type AccountView, type Family } from "../sh
 import { setAgentAccount, setAgentAccounts, useOthersOnce } from "../shared/rpc";
 import {
   agentPlan,
+  canUse,
+  describeUse,
   draftOf,
   moved,
   smartOrder,
@@ -268,6 +270,21 @@ export function agentAccounts(
         // The move goes on without Paseo waiting for it, and the pill shows it under way.
         .catch((error: unknown) => (stoppedWaiting(error) ? undefined : toast.error(error instanceof Error ? error.message : String(error))));
     };
+    // Moves the agent there now, whatever the order says; an account not checked yet gets checked,
+    // and an edit not sent yet goes in the same request.
+    const onUse = (id: string) => {
+      if (timer.current) clearTimeout(timer.current);
+      timer.current = null;
+      const unsent = pending.current !== null;
+      pending.current = null;
+      const next = draft.pool.includes(id) ? draft : (toggled(draft, id) ?? draft);
+      if (next !== draft) setLocal(next);
+      const label = labelOf(accounts, id);
+      store
+        .rpc(setAgentAccount, { agentId, accountId: id, accounts: unsent || next !== draft ? next : undefined })
+        .then((summary) => toast.show(describeUse(label, summary), { variant: "success", durationMs: 3_000 }))
+        .catch((error: unknown) => toast.error(error instanceof Error ? error.message : `Could not move this agent to ${label}.`));
+    };
     const onUndo = () => {
       if (!undo) return;
       change(undo);
@@ -332,6 +349,7 @@ export function agentAccounts(
           panelHeight={panelHeight}
           onToggle={onToggle}
           onMove={onMove}
+          onUse={onUse}
         />
         {quiet ? null : <Status theme={theme} size={size} next={plan.next} label={(id) => labelOf(accounts, id)} onOnce={onOnce} />}
         <View style={{ flexDirection: "row", alignItems: "center", gap: 8, minHeight: size.choice + 4 }}>
@@ -512,6 +530,7 @@ function AccountList({
   panelHeight,
   onToggle,
   onMove,
+  onUse,
 }: {
   theme: Theme;
   plan: AgentPlan;
@@ -523,6 +542,8 @@ function AccountList({
   panelHeight: number;
   onToggle(id: string): void;
   onMove(id: string, index: number): void;
+  /** Moves the agent to this account now. */
+  onUse(id: string): void;
 }) {
   const rowH = size.row;
   const motions = useRef(new Map<string, Motion>()).current;
@@ -658,6 +679,7 @@ function AccountList({
           shakeAt={shake?.id === row.id ? shake.at : 0}
           peek={peeks(row.id)}
           onToggle={() => onToggle(row.id)}
+          onUse={canUse(row) ? () => onUse(row.id) : undefined}
           onDrag={(over) => {
             if (over !== null && drag === null) peeks(row.id).hide();
             setDrag(over === null ? null : { id: row.id, over });
@@ -957,6 +979,7 @@ function AccountRowView({
   shakeAt,
   peek,
   onToggle,
+  onUse,
   onDrag,
   onDrop,
   onStep,
@@ -974,6 +997,8 @@ function AccountRowView({
   shakeAt: number;
   peek: Peek;
   onToggle(): void;
+  /** Moves the agent here now; absent where it can't go (it runs here, or the account is full or off). */
+  onUse?: () => void;
   onDrag(over: number | null): void;
   onDrop(over: number): void;
   onStep(delta: -1 | 1): void;
@@ -1033,17 +1058,19 @@ function AccountRowView({
         aria-checked={checked}
         accessibilityLabel={`Use ${row.label} for this agent${row.now ? ", runs here now" : ""}`}
         accessibilityHint={spokenDetails(row) || undefined}
-        accessibilityActions={
-          movable
+        accessibilityActions={[
+          ...(onUse ? [{ name: "useNow", label: "Use now" }] : []),
+          ...(movable
             ? [
                 { name: "moveUp", label: "Move up" },
                 { name: "moveDown", label: "Move down" },
               ]
-            : undefined
-        }
+            : []),
+        ]}
         onAccessibilityAction={(event) => {
           const action = event.nativeEvent.actionName;
-          if (action === "moveUp") onStep(-1);
+          if (action === "useNow") onUse?.();
+          else if (action === "moveUp") onStep(-1);
           else if (action === "moveDown") onStep(1);
         }}
         onHoverIn={peek.enter}
@@ -1084,7 +1111,12 @@ function AccountRowView({
               </Text>
               {row.now ? <View style={{ width: 5, height: 5, borderRadius: 2.5, backgroundColor: colors.accent }} /> : null}
             </View>
-            <Text style={{ color: colors.foregroundMuted, fontSize: size.small, fontVariant: TABULAR, opacity: checked ? 1 : 0.7 }}>{row.meta}</Text>
+            {/* A mouse on the row offers to move the agent there now, in place of the figure the details repeat. */}
+            {onUse && hovered && !compact && !lifted ? (
+              <TextButton theme={theme} size={size} label="Use now" spoken={`Move this agent to ${row.label} now`} onPress={onUse} />
+            ) : (
+              <Text style={{ color: colors.foregroundMuted, fontSize: size.small, fontVariant: TABULAR, opacity: checked ? 1 : 0.7 }}>{row.meta}</Text>
+            )}
             {compact && movable ? (
               <View
                 {...byHandle.panHandlers}
@@ -1211,9 +1243,18 @@ export function ActionRow({
   );
 }
 
-function TextButton({ theme, size, label, onPress }: { theme: Theme; size: Size; label: string; onPress(): void }): ReactNode {
+function TextButton({ theme, size, label, spoken, onPress }: { theme: Theme; size: Size; label: string; spoken?: string; onPress(): void }): ReactNode {
   return (
-    <Pressable accessibilityRole="button" onPress={onPress} hitSlop={8}>
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={spoken}
+      // Inside a row, the press is the button's alone: the row under it must not toggle too.
+      onPress={(event: GestureResponderEvent) => {
+        (event as { stopPropagation?(): void }).stopPropagation?.();
+        onPress();
+      }}
+      hitSlop={8}
+    >
       {({ hovered, pressed }: { pressed: boolean; hovered?: boolean }) => (
         <Text
           style={{

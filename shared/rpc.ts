@@ -194,6 +194,8 @@ export const setAgentAccount = defineRpc({
     agentId: z.string(),
     /** `null` makes the agent follow the default account again. */
     accountId: z.string().nullable(),
+    /** The agent's checked accounts, saved in the same step (an edit not sent yet). */
+    accounts: AgentAccountsSchema.nullable().optional(),
   }),
   output: ReopenSummarySchema,
 });

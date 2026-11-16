@@ -4,6 +4,7 @@ import { accountGlyph, type AccountGlyph } from "../shared/glyph";
 import type { AccountView, AgentAccounts, AgentRoute, StateView } from "../shared/model";
 import { modelClass, modelName, planAccounts, sourceOfView } from "../shared/plan-input";
 import { fmtIn, rank, shouldMove, type PlanAccount, type PlanRequest, type Ranked } from "../shared/planner";
+import type { ReopenSummary } from "../shared/rpc";
 
 /** The accounts one agent may use, as the panel edits them before they are saved. */
 export type AgentDraft = AgentAccounts;
@@ -278,6 +279,23 @@ export function agentPlan(
   }
 
   return { model: modelName(model), modelShort: short, nowOn, checked, others, next, draft: { ...draft, pool }, chosen };
+}
+
+/**
+ * Whether a row offers "Use now": somewhere else the agent can run its next turn. Not where it runs
+ * already, nor a full, signed-out or turned-off account (the planner ranks those last, as full).
+ */
+export function canUse(row: Pick<AgentAccountRow, "now" | "full">): boolean {
+  return !row.now && !row.full;
+}
+
+/** What moving the agent to `label` came to, as the panel says it once the server answers. */
+export function describeUse(label: string, summary: Pick<ReopenSummary, "reopened" | "deferred" | "failed" | "continuedIn">): string {
+  if (summary.continuedIn) return `Continuing in “${summary.continuedIn.title}” on ${label}`;
+  if (summary.reopened.length > 0) return `Now on ${label}`;
+  if (summary.deferred.length > 0) return `Moves to ${label} once this turn ends`;
+  if (summary.failed.length > 0) return `Moves to ${label} when its session restarts`;
+  return `Runs on ${label}`;
 }
 
 /** Checks or unchecks an account; the last checked one stays. Null: refused. */

@@ -1699,6 +1699,22 @@ export class Service {
       .catch((error: unknown) => log(`could not continue ${agentId}`, error));
   }
 
+  /**
+   * The user moved this agent to another account: if its last turn had stopped at a limit, it picks
+   * that work up again there, as an automatic switch would. Never a guess: an unreadable timeline
+   * leaves it waiting for the user, and so does an agent that's busy again or put away.
+   */
+  private async resumeAfterMove(paseo: PaseoApi, agentId: string, family: Family, summary: ReopenSummary): Promise<void> {
+    if (!summary.reopened.includes(agentId) || !this.prefs.autoContinue) return;
+    if ((await this.lastTurnHitLimit(paseo, agentId, family)) !== true) return;
+    const info = await agentInfo(paseo, agentId);
+    if (!info || info.archived || !settled(info.status)) return;
+    await paseo.agents
+      .ref(agentId)
+      .send(this.prefs.continuePrompt)
+      .catch((error: unknown) => log(`could not continue ${agentId}`, error));
+  }
+
   /** No turn has started or ended on the agent since `endedAt`, and it's still open. */
   private async untouchedSince(paseo: PaseoApi, agentId: string, endedAt: number): Promise<boolean> {
     if (this.turnAt.get(agentId) !== endedAt) return false;
@@ -2381,9 +2397,21 @@ export class Service {
 
   // ------------------------------------------------------------------ RPC: an agent's accounts
 
+  /** The accounts an agent may use, kept to its family's; refused when none of them is left. */
+  private agentAccountsOf(state: StoredState, family: Family, chosen: AgentAccounts): AgentAccounts {
+    const ids = new Set(accountsOf(state, family).map((account) => account.id));
+    const pool = [...new Set(chosen.pool)].filter((id) => ids.has(id));
+    if (pool.length === 0) throw new Error("Keep at least one account checked for this agent.");
+    const order = [...new Set(chosen.order)].filter((id) => ids.has(id));
+    return AgentAccountsSchema.parse({ ...chosen, pool, order });
+  }
+
   /**
    * Sets the accounts an agent may use (or clears them with `null`), then moves it right away when
-   * its account is no longer one of them, or another now comes first in the order the user dragged.
+   * its account is no longer one of them, another now comes first in the order the user dragged, or
+   * its account can't take another turn while a checked one can. This is the user's own choice, so
+   * it moves the agent even with automatic switching off, and an agent that had stopped at a limit
+   * carries on where it lands.
    */
   async setAgentAccounts(paseo: PaseoApi, agentId: string, chosen: AgentAccounts | null): Promise<ReopenSummary> {
     this.attach(paseo);
@@ -2393,14 +2421,7 @@ export class Service {
     const family = (await this.families.resolve(paseo))[info.provider];
     if (!family) throw new Error(`${info.provider} agents don't use Claude or ChatGPT subscription accounts.`);
     const state = await this.store.read();
-    let value: AgentAccounts | null = null;
-    if (chosen) {
-      const ids = new Set(accountsOf(state, family).map((account) => account.id));
-      const pool = [...new Set(chosen.pool)].filter((id) => ids.has(id));
-      if (pool.length === 0) throw new Error("Keep at least one account checked for this agent.");
-      const order = [...new Set(chosen.order)].filter((id) => ids.has(id));
-      value = AgentAccountsSchema.parse({ ...chosen, pool, order });
-    }
+    const value = chosen ? this.agentAccountsOf(state, family, chosen) : null;
     await this.store.update((draft) => {
       if (value) draft.agentAccounts[agentId] = value;
       else delete draft.agentAccounts[agentId];
@@ -2413,14 +2434,19 @@ export class Service {
     const bound = latest.bindings[agentId]?.accountId ?? current;
     const planning = this.planningFor(latest, agentId, info.model);
     const now = Date.now();
-    const best = plannedPick(latest, family, (id) => this.usage.get(id), planning, now, { kind: "move", overflow: false });
+    const usageOf = (id: string) => this.usage.get(id);
+    const best = plannedPick(latest, family, usageOf, planning, now, { kind: "move", overflow: false });
     const unchecked = !!bound && !value.pool.includes(bound);
     const reorder = value.mode === "manual" && !!best && best.account.id !== bound;
-    if (!best || (!unchecked && !reorder)) return emptySummary();
+    const here = findAccount(latest, current);
+    const stuck = !!here && !!best && best.account.id !== current && (isLimited(here, now) || !servesModel(latest, here, usageOf, planning, now));
+    if (!best || (!unchecked && !reorder && !stuck)) return emptySummary();
     await this.store.update((draft) => {
       draft.bindings[agentId] = { accountId: best.account.id, source: "auto", at: new Date(now).toISOString(), selectionReason: "plan" };
     });
-    return this.reconcile(paseo, unchecked ? "unchecked" : "order", [agentId]);
+    const summary = await this.reconcile(paseo, unchecked ? "unchecked" : stuck && !reorder ? "limit" : "order", [agentId]);
+    await this.resumeAfterMove(paseo, agentId, family, summary);
+    return summary;
   }
 
   /**
@@ -3333,19 +3359,29 @@ export class Service {
   }
 
   /**
-   * Moves one agent to an account, or back to following the default. With automatic switching on,
-   * an account at its limit is refused, since the agent would be moved straight off it. A failover
-   * under way finishes first; the agent then moves to the account picked here.
+   * Moves one agent to an account ("Use now"), or back to following the default with `null`. With
+   * automatic switching on, an account at its limit is refused, since the agent would be moved
+   * straight off it. A failover under way finishes first; the agent then moves to the account picked
+   * here. `accounts`, when given, are its checked accounts saved in the same step, so an edit the
+   * panel hadn't sent yet can't undo the move. The user's own choice: it moves the agent even with
+   * automatic switching off, and an agent that had stopped at a limit carries on there.
    */
-  async setAgentAccount(paseo: PaseoApi, agentId: string, accountId: string | null): Promise<ReopenSummary> {
+  async setAgentAccount(paseo: PaseoApi, agentId: string, accountId: string | null, accounts?: AgentAccounts | null): Promise<ReopenSummary> {
     const replyBy = Date.now() + REPLY_WAIT_MS;
     this.attach(paseo);
     const info = await lookUpAgent(paseo, agentId);
     if (!info) throw new Error("That agent is no longer available.");
+    if (info.model) this.models.set(agentId, info.model);
     const family = (await this.families.resolve(paseo))[info.provider];
     if (!family) throw new Error(`${info.provider} agents don't use Claude, ChatGPT, Grok or Cursor subscription accounts.`);
     const adapter = this.adapters[family];
     const state = await this.store.read();
+    if (accounts) {
+      const chosen = this.agentAccountsOf(state, family, accounts);
+      await this.store.update((draft) => {
+        draft.agentAccounts[agentId] = chosen;
+      });
+    }
     const target = accountId ? findAccount(state, accountId) : defaultAccount(state, family);
     if (!target || target.family !== family) throw new Error("That account can't be used with this agent.");
     if (!target.signedIn) throw new Error(`${target.label} is signed out. Sign it in first.`);
@@ -3412,12 +3448,16 @@ export class Service {
       if (accountId) draft.bindings[agentId] = { accountId, source: adapter.portable ? "user" : "thread", at: new Date().toISOString() };
       else delete draft.bindings[agentId];
       // An account picked for the agent counts as checked for it.
-      const chosen = draft.agentAccounts[agentId];
-      if (accountId && chosen && !chosen.pool.includes(accountId)) chosen.pool.push(accountId);
+      const saved = draft.agentAccounts[agentId];
+      if (accountId && saved && !saved.pool.includes(accountId)) saved.pool.push(accountId);
     });
     this.waiting.delete(agentId);
     const summary = emptySummary();
-    return this.answerBy(replyBy, this.reconcile(paseo, "manual", [agentId], undefined, { summary }), summary);
+    const moves = this.reconcile(paseo, "manual", [agentId], undefined, { summary }).then(async (done) => {
+      await this.resumeAfterMove(paseo, agentId, family, done);
+      return done;
+    });
+    return this.answerBy(replyBy, moves, summary);
   }
 
   async rename(accountId: string, label: string): Promise<void> {

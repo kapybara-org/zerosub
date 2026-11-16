@@ -2885,6 +2885,79 @@ describe("an agent's accounts", () => {
     ).rejects.toThrow(/at least one account/);
   });
 
+  /**
+   * After "[System Error] You've hit your 5-hour limit" Paseo shows the agent as "error", its session
+   * still open on the full account. With automatic switching off, the user's own choice is what moves it.
+   */
+  describe("stopped at a limit, with automatic switching off", () => {
+    const stopped = inTurn(
+      "t1",
+      { type: "user_message", text: "carry on" },
+      { type: "assistant_message", text: "[System Error] You've hit your 5-hour limit · resets 5:20pm (Asia/Bangkok)" },
+    );
+    const fullMain = () =>
+      [{ ...account(MAIN, "marketing", "main"), limitedUntil: inFuture(), limitKind: "window", limitedAt: inPast() }, account(HELLO, "hello", "managed")] as never;
+    const CONTINUE = preferences.schema.parse({}).continuePrompt;
+
+    async function stuckAgent(extra: Partial<StoredState> = {}) {
+      const set = await setUp({ accounts: fullMain(), defaults: { claude: MAIN, codex: null, pi: null }, sessions: onMain(), ...extra }, unused, {
+        detectLimit: detectClaudeLimit,
+        recent: stopped,
+      });
+      set.service.setPreferences(preferences.schema.parse({ autoSwitch: false }));
+      (await set.paseo.agents.ref().refresh()).agent.status = "error";
+      return set;
+    }
+
+    it("moves it off the account the user unchecked, and it carries on there", async () => {
+      const { service, store, reopened, sent, paseo } = await stuckAgent();
+      const summary = await service.setAgentAccounts(paseo as never, AGENT, { pool: [HELLO], mode: "smart", order: [], overflow: "wait" });
+      expect(summary.reopened).toEqual([AGENT]);
+      expect(reopened).toEqual([AGENT]);
+      expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+      expect(sent).toEqual([CONTINUE]);
+    });
+
+    it("moves it off a full account the user leaves checked, once another checked one has room", async () => {
+      const { service, store, reopened, sent, paseo } = await stuckAgent();
+      await service.setAgentAccounts(paseo as never, AGENT, { pool: [MAIN, HELLO], mode: "smart", order: [], overflow: "wait" });
+      expect(reopened).toEqual([AGENT]);
+      expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+      expect(sent).toEqual([CONTINUE]);
+    });
+
+    it("moves it where the user says with Use now, saving the edit the panel hadn't sent", async () => {
+      const { service, store, reopened, sent, paseo } = await stuckAgent({
+        agentAccounts: { [AGENT]: { pool: [MAIN], mode: "smart", order: [], overflow: "wait" } },
+      });
+      const summary = await service.setAgentAccount(paseo as never, AGENT, HELLO, { pool: [MAIN, HELLO], mode: "manual", order: [MAIN, HELLO], overflow: "wait" });
+      expect(summary.reopened).toEqual([AGENT]);
+      expect(reopened).toEqual([AGENT]);
+      const state = await store.read();
+      expect(state.sessions[AGENT]?.accountId).toBe(HELLO);
+      expect(state.bindings[AGENT]).toMatchObject({ accountId: HELLO, source: "user" });
+      expect(state.agentAccounts[AGENT]).toMatchObject({ pool: [MAIN, HELLO], mode: "manual" });
+      expect(sent).toEqual([CONTINUE]);
+    });
+
+    it("shows where it really runs, so the panel doesn't claim it moved", async () => {
+      const { service, store, paseo } = await stuckAgent({ bindings: { [AGENT]: { accountId: HELLO, source: "auto", at: new Date().toISOString() } } });
+      const route = (await service.view(paseo as never)).agents.find((entry) => entry.agentId === AGENT);
+      expect(route).toMatchObject({ accountId: HELLO, pendingAccountId: MAIN });
+      expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+    });
+
+    it("doesn't send anything to an agent whose last turn ended well", async () => {
+      const { service, reopened, sent, paseo } = await setUp({ accounts, defaults: { claude: MAIN, codex: null, pi: null }, sessions: onMain() }, unused, {
+        detectLimit: detectClaudeLimit,
+        recent: inTurn("t1", { type: "user_message", text: "fix it" }, { type: "assistant_message", text: "Fixed." }),
+      });
+      await service.setAgentAccount(paseo as never, AGENT, HELLO);
+      expect(reopened).toEqual([AGENT]);
+      expect(sent).toEqual([]);
+    });
+  });
+
   it("carries on once on another account when every checked one is full", async () => {
     const { service, store, reopened, paseo } = await setUp(
       {

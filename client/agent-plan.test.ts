@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { formatResetMoment } from "../shared/format";
 import type { AccountView, AgentRoute, StateView, UsageWindow } from "../shared/model";
-import { agentPlan, detailReason, draftOf, moved, smartOrder, spokenDetails, toggled } from "./agent-plan";
+import { agentPlan, canUse, describeUse, detailReason, draftOf, moved, smartOrder, spokenDetails, toggled } from "./agent-plan";
 
 const NOW = Date.parse("2026-11-14T12:00:00Z");
 const IN_2H = "2026-11-14T14:00:00Z";
@@ -197,5 +197,29 @@ describe("editing an agent's accounts", () => {
     const accounts = [account("a", []), account("b", [])];
     expect(draftOf(null, accounts, ["b", "a"])).toEqual({ pool: ["a", "b"], mode: "smart", order: ["b", "a"], overflow: "wait" });
     expect(draftOf({ pool: ["gone"], mode: "smart", order: ["gone"], overflow: "others" }, accounts, ["a", "b"]).pool).toEqual(["a", "b"]);
+  });
+});
+
+describe("using an account now", () => {
+  it("offers every account the agent can run on next, but not the one it runs on", () => {
+    const stopped = account("stopped", [fiveHour(100), weekly(40)], { isDefault: true, kind: "main" });
+    const free = account("free", [fiveHour(5), weekly(30)]);
+    const out = account("out", [], { status: "signed_out" });
+    const off = account("off", [fiveHour(0), weekly(0)], { status: "disabled" });
+    const s = state([stopped, free, out, off], [route("stopped", { model: "claude-opus-5-5" })]);
+    const r = s.agents[0];
+    const draft = { pool: ["free"], mode: "manual" as const, order: ["free", "stopped", "out", "off"], overflow: "wait" as const };
+    const plan = agentPlan(s, r, "claude", "claude-opus-5-5", draft, true, NOW)!;
+    const offered = [...plan.checked, ...plan.others].filter(canUse).map((row) => row.id);
+    expect(offered).toEqual(["free"]);
+  });
+
+  it("says where the agent went", () => {
+    const none = { reopened: [], deferred: [], failed: [], continuedIn: null };
+    expect(describeUse("home", { ...none, reopened: ["agent"] })).toBe("Now on home");
+    expect(describeUse("home", { ...none, deferred: ["agent"] })).toBe("Moves to home once this turn ends");
+    expect(describeUse("home", { ...none, failed: [{ agentId: "agent", error: "x" }] })).toBe("Moves to home when its session restarts");
+    expect(describeUse("home", none)).toBe("Runs on home");
+    expect(describeUse("home", { ...none, continuedIn: { agentId: "b", title: "Fix" } })).toBe("Continuing in “Fix” on home");
   });
 });
