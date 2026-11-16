@@ -93,6 +93,7 @@ describe("account presentation", () => {
     egress: null,
     externalHome: false,
     moving: null,
+    azure: null,
   };
 
   it("summarises the busiest window", () => {

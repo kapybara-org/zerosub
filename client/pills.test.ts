@@ -36,6 +36,7 @@ function account(id: string, isDefault: boolean, overrides: Partial<AccountView>
     egress: null,
     externalHome: false,
     moving: null,
+    azure: null,
     ...overrides,
   };
 }
