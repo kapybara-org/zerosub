@@ -326,6 +326,8 @@ export async function continueInNewAgent(options: {
    * same request, and a source no longer at its frozen location refuses instead.
    */
   reserved?: { title: string; workspaceId: string | null; cwd: string | null };
+  /** Called when Paseo rejects the create itself, before the error is thrown on. */
+  onCreateRejected?: () => Promise<unknown>;
 }): Promise<Continuation> {
   const { paseo, sourceAgentId, reserved } = options;
   const refreshed = await paseo.agents.ref(sourceAgentId).refresh();
@@ -381,7 +383,12 @@ export async function continueInNewAgent(options: {
     labels: { [CONTINUED_FROM_LABEL]: sourceAgentId, ...(options.parentId ? { [PARENT_LABEL]: options.parentId } : {}) },
   };
   // A reserved request's location was checked against this snapshot above, so the two agree.
-  if (source.workspaceId) await paseo.workspaces.ref(source.workspaceId).agents.create(request);
-  else await paseo.agents.create({ ...request, cwd: source.cwd });
+  try {
+    if (source.workspaceId) await paseo.workspaces.ref(source.workspaceId).agents.create(request);
+    else await paseo.agents.create({ ...request, cwd: source.cwd });
+  } catch (error) {
+    await options.onCreateRejected?.();
+    throw error;
+  }
   return { agentId, title };
 }

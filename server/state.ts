@@ -102,6 +102,12 @@ export const OpenCodeForkSchema = z.object({
         .optional(),
       /** SHA-256 of the exact sent text, so a receipt survives a provider reload. */
       sentDigest: z.string().optional(),
+      /**
+       * The create was seen to fail. Paseo keeps a failed request under its idempotency key, so a
+       * retry with another request needs new IDs. Without it, the outcome is unknown and only the
+       * reserved request may be sent again.
+       */
+      createFailed: z.boolean().optional(),
     })
     .optional(),
 });

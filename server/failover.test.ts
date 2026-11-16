@@ -792,7 +792,15 @@ describe("forking to the other provider", () => {
       createdStatus?: string;
       /** Paseo 0.9.1 to 0.10.3: refreshing an agent it doesn't know throws instead of answering null. */
       unknownThrows?: boolean;
+      /** Makes every create fail with this message, after Paseo has recorded its request. */
+      createError?: string;
     } = {};
+    /** Paseo's creation receipts: each idempotency key's first request fingerprint. */
+    const receipts = new Map<string, string>();
+    const fingerprintOf = (value: unknown) =>
+      JSON.stringify(value, (_key, entry) =>
+        entry && typeof entry === "object" && !Array.isArray(entry) ? Object.fromEntries(Object.entries(entry).sort(([a], [b]) => a.localeCompare(b))) : entry,
+      );
     await store.update((draft) =>
       Object.assign(draft, {
         accounts: options.noChatGPT
@@ -869,6 +877,17 @@ describe("forking to the other provider", () => {
         ref: (workspaceId: string) => ({
           agents: {
             create: async (request: (typeof created)[number]) => {
+              // Paseo ties an idempotency key to its first request, failed or not: the same key with
+              // another request is refused, and the same request again doesn't make a second agent.
+              if (request.idempotencyKey) {
+                const { idempotencyKey: _key, ...intent } = request;
+                const fingerprint = fingerprintOf({ ...intent, workspaceId });
+                const first = receipts.get(request.idempotencyKey);
+                if (first !== undefined && first !== fingerprint) throw new Error("agent_request_key_conflict");
+                receipts.set(request.idempotencyKey, fingerprint);
+                if (byId.has(request.agentId)) return;
+              }
+              if (hooks.createError) throw new Error(hooks.createError);
               created.push({ ...request, workspaceId });
               const agent = {
                 id: request.agentId,
@@ -1307,32 +1326,71 @@ describe("forking to the other provider", () => {
       expect(setup.sends.map((send) => send.messageId)).toEqual([RESERVED.messageId]);
     });
 
-    it("retries a failed create with a new model pick and a renamed source, under the same target ID", async () => {
-      const catalog = [
-        { id: "opencode/glm-5p3-flash", label: "GLM 5.3 Flash", isDefault: true, thinkingOptions: [{ id: "high", label: "High" }] },
-        { id: "opencode/kimi-k3", label: "Kimi K3", thinkingOptions: [{ id: "high", label: "High" }] },
-      ];
-      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS, catalog });
-      const paseo = setup.paseo as { workspaces: { ref: unknown } };
-      const workspaces = paseo.workspaces.ref;
-      paseo.workspaces.ref = () => ({ agents: { create: async () => { throw new Error("GLM is down"); } } });
+    const KIMI_CATALOG = [
+      { id: "opencode/glm-5p3-flash", label: "GLM 5.3 Flash", isDefault: true, thinkingOptions: [{ id: "high", label: "High" }] },
+      { id: "opencode/kimi-k3", label: "Kimi K3", thinkingOptions: [{ id: "high", label: "High" }] },
+    ];
+
+    it("starts a failed create again under new IDs once its model or title changed", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS, catalog: KIMI_CATALOG });
+      setup.hooks.createError = "GLM is down";
       await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/GLM is down/);
-      paseo.workspaces.ref = workspaces;
+      delete setup.hooks.createError;
       const reserved = (await setup.store.read()).opencodeForks[AGENT]!.pending!;
+      expect(reserved.createFailed).toBe(true);
       setup.service.setPreferences(preferences.schema.parse({ ...PREFS, forkOpenCodeModel: "opencode/kimi-k3" }));
       setup.byId.get(AGENT)!.title = "Fix the build and the tests";
       const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
       expect(done.delivery).toBe("sent");
+      // Paseo keeps the failed request under its key, so a changed request needs a key of its own.
       expect(setup.created).toHaveLength(1);
-      // The target ID stays the create's idempotency key: a first create that did land can't double.
       expect(setup.created[0]).toMatchObject({
-        agentId: reserved.targetId,
-        idempotencyKey: reserved.targetId,
         title: "Fix the build and the tests (continued on OpenCode)",
         config: { provider: "opencode/opencode/kimi-k3" },
       });
+      expect(setup.created[0]!.agentId).not.toBe(reserved.targetId);
+      expect(setup.created[0]!.idempotencyKey).toBe(setup.created[0]!.agentId);
       expect(setup.sends).toHaveLength(1);
-      expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toBeUndefined();
+      expect(setup.sends[0]!.messageId).not.toBe(reserved.messageId);
+      const record = (await setup.store.read()).opencodeForks[AGENT]!;
+      expect(record.forkAgentId).toBe(setup.created[0]!.agentId);
+      expect(record.pending).toBeUndefined();
+    });
+
+    it("retries a failed create unchanged under the same target and message IDs", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      setup.hooks.createError = "GLM is down";
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/GLM is down/);
+      delete setup.hooks.createError;
+      const reserved = (await setup.store.read()).opencodeForks[AGENT]!.pending!;
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.agentId).toBe(reserved.targetId);
+      expect(setup.created).toHaveLength(1);
+      expect(setup.created[0]).toMatchObject({ agentId: reserved.targetId, idempotencyKey: reserved.targetId });
+      expect(setup.sends.map((send) => send.messageId)).toEqual([reserved.messageId]);
+    });
+
+    it("retries a create interrupted before its outcome was seen with the reserved request, not the new model pick", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS, catalog: KIMI_CATALOG });
+      setup.hooks.createError = "GLM is down";
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/GLM is down/);
+      delete setup.hooks.createError;
+      // The service stopped before it saw the rejection: Paseo has the request, the record doesn't know how it ended.
+      await setup.store.update((draft) => {
+        delete draft.opencodeForks[AGENT]!.pending!.createFailed;
+      });
+      const reserved = (await setup.store.read()).opencodeForks[AGENT]!.pending!;
+      setup.service.setPreferences(preferences.schema.parse({ ...PREFS, forkOpenCodeModel: "opencode/kimi-k3" }));
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("sent");
+      expect(setup.created).toHaveLength(1);
+      expect(setup.created[0]).toMatchObject({
+        agentId: reserved.targetId,
+        idempotencyKey: reserved.targetId,
+        title: "Fix the build (continued on OpenCode)",
+        config: { provider: "opencode/opencode/glm-5p3-flash", modeId: "build", thinkingOptionId: "high" },
+      });
+      expect(setup.sends.map((send) => send.messageId)).toEqual([reserved.messageId]);
     });
 
     const damage = {
@@ -2205,11 +2263,9 @@ describe("forking to the other provider", () => {
 
     it("never ends with two continuations after a failed OpenCode create, a ChatGPT fork, then Continue on OpenCode", async () => {
       const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: { autoSwitch: false } });
-      const paseo = setup.paseo as { workspaces: { ref: unknown } };
-      const workspaces = paseo.workspaces.ref;
-      paseo.workspaces.ref = () => ({ agents: { create: async () => { throw new Error("OpenCode couldn't start"); } } });
+      setup.hooks.createError = "OpenCode couldn't start";
       await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/couldn't start/);
-      paseo.workspaces.ref = workspaces;
+      delete setup.hooks.createError;
       expect((await setup.store.read()).opencodeForks[AGENT]?.pending?.stage).toBe("creating");
       await setup.service.forkAgent(setup.paseo, AGENT);
       expect(setup.created.map((agent) => agent.config.provider.split("/")[0])).toEqual(["codex"]);
@@ -2223,11 +2279,9 @@ describe("forking to the other provider", () => {
     it("forks to ChatGPT after a failed OpenCode create on Paseo 0.9.1 to 0.10.3, where refreshing the absent target throws", async () => {
       const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: { autoSwitch: false } });
       setup.hooks.unknownThrows = true;
-      const paseo = setup.paseo as { workspaces: { ref: unknown } };
-      const workspaces = paseo.workspaces.ref;
-      paseo.workspaces.ref = () => ({ agents: { create: async () => { throw new Error("OpenCode couldn't start"); } } });
+      setup.hooks.createError = "OpenCode couldn't start";
       await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/couldn't start/);
-      paseo.workspaces.ref = workspaces;
+      delete setup.hooks.createError;
       await setup.service.forkAgent(setup.paseo, AGENT);
       expect(setup.created.map((agent) => agent.config.provider.split("/")[0])).toEqual(["codex"]);
       expect((await setup.store.read()).opencodeForks[AGENT]).toBeUndefined();
@@ -2235,11 +2289,9 @@ describe("forking to the other provider", () => {
 
     it("keeps an OpenCode reservation when a later ChatGPT fork is refused before it starts", async () => {
       const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: { autoSwitch: false }, noChatGPT: true });
-      const paseo = setup.paseo as { workspaces: { ref: unknown } };
-      const workspaces = paseo.workspaces.ref;
-      paseo.workspaces.ref = () => ({ agents: { create: async () => { throw new Error("OpenCode couldn't start"); } } });
+      setup.hooks.createError = "OpenCode couldn't start";
       await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/couldn't start/);
-      paseo.workspaces.ref = workspaces;
+      delete setup.hooks.createError;
       const reserved = (await setup.store.read()).opencodeForks[AGENT]!.pending!;
       await expect(setup.service.forkAgent(setup.paseo, AGENT)).rejects.toThrow();
       expect(setup.created).toHaveLength(0);

@@ -247,6 +247,12 @@ function meaningful<T extends { item: AgentTimelineItem }>(entries: readonly T[]
 const forkRef = (fork: { id: string; title?: string | null }): string =>
   fork.title?.trim() ? fork.title : `${OPENCODE_LABEL} agent ${fork.id}`;
 
+/** Whether two OpenCode creates send Paseo the same request: everything but the prompt's reason. */
+function sameCreate(reserved: OpenCodeCreateConfig | undefined, next: OpenCodeCreateConfig): boolean {
+  const keys = ["provider", "modeId", "thinkingOptionId", "workspaceId", "cwd", "parentId", "title"] as const;
+  return reserved !== undefined && keys.every((key) => (reserved[key] ?? null) === (next[key] ?? null));
+}
+
 /**
  * The same place for a fork on another provider: the same workspace, or the same directory when
  * neither sits in one. (`samePlace` also demands the same provider, which a fork never shares.)
@@ -1989,9 +1995,8 @@ export class Service {
           return this.deliverReservedOpenCode(paseo, agentId, fork);
         }
         if (!fork) {
-          // The create never landed, so nothing was sent. Build it again from today's settings and
-          // source, under the same target ID: it stays the create's idempotency key, so a first
-          // create that lands late can't make a second fork.
+          // The create never landed, so nothing was sent. A create seen to fail is built again from
+          // today's settings and source; one whose outcome is unknown is sent again unchanged.
           return this.createOpenCodeFork(paseo, agentId, original, source, pending);
         }
         if (fork.archivedAt) {
@@ -2284,6 +2289,16 @@ export class Service {
   ): Promise<ForkOutcome> {
     const chatGptCopy = (await listAgents(paseo, false)).agents.find((agent) => agent.continuedFrom === agentId && agent.provider !== OPENCODE_PROVIDER);
     if (chatGptCopy) return { skipped: alreadyContinued(chatGptCopy.title ?? `${PROVIDER_NAME["codex"]} agent ${chatGptCopy.id}`) };
+    // A create whose outcome was never seen may be in Paseo under its key, which stays tied to its
+    // first request: only that exact request may be sent again.
+    if (retry && !retry.createFailed) {
+      const reserved = retry.config;
+      // A reservation saved before the request was frozen whole can't be repeated exactly.
+      if (!reserved?.title || reserved.workspaceId === undefined || reserved.cwd === undefined || reserved.parentId === undefined) {
+        return this.openCodeUncertain(retry.targetId, null, retry.messageId);
+      }
+      return this.sendReservedCreate(paseo, agentId, retry.targetId, retry.messageId, { ...reserved, title: reserved.title });
+    }
     const { models, error } = await paseo.providers.listModels(OPENCODE_PROVIDER);
     if (error) return { skipped: `Couldn't read this host's ${OPENCODE_LABEL} models: ${error}` };
     const savedModel = this.prefs.forkOpenCodeModel;
@@ -2316,53 +2331,63 @@ export class Service {
       return { skipped: HISTORY_GAP_DETAIL };
     }
 
-    const targetId = retry?.targetId ?? randomUUID();
-    const messageId = retry?.messageId ?? `${MESSAGE_PREFIX}${randomUUID()}`;
     const parentId = await this.continuations.parentFor(paseo, agentId);
-    const title = `${original.title?.trim() || "Task"} (continued on ${OPENCODE_LABEL})`;
-    const why = retry?.config?.why ?? (source === "auto" ? "every Claude account reached its usage limit" : "the work was moved to OpenCode");
+    const config = {
+      provider: `${OPENCODE_PROVIDER}/${model.id}`,
+      modeId,
+      ...(thinking ? { thinkingOptionId: thinking } : {}),
+      workspaceId: original.workspaceId ?? null,
+      cwd: original.cwd ?? null,
+      parentId: parentId ?? null,
+      title: `${original.title?.trim() || "Task"} (continued on ${OPENCODE_LABEL})`,
+    };
+    // Paseo keeps a failed create's request under its key: the same request may use that key again,
+    // and any other request needs new IDs. The failed one can't land later, so this can't double.
+    const reuse = retry !== undefined && sameCreate(retry.config, config);
+    const targetId = reuse ? retry.targetId : randomUUID();
+    const messageId = reuse ? retry.messageId : `${MESSAGE_PREFIX}${randomUUID()}`;
+    const why = (reuse ? retry.config?.why : undefined) ?? (source === "auto" ? "every Claude account reached its usage limit" : "the work was moved to OpenCode");
     const prompt = [continuationPrompt(buildTranscript(delta.entries.map((entry) => entry.item)), why, PROVIDER_NAME.claude), transferMarker(messageId)].join("\n");
     await this.store.update((draft) => {
       // A new reservation is this source's journal again; a hold it was told about is spent.
       delete draft.opencodeHolds[agentId];
       draft.opencodeForks[agentId] = {
         forkAgentId: targetId,
-        pending: {
-          stage: "creating",
-          targetId,
-          messageId,
-          seen: delta.mark,
-          config: {
-            provider: `${OPENCODE_PROVIDER}/${model.id}`,
-            modeId,
-            ...(thinking ? { thinkingOptionId: thinking } : {}),
-            workspaceId: original.workspaceId ?? null,
-            cwd: original.cwd ?? null,
-            parentId: parentId ?? null,
-            title,
-            why,
-          },
-          sentDigest: sentDigestOf(prompt),
-        },
+        pending: { stage: "creating", targetId, messageId, seen: delta.mark, config: { ...config, why }, sentDigest: sentDigestOf(prompt) },
       };
     });
+    return this.sendReservedCreate(paseo, agentId, targetId, messageId, config);
+  }
+
+  /** Sends a reserved promptless create, then its reserved handoff once the fork exists. */
+  private async sendReservedCreate(
+    paseo: PaseoApi,
+    agentId: string,
+    targetId: string,
+    messageId: string,
+    config: OpenCodeCreateConfig & { title: string },
+  ): Promise<ForkOutcome> {
     await continueInNewAgent({
       paseo,
       sourceAgentId: agentId,
-      why: source === "auto" ? "every Claude account reached its usage limit" : "the work was moved to OpenCode",
       previous: PROVIDER_NAME.claude,
       agentId: targetId, // also the create's idempotency key, so a retried create can't double it
       deferPrompt: true,
       target: {
         provider: OPENCODE_PROVIDER,
         label: OPENCODE_LABEL,
-        modeId,
-        model: model.id,
-        ...(thinking ? { thinkingOptionId: thinking } : {}),
+        modeId: config.modeId,
+        model: config.provider.slice(`${OPENCODE_PROVIDER}/`.length),
+        ...(config.thinkingOptionId ? { thinkingOptionId: config.thinkingOptionId } : {}),
       },
-      parentId,
-      reserved: { title, workspaceId: original.workspaceId ?? null, cwd: original.cwd ?? null },
+      parentId: config.parentId ?? undefined,
+      reserved: { title: config.title, workspaceId: config.workspaceId ?? null, cwd: config.cwd ?? null },
       bind: async () => {}, // OpenCode is a harness, not an account provider: no binding to record.
+      onCreateRejected: () =>
+        this.store.update((draft) => {
+          const pending = draft.opencodeForks[agentId]?.pending;
+          if (pending?.messageId === messageId) pending.createFailed = true;
+        }),
     });
     const fork = await waitForCreated(paseo, targetId);
     if (!fork) return this.openCodeUncertain(targetId, null, messageId);
