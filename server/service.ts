@@ -205,6 +205,8 @@ interface Opening {
   session?: LiveSession;
   /** A Codex thread's pin it wrote, and the one that pin replaced. */
   pin?: { wrote: Binding; replaced: Binding | undefined };
+  /** Routing left the session alone: its family isn't available here (see `route`). */
+  unavailable?: boolean;
 }
 type Problem = { kind: "limit"; hit: LimitHit } | { kind: "signed_out" };
 
@@ -772,6 +774,10 @@ export class Service {
     abandoned?.addEventListener("abort", giveUp, { once: true });
     try {
       const result = await routed;
+      if (opening.unavailable) {
+        await this.openedUnavailable(request, opening);
+        return result;
+      }
       if (!abandoned?.aborted) {
         if (result) {
           // A fresh session already runs on the routed account, so any pending switch is done.
@@ -823,6 +829,22 @@ export class Service {
     });
   }
 
+  /**
+   * A session of a family that isn't available here runs on the CLI login, like any session ZeroSub
+   * didn't route: so the account recorded for the session before goes, unless a session opened since
+   * replaced it, and a reload of ours counts as not landed. Bindings stay, so the agent goes back to
+   * its account once the family is available again.
+   */
+  private async openedUnavailable(request: PluginSessionOpenRequest, opening: Opening): Promise<void> {
+    const { agentId } = request;
+    this.unrouted.add(agentId);
+    const ended = (session: LiveSession | undefined) => session !== undefined && Date.parse(session.openedAt) < opening.startedAt;
+    if (!ended((await this.store.read()).sessions[agentId])) return;
+    await this.store.update((draft) => {
+      if (ended(draft.sessions[agentId])) delete draft.sessions[agentId];
+    });
+  }
+
   private async route(
     request: PluginSessionOpenRequest,
     context: PluginHookContext,
@@ -832,6 +854,14 @@ export class Service {
     this.attach(context.paseo);
     const family = (await this.families.resolve(context.paseo))[request.provider];
     if (!family) return undefined;
+    // A family known not to work here (Cursor off Linux, with a registry made on Linux, say) gives an
+    // added account no env of its own: the session runs on the CLI login, so it isn't routed or
+    // recorded. Until availability is first checked, sessions are routed as usual.
+    if (this.availability.get(family)?.ok === false) {
+      if (opening) opening.unavailable = true;
+      console.log(`[ZeroSub] ${request.provider} agent ${request.agentId} not routed: ${PROVIDER_NAME[family]} isn't available here (${request.reason})`);
+      return undefined;
+    }
     const adapter = this.adapters[family];
     const now = Date.now();
     const interactive = request.purpose === "interactive";
