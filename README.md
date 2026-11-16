@@ -14,6 +14,7 @@ Use several Claude, ChatGPT (Codex), Grok and Cursor subscriptions side by side 
 - **Grok accounts.** Sign in several Grok (SuperGrok, X Premium+) accounts for Paseo's Grok agents and pick the one each new agent starts on. See [Grok accounts](#grok-accounts).
 - **Cursor accounts.** Sign in several Cursor accounts for Paseo's Cursor agents (`cursor-agent`) and pick the one each new agent starts on (Linux only for now). See [Cursor accounts](#cursor-accounts).
 - **Azure OpenAI accounts.** Add an Azure OpenAI key under ChatGPT (Codex) and pick it for an agent or make it the default. ZeroSub only moves work onto it by itself if you turn that on, and then only when every ChatGPT subscription is out (after a banked reset, if you let ZeroSub spend those). See [Azure OpenAI accounts](#azure-openai-accounts).
+- **AWS Bedrock accounts.** Add Claude Code on Amazon Bedrock under Claude, with the host's own AWS credentials, a profile or an access key, and pick it for an agent or make it the default. ZeroSub only moves work onto it by itself if you turn that on, then only when every Claude subscription is out (after a banked reset, if you let ZeroSub spend those), and back once one has room. See [AWS Bedrock accounts](#aws-bedrock-accounts).
 - **Pi accounts.** Add Anthropic API keys for Paseo's Pi agents, each with an optional base URL and its own proxy, and pick one per Pi agent. See [Pi accounts](#pi-accounts).
 - **Everything else stays the same.** Every account shares your settings, skills, plugins, MCP servers, `CLAUDE.md`/`AGENTS.md` and conversation history.
 
@@ -130,7 +131,7 @@ When a Claude account has extra usage turned on (pay-as-you-go past the plan's l
 ZeroSub tries these in order, and a timeline note says which one happened.
 
 1. **Use a banked reset**, if you turned on **Use banked resets when every account is out**.
-2. **Move to an [Azure OpenAI account](#azure-openai-accounts)** with room, for a ChatGPT agent, if you turned on **Use paid API accounts when every subscription is out**, as it would to another ChatGPT account. A free reset always goes first: Azure is billed per token.
+2. **Move to a paid API account** with room, if you turned on **Use paid API accounts when every subscription is out**: an [Azure OpenAI account](#azure-openai-accounts) for a ChatGPT agent, an [AWS Bedrock account](#aws-bedrock-accounts) for a Claude agent, as it would to another account of its provider. A free reset always goes first: both are billed per token. A Claude agent moves back once a subscription account has room.
 3. **Fork the chat to the other provider**, if you turned on **When every account is out, fork the chat to the other provider** (off by default). A stopped Claude chat continues in a new ChatGPT agent, or the other way round:
    - The new agent opens in the same workspace (under the same parent, for a sub-agent) with the conversation so far and goes straight back to work. If that conversation began as a hand-off itself, only the start and end of the earlier one are quoted. It uses the other provider's default model and its account with the most room left.
    - **OpenCode instead:** in the settings under the fork switch, **Fork a stopped Claude chat to** can point at **OpenCode** rather than ChatGPT. A stopped Claude chat then continues on this host's OpenCode, using the model and thinking option picked there from OpenCode's catalog (or the host's default when the host marks one). OpenCode is a harness, not an account provider: the fork uses no ZeroSub account, and nothing is added to your accounts. If the saved model or thinking option is no longer in the host's catalog, the fork is refused with a note rather than falling back to another model.
@@ -189,6 +190,57 @@ It's remade whenever `~/.codex/config.toml` has changed, checked each time a ses
 - The key reaches Codex through the session's environment, which Paseo starts the agent with; anything that can read that process's environment can read it.
 - Token counts need the Codex session file. A turn whose file isn't found (a thread whose file is more than 120 days of folders back, or a Codex that keeps sessions elsewhere) is counted as "couldn't be counted", and the card says the totals are short. Turns run on the account from a terminal aren't seen.
 - ChatGPT conversations can't change accounts, so a task that moved to Azure keeps its Azure tab; new agents go to a ChatGPT account once one has room, not that tab.
+
+## AWS Bedrock accounts
+
+A Claude account can also be Claude Code on Amazon Bedrock in your AWS account: Claude agents then run on Bedrock, billed per token by AWS, and ZeroSub manages the account like any other.
+
+**Add one.** Under Claude, click **Add account → AWS Bedrock** (the same chooser offers a Claude subscription, an API key or token, and a folder that's signed in already) and enter:
+
+- **Name**, as for any account.
+- **AWS region**, as a code (`us-east-1`, `eu-central-1`). The form fills it in when the host names one: the daemon's `AWS_REGION` or `AWS_DEFAULT_REGION`, the region of its profile in `~/.aws/config` (or `AWS_CONFIG_FILE`), or, on an EC2 instance, the instance's own (IMDSv2). That's looked up only when the form opens, for at most a second and a half, never at startup.
+- **Credentials**, from one of:
+  - **Host's AWS credentials**: the AWS default chain where the daemon runs (its environment, `~/.aws`, an EC2 instance or ECS task role). Nothing is stored.
+  - **AWS profile**: a profile in the host's `~/.aws/config`. Only its name is stored.
+  - **Access key**: an access key ID and secret, with a session token for temporary credentials. Stored in the account's home (see below).
+- **Models** (optional): model or inference-profile IDs for `ANTHROPIC_MODEL` and `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL` and `ANTHROPIC_DEFAULT_HAIKU_MODEL`, as enabled in your AWS account. Empty ones keep Claude Code's own Bedrock defaults.
+
+There's no sign-in. If the host has the `aws` command, ZeroSub checks the credentials with it, only when you add the account or change its credentials or region: `aws sts get-caller-identity`, then `aws bedrock list-inference-profiles` in the region. Missing, wrong or expired credentials (or a profile that doesn't exist) aren't saved. Without the `aws` command, offline, or when listing inference profiles is refused, the account is saved anyway and a warning says so; its first turn tells for sure. The key button on its card changes the region, credentials (an empty secret keeps the stored one for the same key ID), models and the price table. Removing the account deletes its home, with its AWS settings (and access key), once no open agent uses it, and its token counts; its agents move to the default account, as from any Claude account.
+
+**When it's used.** It's billed per use, so by default ZeroSub never moves work onto it by itself, like any API-key account:
+
+- Pick it for an agent (the account button, `/account <name>`, the next-new-agent pick), or make it the default; then new agents start on it.
+- Automatic choices (failover at a limit, **Spread new agents across accounts**, a default that's out, **Fork the chat to the other provider**) skip it.
+
+With **Use paid API accounts when every subscription is out** on (off by default; the same switch as for [Azure OpenAI accounts](#azure-openai-accounts), in Accounts or **Settings → Plugins → zerosub → ZeroSub preferences**), it takes over as a last resort:
+
+- Automatic choices then use it only when every Claude subscription account is at its limit, disabled or signed out. A Claude agent that hits its limit moves to another Claude subscription account with room first, then spends a banked reset if **Use banked resets when every account is out** is on and one can be spent; only then does it move onto Bedrock in the same conversation, as it would to another Claude account, and its timeline says it runs on AWS Bedrock, a paid API, because every subscription account is out.
+- It isn't pinned there. Once its own account, or another Claude subscription account, has room again, the 30-second check moves it back, and its timeline says so. New agents go back to a subscription account then too.
+
+Either way, Bedrock has no 5-hour or weekly limits, so the account counts as available unless AWS turns a turn down. Only a failed turn is read for that, and in it only the failure, error rows and Claude Code's own error replies ("API Error: …"), never an agent's reply that only mentions one. A turn that finished can carry another service's errors in its warnings or a tool's output (an MCP server's "HTTP 401 Unauthorized", an `AccessDenied` from a command the agent ran), and they never touch the account.
+
+- Throttling (`ThrottlingException`, HTTP 429, "Too many tokens") sets it aside for a minute; an exceeded service quota (`ServiceQuotaExceededException`) for five.
+- Refused credentials or access (`AccessDeniedException`, HTTP 401/403, an invalid or expired security token, no credentials found): ZeroSub checks the credentials again first, as when they're saved (`aws sts get-caller-identity`, then `aws bedrock list-inference-profiles`). Only if AWS refuses them too is the account marked signed out, with AWS's answer on its card, until you change its settings. If they pass, or can't be checked (no `aws` command, AWS can't be reached), the account stays usable and the daemon's log says so.
+- A model Bedrock names as unusable ("You don't have access to the model with the specified model ID", "The provided model identifier is invalid", a model that needs an inference profile) marks it signed out the same way without that check: only Bedrock words it so, and the credentials are fine. Change the model overrides in its settings.
+
+**Where the credentials are.** The region, credential source, profile name, model overrides and prices are in the account's home, `$PASEO_HOME/zerosub/homes/claude-<id>/bedrock.json`, readable only by you; for an access key, so are the key ID, the secret and the session token. Unlike other Claude accounts' folders, a Bedrock account's home stays in `homes/`, managed by ZeroSub: it's never moved to `~/.claude-config` (or the folder picked under the Claude accounts) and gets no terminal script, since its access key reaches Claude Code only in the session's environment; removing the account deletes it, `bedrock.json` and all. **A folder that's signed in already** turns down a folder with a `bedrock.json`: to add a Bedrock account back, add it again with **AWS Bedrock**. `bedrock.json` is never linked into or out of any Claude home. The registry marks the account as Bedrock (`provider: "bedrock"`; a Claude API-key account has no such mark and keeps its own form) and keeps its region and source, an access key by a short hash of its ID. The app only ever gets the key ID's last four characters; ZeroSub never logs a secret, and leaves it out of what the `aws` command says when it's shown.
+
+**How it runs.** The home is a Claude home like any added account's: shared entries are links to `~/.claude`, and there's no sign-in in it. When Paseo opens a session there, ZeroSub sets `CLAUDE_CONFIG_DIR` to the home, `CLAUDE_CODE_USE_BEDROCK=1`, `AWS_REGION` and `AWS_DEFAULT_REGION`, and blanks what would send it elsewhere or sign it in another way (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, the Vertex and Foundry switches). By source:
+
+- Host: the daemon's own AWS variables are left as they are.
+- Profile: `AWS_PROFILE` is set, and `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` and `AWS_BEARER_TOKEN_BEDROCK` are blanked, since they'd come before it.
+- Access key: those three are set from `bedrock.json`, read right then, and `AWS_PROFILE` and `AWS_BEARER_TOKEN_BEDROCK` are blanked.
+
+The model variables are set from the overrides, or blanked so a model named for your subscriptions doesn't reach Bedrock. Its generated `settings.json` is `~/.claude/settings.json` with the account's own `settings.account.json` on top, as for any added account, then made to agree with that environment: the same `env` (never a secret), no `apiKeyHelper`, and, unless it uses the host's credentials, no `awsAuthRefresh` or `awsCredentialExport`. A proxy set for the account with the globe button stays in it.
+
+**Usage.** In place of usage bars, the card shows the tokens used this calendar month (UTC): input (with how much was read from and written to the cache) and output, and an estimated cost. At the end of each turn on the account, ZeroSub reads the agent's Claude Code session file (`~/.claude/projects/<project>/<session>.jsonl`, which every Claude account shares) and adds the assistant messages written since the turn started, each one once. Totals are kept by model in `$PASEO_HOME/zerosub/api-usage.json`, with Azure's, and start again each month. The cost comes from the price table in the account's settings (USD per million input, cache read, cache write and output tokens, per model as Claude Code names it; a cache read or write without a price counts at the input price). With no prices it says "cost unknown". It's an estimate from Claude Code's own counts, not AWS's bill.
+
+**Limitations.**
+
+- An access key reaches Claude Code through the session's environment, which Paseo starts the agent with; anything that can read that process's environment can read it. Use the host's credentials or a profile to keep it out of ZeroSub's files.
+- Project settings (`.claude/settings.json` in a repository) that set another provider or AWS credentials still apply on top, as they would in Claude Code.
+- Token counts need the Claude Code session file. A turn whose file isn't found is counted as "couldn't be counted", and the card says the totals are short. Turns run on the account from a terminal aren't seen.
+- The check covers the credentials, not each model: a model your AWS account hasn't enabled in the region shows up as a refusal on its first turn.
 
 ## Pi accounts
 
@@ -303,6 +355,7 @@ ZeroSub never implements OAuth itself and never copies credentials between accou
 - Removing an account moves its agents to the default account, then signs it out (`claude auth logout` / `codex` logout / `grok logout` / `cursor-agent logout`) and deletes its home. This happens once no agent is mid-turn on it. Abandoned sign-ins are cleaned up the same way; one a restart interrupted is deleted only if it isn't signed in.
 - ZeroSub only signs out or deletes homes it recorded for cleanup when you removed the account or started the sign-in, never a home just because the registry doesn't list it: a damaged or hand-edited registry may simply be missing accounts. Folders in `homes/` that no account uses are left alone and named in the log at startup.
 - An Azure OpenAI account's key is in its home's `azure.json` only (see [Azure OpenAI accounts](#azure-openai-accounts)), and is sent nowhere but its endpoint.
+- An AWS Bedrock account's access key, if it has one, is in its home's `bedrock.json` only (see [AWS Bedrock accounts](#aws-bedrock-accounts)), and is handed only to its own sessions and the `aws` command that checks it. The region the Bedrock form fills in is looked up when it opens, never at startup.
 - An account that still has ChatGPT conversations on it can't be removed until you archive them or continue them elsewhere, because they can't move. Grok and Cursor conversations can only be archived.
 - Your CLI login can't be removed from ZeroSub.
 
