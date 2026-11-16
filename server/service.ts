@@ -692,6 +692,8 @@ export class Service {
       const info = await agentInfo(paseo, agentId);
       if (info && !info.archived && info.status !== "closed") return; // Still in use: a later pass.
     }
+    // The registry this pass read may be out of date by now (Paseo took a while to answer, say).
+    if (!(await this.stillToCleanUp(home))) return;
     // A sign-in this run saw end without an account is its own to undo. One left by an earlier run
     // only goes if it isn't signed in: a registry restored from an older copy can still list a
     // sign-in that has since become an account the registry no longer knows.
@@ -725,12 +727,28 @@ export class Service {
         : `gave up signing out ${home}, so its sign-in may still be valid; deleted it anyway`;
     }
     this.cleanupFailures.delete(home);
+    // Checked again just before the folder goes: signing out can take a while too.
+    if (deleteFolder && !(await this.stillToCleanUp(home))) return;
     if (deleteFolder) await removeHome(home);
     await this.store.update((draft) => {
       delete draft.cleanup[home];
       for (const agentId of users) if (draft.sessions[agentId]?.accountId === entry.accountId) delete draft.sessions[agentId];
     });
     console.log(`[ZeroSub] ${outcome}`);
+  }
+
+  /**
+   * Whether `home` is still listed for cleanup with no account using it, read from the registry as it
+   * is now. One an account uses again comes off the list, as in `cleanUpPass`.
+   */
+  private async stillToCleanUp(home: string): Promise<boolean> {
+    const state = await this.store.read();
+    if (!state.cleanup[home]) return false;
+    if (!state.accounts.some((account) => account.home === home)) return true;
+    await this.store.update((draft) => {
+      if (draft.accounts.some((account) => account.home === home)) delete draft.cleanup[home];
+    });
+    return false;
   }
 
   /** Whether a sign-in into `home` ran in this process and has ended. */
