@@ -3152,8 +3152,19 @@ export class Service {
     const kinds: [LauncherKind, string][] = [["claude", launcherDir()]];
     if (this.adapters.pi.homesInUse) kinds.push(["pi", piLauncherDir()]);
     for (const [kind, directory] of kinds) {
-      const written = await writeLaunchers(this.launcherAccounts(state, kind), directory, leaving, moved, kind);
-      for (const [accountId, name] of written) files.set(accountId, name);
+      const accounts = this.launcherAccounts(state, kind);
+      try {
+        const written = await writeLaunchers(accounts, directory, leaving, moved, kind);
+        for (const [accountId, name] of written) files.set(accountId, name);
+      } catch (error) {
+        // One kind's folder failing (say, ~/.claude-config can't be made) never stops the other's
+        // scripts; its accounts keep the names they had until it works again.
+        log(`could not write the ${kind === "claude" ? "Claude" : "Pi"} account scripts in ${directory}`, error);
+        for (const account of accounts) {
+          const name = this.launcherFiles?.get(account.id);
+          if (name !== undefined) files.set(account.id, name);
+        }
+      }
     }
     this.launcherFiles = files;
   }
