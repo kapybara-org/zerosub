@@ -8,8 +8,11 @@ interface CatalogModel {
   id: string;
   label: string;
   isDefault?: boolean;
-  thinkingOptions?: Array<{ id: string; label: string }>;
+  thinkingOptions?: Array<{ id: string; label: string; isDefault?: boolean }>;
 }
+
+// Paseo 0.16 lists its own "Default" thinking option, which sends no variant: the same as "Model default".
+const pickable = (options: CatalogModel["thinkingOptions"]) => (options ?? []).filter((option) => !(option.isDefault && option.id === "default"));
 
 type Catalog =
   | { status: "loading" }
@@ -133,7 +136,7 @@ export function OpenCodeForkRows({
       value={values.forkOpenCodeThinking}
       options={[
         { label: "Model default", value: "" },
-        ...(model?.thinkingOptions ?? []).map((option) => ({ label: option.label, value: option.id })),
+        ...pickable(model?.thinkingOptions).map((option) => ({ label: option.label, value: option.id })),
       ]}
       disabled={saving || !model}
       onValueChange={(forkOpenCodeThinking) => onSave({ forkOpenCodeThinking })}

@@ -67,6 +67,17 @@ beforeEach(() => {
   state = undefined;
 });
 
+describe("Paseo 0.16 thinking catalog", () => {
+  it("lists Model default once when the host adds its own Default option", async () => {
+    catalog = [{ id: "opencode/glm-5p3-flash", label: "GLM 5.3 Flash", isDefault: true, thinkingOptions: [{ id: "default", label: "Default", isDefault: true }, { id: "high", label: "High" }] }];
+    const thinking = (await render()).byLabel("OpenCode thinking");
+    expect(thinking.props.options).toEqual([
+      { label: "Model default", value: "" },
+      { label: "High", value: "high" },
+    ]);
+  });
+});
+
 describe("OpenCodeForkRows and ForkDestinationRows", () => {
   it("renders only the destination select, no model or thinking rows, from ForkDestinationRows", () => {
     const row = ForkDestinationRows({ values: values(), saving: false, onSave: () => undefined }) as unknown as Row;
