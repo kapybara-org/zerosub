@@ -1,5 +1,7 @@
 import { accountPeak } from "../shared/format";
-import type { Family, Usage, UsageWindow } from "../shared/model";
+import type { AgentAccounts, Family, Usage, UsageWindow } from "../shared/model";
+import { modelClass, planAccounts, type PlanSource } from "../shared/plan-input";
+import { estimate, fit, rank, type Ranked } from "../shared/planner";
 import { FIVE_HOUR_MINUTES, WEEK_MINUTES } from "./codex";
 import {
   accountsOf,
@@ -137,6 +139,122 @@ function soonestWeeklyReset(state: StoredState, family: Family, usageOf: RouteIn
     Date.parse(b.usage!.windows.find((window) => window.minutes === WEEK_MINUTES)!.resetsAt!))[0]?.account;
 }
 
+/** What the planner needs beyond the stored state. Without it, routing keeps its plain rules. */
+export interface Planning {
+  /** The agent's model as Paseo last reported it ("claude-fable-5-2"); null when not known yet. */
+  model: string | null;
+  /** The accounts the user checked for this agent. */
+  accounts: AgentAccounts | null;
+  /** The plan re-run every hour; null until the first one. */
+  plan: { horizonH: number; keepFable: boolean; paceH: number } | null;
+  /** Agents running a turn on each account now. */
+  load(accountId: string): number;
+  /** % of its week each account burns per hour, from its last day of readings. */
+  rate(accountId: string): number;
+}
+
+export interface PlannedPick {
+  account: StoredAccount;
+  /** Not among the agent's checked accounts. */
+  outside: boolean;
+  /** The planner's reason, for the timeline and logs. */
+  why: string;
+}
+
+/** The planner's view of a family's accounts for one agent. */
+export function planSources(state: StoredState, family: Family, usageOf: (accountId: string) => Usage | null | undefined, planning: Planning): PlanSource[] {
+  return accountsOf(state, family).map((account) => ({
+    id: account.id,
+    name: account.label,
+    signedIn: account.signedIn,
+    disabled: account.disabled,
+    limitedUntil: account.limitedUntil,
+    limitKind: account.limitKind,
+    modelLimits: account.modelLimits,
+    usage: usageOf(account.id),
+    load: planning.load(account.id),
+    extRate: planning.rate(account.id),
+  }));
+}
+
+/** Ties keep the plain order: the default first, then the CLI login, then the oldest. */
+function tieOrder(state: StoredState, family: Family): string[] {
+  const preferred = defaultAccount(state, family)?.id;
+  return [...accountsOf(state, family)]
+    .sort(
+      (a, b) =>
+        Number(b.id === preferred) - Number(a.id === preferred) ||
+        Number(b.kind === "main") - Number(a.kind === "main") ||
+        (Date.parse(a.createdAt) || 0) - (Date.parse(b.createdAt) || 0),
+    )
+    .map((account) => account.id);
+}
+
+/**
+ * The planner's order for one agent, best first: its checked accounts first (in the order it was
+ * dragged, if any), others after them only when it may overflow.
+ */
+export function plannedOrder(
+  state: StoredState,
+  family: Family,
+  usageOf: (accountId: string) => Usage | null | undefined,
+  planning: Planning,
+  now: number,
+  options: { exclude?: ReadonlySet<string>; kind: "new" | "move"; overflow?: boolean },
+): Ranked[] {
+  const accounts = planAccounts(planSources(state, family, usageOf, planning), planning.model, now);
+  const chosen = planning.accounts;
+  const plan = planning.plan;
+  // Accounts billed per use only take an agent the user checked them for (see `canStandIn`).
+  const billed = accountsOf(state, family)
+    .filter((account) => (account.family === "pi" || account.auth === "api") && !chosen?.pool.includes(account.id))
+    .map((account) => account.id);
+  return rank(accounts, {
+    model: modelClass(planning.model),
+    kind: options.kind,
+    exclude: [...(options.exclude ?? []), ...billed],
+    prev: tieOrder(state, family),
+    keepFable: plan?.keepFable ?? false,
+    paceH: plan?.paceH,
+    horizonH: plan?.horizonH,
+    pool: chosen?.pool ?? null,
+    manual: chosen?.mode === "manual" ? chosen.order.filter((id) => chosen.pool.includes(id)) : null,
+    overflow: options.overflow ?? (chosen ? chosen.overflow === "others" : true),
+  });
+}
+
+/** The planner's pick among usable accounts, or nothing when none can take the agent. */
+export function plannedPick(
+  state: StoredState,
+  family: Family,
+  usageOf: (accountId: string) => Usage | null | undefined,
+  planning: Planning,
+  now: number,
+  options: { exclude?: ReadonlySet<string>; kind: "new" | "move"; overflow?: boolean },
+): PlannedPick | undefined {
+  const row = plannedOrder(state, family, usageOf, planning, now, options).find((candidate) => candidate.ok);
+  const account = row ? findAccount(state, row.id) : undefined;
+  return account && row ? { account, outside: row.outside, why: row.why } : undefined;
+}
+
+/**
+ * Whether the account can run the agent's model now, from its last reading and the limits turns
+ * ran into: an account whose Fable room is used up still serves Opus, but not a Fable agent.
+ */
+export function servesModel(
+  state: StoredState,
+  account: StoredAccount,
+  usageOf: (accountId: string) => Usage | null | undefined,
+  planning: Planning,
+  now: number,
+): boolean {
+  if (!planning.model) return true;
+  const [view] = planAccounts(planSources({ ...state, accounts: [account] }, account.family, usageOf, planning), planning.model, now);
+  if (!view) return true;
+  const verdict = fit(view, estimate(view).read, modelClass(planning.model), 0);
+  return verdict.ok || verdict.tier !== 2;
+}
+
 export interface RouteInput {
   agentId: string;
   family: Family;
@@ -161,6 +279,8 @@ export interface RouteInput {
    * open, not Paseo's helpers (see `takesNextPick` in service.ts). Only a new agent takes it.
    */
   allowNextPick?: boolean;
+  /** Model-aware, per-agent routing. Leave out for the plain rules. */
+  planning?: Planning;
 }
 
 export interface RouteDecision {
@@ -168,7 +288,7 @@ export interface RouteDecision {
   /** A binding to persist so the agent stays where it was routed. */
   bind: Binding | null;
   /** Why the preferred account was skipped, if it was. */
-  skipped: { account: StoredAccount; why: "limited" | "signed_out" | "disabled" } | null;
+  skipped: { account: StoredAccount; why: "limited" | "signed_out" | "disabled" | "model" } | null;
   /**
    * The "next new agent" pick routing looked at, to be cleared: it's spent whether the agent starts
    * on its account or that account couldn't take it.
@@ -190,11 +310,20 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   if (accounts.length === 0) return null;
   const at = new Date(input.now).toISOString();
   const fresh = input.reason === "create";
+  const planning = input.planning;
+  // The planner orders Claude accounts, and any agent the user checked accounts for.
+  const planned = planning && (input.family === "claude" || planning.accounts) ? planning : undefined;
+  const pool = planned?.accounts?.pool ?? null;
+  const pick = (exclude: ReadonlySet<string>, kind: "new" | "move"): StoredAccount | undefined =>
+    planned
+      ? plannedPick(state, input.family, input.usageOf, planned, input.now, { exclude, kind })?.account
+      : mostAvailable(state, input.family, input.usageOf, input.now, exclude);
 
   const binding = state.bindings[input.agentId];
   const bound = findAccount(state, binding?.accountId);
   let account = bound && bound.family === input.family ? bound : undefined;
   let bind: Binding | null = null;
+  const mayMove = fresh || input.portable;
 
   // A pick whose account can't take the agent (at its limit, signed out, disabled, removed) is spent
   // all the same, and the agent routes as usual: kept, it would send every new agent to whichever
@@ -207,9 +336,17 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
       bind = { accountId: picked.id, source: "user", at };
     }
   }
+  // Accounts checked for this agent: it opens on one of them, unless the user let it overflow once.
+  if (planned && pool && mayMove && (!account || (!pool.includes(account.id) && binding?.selectionReason !== "overflow"))) {
+    const inside = plannedPick(state, input.family, input.usageOf, planned, input.now, { kind: fresh ? "new" : "move", overflow: false });
+    if (inside) {
+      account = inside.account;
+      bind = { accountId: inside.account.id, source: input.portable ? "auto" : "thread", at, selectionReason: "plan" };
+    }
+  }
   if (!account && fresh && input.balanceNewAgents && accounts.length > 1) {
     const nearReset = input.family === "codex" ? soonestWeeklyReset(state, input.family, input.usageOf, input.now) : undefined;
-    account = nearReset ?? mostAvailable(state, input.family, input.usageOf, input.now);
+    account = nearReset ?? pick(new Set(), "new");
     if (account) bind = { accountId: account.id, source: "balance", at, selectionReason: nearReset ? "weekly_reset" : "headroom" };
   }
   if (!account) {
@@ -224,14 +361,26 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   if (!account) return null;
 
   let skipped: RouteDecision["skipped"] = null;
-  const why = !account.signedIn ? "signed_out" : account.disabled ? "disabled" : isLimited(account, input.now) ? "limited" : null;
-  const mayMove = fresh || input.portable;
-  if (why && mayMove && (input.autoSwitch || why !== "limited")) {
+  const why = !account.signedIn
+    ? "signed_out"
+    : account.disabled
+      ? "disabled"
+      : isLimited(account, input.now)
+        ? "limited"
+        : planned && !servesModel(state, account, input.usageOf, planned, input.now)
+          ? "model"
+          : null;
+  if (why && mayMove && (input.autoSwitch || why === "signed_out" || why === "disabled")) {
+    // An agent already running on an account that can take it stays there, rather than following
+    // whichever account ranks first at the moment: one of its checked accounts, for its model.
     const staying = findAccount(state, input.current);
-    const alternative =
-      staying && staying.family === input.family && staying.id !== account.id && isUsable(staying, input.now)
-        ? staying
-        : mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]));
+    const stays =
+      staying !== undefined &&
+      staying.family === input.family &&
+      staying.id !== account.id &&
+      isUsable(staying, input.now) &&
+      (!planned || ((!pool || pool.includes(staying.id)) && servesModel(state, staying, input.usageOf, planned, input.now)));
+    const alternative = stays ? staying : pick(new Set([account.id]), fresh ? "new" : "move");
     if (alternative) {
       skipped = { account, why };
       account = alternative;
@@ -242,7 +391,13 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
           ? { accountId: alternative.id, source: "thread", at }
           : why === "disabled"
             ? null
-            : { accountId: alternative.id, source: "auto", at };
+            : {
+                accountId: alternative.id,
+                source: "auto",
+                at,
+                // Past the agent's checked accounts only because the user let it overflow.
+                ...(pool && !pool.includes(alternative.id) ? { selectionReason: "overflow" as const } : {}),
+              };
     }
   }
   return { account, bind, skipped, nextPick };

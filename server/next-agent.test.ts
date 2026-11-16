@@ -203,9 +203,10 @@ describe("the next new agent pick, as sessions open", () => {
       ["removed", null],
     ];
     // The default is busy and another account has more room, so routing as usual and standing in differ.
+    // A 5-hour window under way has a reset time; without one the planner reads it as not started yet.
     const reading = (usedPercent: number): UsageRead => ({
       fetchedAt: new Date().toISOString(),
-      windows: [{ id: "five_hour", label: "5-hour", usedPercent, resetsAt: null }],
+      windows: [{ id: "five_hour", label: "5-hour", usedPercent, resetsAt: new Date(Date.now() + 2 * 3_600_000).toISOString() }],
       error: null,
       cached: false,
       resets: null,

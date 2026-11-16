@@ -1,6 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import { ApiKeyKindSchema, FamilySchema, LoginMethodSchema, LoginViewSchema, StateViewSchema, TrafficSwitchesSchema } from "./model";
+import { AgentAccountsSchema, ApiKeyKindSchema, FamilySchema, LoginMethodSchema, LoginViewSchema, StateViewSchema, TrafficSwitchesSchema } from "./model";
 
 export const getState = defineRpc({
   name: "zerosub.state",
@@ -194,6 +194,22 @@ export const setAgentAccount = defineRpc({
     agentId: z.string(),
     /** `null` makes the agent follow the default account again. */
     accountId: z.string().nullable(),
+    /** The agent's checked accounts, saved in the same step (an edit not sent yet). */
+    accounts: AgentAccountsSchema.nullable().optional(),
   }),
+  output: ReopenSummarySchema,
+});
+
+/** The accounts this agent may use, and in which order (`null`: all of them, smart order). */
+export const setAgentAccounts = defineRpc({
+  name: "zerosub.agents.accounts",
+  input: z.object({ agentId: z.string(), accounts: AgentAccountsSchema.nullable() }),
+  output: ReopenSummarySchema,
+});
+
+/** Every account checked for this agent is full: carry on once on the best other one. */
+export const useOthersOnce = defineRpc({
+  name: "zerosub.agents.overflow",
+  input: z.object({ agentId: z.string() }),
   output: ReopenSummarySchema,
 });

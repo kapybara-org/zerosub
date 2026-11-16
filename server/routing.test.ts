@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Usage } from "../shared/model";
 import { applyEnv } from "./adapter";
 import { parseRateLimits } from "./codex";
-import { chooseAccount, fiveHourGated, mostAvailable } from "./routing";
+import { chooseAccount, fiveHourGated, mostAvailable, type Planning } from "./routing";
 import { emptyState, type StoredAccount, type StoredState } from "./state";
 
 const NOW = Date.parse("2026-09-23T12:00:00Z");
@@ -522,5 +522,79 @@ describe("the 5-hour gate", () => {
             credits: { balance: 500, unlimited: false },
           };
     expect(mostAvailable(stateWith([busy, full]), "codex", usageOf, NOW)?.id).toBe(busy.id);
+  });
+});
+
+describe("chooseAccount with planning", () => {
+  const main = account({ id: "claude-main", kind: "main", home: null });
+  const work = account({ id: "claude-work" });
+  const reading = (fable: number): Usage => ({
+    fetchedAt: "2026-09-23T11:59:00Z",
+    windows: [
+      { id: "five_hour", label: "5-hour", usedPercent: 10, resetsAt: "2026-09-23T14:00:00Z" },
+      { id: "seven_day", label: "Weekly", usedPercent: 20, resetsAt: "2026-09-27T12:00:00Z" },
+      { id: "weekly_fable", label: "Weekly · Fable", usedPercent: fable, resetsAt: "2026-09-25T12:00:00Z" },
+    ],
+    error: null,
+    cached: false,
+    resets: null,
+    credits: null,
+  });
+  const usageOf = (id: string) => (id === "claude-main" ? reading(100) : reading(10));
+  const planning = (patch: Partial<Planning> = {}): Planning => ({
+    model: null,
+    accounts: null,
+    plan: null,
+    load: () => 0,
+    rate: () => 0,
+    ...patch,
+  });
+  const state = stateWith([main, work], { defaults: { claude: "claude-main", codex: null, pi: null } });
+
+  it("opens a Fable agent where Fable has room, and other models where they did", () => {
+    const fable = chooseAccount(state, { ...base, reason: "create", usageOf, planning: planning({ model: "claude-fable-5-2" }) });
+    expect(fable?.account.id).toBe("claude-work");
+    expect(fable?.skipped).toMatchObject({ account: { id: "claude-main" }, why: "model" });
+    const opus = chooseAccount(state, { ...base, reason: "create", usageOf, planning: planning({ model: "claude-opus-5-5" }) });
+    expect(opus?.account.id).toBe("claude-main");
+    expect(opus?.skipped).toBeNull();
+  });
+
+  it("opens an agent on its checked accounts, in the order the user dragged", () => {
+    const only = chooseAccount(state, {
+      ...base,
+      reason: "create",
+      usageOf,
+      planning: planning({ accounts: { pool: ["claude-work"], mode: "smart", order: [], overflow: "wait" } }),
+    });
+    expect(only?.account.id).toBe("claude-work");
+    expect(only?.bind).toMatchObject({ accountId: "claude-work", selectionReason: "plan" });
+    const dragged = chooseAccount(state, {
+      ...base,
+      reason: "create",
+      usageOf: () => reading(10),
+      planning: planning({ accounts: { pool: ["claude-main", "claude-work"], mode: "manual", order: ["claude-work", "claude-main"], overflow: "wait" } }),
+    });
+    expect(dragged?.account.id).toBe("claude-work");
+  });
+
+  it("keeps an agent past its checked accounts only once the user let it overflow", () => {
+    const accounts = { pool: ["claude-main"], mode: "smart" as const, order: [], overflow: "wait" as const };
+    const overflowed = stateWith([main, work], {
+      bindings: { "agent-1": { accountId: "claude-work", source: "auto", at: "2026-09-23T11:00:00Z", selectionReason: "overflow" } },
+    });
+    expect(chooseAccount(overflowed, { ...base, reason: "refresh", usageOf: () => reading(10), planning: planning({ accounts }) })?.account.id).toBe(
+      "claude-work",
+    );
+    const strayed = stateWith([main, work], {
+      bindings: { "agent-1": { accountId: "claude-work", source: "auto", at: "2026-09-23T11:00:00Z" } },
+    });
+    expect(chooseAccount(strayed, { ...base, reason: "refresh", usageOf: () => reading(10), planning: planning({ accounts }) })?.account.id).toBe(
+      "claude-main",
+    );
+  });
+
+  it("routes exactly as before without planning", () => {
+    expect(chooseAccount(state, { ...base, reason: "create", usageOf })?.account.id).toBe("claude-main");
   });
 });
