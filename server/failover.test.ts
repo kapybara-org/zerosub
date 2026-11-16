@@ -4500,3 +4500,100 @@ describe("an API account at a limit with every other account out", () => {
     expect(redeemed).toEqual([]);
   });
 });
+
+describe("AWS Bedrock as the last resort", () => {
+  const window = () => ({ kind: "window" as const, resetsAt: inFuture(), message: "You've hit your session limit" });
+  const bedrock = { ...account("claude-bedrock", "bedrock", "managed"), auth: "api" as const, provider: "bedrock" as const, identity: "bedrock|eu-central-1|host" };
+  const onlyMain = { accounts: [account(MAIN, "main", "main"), bedrock] as never, defaults: { claude: MAIN, codex: null, pi: null }, sessions: {} };
+
+  it("isn't used with paid API fallback off (the default): the agent stays at its limit", async () => {
+    const { store, reopened, notes, limitTurn } = await setUp(onlyMain, window);
+    await limitTurn();
+    expect((await store.read()).sessions[AGENT]?.accountId).not.toBe(bedrock.id);
+    expect(reopened).toEqual([]);
+    expect(notes.at(-1)).toMatchObject({ outcome: "stayed" });
+  });
+
+  it("with it on, takes a limited agent over in place, says it's a paid API, and doesn't pin it there", async () => {
+    const { service, store, reopened, notes, limitTurn } = await setUp(onlyMain, window);
+    service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+    await limitTurn();
+    const state = await store.read();
+    expect(state.sessions[AGENT]?.accountId).toBe(bedrock.id);
+    expect(reopened).toEqual([AGENT]);
+    // Not pinned: once a subscription account has room again, routing takes the agent back.
+    expect(state.bindings[AGENT]?.accountId).not.toBe(bedrock.id);
+    expect(notes.at(-1)).toMatchObject({ to: "bedrock", outcome: "switched" });
+    expect(notes.at(-1)?.detail).toMatch(/AWS Bedrock, a paid API billed per token/);
+  });
+
+  it("with it on, moves the agent back off Bedrock once its subscription has room again", async () => {
+    const { service, store, reopened, notes, limitTurn, paseo } = await setUp(onlyMain, window);
+    service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+    await limitTurn();
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(bedrock.id);
+    await service.clearLimit(MAIN);
+    // Past the minute after its turn that alignment leaves an agent alone for.
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + 2 * 60_000 });
+    try {
+      await service.alignSessions(paseo as never);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+    expect(reopened).toEqual([AGENT, AGENT]);
+    expect(notes.at(-1)).toMatchObject({ reason: "room", to: "main" });
+  });
+
+  describe("with banked resets used automatically too", () => {
+    const redeeming = (outcome: "reset" | "none", calls: Array<string | null>) => ({
+      claude: { redeemReset: async (home: string | null) => (calls.push(home), outcome === "reset" ? { outcome, message: "Limits reset.", left: 0 } : { outcome, message: "No banked resets.", left: 0 }) },
+    });
+
+    it("spends the free reset first, and doesn't move the agent onto Bedrock", async () => {
+      const calls: Array<string | null> = [];
+      const { service, store, reopened, notes, limitTurn } = await setUp(onlyMain, window, redeeming("reset", calls));
+      service.setPreferences(preferences.schema.parse({ paidApiFallback: true, autoRedeem: true }));
+      await limitTurn();
+      expect(calls).toHaveLength(1);
+      expect((await store.read()).sessions[AGENT]?.accountId).not.toBe(bedrock.id);
+      expect(reopened).toEqual([]);
+      expect(notes.at(-1)).toMatchObject({ outcome: "reset" });
+    });
+
+    it("moves onto Bedrock only once no reset could be spent", async () => {
+      const calls: Array<string | null> = [];
+      const { service, store, reopened, notes, limitTurn } = await setUp(onlyMain, window, redeeming("none", calls));
+      service.setPreferences(preferences.schema.parse({ paidApiFallback: true, autoRedeem: true }));
+      await limitTurn();
+      expect(calls).toHaveLength(1);
+      expect((await store.read()).sessions[AGENT]?.accountId).toBe(bedrock.id);
+      expect(reopened).toEqual([AGENT]);
+      expect(notes.at(-1)).toMatchObject({ to: "bedrock", outcome: "switched" });
+    });
+
+    it("still moves to another Claude subscription with room before spending a reset", async () => {
+      const calls: Array<string | null> = [];
+      const { service, store, limitTurn } = await setUp(
+        { accounts: [account(MAIN, "main", "main"), account(HELLO, "hello", "managed"), bedrock] as never, defaults: { claude: MAIN, codex: null, pi: null }, sessions: {} },
+        window,
+        redeeming("reset", calls),
+      );
+      service.setPreferences(preferences.schema.parse({ paidApiFallback: true, autoRedeem: true }));
+      await limitTurn();
+      expect(calls).toEqual([]);
+      expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+    });
+  });
+
+  it("isn't used while a subscription account has room, even with it on", async () => {
+    const { service, store, notes, limitTurn } = await setUp(
+      { accounts: [account(MAIN, "main", "main"), account(HELLO, "hello", "managed"), bedrock] as never, defaults: { claude: MAIN, codex: null, pi: null }, sessions: {} },
+      window,
+    );
+    service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+    await limitTurn();
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(notes.at(-1)?.detail ?? null).toBeNull();
+  });
+});

@@ -651,3 +651,55 @@ describe("Azure OpenAI accounts", () => {
     });
   });
 });
+
+describe("AWS Bedrock accounts", () => {
+  const cli = account({ id: "claude-main", kind: "main", home: null });
+  const sub = account({ id: "claude-sub" });
+  const bedrock = account({ id: "claude-bedrock", auth: "api", provider: "bedrock", createdAt: "2026-08-01T00:00:00Z" });
+  // An API-key account from #65: a Claude account on a key, without the marker.
+  const keyed = account({ id: "claude-key", auth: "api" });
+  const out = (entry: StoredAccount) => ({ ...entry, limitedUntil: "2026-09-23T15:00:00Z", limitKind: "window" as const });
+  const usageOf = (id: string) => (id === bedrock.id ? null : usage(70));
+  const on = { ...base, paidFallback: true };
+
+  it("are told apart by their marker, never by an API key alone", () => {
+    expect(isLastResort(bedrock)).toBe(true);
+    expect(isLastResort(keyed)).toBe(false);
+    expect(isLastResort({ ...keyed, provider: "bedrock", family: "codex" })).toBe(false);
+  });
+
+  it("are never picked by routing with paid API fallback off, only by hand", () => {
+    const state = stateWith([out(cli), { ...sub, disabled: true }, bedrock]);
+    expect(mostAvailable(state, "claude", usageOf, NOW)).toBeUndefined();
+    expect(chooseAccount(state, { ...base, reason: "create", balanceNewAgents: true, usageOf })?.account.id).toBe(cli.id);
+    const bound = stateWith([cli, bedrock], { bindings: { "agent-1": { accountId: bedrock.id, source: "user", at: "2026-09-23T00:00:00Z" } } });
+    expect(chooseAccount(bound, { ...base, reason: "resume", usageOf })?.account.id).toBe(bedrock.id);
+    const asDefault = stateWith([cli, bedrock], { defaults: { claude: bedrock.id, codex: null, pi: null, grok: null, cursor: null } });
+    expect(chooseAccount(asDefault, { ...base, reason: "create", usageOf })?.account.id).toBe(bedrock.id);
+  });
+
+  it("with it on, stand in once every subscription is out, without pinning the agent there", () => {
+    const bindings = { "agent-1": { accountId: cli.id, source: "user" as const, at: "2026-09-23T00:00:00Z" } };
+    const state = stateWith([out(cli), out(sub), keyed, bedrock], { bindings });
+    const decision = chooseAccount(state, { ...on, reason: "refresh", usageOf });
+    expect(decision?.account.id).toBe(bedrock.id);
+    expect(decision?.skipped?.account.id).toBe(cli.id);
+    // The agent keeps its own account, and goes back to it once it has room.
+    expect(decision?.bind).toBeNull();
+    expect(chooseAccount(state, { ...on, reason: "refresh", now: NOW + 4 * 60 * 60_000, current: bedrock.id, usageOf })?.account.id).toBe(cli.id);
+  });
+
+  it("with it on, take new agents spread across accounts without binding them there", () => {
+    const state = stateWith([out(cli), out(sub), bedrock]);
+    const decision = chooseAccount(state, { ...on, reason: "create", balanceNewAgents: true, usageOf });
+    expect(decision?.account.id).toBe(bedrock.id);
+    expect(decision?.bind).toBeNull();
+    expect(chooseAccount(stateWith([cli, out(sub), bedrock]), { ...on, reason: "create", balanceNewAgents: true, usageOf })?.account.id).toBe(cli.id);
+  });
+
+  it("with it on, aren't kept as a stand-in once another subscription could take over", () => {
+    const bindings = { "agent-1": { accountId: cli.id, source: "user" as const, at: "2026-09-23T00:00:00Z" } };
+    expect(chooseAccount(stateWith([out(cli), sub, bedrock], { bindings }), { ...on, reason: "refresh", current: bedrock.id, usageOf })?.account.id).toBe(sub.id);
+    expect(chooseAccount(stateWith([out(cli), out(sub), bedrock], { bindings }), { ...on, reason: "refresh", current: bedrock.id, usageOf })?.account.id).toBe(bedrock.id);
+  });
+});
