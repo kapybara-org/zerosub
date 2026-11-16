@@ -7,6 +7,7 @@ import { FAMILY_LABEL, type AccountView, type Family, type LoginMethod, type Log
 import { cancelLogin, importAccount, startLogin, submitLoginCode } from "../shared/rpc";
 import { ApiAccountForm } from "./api-account";
 import { AzureAccountForm } from "./azure-account";
+import { BedrockAccountForm } from "./bedrock-account";
 import { useInputStyle } from "./pi-accounts";
 import { describe, useStore, type ZeroSubStore } from "./store";
 import { Button, useText } from "./ui";
@@ -47,10 +48,10 @@ export function AddAccountModal({
   const askProxy = family === "claude" && !accountId;
   const [proxy, setProxy] = useState("");
   const [proxyDone, setProxyDone] = useState(!askProxy);
-  // A new Claude account is a subscription to sign in, an API key or token, or a folder that's
-  // signed in already; a new ChatGPT one, a subscription or an Azure OpenAI key. Asked first.
+  // A new Claude account is a subscription to sign in, an API key or token, a folder that's signed
+  // in already, or AWS Bedrock; a new ChatGPT one, a subscription or an Azure OpenAI key. Asked first.
   const askMode = askProxy || (family === "codex" && !accountId);
-  const [mode, setMode] = useState<"ask" | "subscription" | "api" | "import">(askMode ? "ask" : "subscription");
+  const [mode, setMode] = useState<"ask" | "subscription" | "api" | "import" | "bedrock">(askMode ? "ask" : "subscription");
   const [apiAdded, setApiAdded] = useState<string | null>(null);
   const [apiWarning, setApiWarning] = useState<string | null>(null);
   const [imported, setImported] = useState<string | null>(null);
@@ -121,7 +122,9 @@ export function AddAccountModal({
   const azure = family === "codex";
   const title = accountId
     ? "Sign in again"
-    : mode === "api"
+    : mode === "bedrock"
+      ? "Add AWS Bedrock account"
+      : mode === "api"
       ? azure
         ? "Add Azure OpenAI account"
         : "Add Claude API account"
@@ -139,6 +142,7 @@ export function AddAccountModal({
         onSubscription={() => setMode("subscription")}
         onApi={() => setMode("api")}
         onImport={() => setMode("import")}
+        onBedrock={() => setMode("bedrock")}
         onCancel={close}
       />
     );
@@ -159,7 +163,7 @@ export function AddAccountModal({
     ) : (
       <ImportStep theme={theme} store={store} onDone={setImported} onCancel={close} />
     );
-  } else if (mode === "api") {
+  } else if (mode === "api" || mode === "bedrock") {
     const added = apiAdded ? state?.accounts.find((entry) => entry.id === apiAdded) : undefined;
     body = apiAdded ? (
       <>
@@ -167,8 +171,8 @@ export function AddAccountModal({
         <Text style={text.body}>
           {added?.label ?? "The account"} is ready. Make it the default, or pick it for an agent from the account button in
           the message box;{" "}
-          {azure && state?.paidApiFallback
-            ? "ZeroSub moves agents onto it by itself only when every ChatGPT subscription account is out."
+          {(azure || mode === "bedrock") && state?.paidApiFallback
+            ? `ZeroSub moves agents onto it by itself only when every ${azure ? "ChatGPT" : "Claude"} subscription account is out.`
             : "ZeroSub never moves agents onto it by itself."}
         </Text>
         {apiWarning ? <Text style={text.warning}>{apiWarning}</Text> : null}
@@ -176,6 +180,17 @@ export function AddAccountModal({
           <Button theme={theme} tone="primary" label="Done" tooltip="Close this window" tooltipAlign="end" onPress={onClose} />
         </Row>
       </>
+    ) : mode === "bedrock" ? (
+      <BedrockAccountForm
+        theme={theme}
+        store={store}
+        paidFallback={state?.paidApiFallback ?? false}
+        onDone={(id, warning) => {
+          setApiWarning(warning);
+          setApiAdded(id);
+        }}
+        onCancel={close}
+      />
     ) : azure ? (
       <AzureAccountForm
         theme={theme}
@@ -487,8 +502,9 @@ function describeAccount(account: AccountView): string {
 }
 
 /**
- * How a new account connects: a Claude one, a subscription to sign in, an API key or token, or a
- * folder that's signed in already; a ChatGPT one, a subscription to sign in or an Azure OpenAI key.
+ * How a new account connects: a Claude one, a subscription to sign in, an API key or token, a
+ * folder that's signed in already, or AWS Bedrock; a ChatGPT one, a subscription to sign in or an
+ * Azure OpenAI key.
  */
 function ModeStep({
   theme,
@@ -498,6 +514,7 @@ function ModeStep({
   onSubscription,
   onApi,
   onImport,
+  onBedrock,
   onCancel,
 }: {
   theme: Theme;
@@ -509,6 +526,8 @@ function ModeStep({
   onSubscription(): void;
   onApi(): void;
   onImport(): void;
+  /** Offered for Claude only. */
+  onBedrock(): void;
   onCancel(): void;
 }) {
   const text = useText(theme);
@@ -539,6 +558,14 @@ function ModeStep({
             title="A folder that's signed in already"
             detail="A Claude Code folder (its CLAUDE_CONFIG_DIR) signed in with a subscription: one you set up yourself, or one kept when you removed its account here. No sign-in; it stays where it is."
             onPress={onImport}
+          />
+          <Choice
+            theme={theme}
+            title="AWS Bedrock"
+            detail={`Claude Code on Amazon Bedrock in your AWS account, with the host's own AWS credentials, a profile or an access key. Billed per token; ${
+              paidFallback ? "used by itself only when every Claude subscription account is out, or when you choose it." : "used only when you choose it."
+            }`}
+            onPress={onBedrock}
           />
         </>
       ) : (
