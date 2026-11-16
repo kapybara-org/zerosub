@@ -208,6 +208,8 @@ interface Opening {
   session?: LiveSession;
   /** A Codex thread's pin it wrote, and the one that pin replaced. */
   pin?: { wrote: Binding; replaced: Binding | undefined };
+  /** Routing left the session alone: its family isn't available here (see `route`). */
+  unavailable?: boolean;
 }
 type Problem = { kind: "limit"; hit: LimitHit } | { kind: "signed_out" };
 
@@ -777,6 +779,10 @@ export class Service {
     abandoned?.addEventListener("abort", giveUp, { once: true });
     try {
       const result = await routed;
+      if (opening.unavailable) {
+        await this.openedUnavailable(request, opening);
+        return result;
+      }
       if (!abandoned?.aborted) {
         if (result) {
           // A fresh session already runs on the routed account, so any pending switch is done.
@@ -828,6 +834,22 @@ export class Service {
     });
   }
 
+  /**
+   * A session of a family that isn't available here runs on the CLI login, like any session ZeroSub
+   * didn't route: so the account recorded for the session before goes, unless a session opened since
+   * replaced it, and a reload of ours counts as not landed. Bindings stay, so the agent goes back to
+   * its account once the family is available again.
+   */
+  private async openedUnavailable(request: PluginSessionOpenRequest, opening: Opening): Promise<void> {
+    const { agentId } = request;
+    this.unrouted.add(agentId);
+    const ended = (session: LiveSession | undefined) => session !== undefined && Date.parse(session.openedAt) < opening.startedAt;
+    if (!ended((await this.store.read()).sessions[agentId])) return;
+    await this.store.update((draft) => {
+      if (ended(draft.sessions[agentId])) delete draft.sessions[agentId];
+    });
+  }
+
   private async route(
     request: PluginSessionOpenRequest,
     context: PluginHookContext,
@@ -837,6 +859,14 @@ export class Service {
     this.attach(context.paseo);
     const family = (await this.families.resolve(context.paseo))[request.provider];
     if (!family) return undefined;
+    // A family known not to work here (Cursor off Linux, with a registry made on Linux, say) gives an
+    // added account no env of its own: the session runs on the CLI login, so it isn't routed or
+    // recorded. Until availability is first checked, sessions are routed as usual.
+    if (this.availability.get(family)?.ok === false) {
+      if (opening) opening.unavailable = true;
+      console.log(`[ZeroSub] ${request.provider} agent ${request.agentId} not routed: ${PROVIDER_NAME[family]} isn't available here (${request.reason})`);
+      return undefined;
+    }
     const adapter = this.adapters[family];
     const now = Date.now();
     const interactive = request.purpose === "interactive";
@@ -2303,7 +2333,9 @@ export class Service {
       for (const agent of await this.liveAgents(paseo)) {
         const agentId = agent.id;
         const family = families[agent.provider];
-        if (!family || routing.has(agentId) || this.switching.has(agentId) || this.recentlyActive(agent, now)) continue;
+        // A reload can't move an agent of a family that isn't available here: its session opens on
+        // the CLI login again (see `route`).
+        if (!family || this.availability.get(family)?.ok === false || routing.has(agentId) || this.switching.has(agentId) || this.recentlyActive(agent, now)) continue;
         if (this.deferred.has(agentId)) {
           // Its switch waited for a turn that never came (it was only starting), or ended without it.
           if (settled(agent.status)) waiting.push({ agentId, family });
@@ -2346,7 +2378,7 @@ export class Service {
     canReopen: boolean,
     now: number,
   ): NonNullable<AgentRoute["waiting"]> {
-    if (!canReopen || this.failedMoves.get(agent.id) === target) return "restart";
+    if (!canReopen || this.failedMoves.get(agent.id) === target || this.availability.get(family)?.ok === false) return "restart";
     const deferred = this.deferred.get(agent.id);
     // Only a move left for its turn, or one alignment tries, happens before the session next starts.
     // One left for its turn goes ahead as `finishDeferred` checks: always when asked for, and when
