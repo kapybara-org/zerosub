@@ -895,7 +895,7 @@ describe("forking to the other provider", () => {
                 status: hooks.createdStatus ?? "idle",
                 currentModeId: request.config.modeId,
                 title: request.title,
-                workspaceId: "ws-1",
+                workspaceId,
                 archivedAt: null,
                 labels: request.labels,
               };
@@ -1527,7 +1527,42 @@ describe("forking to the other provider", () => {
       atHelperRefresh(setup, (source) => { source.workspaceId = "ws-2"; });
       await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/moved/);
       expect(setup.created).toHaveLength(0);
-      expect((await setup.store.read()).opencodeForks[AGENT]!.pending?.stage).toBe("creating");
+      const pending = (await setup.store.read()).opencodeForks[AGENT]!.pending;
+      expect(pending?.stage).toBe("creating");
+      // Its outcome is still unknown: only the frozen request may go out under its key.
+      expect(pending?.createFailed).toBeUndefined();
+    });
+
+    it("starts a fresh create again when the source moved before the create was sent", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      atHelperRefresh(setup, (source) => { source.workspaceId = "ws-2"; });
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/moved/);
+      expect(setup.created).toHaveLength(0);
+      const first = (await setup.store.read()).opencodeForks[AGENT]!.pending!;
+      expect(first.createFailed).toBe(true);
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("sent");
+      expect(setup.created).toHaveLength(1);
+      expect(setup.created[0]).toMatchObject({ workspaceId: "ws-2" });
+      expect(setup.created[0]!.agentId).not.toBe(first.targetId);
+    });
+
+    it("keeps a failed create's reservation retryable when the source moves before it is sent again", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      await setup.store.update((draft) => {
+        draft.opencodeForks[AGENT] = reservedCreation();
+        draft.opencodeForks[AGENT].pending!.createFailed = true;
+      });
+      atHelperRefresh(setup, (source) => { source.workspaceId = "ws-2"; });
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/moved/);
+      expect(setup.created).toHaveLength(0);
+      const pending = (await setup.store.read()).opencodeForks[AGENT]!.pending!;
+      expect(pending.targetId).toBe(RESERVED.targetId);
+      expect(pending.createFailed).toBe(true);
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("sent");
+      expect(setup.created).toHaveLength(1);
+      expect(setup.created[0]!.agentId).not.toBe(RESERVED.targetId);
     });
 
     it.each([

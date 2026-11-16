@@ -2301,7 +2301,7 @@ export class Service {
       if (!reserved?.title || reserved.workspaceId === undefined || reserved.cwd === undefined || reserved.parentId === undefined) {
         return this.openCodeUncertain(retry.targetId, null, retry.messageId);
       }
-      return this.sendReservedCreate(paseo, agentId, retry.targetId, retry.messageId, { ...reserved, title: reserved.title });
+      return this.sendReservedCreate(paseo, agentId, retry.targetId, retry.messageId, { ...reserved, title: reserved.title }, true);
     }
     const { models, error } = await paseo.providers.listModels(OPENCODE_PROVIDER);
     if (error) return { skipped: `Couldn't read this host's ${OPENCODE_LABEL} models: ${error}` };
@@ -2360,39 +2360,55 @@ export class Service {
         pending: { stage: "creating", targetId, messageId, seen: delta.mark, config: { ...config, why }, sentDigest: sentDigestOf(prompt) },
       };
     });
-    return this.sendReservedCreate(paseo, agentId, targetId, messageId, config);
+    return this.sendReservedCreate(paseo, agentId, targetId, messageId, config, false);
   }
 
-  /** Sends a reserved promptless create, then its reserved handoff once the fork exists. */
+  /**
+   * Sends a reserved promptless create, then its reserved handoff once the fork exists.
+   * `outcomeUnknown`: Paseo may hold this key's request with no answer seen, so a refusal keeps it.
+   */
   private async sendReservedCreate(
     paseo: PaseoApi,
     agentId: string,
     targetId: string,
     messageId: string,
     config: OpenCodeCreateConfig & { title: string },
+    outcomeUnknown: boolean,
   ): Promise<ForkOutcome> {
-    await continueInNewAgent({
-      paseo,
-      sourceAgentId: agentId,
-      previous: PROVIDER_NAME.claude,
-      agentId: targetId, // also the create's idempotency key, so a retried create can't double it
-      deferPrompt: true,
-      target: {
-        provider: OPENCODE_PROVIDER,
-        label: OPENCODE_LABEL,
-        modeId: config.modeId,
-        model: config.provider.slice(`${OPENCODE_PROVIDER}/`.length),
-        ...(config.thinkingOptionId ? { thinkingOptionId: config.thinkingOptionId } : {}),
-      },
-      parentId: config.parentId ?? undefined,
-      reserved: { title: config.title, workspaceId: config.workspaceId ?? null, cwd: config.cwd ?? null },
-      bind: async () => {}, // OpenCode is a harness, not an account provider: no binding to record.
-      onCreateRejected: () =>
-        this.store.update((draft) => {
-          const pending = draft.opencodeForks[agentId]?.pending;
-          if (pending?.messageId === messageId) pending.createFailed = true;
-        }),
-    });
+    const markFailed = () =>
+      this.store.update((draft) => {
+        const pending = draft.opencodeForks[agentId]?.pending;
+        if (pending?.messageId === messageId) pending.createFailed = true;
+      });
+    let sending = false;
+    try {
+      await continueInNewAgent({
+        paseo,
+        sourceAgentId: agentId,
+        previous: PROVIDER_NAME.claude,
+        agentId: targetId, // also the create's idempotency key, so a retried create can't double it
+        deferPrompt: true,
+        target: {
+          provider: OPENCODE_PROVIDER,
+          label: OPENCODE_LABEL,
+          modeId: config.modeId,
+          model: config.provider.slice(`${OPENCODE_PROVIDER}/`.length),
+          ...(config.thinkingOptionId ? { thinkingOptionId: config.thinkingOptionId } : {}),
+        },
+        parentId: config.parentId ?? undefined,
+        reserved: { title: config.title, workspaceId: config.workspaceId ?? null, cwd: config.cwd ?? null },
+        // OpenCode is a harness, not an account provider: no binding to record. Binding is the
+        // helper's last step before it sends the create.
+        bind: async () => {
+          sending = true;
+        },
+        onCreateRejected: markFailed,
+      });
+    } catch (error) {
+      // Refused before the create was sent: Paseo has no record under this key, or only a failed one.
+      if (!sending && !outcomeUnknown) await markFailed();
+      throw error;
+    }
     const fork = await waitForCreated(paseo, targetId);
     if (!fork) return this.openCodeUncertain(targetId, null, messageId);
     return this.deliverReservedOpenCode(paseo, agentId, fork);
