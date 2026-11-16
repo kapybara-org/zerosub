@@ -135,7 +135,7 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
             ))
           : null}
 
-        <AutomationSettings theme={theme} />
+        <AutomationSettings theme={theme} compact={layout.compact} />
       </ScrollView>
 
       {adding?.family === "pi" ? (
@@ -770,7 +770,7 @@ function Avatar({ theme, label }: { theme: Theme; label: string }) {
   );
 }
 
-function AutomationSettings({ theme }: { theme: Theme }) {
+function AutomationSettings({ theme, compact }: { theme: Theme; compact: boolean }) {
   const settings = useSettings(preferences);
   const text = useText(theme);
   if (settings.status === "loading") return null;
@@ -780,75 +780,80 @@ function AutomationSettings({ theme }: { theme: Theme }) {
   const save = (patch: Partial<typeof settings.values>) =>
     void settings.save({ ...settings.values, ...patch }, settings.revision);
   return (
-    <View style={{ gap: 10 }}>
-      <Text style={text.heading} accessibilityRole="header">
-        Automatic switching
-      </Text>
-      <SettingsCard>
-        <SettingsSwitch
-          label="Switch accounts when one hits its limit"
-          hint="Agents move to the account with the most room left."
-          value={settings.values.autoSwitch}
-          disabled={settings.saving}
-          onValueChange={(autoSwitch) => save({ autoSwitch })}
-        />
-        <SettingsSwitch
-          label="Keep going after a switch"
-          hint="Sends a short follow-up so the interrupted task continues."
-          value={settings.values.autoContinue}
-          disabled={settings.saving || !settings.values.autoSwitch}
-          onValueChange={(autoContinue) => save({ autoContinue })}
-        />
-        <SettingsSwitch
-          label="Spread new agents across accounts"
-          hint="New ChatGPT agents prefer a weekly reset within one day when both limits have at least 20% left. Otherwise, new agents use the account with the most room."
-          value={settings.values.balanceNewAgents}
-          disabled={settings.saving}
-          onValueChange={(balanceNewAgents) => save({ balanceNewAgents })}
-        />
-        <SettingsSwitch
-          label="Move open agents when the default changes"
-          hint="Off: open agents stay on the account they're using, even after they reopen. New agents, and agents that aren't open at the time, use the new default."
-          value={settings.values.moveAgentsOnDefaultChange}
-          disabled={settings.saving}
-          onValueChange={(moveAgentsOnDefaultChange) => save({ moveAgentsOnDefaultChange })}
-        />
-        <SettingsSwitch
-          label="Use banked resets when every account is out"
-          hint="Spends one of the account's banked resets instead of stopping. Resets are scarce, so this is off unless you turn it on."
-          value={settings.values.autoRedeem}
-          disabled={settings.saving || !settings.values.autoSwitch}
-          onValueChange={(autoRedeem) => save({ autoRedeem })}
-        />
-        <SettingsSwitch
-          label="Use ChatGPT credits when a limit is reached"
-          hint="A ChatGPT account at its limit stays in use while it has credits, so new agents may spend paid credits even while another account still has room."
-          value={settings.values.useCredits}
-          disabled={settings.saving}
-          onValueChange={(useCredits) => save({ useCredits })}
-        />
-        <SettingsSwitch
-          label="When every account is out, fork the chat to the other provider"
-          hint="A stopped Claude chat carries on in a new ChatGPT or OpenCode agent (pick the destination below) with the conversation so far. ChatGPT gets a mode no looser than this agent's. OpenCode gets Plan or Build under the host's own permission policy, which can allow more than Claude does. The original stays as it was."
-          value={settings.values.forkOtherProvider}
-          disabled={settings.saving || !settings.values.autoSwitch}
-          onValueChange={(forkOtherProvider) => save({ forkOtherProvider })}
-        />
-        <ForkDestinationRows values={settings.values} saving={settings.saving} onSave={save} />
-        <SettingsSwitch
-          label="Keep a Codex chat in the same conversation"
-          hint="Off unless you turn it on. Two ChatGPT accounts in one workspace reload this agent on the other account instead of opening a new tab. A different workspace, an email-only account, or a workspace that is out of credits still opens a new tab. If the first turn cannot resume the thread, this agent goes back and the new tab opens."
-          value={settings.values.codexSameConversation}
-          disabled={settings.saving || !settings.values.autoSwitch}
-          onValueChange={(codexSameConversation) => save({ codexSameConversation })}
-        />
-      </SettingsCard>
-      <Text style={text.heading} accessibilityRole="header">
-        Continue on OpenCode
-      </Text>
-      <SettingsCard>
-        <OpenCodeForkRows values={settings.values} saving={settings.saving} onSave={save} />
-      </SettingsCard>
+    // Same gap as the page's other sections, so the OpenCode card reads as its own section.
+    <View style={{ gap: compact ? 20 : 28 }}>
+      <View style={{ gap: 10 }}>
+        <Text style={text.heading} accessibilityRole="header">
+          Automatic switching
+        </Text>
+        <SettingsCard>
+          <SettingsSwitch
+            label="Switch accounts when one hits its limit"
+            hint="Agents move to the account with the most room left."
+            value={settings.values.autoSwitch}
+            disabled={settings.saving}
+            onValueChange={(autoSwitch) => save({ autoSwitch })}
+          />
+          <SettingsSwitch
+            label="Keep going after a switch"
+            hint="Sends a short follow-up so the interrupted task continues."
+            value={settings.values.autoContinue}
+            disabled={settings.saving || !settings.values.autoSwitch}
+            onValueChange={(autoContinue) => save({ autoContinue })}
+          />
+          <SettingsSwitch
+            label="Spread new agents across accounts"
+            hint="New ChatGPT agents prefer a weekly reset within one day when both limits have at least 20% left. Otherwise, new agents use the account with the most room."
+            value={settings.values.balanceNewAgents}
+            disabled={settings.saving}
+            onValueChange={(balanceNewAgents) => save({ balanceNewAgents })}
+          />
+          <SettingsSwitch
+            label="Move open agents when the default changes"
+            hint="Off: open agents stay on the account they're using, even after they reopen. New agents, and agents that aren't open at the time, use the new default."
+            value={settings.values.moveAgentsOnDefaultChange}
+            disabled={settings.saving}
+            onValueChange={(moveAgentsOnDefaultChange) => save({ moveAgentsOnDefaultChange })}
+          />
+          <SettingsSwitch
+            label="Use banked resets when every account is out"
+            hint="Spends one of the account's banked resets instead of stopping. Resets are scarce, so this is off unless you turn it on."
+            value={settings.values.autoRedeem}
+            disabled={settings.saving || !settings.values.autoSwitch}
+            onValueChange={(autoRedeem) => save({ autoRedeem })}
+          />
+          <SettingsSwitch
+            label="Use ChatGPT credits when a limit is reached"
+            hint="A ChatGPT account at its limit stays in use while it has credits, so new agents may spend paid credits even while another account still has room."
+            value={settings.values.useCredits}
+            disabled={settings.saving}
+            onValueChange={(useCredits) => save({ useCredits })}
+          />
+          <SettingsSwitch
+            label="When every account is out, fork the chat to the other provider"
+            hint="A stopped Claude chat carries on in a new ChatGPT or OpenCode agent (pick the destination below) with the conversation so far. ChatGPT gets a mode no looser than this agent's. OpenCode gets Plan or Build under the host's own permission policy, which can allow more than Claude does. The original stays as it was."
+            value={settings.values.forkOtherProvider}
+            disabled={settings.saving || !settings.values.autoSwitch}
+            onValueChange={(forkOtherProvider) => save({ forkOtherProvider })}
+          />
+          <ForkDestinationRows values={settings.values} saving={settings.saving} onSave={save} />
+          <SettingsSwitch
+            label="Keep a Codex chat in the same conversation"
+            hint="Off unless you turn it on. Two ChatGPT accounts in one workspace reload this agent on the other account instead of opening a new tab. A different workspace, an email-only account, or a workspace that is out of credits still opens a new tab. If the first turn cannot resume the thread, this agent goes back and the new tab opens."
+            value={settings.values.codexSameConversation}
+            disabled={settings.saving || !settings.values.autoSwitch}
+            onValueChange={(codexSameConversation) => save({ codexSameConversation })}
+          />
+        </SettingsCard>
+      </View>
+      <View style={{ gap: 10 }}>
+        <Text style={text.heading} accessibilityRole="header">
+          Continue on OpenCode
+        </Text>
+        <SettingsCard>
+          <OpenCodeForkRows values={settings.values} saving={settings.saving} onSave={save} />
+        </SettingsCard>
+      </View>
       {settings.saveError ? <Text style={text.danger}>{settings.saveError}</Text> : null}
     </View>
   );
