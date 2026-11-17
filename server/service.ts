@@ -2997,6 +2997,30 @@ export class Service {
     });
   }
 
+  /** While spreading is on: per family, the account a new agent naming none would start on. */
+  private pacedNextAccounts(state: StoredState, now: number): Record<string, string> | undefined {
+    if (!this.prefs.balanceNewAgents) return undefined;
+    const next: Record<string, string> = {};
+    for (const family of FAMILIES) {
+      if (accountsOf(state, family).length < 2) continue;
+      const decision = chooseAccount(state, {
+        agentId: "",
+        family,
+        reason: "create",
+        now,
+        autoSwitch: this.prefs.autoSwitch,
+        balanceNewAgents: true,
+        paidFallback: this.prefs.paidApiFallback,
+        autoRedeem: this.prefs.autoRedeem,
+        portable: this.adapters[family].portable,
+        usageOf: (id) => this.usage.get(id),
+        pendingOf: (id) => this.pendingOn(id, now),
+      });
+      if (decision?.bind?.source === "balance") next[family] = decision.account.id;
+    }
+    return next;
+  }
+
   /**
    * Where this agent's session belongs now. One on a usable stand-in, `current` (see `standingIn`),
    * belongs where it is.
@@ -3621,6 +3645,7 @@ export class Service {
       openCodeAvailable: await this.openCodeAvailable(paseo),
       autoSwitch: this.prefs.autoSwitch,
       balanceNewAgents: this.prefs.balanceNewAgents,
+      pacedNext: this.pacedNextAccounts(state, now),
       agentMetadata: takesAgentMetadata(paseo),
       paidApiFallback: this.prefs.paidApiFallback,
       warnings: await this.warnings(),

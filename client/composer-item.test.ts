@@ -1,7 +1,7 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
 import type { ReactElement } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { ACCOUNT_METADATA_KEY, AGENT_METADATA_KEY, type AccountView, type AgentRoute, type StateView } from "../shared/model";
+import { ACCOUNT_METADATA_KEY, AGENT_METADATA_KEY, type AccountView, type AgentRoute, type PaceView, type StateView } from "../shared/model";
 import { setAgentAccount } from "../shared/rpc";
 import { FOLLOW, MANAGE, accountChoices, agentChoices, contributeComposerItem } from "./composer-item";
 import type { ZeroSubStore } from "./store";
@@ -87,6 +87,18 @@ function view(accounts: AccountView[], fields: Partial<StateView> = {}): StateVi
   };
 }
 
+const paced = (fields: Partial<PaceView>): PaceView => ({
+  fiveHourUsed: 0,
+  fiveHourProjected: 0,
+  pendingFiveHour: 0,
+  weeklyUsed: 0,
+  pendingWeekly: 0,
+  weekElapsed: 50,
+  pending: 0,
+  gated: false,
+  ...fields,
+});
+
 const main = account("main", { isDefault: true, usage: used(42) });
 const work = account("work", { usage: used(7) });
 const home = account("home");
@@ -158,6 +170,48 @@ describe("the accounts a composer without an agent offers", () => {
         { value: "main", label: "main", description: "42% used" },
       ]);
     }
+  });
+});
+
+describe("pacing in the menu", () => {
+  const pacedMain = account("main", {
+    isDefault: true,
+    usage: used(72),
+    pace: paced({ fiveHourUsed: 72, fiveHourProjected: 91, weeklyUsed: 60, pending: 1, pendingFiveHour: 10, gated: true }),
+  });
+  const pacedWork = account("work", { usage: used(7), pace: paced({ fiveHourUsed: 7, fiveHourProjected: 12, weeklyUsed: 20 }) });
+  const spreading = (accounts: AccountView[], fields: Partial<StateView> = {}) =>
+    view(accounts, { balanceNewAgents: true, pacedNext: { claude: "work" }, ...fields });
+
+  it("shows pacing on each account while spreading", () => {
+    expect(accountChoices(spreading([pacedMain, pacedWork]), "claude", undefined)?.options).toEqual([
+      { value: FOLLOW, label: "Automatic", description: "Pacing picks work" },
+      { value: "main", label: "main", description: "Held back: busy hour" },
+      { value: "work", label: "work", description: "Picks next" },
+    ]);
+  });
+
+  it("keeps the usual text without a pace, and says Limit reached for a limited account", () => {
+    expect(accountChoices(spreading([main, work], { pacedNext: undefined }), "claude", undefined)?.options.map((option) => option.description)).toEqual([
+      "The account with the most room",
+      "42% used",
+      "7% used",
+    ]);
+    const full = account("work", { status: "limited" });
+    expect(accountChoices(spreading([pacedMain, full], { autoSwitch: false }), "claude", undefined)?.options.at(-1)?.description).toBe("Limit reached");
+  });
+
+  it("keeps Automatic's usual text when the paced account isn't offered", () => {
+    const out = account("work", { status: "signed_out" });
+    const third = account("home");
+    expect(accountChoices(spreading([pacedMain, out, third]), "claude", undefined)?.options[0]?.description).toBe("The account with the most room");
+  });
+
+  it("keeps the one-time pick first, as the pick, and doesn't say Picks next on another account", () => {
+    const picked = account("main", { isDefault: true, nextAgentUntil: "2026-11-09T12:10:00Z", pace: paced({ fiveHourUsed: 5, fiveHourProjected: 6 }) });
+    const options = accountChoices(spreading([picked, pacedWork]), "claude", undefined)?.options;
+    expect(options?.[0]).toMatchObject({ label: "main", description: "Picked for the next new agent" });
+    expect(options?.[1]?.description).toBe("Room to spare");
   });
 });
 
@@ -289,6 +343,13 @@ describe("the accounts a running agent's composer offers", () => {
         { value: MANAGE, label: "Manage accounts…" },
       ],
     });
+  });
+
+  it("shows pacing's verdict on each account while spreading, as the account button does", () => {
+    const pacedMain = account("main", { isDefault: true, usage: used(72), pace: paced({ fiveHourUsed: 72, fiveHourProjected: 91, gated: true }) });
+    const pacedWork = account("work", { usage: used(7), pace: paced({ fiveHourUsed: 7, fiveHourProjected: 12, weeklyUsed: 20 }) });
+    const options = agentChoices(running([pacedMain, pacedWork], {}, { balanceNewAgents: true, pacedNext: { claude: "work" } }), "agent-1")!.options;
+    expect(options.map((option) => option.description)).toEqual(["Held back: busy hour", "Picks next", undefined]);
   });
 
   it("offers the way back to the default to an agent that was given an account", () => {

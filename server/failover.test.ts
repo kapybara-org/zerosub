@@ -4618,6 +4618,24 @@ describe("pending placements", () => {
     expect(new Set([sessions["new-a"]?.accountId, sessions["new-b"]?.accountId])).toEqual(new Set([MAIN, HELLO]));
   });
 
+  it("view names the pacedNext account", async () => {
+    const { service, paseo } = await setUp(
+      {
+        accounts: [account(MAIN, "work", "main"), account(HELLO, "personal", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+      },
+      () => {
+        throw new Error("unused");
+      },
+    );
+    expect((await service.view(paseo as never)).pacedNext).toBeUndefined();
+    service.setPreferences(preferences.schema.parse({ balanceNewAgents: true }));
+    await service.onSessionOpen({ agentId: "new-a", provider: "claude", reason: "create", purpose: "interactive", workspaceId: "ws-1", env: {} } as never, { paseo } as never);
+    const placed = (await service.view(paseo as never)).accounts.find((a) => a.pace && a.pace.pending > 0)?.id;
+    expect(placed).toBeDefined();
+    expect((await service.view(paseo as never)).pacedNext?.claude).toBe(placed === MAIN ? HELLO : MAIN);
+  });
+
   it("logs pace scores for a balanced new agent", async () => {
     const { service, paseo } = await setUp(
       {
