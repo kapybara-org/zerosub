@@ -4,12 +4,11 @@ import type {
   PluginButtonRegistration,
   PluginClientContext,
 } from "@getpaseo/plugin/client";
-import { accountPeak, formatCredits, formatPercent, moveProblem, pillText } from "../shared/format";
+import { accountPeak, formatCredits, formatPercent, pillText } from "../shared/format";
 import { FAMILY_LABEL, HAND_OFF, OTHER_FAMILY, type AccountView, type StateView } from "../shared/model";
-import { setAgentAccount } from "../shared/rpc";
 import { forkPopover } from "./fork-confirm";
 import { resetPopover } from "./reset-confirm";
-import { stoppedWaiting, type ZeroSubStore } from "./store";
+import { moveAgent, type ZeroSubStore } from "./store";
 
 /** The most agents Paseo returns per page. */
 const PAGE_SIZE = 200;
@@ -24,9 +23,10 @@ interface TrackedAgent {
 /**
  * One composer pill per Claude/Codex agent showing the account it runs on. Tapping it opens a menu
  * of that provider's accounts. Pills only appear once a provider has more than one account, so a
- * single-account setup looks exactly like stock Paseo.
+ * single-account setup looks exactly like stock Paseo. With `inComposer`, the Account control in
+ * the composer shows the account instead, and a pill appears only to offer a way out of a limit.
  */
-export function contributePills(client: PluginClientContext, store: ZeroSubStore): () => void {
+export function contributePills(client: PluginClientContext, store: ZeroSubStore, inComposer = false): () => void {
   const agents = new Map<string, TrackedAgent>();
   const pills = new Map<string, { registration: PluginButtonRegistration; key: string }>();
   const lifetime = new AbortController();
@@ -42,7 +42,7 @@ export function contributePills(client: PluginClientContext, store: ZeroSubStore
       }
     }
     for (const agent of agents.values()) {
-      const button = state ? buttonFor(client, store, state, agent) : null;
+      const button = state ? buttonFor(client, store, state, agent, inComposer) : null;
       const existing = pills.get(agent.id);
       if (!button) {
         existing?.registration.remove();
@@ -143,6 +143,7 @@ function buttonFor(
   store: ZeroSubStore,
   state: StateView,
   agent: TrackedAgent,
+  inComposer: boolean,
 ): PluginButton | null {
   if (!state.showComposerPill) return null;
   const family = state.providers[agent.provider];
@@ -165,17 +166,13 @@ function buttonFor(
     accounts.every((account) => account.status === "limited" || account.status === "signed_out" || account.status === "disabled") &&
     state.accounts.some((account) => account.family === other && account.status === "ready");
   if (accounts.length < 2 && !(current.status === "limited" && (offerReset || offerFork))) return null;
+  // Where the composer has the Account control (see composer-item.tsx), the account stays there for
+  // a running agent too. The button is then only the way out of a limit, which a control can't
+  // offer, or the stand-in for an agent the control can't show for.
+  if (inComposer && state.agentMetadata && route?.inComposer !== false && !(current.status === "limited" && (offerReset || offerFork))) return null;
 
-  const choose = (accountId: string | null, to: string) => async () => {
-    const summary = await store.rpc(setAgentAccount, { agentId: agent.id, accountId }).catch((error: unknown) => {
-      // The move goes on without Paseo waiting for it, and the pill shows it under way.
-      if (stoppedWaiting(error)) return null;
-      throw error;
-    });
-    // Paseo shows what an action throws: here, that the agent couldn't be reloaded.
-    const problem = summary && moveProblem(summary, to);
-    if (problem) throw new Error(problem);
-  };
+  // Paseo shows what an action throws: here, that the agent couldn't be reloaded.
+  const choose = (accountId: string | null, to: string) => () => moveAgent(store, agent.id, accountId, to);
 
   // Codex threads can't change accounts in place; continue in this task's tab for that account.
   const movable = route?.movable ?? true;

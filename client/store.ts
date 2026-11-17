@@ -2,8 +2,9 @@ import type { PluginRpcContract } from "@getpaseo/plugin";
 import type { PluginClientContext } from "@getpaseo/plugin/client";
 import type { ZodType, input as ZodInput, output as ZodOutput } from "zod";
 import { useSyncExternalStore } from "react";
+import { moveProblem } from "../shared/format";
 import type { StateView } from "../shared/model";
-import { getState } from "../shared/rpc";
+import { getState, setAgentAccount } from "../shared/rpc";
 
 const IDLE_POLL_MS = 20_000;
 /** While the Accounts screen is open, so usage moves as agents use it. */
@@ -273,6 +274,20 @@ function describeIssue(issue: Issue): string {
  */
 export function stoppedWaiting(error: unknown): boolean {
   return /Plugin RPC timed out|Timeout waiting for message/i.test(describe(error));
+}
+
+/**
+ * Moves an agent to an account (`null`: back to following the default), for its account button
+ * and its Account control. Throws what Paseo should show: that the agent couldn't be reloaded, say.
+ */
+export async function moveAgent(store: ZeroSubStore, agentId: string, accountId: string | null, to: string): Promise<void> {
+  const summary = await store.rpc(setAgentAccount, { agentId, accountId }).catch((error: unknown) => {
+    // The move goes on without Paseo waiting for it, and the account shows it under way.
+    if (stoppedWaiting(error)) return null;
+    throw error;
+  });
+  const problem = summary && moveProblem(summary, to);
+  if (problem) throw new Error(problem);
 }
 
 export function useStore(store: ZeroSubStore): StoreSnapshot {
