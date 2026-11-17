@@ -16,6 +16,9 @@ export const FAMILY_LABEL: Record<Family, string> = {
   cursor: "Cursor",
 };
 
+/** Paseo's OpenCode harness provider. It runs on the host itself, so a fork to it uses no account. */
+export const OPENCODE_PROVIDER = "opencode";
+export const OPENCODE_LABEL = "OpenCode";
 /**
  * The provider a stopped chat can carry on with when every account of its own is out (Claude ↔
  * ChatGPT); null for Pi, whose added accounts are billed per use and never take work over by themselves,
@@ -125,11 +128,27 @@ export const AuthKindSchema = z.enum([
   "subscription",
   /**
    * An API key or token (a Claude account's, optionally against another base URL; an added Pi
-   * account's Anthropic key), billed per use, so never picked automatically.
+   * account's Anthropic key; an Azure OpenAI account's), billed per use, so never picked
+   * automatically. An Azure OpenAI account can be, as a last resort, once `paidApiFallback` is on.
    */
   "api",
 ]);
 export type AuthKind = z.infer<typeof AuthKindSchema>;
+
+/**
+ * The paid API behind an `api` account that stands in for a subscription, set when it's added. Never
+ * inferred from `auth`: a Claude or Pi API-key account has none, and is only used when chosen.
+ */
+export const ApiProviderSchema = z.enum([
+  /** An Azure OpenAI resource, under ChatGPT (Codex). */
+  "azure",
+]);
+export type ApiProvider = z.infer<typeof ApiProviderSchema>;
+
+/** An Azure OpenAI account: a ChatGPT (Codex) account added as one, marked `provider: "azure"`. */
+export function isAzureAccount(account: { family: Family; provider?: ApiProvider }): boolean {
+  return account.family === "codex" && account.provider === "azure";
+}
 
 export const ApiKeyKindSchema = z.enum([
   /** `ANTHROPIC_API_KEY`, sent as `x-api-key`. */
@@ -161,6 +180,104 @@ export const ApiSummarySchema = TrafficSwitchesSchema.extend({
 });
 /** As an adapter gives it: the kind and switches may be left out, and are filled in for the client. */
 export type ApiSummary = z.input<typeof ApiSummarySchema>;
+
+/** USD per million tokens for one model on a paid API account; null where the user left it empty. */
+export const ApiPriceSchema = z.object({
+  input: z.number().nonnegative().nullable().default(null),
+  /** Cached input (OpenAI), or cache reads (Anthropic). */
+  cachedInput: z.number().nonnegative().nullable().default(null),
+  /** Cache writes (Anthropic); Azure OpenAI has none. */
+  cacheWrite: z.number().nonnegative().nullable().default(null),
+  output: z.number().nonnegative().nullable().default(null),
+});
+export type ApiPrice = z.infer<typeof ApiPriceSchema>;
+
+/**
+ * Tokens one model used. `input` is every input token, cached ones included (as OpenAI and Codex
+ * count them): `cachedInput` of them were read from the cache, and `cacheWrite` written to it.
+ */
+export const TokenCountSchema = z.object({
+  input: z.number().nonnegative().default(0),
+  cachedInput: z.number().nonnegative().default(0),
+  cacheWrite: z.number().nonnegative().default(0),
+  output: z.number().nonnegative().default(0),
+});
+export type TokenCount = z.infer<typeof TokenCountSchema>;
+
+/** A paid API account's tokens this calendar month (UTC), as its CLI counted them, by model. */
+export const ApiMonthSchema = z.object({
+  /** `YYYY-MM`, UTC. */
+  month: z.string(),
+  models: z.record(z.string(), TokenCountSchema).default({}),
+  /** Turns that ended on the account whose tokens couldn't be read (no session file found). */
+  uncounted: z.number().nonnegative().default(0),
+  updatedAt: z.string().nullable().default(null),
+});
+export type ApiMonth = z.infer<typeof ApiMonthSchema>;
+
+/** Month key (`YYYY-MM`, UTC) API token totals are kept under. */
+export function usageMonth(at: number | Date = Date.now()): string {
+  return new Date(at).toISOString().slice(0, 7);
+}
+
+/**
+ * The estimated cost of `month` at `prices` (USD per million tokens, by model). `complete` is false
+ * when a model that used tokens has no price, or a price it needs is empty; `usd` then counts only
+ * what has a price, and is null when nothing does.
+ */
+export function estimateApiCost(month: ApiMonth | null, prices: Readonly<Record<string, ApiPrice>>): { usd: number | null; complete: boolean } {
+  if (!month) return { usd: null, complete: true };
+  let usd = 0;
+  let priced = false;
+  let complete = true;
+  for (const [model, count] of Object.entries(month.models)) {
+    const price = prices[model];
+    const uncached = Math.max(0, count.input - count.cachedInput - count.cacheWrite);
+    const parts: Array<[number, number | null | undefined]> = [
+      [uncached, price?.input],
+      // Cache reads or writes without a price of their own are counted at the input price.
+      [count.cachedInput, price?.cachedInput ?? price?.input],
+      [count.cacheWrite, price?.cacheWrite ?? price?.input],
+      [count.output, price?.output],
+    ];
+    for (const [tokens, perMillion] of parts) {
+      if (tokens === 0) continue;
+      if (perMillion == null) {
+        complete = false;
+        continue;
+      }
+      usd += (tokens / 1_000_000) * perMillion;
+      priced = true;
+    }
+  }
+  return { usd: priced ? usd : null, complete };
+}
+
+/** A month's tokens over every model. */
+export function totalTokens(month: ApiMonth | null): TokenCount {
+  const total = { input: 0, cachedInput: 0, cacheWrite: 0, output: 0 };
+  for (const count of Object.values(month?.models ?? {})) {
+    total.input += count.input;
+    total.cachedInput += count.cachedInput;
+    total.cacheWrite += count.cacheWrite;
+    total.output += count.output;
+  }
+  return total;
+}
+
+/** An Azure OpenAI account (a ChatGPT/Codex account on an API key) as the app sees it. The key never leaves the host. */
+export const AzureSummarySchema = z.object({
+  /** The endpoint's base URL, e.g. `https://<resource>.openai.azure.com/openai/v1`. */
+  endpoint: z.string(),
+  host: z.string(),
+  /** The key's last four characters, or empty for a key too short to show any of it. */
+  keyHint: z.string(),
+  /** USD per million tokens, by model (deployment name). */
+  prices: z.record(z.string(), ApiPriceSchema).default({}),
+  /** This month's tokens; null before the first counted turn. */
+  usage: ApiMonthSchema.nullable().default(null),
+});
+export type AzureSummary = z.infer<typeof AzureSummarySchema>;
 
 /** The address an account's requests come from, as the provider's edge sees it. */
 export const EgressSchema = z.object({
@@ -224,6 +341,8 @@ export const AccountViewSchema = z.object({
    * account only takes it out of ZeroSub, and its folder, key and script stay.
    */
   externalHome: z.boolean().default(false),
+  /** Set for an Azure OpenAI account (a ChatGPT/Codex account on an API key); null for any other. */
+  azure: AzureSummarySchema.nullable().default(null),
   /** The account's home is due to move to `to`, and hasn't yet: what it waits for, or what went wrong. */
   moving: z.object({ to: z.string(), waiting: z.string().nullable(), error: z.string().nullable() }).nullable().default(null),
 });
@@ -335,12 +454,21 @@ export const StateViewSchema = z.object({
   /** The folder added Claude accounts' homes are kept in (`~/.claude-config`, say), and whether it's the default. */
   claudeHomes: z.object({ dir: z.string(), isDefault: z.boolean() }).nullable().default(null),
   showComposerPill: z.boolean(),
+  /** This host's Paseo lists OpenCode as available, so "Continue on OpenCode" can work. */
+  openCodeAvailable: z.boolean().default(false),
   /** Accounts at their limit are skipped, so agents can't be moved onto one by hand either. */
   autoSwitch: z.boolean().default(true),
   /** New agents without an account of their own start on the one with the most room, not on the default. */
   balanceNewAgents: z.boolean().optional(),
-  /** Paseo here keeps agent metadata (0.16 and later), which the Account control of a running agent needs. */
+  /**
+   * This host's Paseo keeps agent metadata (0.16 and later), which carries the Account control's
+   * choice for a new agent and tells it which running agent it belongs to. Without it the control
+   * isn't shown, and the account button stays: an app from 0.16 would take the choice and then fail
+   * to create the agent on an older host.
+   */
   agentMetadata: z.boolean().optional(),
+  /** Paid API accounts (Azure OpenAI) may take work over by themselves once every subscription is out. */
+  paidApiFallback: z.boolean().optional(),
   warnings: z.array(z.string()),
 });
 export type StateView = z.infer<typeof StateViewSchema>;

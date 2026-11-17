@@ -1,6 +1,6 @@
 {
   "name": "@kapybara/zerosub",
-  "version": "1.12.0",
+  "version": "1.14.0",
   "description": "ZeroSub: use several Claude and ChatGPT (Codex) subscriptions side by side in Paseo. Add accounts in-app, pick one per agent, and switch automatically when an account hits its limit.",
   "keywords": [
     "paseo",
@@ -37,7 +37,9 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.server.json",
-    "test": "vitest run",
+    "guard:context": "node scripts/guard-context.mjs",
+    "guard:history": "node scripts/guard-context.mjs --history origin/main",
+    "test": "npm run guard:context && vitest run",
     "audit:mobile": "! grep -rnE \"\\\\b(document|window|localStorage|navigator)\\\\.|<(div|span|p|a|button|input|img|ul|ol|li|section|header|footer|main|nav|form|label|h[1-6]|table|tr|td|svg|path|br|hr)[ >/]|className=|onClick=\" client/"
   },
   "devDependencies": {

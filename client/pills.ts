@@ -6,7 +6,7 @@ import type {
 } from "@getpaseo/plugin/client";
 import { accountPeak, formatCredits, formatPercent, pillText } from "../shared/format";
 import { FAMILY_LABEL, HAND_OFF, OTHER_FAMILY, type AccountView, type StateView } from "../shared/model";
-import { forkPopover } from "./fork-confirm";
+import { forkPopover, openCodeForkPopover } from "./fork-confirm";
 import { resetPopover } from "./reset-confirm";
 import { moveAgent, type ZeroSubStore } from "./store";
 
@@ -165,11 +165,16 @@ function buttonFor(
     current.status === "limited" &&
     accounts.every((account) => account.status === "limited" || account.status === "signed_out" || account.status === "disabled") &&
     state.accounts.some((account) => account.family === other && account.status === "ready");
-  if (accounts.length < 2 && !(current.status === "limited" && (offerReset || offerFork))) return null;
+  // OpenCode is a harness, not an account: any Claude agent can continue there by hand, however its
+  // accounts are doing and whether or not automatic forking is on, once this host has OpenCode. Even a
+  // single ready account gets the pill for that entry; Codex still only shows a pill with two accounts or a way out of a limit.
+  const offerOpenCode = family === "claude" && state.openCodeAvailable;
+  if (accounts.length < 2 && !(offerOpenCode || (current.status === "limited" && (offerReset || offerFork)))) return null;
   // Where the composer has the Account control (see composer-item.tsx), the account stays there for
-  // a running agent too. The button is then only the way out of a limit, which a control can't
-  // offer, or the stand-in for an agent the control can't show for.
-  if (inComposer && state.agentMetadata && route?.inComposer !== false && !(current.status === "limited" && (offerReset || offerFork))) return null;
+  // a running agent too. The button is then only for what a control can't offer, each needing a
+  // confirmation: continuing on OpenCode, or the way out of a limit. Or it stands in for an agent
+  // the control can't show for.
+  if (inComposer && state.agentMetadata && route?.inComposer !== false && !(offerOpenCode || (current.status === "limited" && (offerReset || offerFork)))) return null;
 
   // Paseo shows what an action throws: here, that the agent couldn't be reloaded.
   const choose = (accountId: string | null, to: string) => () => moveAgent(store, agent.id, accountId, to);
@@ -215,6 +220,15 @@ function buttonFor(
     });
   }
   if (wayOut.length > 0) items.unshift(...wayOut, { kind: "separator", id: "way-out-divider" });
+  if (offerOpenCode) {
+    items.push({
+      kind: "item",
+      id: "fork-opencode",
+      title: "Continue on OpenCode (new agent)…",
+      icon: "Bot",
+      behavior: { kind: "popover", Content: openCodeForkPopover(store, agent.id) },
+    });
+  }
   if (route?.selectionReason === "weekly_reset") {
     items.push({
       kind: "item", id: "selection-reason",

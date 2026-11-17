@@ -9,6 +9,7 @@ import {
 import { useState } from "react";
 import { Text } from "react-native";
 import { DEFAULT_CONTINUE_PROMPT, preferences, type Preferences } from "../shared/preferences";
+import { ForkDestinationRows, OpenCodeForkRows } from "./fork-settings";
 
 /** Settings → Plugins → zerosub. Accounts themselves live in the sidebar surface. */
 export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurfaceProps & { onOpenAccounts(): void }) {
@@ -132,12 +133,20 @@ export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurface
             onValueChange={(useCredits) => save({ useCredits })}
           />
           <SettingsSwitch
+            label="Use paid API accounts when every subscription is out"
+            hint="Off unless you turn it on. When every ChatGPT subscription account is at its limit, signed out or disabled, agents may move to an Azure OpenAI account, billed per token (after a banked reset, if those are used automatically). Off, it's used only as the default or when you pick it for an agent."
+            value={settings.values.paidApiFallback}
+            disabled={settings.saving}
+            onValueChange={(paidApiFallback) => save({ paidApiFallback })}
+          />
+          <SettingsSwitch
             label="When every account is out, fork the chat to the other provider"
-            hint="A stopped Claude chat carries on in a new ChatGPT agent, or the other way round, with the conversation so far and no more permissions than the original. The original stays as it was."
+            hint="A stopped Claude chat carries on in a new ChatGPT or OpenCode agent (pick the destination below) with the conversation so far. ChatGPT gets a mode no looser than this agent's. OpenCode gets Plan or Build under the host's own permission policy, which can allow more than Claude does. The original stays as it was."
             value={settings.values.forkOtherProvider}
             disabled={settings.saving || !settings.values.autoSwitch}
             onValueChange={(forkOtherProvider) => save({ forkOtherProvider })}
           />
+          <ForkDestinationRows values={settings.values} saving={settings.saving} onSave={save} />
           <SettingsSwitch
             label="Keep a Codex chat in the same conversation"
             hint="Off unless you turn it on. Two ChatGPT accounts in one workspace reload this agent on the other account instead of opening a new tab. A different workspace, an email-only account, or a workspace that is out of credits still opens a new tab. If the first turn cannot resume the thread, this agent goes back and the new tab opens."
@@ -152,6 +161,11 @@ export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurface
             disabled={settings.saving}
             onValueChange={(showComposerPill) => save({ showComposerPill })}
           />
+        </SettingsCard>
+      </SettingsSection>
+      <SettingsSection title="Continue on OpenCode">
+        <SettingsCard>
+          <OpenCodeForkRows values={settings.values} saving={settings.saving} onSave={save} />
         </SettingsCard>
       </SettingsSection>
     </>

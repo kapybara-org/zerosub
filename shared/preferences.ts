@@ -33,9 +33,15 @@ export const preferences = defineSettings({
     useCredits: z.boolean().default(false),
     /**
      * When every account of a provider is at its limit, carry the chat on in a new agent on the
-     * other provider (Claude ↔ ChatGPT), in a mode no more permissive than the original's.
+     * other provider (Claude ↔ ChatGPT) or, for Claude, on OpenCode. ChatGPT gets a mode no looser than the original's; OpenCode runs the host's policy.
      */
     forkOtherProvider: z.boolean().default(false),
+    /** Where a stopped Claude chat continues when the fork option is on. */
+    claudeForkDestination: z.enum(["codex", "opencode"]).default("codex"),
+    /** OpenCode model for that fork, from this host's catalog. Empty uses the host's default. */
+    forkOpenCodeModel: z.string().default(""),
+    /** Thinking option that model offers, from this host's catalog. Empty uses the model's default. */
+    forkOpenCodeThinking: z.string().default(""),
     /**
      * Off unless turned on. Two ChatGPT accounts in one workspace may keep a Codex conversation:
      * a limit reloads that agent on the other account. Every other case, including a workspace
@@ -43,6 +49,14 @@ export const preferences = defineSettings({
      * opens that tab.
      */
     codexSameConversation: z.boolean().default(false),
+    /**
+     * Off unless turned on. When every subscription account of a provider is out (at its limit,
+     * signed out or disabled), routing may move agents onto a paid API account that stands in for
+     * one (an Azure OpenAI account under ChatGPT), billed per token; a banked reset goes first when
+     * `autoRedeem` is on. Off, such an account is only used when picked for an agent or made the
+     * default, like any API-key account.
+     */
+    paidApiFallback: z.boolean().default(false),
     /** Show the account pill in the composer of Claude and Codex agents. */
     showComposerPill: z.boolean().default(true),
   }),

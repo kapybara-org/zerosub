@@ -1,5 +1,5 @@
-import { createHash, randomBytes } from "node:crypto";
-import { lstat, readdir } from "node:fs/promises";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { lstat, readdir, readFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import type {
   PluginHookContext,
@@ -12,11 +12,16 @@ import {
   FAMILIES,
   FAMILY_LABEL,
   HAND_OFF,
+  OPENCODE_LABEL,
+  OPENCODE_PROVIDER,
   OPTIONAL,
   OTHER_FAMILY,
   type AccountView,
+  type ApiPrice,
   type ApiSummary,
   ApiSummarySchema,
+  type AzureSummary,
+  isAzureAccount,
   type AgentRoute,
   type ApiKeyKind,
   type Egress,
@@ -46,23 +51,36 @@ import {
 } from "./adapter";
 import { FamilyResolver } from "./families";
 import { sameAccountIdentity, withoutWorkspace } from "./account-identity";
+import { ApiUsageStore, currentMonth, type ApiUsageFile } from "./api-usage";
+import {
+  azureIdentity,
+  azureSummary,
+  checkAzureKey,
+  findRollout,
+  isAzureHome,
+  normalizeAzureEndpoint,
+  parseRollout,
+  readAzureAccount,
+  writeAzureAccount,
+} from "./azure";
 import { codexHandoffMode, encryptedResumeFailure, sameWorkspace, turnFailedText } from "./codex-same-conversation";
-import { CodexContinuations } from "./continuations";
-import { CONTINUED_FROM_LABEL, continueInNewAgent, type Continuation } from "./handoff";
+import { CodexContinuations, MESSAGE_PREFIX, UnresolvableEpochError, fitInstructions, matchesTransfer, readUpdates, ready, sentDigestOf, snapshot, transferMarker, waitForCreated, waitForSource, type Agent } from "./continuations";
+import { CONTINUED_FROM_LABEL, PARENT_LABEL, buildTranscript, continueInNewAgent, continuationPrompt, promptInstruction, updatePrompt, type Continuation } from "./handoff";
 import { PI_ACCOUNT_FILE, codexSessionsShared, crossesInheritedProxy, isAccountHome, moveHome, normalizeBaseUrl, plainHttp, readPiAccount, readPiAccountForAgents, removeHome, sentInTheClear } from "./homes";
 import { launcherDir, launcherNames, piLauncherDir, writeLaunchers, type LauncherAccount, type LauncherKind } from "./launchers";
 import { Mutex } from "./json-file";
-import { turnRows } from "./limits";
+import { detectAzureLimit, detectAzureSignOut, turnRows } from "./limits";
 import { canSignInWithBrowser } from "./machine";
-import { equivalentMode } from "./modes";
+import { equivalentMode, withinMode } from "./modes";
 import { homesDir, inHomesDir, isOwnHome, shownPath } from "./paths";
 import { chooseHomesDir, chooseImportedHome, chooseImportedPiHome, homesDirFor, PLACED, placeFor, type PlacedFamily } from "./placement";
 import { maskProxy, normalizeProxy } from "./proxy";
 import { Reopener, hostCanReload } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
-import { chooseAccount, isLimited, isUsable, mostAvailable, type RouteDecision, type RouteInput } from "./routing";
+import { chooseAccount, isLastResort, isLimited, isUsable, mostAvailable, withBankedReset, type RouteDecision, type RouteInput } from "./routing";
 import {
+  ALL_SOURCES,
   MAIN_ACCOUNT_ID,
   StateStore,
   accountsOf,
@@ -73,10 +91,12 @@ import {
   type Cleanup,
   type Move,
   type ContinuationChain,
+  type OpenCodeFork,
   type LiveSession,
   type NextAgentPick,
   type StoredAccount,
   type StoredState,
+  type TimelineMark,
 } from "./state";
 
 type PaseoApi = PluginHookContext["paseo"];
@@ -108,6 +128,8 @@ const CLEANUP_TRIES = 3;
 /** After a reset, limit notices from turns that were already running are stale. */
 const RESET_GRACE_MS = 5 * 60_000;
 const AGENT_LIST_MS = 3_000;
+/** Paseo answers an availability read by probing every provider, so the state view reuses one for this long. */
+const OPENCODE_AVAILABLE_MS = 60_000;
 /** How long a default change waits for sessions already being routed to record their account. */
 const ROUTING_WAIT_MS = 5_000;
 /** How long the end of a turn waits for Paseo to page the agent's timeline. The SDK itself waits 60 s. */
@@ -144,7 +166,11 @@ const DEFAULT_PREFERENCES: Preferences = {
   autoRedeem: false,
   useCredits: false,
   forkOtherProvider: false,
+  claudeForkDestination: "codex",
+  forkOpenCodeModel: "",
+  forkOpenCodeThinking: "",
   codexSameConversation: false,
+  paidApiFallback: false,
 };
 
 interface LoginSession {
@@ -190,6 +216,72 @@ interface AgentInfo {
   backgroundWork: number;
   /** Its metadata holds its own ID (see `AGENT_METADATA_KEY`). Null when Paseo sends no metadata (before 0.16). */
   named: boolean | null;
+}
+
+/**
+ * Whether a fork's conversation was delivered: `sent` and confirmed on the fork's timeline,
+ * `up-to-date` (nothing new to send), or `found` (an existing fork without a provable checkpoint, so
+ * nothing was sent). `detail` says why nothing was sent.
+ */
+type ForkDelivery = "sent" | "up-to-date" | "found" | "uncertain";
+type OpenCodeCreateConfig = NonNullable<NonNullable<OpenCodeFork["pending"]>["config"]>;
+
+/** What a fork attempt settles on: the new (or found) continuation and where the row says it went, or `skipped` with the reason nothing was started. */
+type ForkOutcome =
+  | {
+      fork: Continuation;
+      to: string;
+      toFamily: Family | null;
+      toProvider: string | null;
+      delivery: ForkDelivery;
+      detail?: string;
+    }
+  | { skipped: string };
+
+const UP_TO_DATE_DETAIL = "No update was sent: the OpenCode continuation already has everything from this agent.";
+/** Canonical pages one receipt search may read before it stops, uncertain. */
+const RECEIPT_PAGES = 10;
+const FOUND_DETAIL =
+  "Found the existing OpenCode continuation, but couldn't tell what it has already received. Nothing was sent; open that chat to inspect it against this agent's latest instructions.";
+const HISTORY_GAP_DETAIL =
+  "ZeroSub couldn't read this agent's handoff history, so it can't prove what the continuation has. Nothing was sent; check both chats.";
+const uncertainDetail = (title: string, messageId: string): string =>
+  `The last handoff to “${title}” couldn't be confirmed (transfer ${messageId}). Open that chat before retrying; ZeroSub won't send it a second copy. To continue in a new chat instead, archive that one.`;
+const alreadyContinued = (title: string): string =>
+  `This agent was already continued in “${title}”. Nothing was started; carry on in that chat.`;
+const MOVED_REFUSAL = "The existing OpenCode continuation moved, is working or is waiting for permission. Check that chat before retrying.";
+const MODE_REFUSAL =
+  "This agent's mode changed since the OpenCode continuation was set up. Nothing was sent; check both chats before retrying.";
+const HOLD_REFUSAL =
+  "ZeroSub's record of what it sent to OpenCode for this agent is damaged or incomplete, so it can't tell whether a continuation already has this work. Nothing was sent. Check this agent's OpenCode chats; to start a new continuation anyway, choose Continue on OpenCode again.";
+const OPENCODE_IN_FLIGHT = "A continuation of this agent on OpenCode is being set up. Wait for it to finish, then check that chat.";
+const SOURCE_BUSY_REFUSAL = "This agent is working or waiting for permission. Wait for it to stop, then continue it on OpenCode.";
+const NEWER_REFUSAL = "This agent received a newer message while ZeroSub prepared the handoff. Nothing was sent; try again.";
+
+/** The conversation a handoff carries: no plugin rows, and none of our own handoff prompts. */
+function meaningful<T extends { item: AgentTimelineItem }>(entries: readonly T[]): T[] {
+  return entries
+    .filter((entry) => ["user_message", "assistant_message", "tool_call", "todo"].includes(entry.item.type))
+    .filter((entry) => !(entry.item.type === "user_message" && entry.item.clientMessageId?.startsWith(MESSAGE_PREFIX)));
+}
+
+/** A reference a person can find: the fork's title, or its known agent ID when it has none. */
+const forkRef = (fork: { id: string; title?: string | null }): string =>
+  fork.title?.trim() ? fork.title : `${OPENCODE_LABEL} agent ${fork.id}`;
+
+/** Whether two OpenCode creates send Paseo the same request: everything but the prompt's reason. */
+function sameCreate(reserved: OpenCodeCreateConfig | undefined, next: OpenCodeCreateConfig): boolean {
+  const keys = ["provider", "modeId", "thinkingOptionId", "workspaceId", "cwd", "parentId", "title"] as const;
+  return reserved !== undefined && keys.every((key) => (reserved[key] ?? null) === (next[key] ?? null));
+}
+
+/**
+ * The same place for a fork on another provider: the same workspace, or the same directory when
+ * neither sits in one. (`samePlace` also demands the same provider, which a fork never shares.)
+ */
+function sameForkPlace(left: Agent, right: Agent): boolean {
+  if (left.workspaceId !== right.workspaceId) return false;
+  return Boolean(left.workspaceId) || left.cwd === right.cwd;
 }
 
 /** `unchecked`: Paseo couldn't say how the agent was doing, so it wasn't reloaded at all. */
@@ -304,6 +396,15 @@ function takesNextPick(request: PluginSessionOpenRequest): boolean {
   return request.purpose === "interactive" && Boolean(request.workspaceId) && (background === undefined || background === false);
 }
 
+/** Whether this host's Paseo keeps agent metadata (0.16 and later): its SDK can then write it. */
+function takesAgentMetadata(paseo: PaseoApi): boolean {
+  try {
+    return typeof (paseo.agents.ref("zerosub") as unknown as { setMetadata?: unknown }).setMetadata === "function";
+  } catch {
+    return false;
+  }
+}
+
 /**
  * The account named in a new agent's metadata: the one its composer's account control was set to
  * before the agent existed. A Paseo before 0.16 sends no metadata.
@@ -319,8 +420,6 @@ export class Service {
   private paseo: PaseoApi | null = null;
   private prefs: Preferences = DEFAULT_PREFERENCES;
   private readonly usage = new Map<string, Usage>();
-  /** Paseo here has shown agent metadata (0.16 and later): on an agent, or as a session opened. */
-  private agentMetadata = false;
   /** Agents whose metadata was asked to hold their ID, so each is asked once. */
   private readonly naming = new Set<string>();
   /** Those for which that failed: their composer can't show the Account control. */
@@ -388,6 +487,8 @@ export class Service {
   private readonly moveNotes = new Map<string, { waiting: string | null; error: string | null }>();
   /** Each account's script, as the launchers were last written. */
   private launcherFiles: Map<string, string> | null = null;
+  /** OpenCode fork handoffs in flight, by source agent; duplicate requests join the first call. */
+  private readonly openCodeForkInFlight = new Map<string, Promise<ForkOutcome>>();
   /** Interactive sessions being routed right now, and their agents. Where each opens isn't recorded yet. */
   private readonly routing = new Map<Promise<unknown>, string>();
   /** One failover at a time per exhausted account. */
@@ -410,6 +511,7 @@ export class Service {
   private readonly redeeming = new Set<string>();
   private readonly browserSignIn = canSignInWithBrowser();
   private agentCache: { at: number; agents: Promise<AgentInfo[]> } | null = null;
+  private openCodeCache: { at: number; available: boolean } | null = null;
   private lastPrune = 0;
   private cleaning: Promise<void> | null = null;
   /** Failed cleanup attempts this run, by home. */
@@ -432,6 +534,7 @@ export class Service {
     private readonly store = new StateStore(),
     private readonly families = new FamilyResolver(),
     private readonly reopener = new Reopener(),
+    private readonly apiUsage = new ApiUsageStore(),
   ) {
     this.adapters = Object.fromEntries(FAMILIES.map((family) => [family, adapters[family] ?? missingAdapter(family)])) as Record<Family, FamilyAdapter>;
     this.continuations = new CodexContinuations(store);
@@ -720,7 +823,11 @@ export class Service {
     // An API account (every Pi one) is saved, and its entry dropped, in one write (see `addApiAccount`):
     // an entry left means it never became an account, so its home goes, key and all, though Claude
     // Code calls a home with a key signed in.
-    const apiHome = entry.family === "pi" || (await this.adapters[entry.family].api?.(home).catch(() => null)) != null;
+    // So is an Azure OpenAI account's (its home holds azure.json): nothing in it signs in.
+    const apiHome =
+      entry.family === "pi" ||
+      (entry.family === "codex" && isAzureHome(home)) ||
+      (await this.adapters[entry.family].api?.(home).catch(() => null)) != null;
     const earlier = entry.why === "unfinished" && !apiHome && !this.endedHere(home);
     let deleteFolder = true;
     let outcome: string;
@@ -932,6 +1039,8 @@ export class Service {
       now,
       autoSwitch: this.prefs.autoSwitch,
       balanceNewAgents: this.prefs.balanceNewAgents,
+      paidFallback: this.prefs.paidApiFallback,
+      autoRedeem: this.prefs.autoRedeem,
       portable: adapter.portable,
       usageOf: (id) => this.usage.get(id),
       // Alignment and the account button decide with the same stand-in rule, so a reopen lands where they expect.
@@ -988,9 +1097,9 @@ export class Service {
     // a change to the agent, and would put every agent at the top of lists sorted by their last one.
     // Not waited for: Paseo applies a write to the agent being opened once it has opened.
     const { metadata } = request as { metadata?: Readonly<Record<string, unknown>> | null };
-    if (metadata) this.agentMetadata = true;
     if (interactive && metadata && metadata[AGENT_METADATA_KEY] !== request.agentId) this.nameAgent(context.paseo, request.agentId);
-    // A new agent is in the next state the app reads, so its composer has its account at once.
+    // A new agent is in the next state the app reads, so its composer has its account at once. Paseo
+    // lists the agent only after this, so the list is dropped again once it says so (`onAgentCreated`).
     if (request.reason === "create") this.agentCache = null;
     if (input.requested && seenBinding === undefined && !(decision.bind?.source === "user" && account.id === input.requested)) {
       console.log(`[ZeroSub] the account chosen for ${request.agentId} before it started can't take it now, so it starts as any new agent would`);
@@ -1035,8 +1144,14 @@ export class Service {
     const agentId = event.agent.id;
     // The account the turn ran on, read before anything that takes a while: the agent may be moved
     // meanwhile, and the limit is still this account's.
-    const accountId = this.runningOn(await this.store.read(), agentId, family) ?? null;
+    const ranOn = await this.store.read();
+    const accountId = this.runningOn(ranOn, agentId, family) ?? null;
     if (accountId) this.activeAt.set(accountId, Date.now());
+    // An Azure OpenAI account fails on the API's errors, not the ChatGPT plan's notices, and only a
+    // failed turn's (see `detectAzureLimit`).
+    const ranAccount = findAccount(ranOn, accountId);
+    const azure = ranAccount !== undefined && isAzureAccount(ranAccount);
+    if (azure && accountId) void this.countAzureTurn(context.paseo, agentId, accountId).catch((error: unknown) => log(`could not count the tokens of ${agentId}'s turn`, error));
     if (event.outcome.kind === "completed") this.sameConversationBlocked.delete(agentId);
     const probe = this.sameConversationProbe.get(agentId);
     if (event.outcome.kind !== "canceled") {
@@ -1051,10 +1166,10 @@ export class Service {
       if (probe) this.sameConversationProbe.delete(agentId);
       // A hand-off quotes the whole conversation, not just this turn. Paseo 0.13 sends none, so the hand-off pages it.
       const conversation = event.timeline.length > 0 ? event.timeline : undefined;
-      const hit = adapter.detectLimit(turn);
+      const hit = azure ? detectAzureLimit(turn) : adapter.detectLimit(turn);
       const problem: Problem | null = hit
         ? { kind: "limit", hit }
-        : adapter.detectSignOut(turn) && (await this.confirmSignedOut(accountId))
+        : (azure ? detectAzureSignOut(turn) : adapter.detectSignOut(turn)) && (await this.confirmSignedOut(accountId))
           ? { kind: "signed_out" }
           : null;
       if (problem) {
@@ -1122,6 +1237,14 @@ export class Service {
     });
   }
 
+  /**
+   * Paseo has listed a new agent. A list read between its session opening and now doesn't have it,
+   * and would keep its composer without an account until the app next asks.
+   */
+  onAgentCreated(): void {
+    this.agentCache = null;
+  }
+
   async onAgentArchived(agentId: string): Promise<void> {
     this.deferred.delete(agentId);
     this.alignedAt.delete(agentId);
@@ -1143,8 +1266,13 @@ export class Service {
   private async confirmSignedOut(accountId: string | null): Promise<boolean> {
     if (!accountId) return false;
     const state = await this.store.read();
-    if (findAccount(state, accountId)?.auth === "api") {
-      // Nothing to re-check against: the refusal itself is the answer.
+    const account = findAccount(state, accountId);
+    if (account?.auth === "api") {
+      // An Azure key is asked about first: the 401 or 403 in the turn may be another service's (an MCP
+      // server's, say). Only Azure refusing it now signs the account out; a check that can't get an
+      // answer (the network, another status) leaves it as it is. Other keys have nothing to re-check
+      // against: the refusal itself is the answer.
+      if (isAzureAccount(account) && !(await this.azureRefusesKey(account))) return false;
       await this.store.update((draft) => {
         const target = findAccount(draft, accountId);
         if (target) {
@@ -1156,6 +1284,16 @@ export class Service {
     }
     await this.refreshIdentity(accountId);
     return findAccount(await this.store.read(), accountId)?.signedIn === false;
+  }
+
+  /** Whether Azure refuses the account's key now (401/403), or its home no longer holds one. */
+  private async azureRefusesKey(account: StoredAccount): Promise<boolean> {
+    const settings = account.home ? await readAzureAccount(account.home).catch(() => null) : null;
+    if (!settings) return true;
+    const check = await checkAzureKey(settings.endpoint, settings.key);
+    if (check.ok) return false;
+    if (!check.fatal) console.log(`[ZeroSub] ${account.label}'s turn failed on what looked like a refused key, but it couldn't be checked: ${check.message} It stays signed in.`);
+    return check.fatal;
   }
 
   /**
@@ -1322,6 +1460,7 @@ export class Service {
       continued: false,
       continuedIn: null,
       toFamily: null,
+      toProvider: null,
       detail: null,
       at: new Date(now).toISOString(),
     };
@@ -1341,10 +1480,12 @@ export class Service {
       return;
     }
     const move = adapter.portable ? this.nextAccount(latest, agentId, family, account.id) : null;
-    const next = adapter.portable ? move?.account : mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]));
+    // Another subscription account comes first, then a banked reset (free), and a paid Azure account
+    // (with `paidApiFallback` on) only once neither is to be had.
+    let next = adapter.portable ? move?.account : mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]));
     if (!next) {
       if (problem.kind === "limit" && problem.hit.kind === "window" && this.prefs.autoRedeem && !account.disabled && account.auth !== "api") {
-        // Opt-in: every account is out, so spend a banked reset rather than stop.
+        // Opt-in: every subscription account is out, so spend a banked reset rather than stop (or pay).
         const reply = await this.redeemOn(account, true);
         if (reply.outcome === "reset") {
           this.switchGuard.note(agentId, now);
@@ -1371,30 +1512,43 @@ export class Service {
         }
         console.log(`[ZeroSub] no automatic reset for ${account.label}: ${reply.message}`);
       }
+      if (!adapter.portable && this.prefs.paidApiFallback) {
+        next = mostAvailable(await this.store.read(), family, (id) => this.usage.get(id), Date.now(), new Set([account.id]), true);
+      }
+    }
+    if (!next) {
       if (reason !== "limit") return;
       let detail: string | null = null;
       const otherFamily = OTHER_FAMILY[family];
-      if (this.prefs.forkOtherProvider && otherFamily) {
-        // Opt-in: every account of this provider is out, so carry on with the other provider.
-        const result = await this.forkToOtherProvider(paseo, agentId, family, timeline, "auto").catch((error: unknown) => ({
-          skipped: `Couldn't continue on ${FAMILY_LABEL[otherFamily]}: ${describe(error)}`,
+      // Opt-in: every account of this provider is out, so carry on with the other provider, or on
+      // the host's OpenCode when a stopped Claude chat was pointed there in the settings.
+      const toOpenCode = family === "claude" && this.prefs.claudeForkDestination === "opencode";
+      if (this.prefs.forkOtherProvider && (toOpenCode || otherFamily)) {
+        const result = await (toOpenCode
+          ? this.forkToOpenCode(paseo, agentId, "auto")
+          : this.forkToOtherProvider(paseo, agentId, family, timeline, "auto")
+        ).catch((error: unknown) => ({
+          skipped: `Couldn't continue on ${toOpenCode ? OPENCODE_LABEL : FAMILY_LABEL[otherFamily!]}: ${describe(error)}`,
         }));
         if ("fork" in result) {
           this.switchGuard.note(agentId, now);
           await this.appendRow(paseo, agentId, {
             ...base,
-            to: result.account.label,
-            toFamily: result.family,
+            to: result.to,
+            toFamily: result.toFamily,
+            toProvider: result.toProvider,
             reason: "exhausted",
-            continued: true,
+            continued: result.delivery === "sent",
             continuedIn: result.fork,
-            outcome: "continued",
+            outcome: result.delivery === "sent" ? "continued" : "stayed",
+            delivery: result.delivery,
+            detail: result.detail ?? null,
           });
           return;
         }
-        console.log(`[ZeroSub] not continuing ${agentId} on ${FAMILY_LABEL[otherFamily]}: ${result.skipped}`);
+        console.log(`[ZeroSub] not continuing ${agentId}: ${result.skipped}`);
         detail = result.skipped;
-      } else if (otherFamily && mostAvailable(latest, otherFamily, (id) => this.usage.get(id), now, new Set())) {
+      } else if (otherFamily && mostAvailable(latest, otherFamily, (id) => this.usage.get(id), now, new Set(), this.prefs.paidApiFallback)) {
         detail = `Or continue on ${FAMILY_LABEL[otherFamily]} in a new agent from the account button.`;
       }
       await this.appendRow(paseo, agentId, { ...base, to: account.label, reason: "exhausted", outcome: "stayed", detail });
@@ -1435,10 +1589,12 @@ export class Service {
       });
       return;
     }
+    const paid = isLastResort(next);
     const why =
-      reason === "limit"
+      (reason === "limit"
         ? `its ChatGPT account (${account.label}) reached its usage limit`
-        : `its ChatGPT account (${account.label}) was signed out`;
+        : `its ChatGPT account (${account.label}) was signed out`) +
+      (paid ? ` and every other ChatGPT account is out too, so it moved to Azure OpenAI (${next.label}, a paid API billed per token)` : "");
     try {
       const continuation = await this.continueElsewhere(paseo, agentId, next, why, timeline, "auto");
       this.switchGuard.note(agentId, now);
@@ -1449,6 +1605,7 @@ export class Service {
         continued: true,
         continuedIn: continuation,
         outcome: "continued",
+        detail: paid ? azureFallbackNote(next.label) : null,
       });
     } catch (error) {
       log(`could not continue ${agentId} on ${next.label}`, error);
@@ -1491,6 +1648,7 @@ export class Service {
       continued: false,
       continuedIn: null,
       toFamily: null,
+      toProvider: null,
       outcome: "stayed",
       detail: `This task continues in “${elsewhere.title}”, so ZeroSub didn't ${skipped} this tab automatically. Carry on there, or pick an account from the account button to continue from here.`,
       at: new Date(now).toISOString(),
@@ -1632,6 +1790,7 @@ export class Service {
       continued: true,
       continuedIn: null,
       toFamily: null,
+      toProvider: null,
       outcome: "reset",
       detail,
       at,
@@ -1715,7 +1874,7 @@ export class Service {
   private nextAccount(state: StoredState, agentId: string, family: Family, exhausted: string): { account: StoredAccount; pin: boolean } | undefined {
     const routed = this.routeFor(state, agentId, family, exhausted);
     if (routed && routed.account.id !== exhausted && !routed.skipped) return { account: routed.account, pin: false };
-    const roomiest = mostAvailable(state, family, (id) => this.usage.get(id), Date.now(), new Set([exhausted]));
+    const roomiest = mostAvailable(state, family, (id) => this.usage.get(id), Date.now(), new Set([exhausted]), this.prefs.paidApiFallback);
     return roomiest && { account: roomiest, pin: true };
   }
 
@@ -1775,6 +1934,7 @@ export class Service {
           continued: false,
           continuedIn: null,
           toFamily: null,
+          toProvider: null,
           outcome: "switched",
           detail: null,
           at: new Date(now).toISOString(),
@@ -1797,19 +1957,38 @@ export class Service {
     family: Family,
     timeline: readonly AgentTimelineItem[] | undefined,
     source: "auto" | "user",
-  ): Promise<{ fork: Continuation; account: StoredAccount; family: Family } | { skipped: string }> {
+  ): Promise<ForkOutcome> {
     const other = OTHER_FAMILY[family];
     if (!other) return { skipped: `${FAMILY_LABEL[family]} agents don't carry on with another provider.` };
     const name = FAMILY_LABEL[other];
     const families = await this.families.resolve(paseo);
     const state = await this.store.read();
     // Prompting the original again while it's still out mustn't start a second copy of the work.
-    const earlier = (await listAgents(paseo, false)).agents.find(
+    const { agents } = await listAgents(paseo, false);
+    const earlier = agents.find(
       (agent) => agent.continuedFrom === agentId && families[agent.provider] === other,
     );
     const earlierAccount = earlier && (findAccount(state, state.bindings[earlier.id]?.accountId) ?? mainAccount(state, other));
     if (earlier && earlierAccount) {
-      return { fork: { agentId: earlier.id, title: earlier.title ?? `${name} agent` }, account: earlierAccount, family: other };
+      return {
+        fork: { agentId: earlier.id, title: earlier.title ?? `${name} agent` },
+        to: earlierAccount.label,
+        toFamily: other,
+        toProvider: null,
+        delivery: "sent",
+        ...(isLastResort(earlierAccount) ? { detail: azureFallbackNote(earlierAccount.label) } : {}),
+      };
+    }
+
+    const openCodeCopy = agents.find((agent) => agent.continuedFrom === agentId && agent.provider === OPENCODE_PROVIDER);
+    if (openCodeCopy) return { skipped: alreadyContinued(openCodeCopy.title ?? `${OPENCODE_LABEL} agent ${openCodeCopy.id}`) };
+    if (this.openCodeForkInFlight.has(agentId)) return { skipped: OPENCODE_IN_FLIGHT };
+    // An OpenCode reservation is a continuation while its fork exists. One whose create never landed,
+    // or whose fork was archived, is dropped here: nothing more is ever sent to it without its record.
+    const reservation = state.opencodeForks[agentId]?.pending;
+    if (reservation) {
+      const target = await snapshot(paseo, reservation.targetId);
+      if (target && !target.archivedAt) return { skipped: alreadyContinued(forkRef(target)) };
     }
 
     if (this.availability.get(other)?.ok === false) return { skipped: `${PROVIDER_NAME[other]} isn't installed where the daemon runs.` };
@@ -1819,7 +1998,11 @@ export class Service {
       : false;
     if (!provider || !available) return { skipped: `${name} isn't available in Paseo on this host.` };
     const now = Date.now();
-    const account = mostAvailable(state, other, (id) => this.usage.get(id), now, new Set());
+    let account = mostAvailable(state, other, (id) => this.usage.get(id), now, new Set(), this.prefs.paidApiFallback);
+    // A fork is a new agent that can't change accounts later, so a free banked reset goes before a paid stand-in here too.
+    if (account && isLastResort(account) && this.prefs.autoRedeem) {
+      account = withBankedReset(state, other, (id) => this.usage.get(id), now) ?? account;
+    }
     if (!account) {
       // API accounts are billed per use, so they never take work over by themselves; say so rather than "at its limit".
       const apiOnly = accountsOf(state, other).some((entry) => entry.auth === "api" && isUsable(entry, now));
@@ -1844,6 +2027,12 @@ export class Service {
       };
     }
 
+    // Every check that can refuse has passed, so the stale reservation goes now.
+    if (reservation) {
+      await this.store.update((draft) => {
+        if (draft.opencodeForks[agentId]?.pending?.messageId === reservation.messageId) delete draft.opencodeForks[agentId];
+      });
+    }
     const fork = await continueInNewAgent({
       paseo,
       sourceAgentId: agentId,
@@ -1863,12 +2052,577 @@ export class Service {
       },
     });
     console.log(`[ZeroSub] ${agentId} continues on ${name} (${account.label}) in ${fork.agentId}`);
-    return { fork, account, family: other };
+    return {
+      fork,
+      to: account.label,
+      toFamily: other,
+      toProvider: null,
+      delivery: "sent",
+      ...(isLastResort(account) ? { detail: azureFallbackNote(account.label) } : {}),
+    };
+  }
+
+  /**
+   * Carries a stopped Claude chat on in a new agent on this host's OpenCode, when that's the chosen
+   * destination and every Claude account is out. OpenCode is a harness, not an account provider, so
+   * the new agent gets no account binding. Its model, thinking option, and mode all come from this
+   * host's catalog. The mode is Plan or Build under the host's own permission policy, which can
+   * allow more than Claude does. Anything else refuses the fork.
+   */
+  private forkToOpenCode(paseo: PaseoApi, agentId: string, source: "auto" | "user" = "auto"): Promise<ForkOutcome> {
+    // One handoff at a time per source; a concurrent duplicate gets the first call's result. There is
+    // no atomic compare-and-send in the SDK: this guard plus the fresh checks below are the bounds.
+    const existing = this.openCodeForkInFlight.get(agentId);
+    if (existing) return existing;
+    const task = this.forkToOpenCodeNow(paseo, agentId, source).finally(() => this.openCodeForkInFlight.delete(agentId));
+    this.openCodeForkInFlight.set(agentId, task);
+    return task;
+  }
+
+  private async forkToOpenCodeNow(paseo: PaseoApi, agentId: string, source: "auto" | "user"): Promise<ForkOutcome> {
+    const available = (await paseo.providers.listAvailable()).providers?.some(
+      (entry) => entry.provider === OPENCODE_PROVIDER && entry.available,
+    );
+    if (!available) return { skipped: `${OPENCODE_LABEL} isn't available in Paseo on this host.` };
+
+    const first = await snapshot(paseo, agentId);
+    if (!first) throw new Error("That agent is no longer available.");
+    // turn_ended can arrive just before the source reports idle: an automatic fork waits a moment,
+    // refusing if a newer message arrives meanwhile.
+    const original = source === "auto" ? await waitForSource(paseo, first, "auto").catch(() => undefined) : first;
+    if (!original || !ready(original)) return { skipped: SOURCE_BUSY_REFUSAL };
+
+    await this.settleGlobalHold(paseo);
+    const recordRead = await this.store.read();
+    let record = recordRead.opencodeForks[agentId];
+    // Recovery lost what was sent for this source. A missing, archived or unlisted fork proves
+    // nothing, so nothing is forked or sent on its own; a person asked once may start a new one.
+    if (!record && (recordRead.opencodeHolds[agentId] ?? recordRead.opencodeHolds[ALL_SOURCES])) {
+      const refusal = await this.askBeforeUnproven(agentId, source);
+      if (refusal) return refusal;
+    }
+    // Prompting the original again while it's still out must reuse its fork, not start a second one.
+    const forkId =
+      record?.forkAgentId ??
+      (await listAgents(paseo, false)).agents.find((agent) => agent.continuedFrom === agentId && agent.provider === OPENCODE_PROVIDER)?.id;
+    if (!forkId) return this.createOpenCodeFork(paseo, agentId, original, source);
+
+    let fork = await snapshot(paseo, forkId);
+    // Reconcile a reservation an earlier call left behind, before anything else happens.
+    if (record?.pending) {
+      const pending = record.pending;
+      if (pending.stage === "creating") {
+        if (fork && !fork.archivedAt && !fork.lastUserMessageAt) {
+          // Created but never prompted: deliver the reserved initial handoff under its reserved ID.
+          return this.deliverReservedOpenCode(paseo, agentId, fork);
+        }
+        if (!fork) {
+          // The create never landed, so nothing was sent. A create seen to fail is built again from
+          // today's settings and source; one whose outcome is unknown is sent again unchanged.
+          return this.createOpenCodeFork(paseo, agentId, original, source, pending);
+        }
+        if (fork.archivedAt) {
+          // Nothing was sent, so dropping the reservation cannot duplicate work.
+          await this.store.update((draft) => { delete draft.opencodeForks[agentId]; });
+          return this.createOpenCodeFork(paseo, agentId, original, source);
+        }
+        return {
+          skipped: `The unstarted OpenCode fork “${fork.title ?? OPENCODE_LABEL}” received another message. Check it and archive it before retrying.`,
+        };
+      }
+      if (!fork || fork.archivedAt) {
+        // The fork of an unconfirmed send was archived or is gone: whatever it received stays there,
+        // and nothing more can reach it, so the reservation goes and the work continues in a new fork.
+        await this.store.update((draft) => {
+          if (draft.opencodeForks[agentId]?.pending?.messageId === pending.messageId) delete draft.opencodeForks[agentId];
+        });
+        return this.createOpenCodeFork(paseo, agentId, original, source);
+      }
+      if (pending.sentDigest !== undefined && (await this.hasReceipt(paseo, forkId, pending.messageId, pending.sentDigest))) {
+        await this.settleOpenCode(agentId, pending.messageId);
+        fork = await snapshot(paseo, forkId);
+        record = (await this.store.read()).opencodeForks[agentId];
+      } else {
+        return this.openCodeUncertain(forkId, fork.title, pending.messageId);
+      }
+    }
+
+    if (!fork || fork.archivedAt) {
+      // A settled fork that is gone or archived may be replaced by a new one. Without a checkpoint,
+      // nothing proves what it received, so it is treated like a lost record.
+      if (!record?.seen) {
+        const refusal = await this.askBeforeUnproven(agentId, source);
+        if (refusal) return refusal;
+      }
+      return this.createOpenCodeFork(paseo, agentId, original, source);
+    }
+    if (!record?.seen) {
+      // A fork from an earlier release, or one without a checkpoint: what it has can't be proven,
+      // so nothing is sent and nothing is adopted silently.
+      return this.openCodeFound(fork);
+    }
+    // Fresh checks before sending: same place, same parent, not working, nobody waiting on it.
+    const checked = await this.freshOpenCodeTarget(paseo, agentId, fork.id);
+    if ("refused" in checked) return { skipped: checked.refused };
+    return this.updateOpenCodeFork(paseo, agentId, checked.fork, record.seen, checked.original.lastUserMessageAt);
+  }
+
+  /**
+   * Settles the hold recovery put on every source when it couldn't read the fork records at all.
+   * Only a source with an OpenCode continuation (archived ones included) can have lost a record, so
+   * each such source gets a hold of its own and the global hold goes: agents without one, and agents
+   * created later, fork as before. It stays while Paseo's agent list can't be read whole.
+   */
+  private async settleGlobalHold(paseo: PaseoApi): Promise<void> {
+    if (!(await this.store.read()).opencodeHolds[ALL_SOURCES]) return;
+    const { agents, complete } = await listAgents(paseo, true);
+    if (!complete) return;
+    await this.store.update((draft) => {
+      const hold = draft.opencodeHolds[ALL_SOURCES];
+      if (!hold) return;
+      for (const agent of agents) {
+        const source = agent.continuedFrom;
+        if (source && agent.provider === OPENCODE_PROVIDER && !draft.opencodeForks[source]) draft.opencodeHolds[source] ??= { at: hold.at };
+      }
+      delete draft.opencodeHolds[ALL_SOURCES];
+    });
+  }
+
+  /**
+   * Nothing proves what this source's OpenCode fork already received. An automatic fork never goes
+   * ahead; a person is told once, and the next manual request may start a new fork. The hold is
+   * cleared when that fork's reservation is written.
+   */
+  private async askBeforeUnproven(agentId: string, source: "auto" | "user"): Promise<ForkOutcome | undefined> {
+    if (source === "user" && (await this.store.read()).opencodeHolds[agentId]?.told) return undefined;
+    const at = new Date().toISOString();
+    await this.store.update((draft) => {
+      const hold = draft.opencodeHolds[agentId] ?? { at };
+      draft.opencodeHolds[agentId] = source === "user" ? { at: hold.at, told: true } : hold;
+    });
+    return { skipped: HOLD_REFUSAL };
+  }
+
+  private async openCodeSource(
+    paseo: PaseoApi,
+    agentId: string,
+    config?: OpenCodeCreateConfig,
+  ): Promise<{ original: Agent; parentId: string | undefined } | undefined> {
+    const original = await snapshot(paseo, agentId);
+    if (!original || !ready(original)) return undefined;
+    const parentId = await this.continuations.parentFor(paseo, agentId);
+    if (config) {
+      if (config.workspaceId === undefined || config.cwd === undefined || config.parentId === undefined || config.title === undefined) return undefined;
+      if ((original.workspaceId ?? null) !== config.workspaceId || (original.cwd ?? null) !== config.cwd) return undefined;
+      if ((parentId ?? null) !== config.parentId) return undefined;
+      if (`${original.title?.trim() || "Task"} (continued on ${OPENCODE_LABEL})` !== config.title) return undefined;
+    }
+    return { original, parentId };
+  }
+
+  /**
+   * The checks run before a reservation is written and again right before its send: the source has
+   * nothing newer than `mark` and is ready and in place; the target is ready, in place, under the same
+   * parent, and in a mode whose Paseo tier is no higher than the source's current one (tiers only, not
+   * OpenCode's permission policy). A reserved creation first waits for its new target to finish
+   * initializing, and the target must still be the promptless agent it reserved. The snapshots are
+   * read last, after every timeline read, so the comparison sees the modes as of the send. The SDK has
+   * no compare-and-send: a change after these reads and before the send is still possible.
+   */
+  private async freshOpenCodeTarget(
+    paseo: PaseoApi,
+    agentId: string,
+    forkId: string,
+    mark?: TimelineMark,
+    config?: OpenCodeCreateConfig,
+  ): Promise<{ original: Agent; fork: Agent } | { refused: string; unreadable?: true }> {
+    if (config) await waitForCreated(paseo, forkId);
+    if (mark) {
+      const since = await this.sourceSince(paseo, agentId, mark);
+      if (since === "newer") return { refused: NEWER_REFUSAL };
+      // Unreadable history proves no newer message either: the caller reports it as an inspection.
+      if (since !== "same") return { refused: since === "epoch" ? FOUND_DETAIL : HISTORY_GAP_DETAIL, unreadable: true };
+    }
+    const source = await this.openCodeSource(paseo, agentId, config);
+    if (!source) return { refused: MOVED_REFUSAL };
+    const [sourceModes, targetModes] = await Promise.all([
+      paseo.providers.listModes(source.original.provider).then((result) => result.modes ?? []),
+      paseo.providers.listModes(OPENCODE_PROVIDER).then((result) => result.modes ?? []),
+    ]);
+    // The parent is resolved again after the catalog reads, then the snapshots come last.
+    const parentId = await this.continuations.parentFor(paseo, agentId);
+    const [original, fork] = await Promise.all([
+      snapshot(paseo, agentId),
+      snapshot(paseo, forkId),
+    ]);
+    if (!original || !ready(original)) return { refused: MOVED_REFUSAL };
+    if (original.lastUserMessageAt !== source.original.lastUserMessageAt) return { refused: NEWER_REFUSAL };
+    const expectedParent = config ? config.parentId ?? undefined : source.parentId;
+    if (parentId !== expectedParent || original.labels?.[PARENT_LABEL] !== source.original.labels?.[PARENT_LABEL]) return { refused: MOVED_REFUSAL };
+    // A reserved creation's source must still be where it was reserved; the fork moving with it isn't enough.
+    if (config && ((original.workspaceId ?? null) !== config.workspaceId || (original.cwd ?? null) !== config.cwd)) return { refused: MOVED_REFUSAL };
+    if (!fork || !ready(fork) || fork.provider !== OPENCODE_PROVIDER || fork.labels?.[CONTINUED_FROM_LABEL] !== agentId ||
+      !sameForkPlace(original, fork) || fork.labels?.[PARENT_LABEL]?.trim() !== expectedParent) return { refused: MOVED_REFUSAL };
+    if (config && (fork.lastUserMessageAt || fork.title !== config.title)) return { refused: MOVED_REFUSAL };
+    if (!withinMode(sourceModes, original.currentModeId, targetModes, fork.currentModeId)) return { refused: MODE_REFUSAL };
+    return { original, fork };
+  }
+
+  /** What the source gained after `mark`: proven newer conversation, nothing, or unreadable history. */
+  private async sourceSince(paseo: PaseoApi, agentId: string, mark: TimelineMark): Promise<"newer" | "same" | "epoch" | "gap"> {
+    try {
+      const { entries } = await readUpdates(paseo, agentId, mark, undefined, { onEpochReset: "unresolvable" });
+      return meaningful(entries).length > 0 ? "newer" : "same";
+    } catch (error) {
+      return error instanceof UnresolvableEpochError ? "epoch" : "gap";
+    }
+  }
+
+  /** A found fork with no provable checkpoint, or history that can't be read: link it, send nothing. */
+  private openCodeFound(fork: { id: string; title?: string | null }, detail = FOUND_DETAIL): ForkOutcome {
+    return {
+      fork: { agentId: fork.id, title: forkRef(fork) },
+      to: OPENCODE_LABEL,
+      toFamily: null,
+      toProvider: OPENCODE_PROVIDER,
+      delivery: "found",
+      detail,
+    };
+  }
+
+  /** An unconfirmed handoff: the reservation stays, the row links the fork, nothing is claimed. */
+  private openCodeUncertain(forkId: string, title: string | null | undefined, messageId: string): ForkOutcome {
+    const ref = title?.trim() ? title : `${OPENCODE_LABEL} agent ${forkId}`;
+    return {
+      fork: { agentId: forkId, title: ref },
+      to: OPENCODE_LABEL,
+      toFamily: null,
+      toProvider: OPENCODE_PROVIDER,
+      delivery: "uncertain",
+      detail: uncertainDetail(ref, messageId),
+    };
+  }
+
+  /** Whether the fork's timeline proves this exact message arrived, by ID or by marker plus digest. */
+  private async hasReceipt(paseo: PaseoApi, forkId: string, messageId: string, digest: string): Promise<boolean> {
+    // An incomplete or failed scan proves nothing: the caller keeps the reservation, never resends.
+    try {
+      const timeline = paseo.agents.ref(forkId).timeline;
+      let page = await timeline.refetch({ direction: "tail", limit: 500, projection: "canonical" });
+      for (let pages = 1; ; pages += 1) {
+        if (page.entries.some((entry) => matchesTransfer(entry, messageId, digest))) return true;
+        if (!page.hasOlder || page.gap || page.staleCursor || pages >= RECEIPT_PAGES || !page.startCursor) return false;
+        page = await timeline.refetch({ direction: "before", cursor: page.startCursor, limit: 500, projection: "canonical" });
+        if (page.gap || page.staleCursor) return false;
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  /** Records what the fork has seen once its receipt matched, clearing the reservation. */
+  private async settleOpenCode(agentId: string, messageId: string): Promise<void> {
+    await this.store.update((draft) => {
+      const record = draft.opencodeForks[agentId];
+      if (record?.pending?.messageId === messageId) {
+        record.seen = record.pending.seen;
+        delete record.pending;
+      }
+    });
+  }
+
+  /** Sends the source's newest instructions to an existing OpenCode fork, once, under one message ID. */
+  /** `sourceAt` is the source's last user message time as checked before its history was read. */
+  private async updateOpenCodeFork(
+    paseo: PaseoApi,
+    agentId: string,
+    fork: Agent,
+    seen: TimelineMark,
+    sourceAt: string | null | undefined,
+  ): Promise<ForkOutcome> {
+    let delta: Awaited<ReturnType<typeof readUpdates>>;
+    try {
+      delta = await readUpdates(paseo, agentId, seen, undefined, { onEpochReset: "unresolvable" });
+    } catch (error) {
+      // A gap or new epoch means what the fork has can't be proven; refuse honestly instead of guessing.
+      return this.openCodeFound(fork, error instanceof UnresolvableEpochError ? FOUND_DETAIL : HISTORY_GAP_DETAIL);
+    }
+    // Only meaningful conversation advances a turn. Plugin rows, including our own notes, do not.
+    const items = meaningful(delta.entries).map((entry) => entry.item);
+    if (!items.length) {
+      await this.store.update((draft) => {
+        const record = draft.opencodeForks[agentId];
+        if (record) record.seen = delta.mark;
+      });
+      // Input can land while the watermark is saved. The mark stays where it was inspected, and
+      // "up to date" holds only if the source still has nothing newer and is still stopped.
+      const since = await this.sourceSince(paseo, agentId, delta.mark);
+      if (since === "newer") return { skipped: NEWER_REFUSAL };
+      if (since !== "same") return this.openCodeFound(fork, since === "epoch" ? FOUND_DETAIL : HISTORY_GAP_DETAIL);
+      const now = await snapshot(paseo, agentId);
+      if (!now || !ready(now)) return { skipped: SOURCE_BUSY_REFUSAL };
+      // A message that landed after the history read shows only in the source's own timestamp.
+      if (now.lastUserMessageAt !== sourceAt) return { skipped: NEWER_REFUSAL };
+      return {
+        fork: { agentId: fork.id, title: forkRef(fork) },
+        to: OPENCODE_LABEL,
+        toFamily: null,
+        toProvider: OPENCODE_PROVIDER,
+        delivery: "up-to-date",
+        detail: UP_TO_DATE_DETAIL,
+      };
+    }
+    // Instructions are prompts from a human, another agent or a schedule, as in a Codex continuation.
+    const instructions = fitInstructions(items.flatMap((item) => {
+      const text = promptInstruction(item);
+      return text?.trim() ? [text] : [];
+    }));
+    const progress = buildTranscript(items.filter((item) => promptInstruction(item) === null));
+    const messageId = `${MESSAGE_PREFIX}${randomUUID()}`;
+    const prompt = updatePrompt(instructions, progress, PROVIDER_NAME.claude, transferMarker(messageId));
+    const checked = await this.freshOpenCodeTarget(paseo, agentId, fork.id, delta.mark);
+    if ("refused" in checked) return checked.unreadable ? this.openCodeFound(fork, checked.refused) : { skipped: checked.refused };
+    // Reserved before any send: an uncertain dispatch must never send a second copy.
+    await this.store.update((draft) => {
+      const record = draft.opencodeForks[agentId] ?? { forkAgentId: fork.id };
+      record.pending = { stage: "sending", targetId: fork.id, messageId, seen: delta.mark, sentDigest: sentDigestOf(prompt) };
+      draft.opencodeForks[agentId] = record;
+    });
+    // Again after the write: input or modes can change while it commits. Nothing is sent yet, so a
+    // refusal here drops the reservation instead of leaving it uncertain.
+    const recheck = await this.freshOpenCodeTarget(paseo, agentId, fork.id, delta.mark);
+    if ("refused" in recheck) {
+      await this.store.update((draft) => {
+        const record = draft.opencodeForks[agentId];
+        if (record?.pending?.messageId === messageId) delete record.pending;
+      });
+      return recheck.unreadable ? this.openCodeFound(fork, recheck.refused) : { skipped: recheck.refused };
+    }
+    return this.sendReserved(paseo, agentId, recheck.fork, prompt, messageId);
+  }
+
+  /**
+   * Starts a fresh OpenCode fork: reserve the target and its create request, create promptless, then
+   * deliver the initial handoff under the reserved message ID. `retry` is a reservation whose create
+   * never landed: its target ID, message ID and reason are kept, and the rest is read afresh.
+   */
+  private async createOpenCodeFork(
+    paseo: PaseoApi,
+    agentId: string,
+    original: Agent,
+    source: "auto" | "user",
+    retry?: NonNullable<OpenCodeFork["pending"]>,
+  ): Promise<ForkOutcome> {
+    const chatGptCopy = (await listAgents(paseo, false)).agents.find((agent) => agent.continuedFrom === agentId && agent.provider !== OPENCODE_PROVIDER);
+    if (chatGptCopy) return { skipped: alreadyContinued(chatGptCopy.title ?? `${PROVIDER_NAME["codex"]} agent ${chatGptCopy.id}`) };
+    // A create whose outcome was never seen may be in Paseo under its key, which stays tied to its
+    // first request: only that exact request may be sent again.
+    if (retry && !retry.createFailed) {
+      const reserved = retry.config;
+      // A reservation saved before the request was frozen whole can't be repeated exactly.
+      if (!reserved?.title || reserved.workspaceId === undefined || reserved.cwd === undefined || reserved.parentId === undefined) {
+        return this.openCodeUncertain(retry.targetId, null, retry.messageId);
+      }
+      return this.sendReservedCreate(paseo, agentId, retry.targetId, retry.messageId, { ...reserved, title: reserved.title }, true);
+    }
+    const { models, error } = await paseo.providers.listModels(OPENCODE_PROVIDER);
+    if (error) return { skipped: `Couldn't read this host's ${OPENCODE_LABEL} models: ${error}` };
+    const savedModel = this.prefs.forkOpenCodeModel;
+    const model = savedModel ? models?.find((entry) => entry.id === savedModel) : models?.find((entry) => entry.isDefault);
+    if (savedModel && !model) {
+      return { skipped: "The saved OpenCode model is no longer in this host's catalog. Pick one in ZeroSub's settings." };
+    }
+    if (!model) return { skipped: `No OpenCode model is marked default on this host. Pick one in ZeroSub's settings.` };
+    // A "default" saved from Paseo 0.16's own Default option sends no variant, as the model default does.
+    const thinking = this.prefs.forkOpenCodeThinking === "default" ? "" : this.prefs.forkOpenCodeThinking;
+    if (thinking && !model.thinkingOptions?.some((option) => option.id === thinking)) {
+      return { skipped: `“${model.label}” no longer offers the saved thinking option. Pick one in ZeroSub's settings.` };
+    }
+
+    const [sourceModes, targetModes] = await Promise.all([
+      paseo.providers.listModes(original.provider).then((result) => result.modes ?? []),
+      paseo.providers.listModes(OPENCODE_PROVIDER).then((result) => result.modes ?? []),
+    ]);
+    const modeId = equivalentMode(sourceModes, original.currentModeId, targetModes);
+    if (!modeId) {
+      const current = sourceModes.find((mode) => mode.id === original.currentModeId)?.label;
+      return {
+        skipped: `${OPENCODE_LABEL} has no mode as careful as this agent's${current ? ` (“${current}”)` : ""}, so ZeroSub didn't continue it there.`,
+      };
+    }
+
+    let delta: Awaited<ReturnType<typeof readUpdates>>;
+    try {
+      delta = await readUpdates(paseo, agentId);
+    } catch {
+      return { skipped: HISTORY_GAP_DETAIL };
+    }
+
+    const parentId = await this.continuations.parentFor(paseo, agentId);
+    const config = {
+      provider: `${OPENCODE_PROVIDER}/${model.id}`,
+      modeId,
+      ...(thinking ? { thinkingOptionId: thinking } : {}),
+      workspaceId: original.workspaceId ?? null,
+      cwd: original.cwd ?? null,
+      parentId: parentId ?? null,
+      title: `${original.title?.trim() || "Task"} (continued on ${OPENCODE_LABEL})`,
+    };
+    // Paseo keeps a failed create's request under its key: the same request may use that key again,
+    // and any other request needs new IDs. The failed one can't land later, so this can't double.
+    // A key Paseo answers with outcome unknown stays failed for good, so it is never reused.
+    const reuse = retry !== undefined && !retry.createOutcomeUnknown && sameCreate(retry.config, config);
+    const targetId = reuse ? retry.targetId : randomUUID();
+    const messageId = reuse ? retry.messageId : `${MESSAGE_PREFIX}${randomUUID()}`;
+    const why = (reuse ? retry.config?.why : undefined) ?? (source === "auto" ? "every Claude account reached its usage limit" : "the work was moved to OpenCode");
+    const prompt = [continuationPrompt(buildTranscript(delta.entries.map((entry) => entry.item)), why, PROVIDER_NAME.claude), transferMarker(messageId)].join("\n");
+    await this.store.update((draft) => {
+      // A new reservation is this source's journal again; a hold it was told about is spent.
+      delete draft.opencodeHolds[agentId];
+      draft.opencodeForks[agentId] = {
+        forkAgentId: targetId,
+        pending: { stage: "creating", targetId, messageId, seen: delta.mark, config: { ...config, why }, sentDigest: sentDigestOf(prompt) },
+      };
+    });
+    return this.sendReservedCreate(paseo, agentId, targetId, messageId, config, false);
+  }
+
+  /**
+   * Sends a reserved promptless create, then its reserved handoff once the fork exists.
+   * `outcomeUnknown`: Paseo may hold this key's request with no answer seen, so a refusal keeps it.
+   */
+  private async sendReservedCreate(
+    paseo: PaseoApi,
+    agentId: string,
+    targetId: string,
+    messageId: string,
+    config: OpenCodeCreateConfig & { title: string },
+    outcomeUnknown: boolean,
+  ): Promise<ForkOutcome> {
+    const markFailed = (keyLost = false) =>
+      this.store.update((draft) => {
+        const pending = draft.opencodeForks[agentId]?.pending;
+        if (pending?.messageId !== messageId) return;
+        pending.createFailed = true;
+        if (keyLost) pending.createOutcomeUnknown = true;
+      });
+    let sending = false;
+    try {
+      await continueInNewAgent({
+        paseo,
+        sourceAgentId: agentId,
+        previous: PROVIDER_NAME.claude,
+        agentId: targetId, // also the create's idempotency key, so a retried create can't double it
+        deferPrompt: true,
+        target: {
+          provider: OPENCODE_PROVIDER,
+          label: OPENCODE_LABEL,
+          modeId: config.modeId,
+          model: config.provider.slice(`${OPENCODE_PROVIDER}/`.length),
+          ...(config.thinkingOptionId ? { thinkingOptionId: config.thinkingOptionId } : {}),
+        },
+        parentId: config.parentId ?? undefined,
+        reserved: { title: config.title, workspaceId: config.workspaceId ?? null, cwd: config.cwd ?? null },
+        // OpenCode is a harness, not an account provider: no binding to record. Binding is the
+        // helper's last step before it sends the create.
+        bind: async () => {
+          sending = true;
+        },
+        onCreateRejected: markFailed,
+      });
+    } catch (error) {
+      // Refused before the create was sent: Paseo has no record under this key, or only a failed one.
+      if (!sending && !outcomeUnknown) await markFailed();
+      throw error;
+    }
+    const fork = await waitForCreated(paseo, targetId);
+    if (!fork) return this.openCodeUncertain(targetId, null, messageId);
+    return this.deliverReservedOpenCode(paseo, agentId, fork);
+  }
+
+  /** Sends the reserved initial handoff to a created promptless fork, under its reserved message ID. */
+  private async deliverReservedOpenCode(paseo: PaseoApi, agentId: string, fork: Agent): Promise<ForkOutcome> {
+    const pending = (await this.store.read()).opencodeForks[agentId]?.pending;
+    if (!pending || pending.stage !== "creating") {
+      throw new Error("The OpenCode fork's reservation changed during the handoff. Check the fork's chat and retry.");
+    }
+    const config = pending.config;
+    // The prompt is rebuilt from the reason frozen with the reservation: a retry's own trigger must
+    // not change it, and a reservation old enough to lack the reason can't be reconstructed safely.
+    if (!config?.why || !pending.sentDigest) return this.openCodeUncertain(fork.id, fork.title, pending.messageId);
+    let delta: Awaited<ReturnType<typeof readUpdates>>;
+    try {
+      delta = await readUpdates(paseo, agentId, undefined, undefined, { onEpochReset: "unresolvable" });
+    } catch {
+      return this.openCodeUncertain(fork.id, fork.title, pending.messageId);
+    }
+    if (delta.mark.epoch !== pending.seen.epoch) return this.openCodeUncertain(fork.id, fork.title, pending.messageId);
+    const why = config.why;
+    const compose = (entries: typeof delta.entries) =>
+      [continuationPrompt(buildTranscript(entries.map((entry) => entry.item)), why, PROVIDER_NAME.claude), transferMarker(pending.messageId)].join("\n");
+    // The reserved prompt must still rebuild to its digest before anything is sent or rebuilt.
+    const reserved = compose(delta.entries.filter((entry) => entry.seqEnd <= pending.seen.seq));
+    if (sentDigestOf(reserved) !== pending.sentDigest) return this.openCodeUncertain(fork.id, fork.title, pending.messageId);
+    // Nothing has been sent yet (the target is checked promptless below), so source instructions newer
+    // than the reservation are folded in by rebuilding it, never left behind an older request.
+    const newer = meaningful(delta.entries.filter((entry) => entry.seqEnd > pending.seen.seq)).length > 0;
+    const prompt = newer ? compose(delta.entries) : reserved;
+    const checked = await this.freshOpenCodeTarget(paseo, agentId, fork.id, delta.mark, config);
+    if ("refused" in checked) return this.openCodeUncertain(fork.id, fork.title, pending.messageId);
+    await this.store.update((draft) => {
+      const record = draft.opencodeForks[agentId];
+      if (record?.pending?.messageId === pending.messageId) {
+        record.pending.stage = "sending";
+        record.pending.seen = newer ? delta.mark : pending.seen;
+        record.pending.sentDigest = sentDigestOf(prompt);
+      }
+    });
+    // Again after the write. Nothing is sent yet, so a refusal returns the reservation to the
+    // promptless state it was frozen in, for the next call to rebuild.
+    const recheck = await this.freshOpenCodeTarget(paseo, agentId, fork.id, delta.mark, config);
+    if ("refused" in recheck) {
+      await this.store.update((draft) => {
+        const record = draft.opencodeForks[agentId];
+        if (record?.pending?.messageId === pending.messageId) record.pending = pending;
+      });
+      return recheck.unreadable ? this.openCodeUncertain(fork.id, fork.title, pending.messageId) : { skipped: recheck.refused };
+    }
+    return this.sendReserved(paseo, agentId, recheck.fork, prompt, pending.messageId);
+  }
+
+  /**
+   * Sends a reserved prompt. A send can fail after the daemon took it, so a throw proves nothing:
+   * the receipt decides, and without one the reservation stays and the result is uncertain.
+   */
+  private async sendReserved(paseo: PaseoApi, agentId: string, fork: Agent, prompt: string, messageId: string): Promise<ForkOutcome> {
+    try {
+      await paseo.agents.ref(fork.id).send(prompt, { messageId });
+    } catch {
+      // Possibly delivered: the receipt check below decides.
+    }
+    return this.confirmOpenCode(paseo, agentId, fork, messageId);
+  }
+
+  /** Checks the fork's timeline for the reserved message; a match settles, anything else stays reserved. */
+  private async confirmOpenCode(paseo: PaseoApi, agentId: string, fork: { id: string; title?: string | null }, messageId: string): Promise<ForkOutcome> {
+    const pending = (await this.store.read()).opencodeForks[agentId]?.pending;
+    if (pending?.stage === "sending" && pending.messageId === messageId && pending.sentDigest !== undefined &&
+      (await this.hasReceipt(paseo, fork.id, messageId, pending.sentDigest))) {
+      await this.settleOpenCode(agentId, messageId);
+      return {
+        fork: { agentId: fork.id, title: forkRef(fork) },
+        to: OPENCODE_LABEL,
+        toFamily: null,
+        toProvider: OPENCODE_PROVIDER,
+        delivery: "sent",
+      };
+    }
+    return this.openCodeUncertain(fork.id, fork.title, messageId);
   }
 
   /** "Continue on …" from an agent's account button: the same fork, asked for by the user. */
-  async forkAgent(paseo: PaseoApi, agentId: string): Promise<Continuation> {
-    return this.withSwitch(agentId, () => this.forkAgentNow(paseo, agentId));
+  async forkAgent(paseo: PaseoApi, agentId: string, destination: "other" | "opencode" = "other"): Promise<Continuation & { delivery: ForkDelivery }> {
+    return this.withSwitch(agentId, () => this.forkAgentNow(paseo, agentId, destination));
   }
 
   /** Manual continuations share the automatic failover guard, including cross-provider forks. */
@@ -1902,7 +2656,7 @@ export class Service {
     }
   }
 
-  private async forkAgentNow(paseo: PaseoApi, agentId: string): Promise<Continuation> {
+  private async forkAgentNow(paseo: PaseoApi, agentId: string, destination: "other" | "opencode" = "other"): Promise<Continuation & { delivery: ForkDelivery }> {
     this.attach(paseo);
     const info = await lookUpAgent(paseo, agentId);
     if (!info || info.archived) throw new Error("That agent is no longer available.");
@@ -1911,23 +2665,31 @@ export class Service {
     if (info.status === "running" || info.status === "initializing") {
       throw new Error("This agent is working right now. Wait for its turn to finish, then continue it elsewhere.");
     }
-    const result = await this.forkToOtherProvider(paseo, agentId, family, undefined, "user");
+    let result: ForkOutcome;
+    if (destination === "opencode") {
+      if (family !== "claude") throw new Error("Only Claude agents can continue on OpenCode.");
+      result = await this.forkToOpenCode(paseo, agentId, "user");
+    } else {
+      result = await this.forkToOtherProvider(paseo, agentId, family, undefined, "user");
+    }
     if ("skipped" in result) throw new Error(result.skipped);
     const state = await this.store.read();
     await this.appendRow(paseo, agentId, {
       family,
       from: findAccount(state, this.runningOn(state, agentId, family))?.label ?? null,
-      to: result.account.label,
+      to: result.to,
       reason: "manual",
       resetsAt: null,
-      continued: true,
+      continued: result.delivery === "sent",
       continuedIn: result.fork,
-      toFamily: result.family,
-      outcome: "continued",
-      detail: null,
+      toFamily: result.toFamily,
+      toProvider: result.toProvider,
+      outcome: result.delivery === "sent" ? "continued" : "stayed",
+      delivery: result.delivery,
+      detail: result.detail ?? null,
       at: new Date().toISOString(),
     });
-    return result.fork;
+    return { ...result.fork, delivery: result.delivery };
   }
 
   /**
@@ -2023,6 +2785,7 @@ export class Service {
           continued: false,
           continuedIn: null,
           toFamily: null,
+          toProvider: null,
           outcome: "stayed",
           detail: `New ${FAMILY_LABEL[family]} agents will use ${to.label}.`,
           at: new Date().toISOString(),
@@ -2041,6 +2804,7 @@ export class Service {
           continued: true,
           continuedIn: continuation,
           toFamily: null,
+          toProvider: null,
           outcome: "continued",
           detail: `${to.label} could not resume this thread.`,
           at: new Date().toISOString(),
@@ -2056,6 +2820,7 @@ export class Service {
           continued: false,
           continuedIn: null,
           toFamily: null,
+          toProvider: null,
           outcome: "stayed",
           detail: `Couldn't continue on ${to.label}: ${describe(error)}`,
           at: new Date().toISOString(),
@@ -2139,6 +2904,8 @@ export class Service {
       now: Date.now(),
       autoSwitch: this.prefs.autoSwitch,
       balanceNewAgents: false,
+      paidFallback: this.prefs.paidApiFallback,
+      autoRedeem: this.prefs.autoRedeem,
       portable: this.adapters[family].portable,
       usageOf: (id) => this.usage.get(id),
       current,
@@ -2328,6 +3095,7 @@ export class Service {
           continued: false,
           continuedIn: null,
           toFamily: null,
+          toProvider: null,
           outcome: "switched",
           detail: null,
           at: new Date().toISOString(),
@@ -2616,7 +3384,6 @@ export class Service {
     for (const agent of agents) {
       const family = families[agent.provider];
       if (!family || agent.archived) continue;
-      if (agent.named !== null) this.agentMetadata = true;
       const live = isLive(agent.status);
       const accountId = this.targetFor(state, agent.id, family, this.standingIn(state, agent.id, family, live));
       if (!accountId) continue;
@@ -2647,6 +3414,8 @@ export class Service {
     const launcherOf = this.launcherFiles ?? new Map([...launcherNames(claudeScripts), ...launcherNames(piScripts, new Map(), "pi")]);
     const proxies = new Map<string, ProxyState>();
     const apis = new Map<string, ApiSummary | null>();
+    const azures = new Map<string, AzureSummary>();
+    const apiMonths: ApiUsageFile = await this.apiUsage.read().catch(() => ({ accounts: {}, threads: {} }));
     const external = new Set<string>();
     await Promise.all(
       state.accounts.map(async (account) => {
@@ -2660,6 +3429,11 @@ export class Service {
         if (account.kind !== "managed" || !account.home) return;
         if (adapter.homesInUse && !(await isOwnHome(account.home))) external.add(account.id);
         if (account.auth === "api" && adapter.api) apis.set(account.id, await adapter.api(account.home).catch(() => null));
+        if (isAzureAccount(account)) {
+          // Only the key's hint goes to the app (see azureSummary).
+          const settings = await readAzureAccount(account.home).catch(() => null);
+          if (settings) azures.set(account.id, azureSummary(settings, currentMonth(apiMonths.accounts[account.id], now)));
+        }
       }),
     );
     // A proxy kept in the user's file (Pi's own login's in its settings) is also the one every added
@@ -2694,7 +3468,8 @@ export class Service {
         home: account.home,
         auth: account.auth,
         api: apiView(apis.get(account.id)),
-        apiEditable: account.auth === "api" || (account.kind === "main" && this.adapters[account.family].mainApi === true),
+        // An Azure account's endpoint and key have their own form (see `azure`).
+        apiEditable: (account.auth === "api" && !isAzureAccount(account)) || (account.kind === "main" && this.adapters[account.family].mainApi === true),
         proxy: proxy?.own ? maskProxy(proxy.own) : null,
         proxyEditable: proxy !== undefined,
         proxyBlocked: proxy?.blocked ?? null,
@@ -2705,6 +3480,7 @@ export class Service {
         egress: this.egress.get(account.id) ?? null,
         externalHome: external.has(account.id),
         moving: moving(account),
+        azure: azures.get(account.id) ?? null,
       };
     });
 
@@ -2716,15 +3492,34 @@ export class Service {
       canReopen,
       browserSignIn: this.browserSignIn,
       showComposerPill: this.prefs.showComposerPill,
+      openCodeAvailable: await this.openCodeAvailable(paseo),
       autoSwitch: this.prefs.autoSwitch,
       balanceNewAgents: this.prefs.balanceNewAgents,
-      agentMetadata: this.agentMetadata,
+      agentMetadata: takesAgentMetadata(paseo),
+      paidApiFallback: this.prefs.paidApiFallback,
       warnings: await this.warnings(),
       launchers: claudeScripts.length > 0 ? launcherDir() : null,
       piLaunchers: piScripts.length > 0 ? piLauncherDir() : null,
       claudeHomes: this.adapters.claude.homesInUse ? { dir: shownPath(homesNow("claude")), isDefault: state.claudeHomes.dir === null } : null,
       piHomes: this.adapters.pi.homesInUse ? { dir: shownPath(homesNow("pi")), isDefault: state.piHomes.dir === null } : null,
     };
+  }
+
+  /**
+   * Whether Paseo lists OpenCode as available, read at most once a minute. A failed read keeps the last good
+   * answer and must not break the whole state view. Only the menu entry uses this; the fork checks again itself.
+   */
+  private async openCodeAvailable(paseo: PaseoApi): Promise<boolean> {
+    if (this.openCodeCache && Date.now() - this.openCodeCache.at < OPENCODE_AVAILABLE_MS) return this.openCodeCache.available;
+    try {
+      const result = await paseo.providers.listAvailable();
+      if (result.error) throw new Error(result.error);
+      const available = Boolean(result.providers?.some((entry) => entry.provider === OPENCODE_PROVIDER && entry.available));
+      this.openCodeCache = { at: Date.now(), available };
+      return available;
+    } catch {
+      return this.openCodeCache?.available ?? false;
+    }
   }
 
   /** Whether running agents can change accounts right away: through the host's own reopen, or the CLI. */
@@ -2886,7 +3681,7 @@ export class Service {
       // No Pi account stands in for another (each may be billed), so a disabled one would still be used.
       throw new Error("Pi accounts can't be disabled. Make another one the default, or pick another for its agents, or remove it.");
     }
-    if (!enabled && !mostAvailable(state, account.family, (id) => this.usage.get(id), Date.now(), new Set([account.id]))) {
+    if (!enabled && !mostAvailable(state, account.family, (id) => this.usage.get(id), Date.now(), new Set([account.id]), this.prefs.paidApiFallback)) {
       // Routing only stands in a usable account for a disabled one. Without one, its
       // agents and new ones would stay on it, or quietly fall back to the CLI login.
       const others = accountsOf(state, account.family).some((other) => other.id !== account.id && other.signedIn && !other.disabled);
@@ -3052,6 +3847,7 @@ export class Service {
             continued: true,
             continuedIn: continuation,
             toFamily: null,
+            toProvider: null,
             outcome: "continued",
             detail: null,
             at: new Date().toISOString(),
@@ -3071,6 +3867,7 @@ export class Service {
             continued: false,
             continuedIn: null,
             toFamily: null,
+            toProvider: null,
             outcome: "stayed",
             detail: `Couldn't continue on ${target.label}: ${describe(error)}`,
             at: new Date().toISOString(),
@@ -3147,6 +3944,7 @@ export class Service {
     });
     this.setUsage(accountId, null);
     this.egress.delete(accountId);
+    if (isAzureAccount(account)) await this.apiUsage.forget(accountId).catch((error: unknown) => log(`could not forget ${account.label}'s token counts`, error));
     if (account.home && kept) console.log(`[ZeroSub] removed ${account.label} from ZeroSub only: ${account.home} isn't a folder ZeroSub made in ${homesDir()}, so its files and script stay`);
     // Its script is released rather than deleted when its home stays (see writeLaunchers).
     await this.refreshLaunchers(account.home && !kept ? [account.home] : []).catch((error: unknown) => log("could not write the shell launchers", error));
@@ -3156,6 +3954,123 @@ export class Service {
     const moves = await this.answerBy(replyBy, this.reconcile(paseo, "removed", affected, new Map([[account.id, account.label]]), { summary }), summary);
     void this.cleanUpHomes(paseo).catch((error: unknown) => log("cleanup failed", error));
     return { affected: affected.length, moves };
+  }
+
+  // ------------------------------------------------------------------ Azure OpenAI accounts
+
+  /**
+   * Adds an Azure OpenAI account under ChatGPT (Codex): an endpoint and an API key, checked against
+   * the endpoint first. A refused key (401/403) isn't saved; when the endpoint can't be reached the
+   * account is saved anyway and `warning` says so. The key goes only to the home's `azure.json`, and
+   * the account is marked `provider: "azure"`.
+   */
+  async addAzureAccount(input: { label: string; endpoint: string; key: string }): Promise<{ accountId: string; warning: string | null }> {
+    const endpoint = normalizeAzureEndpoint(input.endpoint);
+    const key = input.key.trim();
+    if (!key) throw new Error("Enter the API key.");
+    const identity = azureIdentity(endpoint, key);
+    const duplicate = accountsOf(await this.store.read(), "codex").find((account) => account.identity === identity);
+    if (duplicate) throw new Error(`That key and endpoint are already added as "${duplicate.label}".`);
+    const check = await checkAzureKey(endpoint, key);
+    if (!check.ok && check.fatal) throw new Error(check.message);
+
+    const id = `codex-${randomBytes(6).toString("hex")}`;
+    const home = join(homesDir(), id);
+    this.creatingHomes.add(home);
+    try {
+      await this.store.update((draft) => {
+        draft.cleanup[home] = { family: "codex", accountId: id, why: "unfinished", at: new Date().toISOString() };
+      });
+      await writeAzureAccount(home, { endpoint, key, prices: {} });
+      await this.adapters.codex.prepareHome(home);
+      await this.store.update((draft) => {
+        const twin = accountsOf(draft, "codex").find((entry) => entry.identity === identity);
+        if (twin) throw new Error(`That key and endpoint are already added as "${twin.label}".`);
+        const account = newAccount({ id, family: "codex", kind: "managed", home, auth: "api", provider: "azure" });
+        account.label = input.label.trim();
+        account.autoLabel = false;
+        account.identity = identity;
+        account.plan = "Azure OpenAI";
+        draft.accounts.push(account);
+        delete draft.cleanup[home];
+      });
+    } catch (error) {
+      const removed = await removeHome(home).then(
+        () => true,
+        (failure: unknown) => (log(`could not delete the half-made home ${home}; the cleanup pass tries again`, failure), false),
+      );
+      if (removed) await this.store.update((draft) => void delete draft.cleanup[home]).catch(() => undefined);
+      throw error;
+    } finally {
+      this.creatingHomes.delete(home);
+    }
+    console.log(`[ZeroSub] added Azure OpenAI account ${input.label.trim()} (${new URL(endpoint).host})${check.ok ? "" : "; its key couldn't be checked"}`);
+    return { accountId: id, warning: check.ok ? null : `Saved, but the key couldn't be checked: ${check.message}` };
+  }
+
+  /**
+   * Changes an Azure account's endpoint, key (empty keeps it) or price table. A new key or endpoint is
+   * checked as when adding one; a kept key only goes to a new endpoint when it's typed again.
+   */
+  async updateAzureAccount(accountId: string, input: { endpoint?: string; key?: string; prices?: Record<string, ApiPrice> }): Promise<{ warning: string | null }> {
+    return this.onAccount(accountId, async (account) => {
+      if (!account || !account.home) throw new Error("That account no longer exists.");
+      if (!isAzureAccount(account)) throw new Error(`${account.label} isn't an Azure OpenAI account.`);
+      const home = account.home;
+      const current = await readAzureAccount(home);
+      const endpoint = input.endpoint?.trim() ? normalizeAzureEndpoint(input.endpoint) : current.endpoint;
+      const typed = input.key?.trim() || null;
+      if (!typed && endpoint !== current.endpoint) throw new Error("Enter the key again to use it with a different endpoint.");
+      const key = typed ?? current.key;
+      const changed = typed !== null || endpoint !== current.endpoint;
+      let warning: string | null = null;
+      if (changed) {
+        const identity = azureIdentity(endpoint, key);
+        const duplicate = accountsOf(await this.store.read(), "codex").find((entry) => entry.id !== accountId && entry.identity === identity);
+        if (duplicate) throw new Error(`That key and endpoint are already added as "${duplicate.label}".`);
+        const check = await checkAzureKey(endpoint, key);
+        if (!check.ok && check.fatal) throw new Error(check.message);
+        if (!check.ok) warning = `Saved, but the key couldn't be checked: ${check.message}`;
+      }
+      const prices = input.prices
+        ? Object.fromEntries(Object.entries(input.prices).map(([model, price]) => [model.trim(), price] as const).filter(([model]) => model !== ""))
+        : current.prices;
+      if (!(await this.stillHas(account)())) throw new Error("That account no longer exists.");
+      await writeAzureAccount(home, { endpoint, key, prices });
+      await this.adapters.codex.prepareHome(home).catch((error: unknown) => log(`could not refresh the home of ${account.label}`, error));
+      await this.store.update((draft) => {
+        const target = findAccount(draft, accountId);
+        if (!target) return;
+        target.identity = azureIdentity(endpoint, key);
+        // A new key or endpoint is worth trying again even if the old one was refused.
+        if (changed) target.signedIn = true;
+      });
+      return { warning };
+    });
+  }
+
+  /**
+   * Counts the tokens an agent's turn on an Azure account used, from its Codex thread's rollout file
+   * (the last `token_count` event's running total, minus what was counted before). Codex writes it
+   * as the turn goes, so this waits a moment after the turn ends. A turn whose file can't be found is
+   * noted as uncounted, so the card says its totals are short.
+   */
+  private async countAzureTurn(paseo: PaseoApi, agentId: string, accountId: string): Promise<void> {
+    await delay(1_500);
+    const agent = (await paseo.agents.ref(agentId).refresh().catch(() => null))?.agent as
+      | { persistence?: { sessionId?: string; nativeHandle?: string } | null; model?: string | null }
+      | undefined;
+    const ids = [agent?.persistence?.nativeHandle, agent?.persistence?.sessionId].filter((id): id is string => typeof id === "string" && id !== "");
+    for (const threadId of new Set(ids)) {
+      const path = await findRollout(threadId);
+      if (!path) continue;
+      const reading = parseRollout(await readFile(path, "utf8"));
+      if (!reading) continue;
+      await this.apiUsage.countThread(accountId, threadId, reading, agent?.model ?? "unknown");
+      return;
+    }
+    await this.apiUsage.noteUncounted(accountId);
+    console.log(`[ZeroSub] couldn't find the Codex session file of ${agentId}, so its last turn's tokens aren't counted`);
   }
 
   // ------------------------------------------------------------------ Pi accounts
@@ -3463,6 +4378,7 @@ export class Service {
         await this.followMainSettings(account.family);
         return;
       }
+      if (isAzureAccount(account)) throw new Error(`${account.label} is an Azure OpenAI account: change its key from its own settings.`);
       if (account.auth !== "api" || !account.home || !adapter.setApi) throw new Error(`${account.label} signs in with a subscription, not an API key.`);
       // A kept key stays on its base URL (the adapter refuses to move it), so its identity holds.
       const identity = key ? apiIdentity(baseUrl, keyDigest(key)) : null;
@@ -4087,6 +5003,11 @@ function trafficSwitches(input: Partial<TrafficSwitches>): TrafficSwitches {
   };
 }
 
+/** The timeline's word on work that moved onto a paid Azure account by itself (with `paidApiFallback` on). */
+function azureFallbackNote(label: string): string {
+  return `Every ChatGPT subscription account is out, so this runs on ${label}: Azure OpenAI, a paid API billed per token. New agents go back to a ChatGPT account once one has room.`;
+}
+
 /** What tells an API key's account from another: where the key goes, and a short hash of the key. */
 /** Anthropic's API, which a blank base URL means too. */
 const ANTHROPIC_API = "https://api.anthropic.com";
@@ -4104,7 +5025,7 @@ function keyDigest(key: string): string {
   return createHash("sha256").update(key).digest("hex").slice(0, 16);
 }
 
-function newAccount(fields: Pick<StoredAccount, "id" | "family" | "kind" | "home"> & Partial<Pick<StoredAccount, "auth">>): StoredAccount {
+function newAccount(fields: Pick<StoredAccount, "id" | "family" | "kind" | "home"> & Partial<Pick<StoredAccount, "auth" | "provider">>): StoredAccount {
   return {
     auth: "subscription",
     ...fields,

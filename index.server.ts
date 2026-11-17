@@ -8,6 +8,7 @@ import { Service, describe } from "./server/service";
 import { preferences } from "./shared/preferences";
 import {
   addApiAccount,
+  addAzureAccount,
   cancelLogin,
   clearAccountLimit,
   getState,
@@ -27,6 +28,7 @@ import {
   startLogin,
   submitLoginCode,
   updateApiAccount,
+  updateAzureAccount,
 } from "./shared/rpc";
 
 export default function contribute(server: PluginServerContext) {
@@ -108,13 +110,15 @@ export default function contribute(server: PluginServerContext) {
   });
   server.handle(redeemReset, ({ accountId, agentId }, { paseo }) => service.redeem(paseo, accountId, agentId));
   server.handle(setAgentAccount, ({ agentId, accountId }, { paseo }) => service.setAgentAccount(paseo, agentId, accountId));
-  server.handle(forkAgent, ({ agentId }, { paseo }) => service.forkAgent(paseo, agentId));
+  server.handle(forkAgent, ({ agentId, destination }, { paseo }) => service.forkAgent(paseo, agentId, destination));
   server.handle(setAccountEnabled, ({ accountId, enabled }, { paseo }) => service.setAccountEnabled(paseo, accountId, enabled));
   server.handle(addApiAccount, async (input) => ({ accountId: await service.addApiAccount(input) }));
   server.handle(updateApiAccount, async ({ accountId, ...input }) => {
     await service.updateApiAccount(accountId, input);
     return { ok: true as const };
   });
+  server.handle(addAzureAccount, (input) => service.addAzureAccount(input));
+  server.handle(updateAzureAccount, async ({ accountId, ...input }) => ({ ok: true as const, ...(await service.updateAzureAccount(accountId, input)) }));
   server.handle(setAccountProxy, async ({ accountId, proxy }) => ({ ok: true as const, proxy: await service.setProxy(accountId, proxy) }));
   server.handle(setClaudeHomesDir, async ({ dir }) => ({ ok: true as const, ...(await service.setClaudeHomesDir(dir)) }));
   server.handle(importAccount, async ({ path }) => ({ accountId: await service.importAccount(path) }));

@@ -11,6 +11,7 @@ import {
   type RedeemReply,
 } from "./adapter";
 import { providerCommand } from "./binaries";
+import { AZURE_KEY_ENV, azureIdentity, isAzureHome, readAzureAccount, syncAzureConfig } from "./azure";
 import { codexSqliteHome, prepareCodexHome } from "./homes";
 import { detectCodexLimit, detectCodexSignOut } from "./limits";
 import { run } from "./process";
@@ -70,7 +71,7 @@ class AppServer {
     try {
       await server.request(
         "initialize",
-        { clientInfo: { name: CLIENT_NAME, title: "Paseo ZeroSub", version: "1.12.0" }, capabilities: { experimentalApi: false } },
+        { clientInfo: { name: CLIENT_NAME, title: "Paseo ZeroSub", version: "1.14.0" }, capabilities: { experimentalApi: false } },
         60_000,
       );
       server.send({ method: "initialized" });
@@ -204,10 +205,24 @@ export class CodexAdapter implements FamilyAdapter {
 
   async env(home: string | null): Promise<EnvPatch> {
     if (!home) return { CODEX_HOME: null, CODEX_SQLITE_HOME: null };
+    if (isAzureHome(home)) return this.azureEnv(home);
     const patch: EnvPatch = { CODEX_HOME: home };
     // Share thread metadata with the main home so every account sees the same threads.
     const sqlite = await codexSqliteHome();
     patch.CODEX_SQLITE_HOME = sqlite;
+    if (process.env.CODEX_ACCESS_TOKEN) patch.CODEX_ACCESS_TOKEN = "";
+    return patch;
+  }
+
+  /**
+   * An Azure OpenAI account's session: its home (whose `config.toml` selects ZeroSub's Azure provider,
+   * remade now if the shared one changed) and the key in the variable that provider reads. Throws when
+   * the key can't be read, so the session isn't opened on Azure without it.
+   */
+  private async azureEnv(home: string): Promise<EnvPatch> {
+    const { key } = await readAzureAccount(home);
+    await syncAzureConfig(home);
+    const patch: EnvPatch = { CODEX_HOME: home, CODEX_SQLITE_HOME: await codexSqliteHome(), [AZURE_KEY_ENV]: key };
     if (process.env.CODEX_ACCESS_TOKEN) patch.CODEX_ACCESS_TOKEN = "";
     return patch;
   }
@@ -224,10 +239,19 @@ export class CodexAdapter implements FamilyAdapter {
   }
 
   async identity(home: string | null): Promise<Identity> {
+    if (isAzureHome(home)) {
+      // Nothing signs in: the key is checked when it's saved, and a refused one is learned from a turn.
+      const { endpoint, key } = await readAzureAccount(home);
+      return { signedIn: true, email: null, plan: "Azure OpenAI", organization: null, identity: azureIdentity(endpoint, key) };
+    }
     return (await this.snapshot(home)).identity;
   }
 
   async usage(home: string | null): Promise<Usage> {
+    if (isAzureHome(home)) {
+      // No plan windows: its tokens are counted per turn instead (see Service.countAzureTurn).
+      return { fetchedAt: new Date().toISOString(), windows: [], error: null, cached: false, resets: null, credits: null };
+    }
     return (await this.snapshot(home, true)).usage;
   }
 
@@ -328,12 +352,15 @@ export class CodexAdapter implements FamilyAdapter {
   }
 
   async login(home: string | null, method: LoginMethod): Promise<LoginHandle> {
+    if (isAzureHome(home)) throw new Error("Azure OpenAI accounts use an API key: change it from the account's card.");
     this.snapshots.delete(home ?? "");
     const server = await AppServer.open(spawnEnv(await this.env(home), "codex"));
     return new CodexLogin(server, method, () => this.snapshots.delete(home ?? ""));
   }
 
   async logout(home: string): Promise<void> {
+    // Nothing is signed in: deleting the home (and its azure.json) is all removing it takes.
+    if (isAzureHome(home)) return;
     this.snapshots.delete(home);
     const server = await AppServer.open(spawnEnv(await this.env(home), "codex"));
     try {
@@ -348,6 +375,7 @@ export class CodexAdapter implements FamilyAdapter {
    * credit while nothing is used up (`nothingToReset`), so automatic use needs no extra check.
    */
   async redeemReset(home: string | null): Promise<RedeemReply> {
+    if (isAzureHome(home)) return { outcome: "none", message: "Azure OpenAI accounts have no banked resets.", left: 0 };
     this.snapshots.delete(home ?? "");
     const server = await AppServer.open(spawnEnv(await this.env(home), "codex"));
     try {
