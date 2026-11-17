@@ -117,18 +117,17 @@ export function isAccountHome(home: string, family?: Family): boolean {
 
 /**
  * Deletes a managed home. Its top level holds symlinks into the user's real CLI home, so those are
- * unlinked first; nothing outside ZeroSub's own directory is ever followed or removed. It holds the
- * home's lock, so a sync never puts entries back while the home is being deleted.
+ * unlinked first; nothing outside ZeroSub's own directory is ever followed or removed: only a folder
+ * it made for an account (see `isAccountHome`) goes, and a link put in its place is left as it is.
+ * It holds the home's lock, so a sync never puts entries back while the home is being deleted.
  */
 export function removeHome(home: string): Promise<void> {
   return withHome(home, async () => {
-    if (!isAccountHome(home)) return;
-    for (const name of await readdir(home).catch(() => [] as string[])) {
-      const path = join(home, name);
-      const entry = await lstat(path).catch(() => null);
-      if (entry?.isSymbolicLink()) await unlink(path).catch(() => undefined);
-    }
-    await rm(home, { recursive: true, force: true });
+    if (!isAccountHome(home) || !(await isOwnHome(home))) return;
+    // Checked again right here: a link put in its place is never followed into the folder it points at.
+    const entry = await lstat(home).catch(() => null);
+    if (!entry?.isDirectory()) return;
+    await removeTree(home);
   });
 }
 

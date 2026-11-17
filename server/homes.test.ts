@@ -397,6 +397,23 @@ describe("removeHome", () => {
     await removeHome([join(root, "zerosub", "homes", "claude-x"), "..", "..", "elsewhere"].join(sep));
     expect((await lstat(outside)).isDirectory()).toBe(true);
   });
+
+  it("isn't undone by a sync that was waiting for the home, once its account has gone", async () => {
+    process.env.PASEO_HOME = root;
+    const main = join(root, "main");
+    const home = join(root, "zerosub", "homes", "claude-y");
+    process.env.CLAUDE_CONFIG_DIR = main;
+    await mkdir(join(main, "projects"), { recursive: true });
+    await prepareClaudeHome(home, true);
+
+    let registered = true;
+    const removing = removeHome(home);
+    const syncing = prepareClaudeHome(home, true, async () => registered);
+    registered = false; // the account went before the sync got to the home
+    await Promise.all([removing, syncing]);
+
+    expect(await lstat(home).catch(() => null)).toBeNull();
+  });
 });
 
 describe("mergeShared", () => {
@@ -691,6 +708,26 @@ describe("an account's own proxy and the no-proxy list", () => {
     expect(JSON.parse(await readFile(join(home, "settings.json"), "utf8")).env).toMatchObject(NO_PROXY_PINNED);
     await writeAccountProxy(home, null);
     expect(JSON.parse(await readFile(join(home, "settings.json"), "utf8")).env).toBeUndefined();
+  });
+});
+
+describe("removeHome through a link", () => {
+  it("leaves the folder a link in homes/ points at, and everything in it, alone", async () => {
+    process.env.PASEO_HOME = root;
+    const real = join(root, "claude-config", "claude-mine");
+    const main = join(root, "main");
+    await mkdir(join(main, "projects"), { recursive: true });
+    await mkdir(real, { recursive: true });
+    await writeFile(join(real, ".claude.json"), "{}");
+    await symlink(join(main, "projects"), join(real, "projects"));
+    await mkdir(join(root, "zerosub", "homes"), { recursive: true });
+    const link = join(root, "zerosub", "homes", "claude-mine");
+    await symlink(real, link);
+
+    await removeHome(link);
+    expect(await isLinkTo(link, real)).toBe(true);
+    expect(await readFile(join(real, ".claude.json"), "utf8")).toBe("{}");
+    expect(await isLinkTo(join(real, "projects"), join(main, "projects"))).toBe(true);
   });
 });
 
