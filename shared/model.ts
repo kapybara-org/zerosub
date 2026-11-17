@@ -293,6 +293,13 @@ export const LoginViewSchema = z.object({
 });
 export type LoginView = z.infer<typeof LoginViewSchema>;
 
+/**
+ * Agent metadata (Paseo 0.16 and later) naming the account a new agent starts on. The account
+ * control in a composer that has no agent yet sets it, and anything else that creates an agent can
+ * (`paseo.agents.create({ metadata })`). Routing reads it once, when the agent is created.
+ */
+export const ACCOUNT_METADATA_KEY = "zerosub.account";
+
 export const StateViewSchema = z.object({
   accounts: z.array(AccountViewSchema),
   agents: z.array(AgentRouteSchema),
@@ -317,6 +324,8 @@ export const StateViewSchema = z.object({
   showComposerPill: z.boolean(),
   /** Accounts at their limit are skipped, so agents can't be moved onto one by hand either. */
   autoSwitch: z.boolean().default(true),
+  /** New agents without an account of their own start on the one with the most room, not on the default. */
+  balanceNewAgents: z.boolean().optional(),
   warnings: z.array(z.string()),
 });
 export type StateView = z.infer<typeof StateViewSchema>;
