@@ -192,6 +192,12 @@ async function redeemNow(service: Service, paseo: unknown, accountId: string, ag
 }
 
 const inFuture = () => new Date(Date.now() + 30 * 60_000).toISOString();
+/** Agents placed on an account in the last 10 minutes, as pacing counts them. */
+const pendingOn = (service: Service, accountId: string) =>
+  (service as unknown as { pendingOn(id: string, now: number): number }).pendingOn(accountId, Date.now());
+/** Records an agent just placed on an account. */
+const placed = (service: Service, accountId: string) =>
+  (service as unknown as { notePlacement(id: string, now: number): void }).notePlacement(accountId, Date.now());
 const inPast = () => new Date(Date.now() - 60_000).toISOString();
 
 const TWIN = "claude-twin";
@@ -1048,14 +1054,15 @@ describe("forking to the other provider", () => {
     expect(notes.at(-1)).toMatchObject({ outcome: "continued", continuedIn: { agentId: created[0]?.agentId } });
   });
 
-  it("records one pending placement for a fork with balancing on", async () => {
+  it("records one pending placement for a fork with balancing on, as the fork opens", async () => {
     const { service, created, limitTurn, context } = await setUpFork("bypassPermissions", [], {}, [], { prefs: { balanceNewAgents: true } });
     await limitTurn();
+    expect(pendingOn(service, CODEX_MAIN)).toBe(0);
     await service.onSessionOpen(
-      { agentId: created[0]!.agentId, provider: "codex", reason: "create", purpose: "interactive", env: {} } as never,
+      { agentId: created[0]!.agentId, provider: "codex", reason: "create", purpose: "interactive", workspaceId: "ws-1", env: {} } as never,
       context,
     );
-    expect((service as unknown as { pendingOn(id: string, now: number): number }).pendingOn(CODEX_MAIN, Date.now())).toBe(1);
+    expect(pendingOn(service, CODEX_MAIN)).toBe(1);
   });
 
   it("won't fork into a mode more permissive than the original's", async () => {
@@ -4526,6 +4533,26 @@ describe("the account button's reason row", () => {
 });
 
 describe("pending placements", () => {
+  it("records none for Paseo's helper sessions, which open in no workspace", async () => {
+    const { service, paseo } = await setUp(
+      {
+        accounts: [account(MAIN, "work", "main"), account(HELLO, "personal", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+      },
+      () => {
+        throw new Error("unused");
+      },
+    );
+    service.setPreferences(preferences.schema.parse({ balanceNewAgents: true }));
+    const open = (agentId: string, extra: Record<string, unknown>) =>
+      service.onSessionOpen({ agentId, provider: "claude", reason: "create", purpose: "interactive", env: {}, ...extra } as never, { paseo } as never);
+    await open("commit-message", {});
+    await open("hidden-helper", { workspaceId: "ws-1", background: true });
+    expect(pendingOn(service, MAIN) + pendingOn(service, HELLO)).toBe(0);
+    await open("new-agent", { workspaceId: "ws-1" });
+    expect(pendingOn(service, MAIN) + pendingOn(service, HELLO)).toBe(1);
+  });
+
   it("spreads concurrent new agents by pending placements", async () => {
     const { service, store, paseo } = await setUp(
       {
@@ -4539,7 +4566,7 @@ describe("pending placements", () => {
     service.setPreferences(preferences.schema.parse({ balanceNewAgents: true }));
     const context = { paseo } as never;
     const create = (agentId: string) =>
-      service.onSessionOpen({ agentId, provider: "claude", reason: "create", purpose: "interactive", env: {} } as never, context);
+      service.onSessionOpen({ agentId, provider: "claude", reason: "create", purpose: "interactive", workspaceId: "ws-1", env: {} } as never, context);
     await Promise.all([create("new-a"), create("new-b")]);
     const { sessions } = await store.read();
     expect(new Set([sessions["new-a"]?.accountId, sessions["new-b"]?.accountId])).toEqual(new Set([MAIN, HELLO]));
@@ -4559,7 +4586,7 @@ describe("pending placements", () => {
     const logged = vi.spyOn(console, "log").mockImplementation(() => undefined);
     try {
       await service.onSessionOpen(
-        { agentId: "agent-new", provider: "claude", reason: "create", purpose: "interactive", env: {} } as never,
+        { agentId: "agent-new", provider: "claude", reason: "create", purpose: "interactive", workspaceId: "ws-1", env: {} } as never,
         { paseo } as never,
       );
       expect(logged.mock.calls.map((call) => String(call[0]))).toContainEqual(

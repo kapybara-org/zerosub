@@ -1000,9 +1000,11 @@ export class Service {
   /** Agents placed on an account in the last `PENDING_MS`, which its latest usage reading may not show yet. */
   private readonly placements: { accountId: string; at: number }[] = [];
 
-  private notePlacement(accountId: string, now: number): void {
-    this.placements.push({ accountId, at: now });
+  private notePlacement(accountId: string, now: number): { accountId: string; at: number } {
+    const placement = { accountId, at: now };
+    this.placements.push(placement);
     while (this.placements.length > 0 && this.placements[0]!.at <= now - PENDING_MS) this.placements.shift();
+    return placement;
   }
 
   private pendingOn(accountId: string, now: number): number {
@@ -1096,8 +1098,10 @@ export class Service {
     const first = chooseAccount(state, input);
     if (!first) return undefined;
     if (first.bind?.source === "balance") this.logPlacement(state, family, request.agentId, first.account, now, "new agent");
-    // Recorded before any await, so concurrent creates see each other's placements.
-    if (interactive && (request.reason === "create" || first.skipped)) this.notePlacement(first.account.id, now);
+    // Recorded before any await, so concurrent creates see each other's placements, and moved below
+    // if the session opens elsewhere. Only the user's own agents count, not Paseo's helpers.
+    const placement =
+      takesNextPick(request) && (request.reason === "create" || first.skipped) ? this.notePlacement(first.account.id, now) : undefined;
     let decision = first;
     const prepare = async (account: StoredAccount) => {
       // Taken before anything else waits, so a move of this home that hasn't finished gives way (see
@@ -1137,6 +1141,7 @@ export class Service {
       });
     }
     const { account } = decision;
+    if (placement) placement.accountId = account.id;
     if (account.id !== first.account.id) await prepare(account);
     if (decision.nextPick && Date.parse(decision.nextPick.until) > now) {
       console.log(`[ZeroSub] next-agent pick ${decision.bind?.source === "user" ? "used" : "dropped, as its account can't take agents now"}: ${request.agentId}`);
@@ -1603,12 +1608,12 @@ export class Service {
       return;
     }
 
-    this.notePlacement(next.id, now);
-
     if (!adapter.portable && (await this.keptSameConversation(paseo, agentId, account, next, problem, base, reason, endedAt))) return;
 
     if (adapter.portable) {
       if (move?.pin) await this.pin(agentId, next.id, latest.bindings[agentId]);
+      // Only a Claude agent moves here. A ChatGPT hand-off's new agent counts itself as it opens.
+      this.notePlacement(next.id, now);
       this.switchGuard.note(agentId, now);
       const result = await this.reopenAgent(paseo, agentId, { settle: true });
       const continued = result.outcome === "reopened" && this.prefs.autoContinue && (await this.untouchedSince(paseo, agentId, endedAt));
