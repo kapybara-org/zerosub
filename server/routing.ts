@@ -1,5 +1,5 @@
 import { accountPeak } from "../shared/format";
-import { isAzureAccount, type Family, type Usage, type UsageWindow } from "../shared/model";
+import { isAzureAccount, PACE_GATE_PERCENT, type Family, type PaceView, type Usage, type UsageWindow } from "../shared/model";
 import { FIVE_HOUR_MINUTES, WEEK_MINUTES } from "./codex";
 import {
   accountsOf,
@@ -23,7 +23,7 @@ const NEAR_RESET_MAX_USED_PERCENT = 80;
  * new agents, any account under this ranks ahead of every account past it, unless a window that caps
  * it is full (see `mostAvailable`).
  */
-const FIVE_HOUR_GATE_PERCENT = 80;
+const FIVE_HOUR_GATE_PERCENT = PACE_GATE_PERCENT;
 
 const FIVE_HOUR_MS = FIVE_HOUR_MINUTES * 60_000;
 const WEEK_MS = WEEK_MINUTES * 60_000;
@@ -157,6 +157,33 @@ export function paceScore(usage: Usage | null | undefined, pending: number, now:
     weekly,
     score: Math.max(fiveHour, weekly),
     gated: fiveHourGated(usage, now) || fiveHour >= FIVE_HOUR_GATE_PERCENT,
+  };
+}
+
+/** `paceScore` broken into the parts an account card draws. */
+export function paceView(usage: Usage | null | undefined, pending: number, now: number): PaceView {
+  const pace = paceScore(usage, pending, now);
+  const short = usage ? fiveHourWindow(usage) : undefined;
+  const long = usage ? weeklyWindow(usage) : undefined;
+  const expired = (window: UsageWindow) => !!window.resetsAt && Date.parse(window.resetsAt) <= now;
+  const used = (window: UsageWindow | undefined) =>
+    window && Number.isFinite(window.usedPercent) ? (expired(window) ? 0 : window.usedPercent) : null;
+  const parsed = usage ? Date.parse(usage.fetchedAt) : Number.NaN;
+  const fetched = Number.isFinite(parsed) ? Math.min(parsed, now) : now;
+  const weekReset = long?.resetsAt ? Date.parse(long.resetsAt) : Number.NaN;
+  const weekElapsed =
+    long && Number.isFinite(long.usedPercent) && !expired(long) && Number.isFinite(weekReset)
+      ? Math.min(100, Math.max(0, (1 - (weekReset - fetched) / WEEK_MS) * 100))
+      : null;
+  return {
+    fiveHourUsed: used(short),
+    fiveHourProjected: pace.fiveHour,
+    pendingFiveHour: PENDING_FIVE_HOUR_PERCENT * pending,
+    weeklyUsed: used(long),
+    pendingWeekly: PENDING_WEEKLY_PERCENT * pending,
+    weekElapsed,
+    pending,
+    gated: pace.gated,
   };
 }
 

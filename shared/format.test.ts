@@ -95,6 +95,7 @@ describe("account presentation", () => {
     egress: null,
     externalHome: false,
     moving: null,
+    pace: null,
     azure: null,
   };
 

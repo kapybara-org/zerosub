@@ -78,7 +78,7 @@ import { maskProxy, normalizeProxy } from "./proxy";
 import { Reopener, hostCanReload } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
-import { canStandIn, chooseAccount, fiveHourWindow, headroomScore, isLastResort, isLimited, isUsable, mostAvailable, paceScore, PENDING_MS, weeklyWindow, withBankedReset, type Pacing, type RouteDecision, type RouteInput } from "./routing";
+import { canStandIn, chooseAccount, fiveHourWindow, headroomScore, isLastResort, isLimited, isUsable, mostAvailable, paceScore, paceView, PENDING_MS, weeklyWindow, withBankedReset, type Pacing, type RouteDecision, type RouteInput } from "./routing";
 import {
   ALL_SOURCES,
   MAIN_ACCOUNT_ID,
@@ -3567,6 +3567,10 @@ export class Service {
       const note = this.moveNotes.get(account.id);
       return { to: shownPath(move?.to ?? homesNow(account.family === "pi" ? "pi" : "claude")), waiting: note?.waiting ?? null, error: note?.error ?? null };
     };
+    // Pacing only chooses between two or more accounts that can take agents by themselves.
+    const pacedFamilies = new Set(
+      FAMILIES.filter((family) => state.accounts.filter((other) => other.family === family && canStandIn(other, now)).length > 1),
+    );
     const accounts: AccountView[] = state.accounts.map((account) => {
       const limited = isLimited(account, now);
       const proxy = proxies.get(account.id);
@@ -3599,6 +3603,9 @@ export class Service {
         egress: this.egress.get(account.id) ?? null,
         externalHome: external.has(account.id),
         moving: moving(account),
+        pace: this.prefs.balanceNewAgents && pacedFamilies.has(account.family) && canStandIn(account, now)
+          ? paceView(this.usage.get(account.id), this.pendingOn(account.id, now), now)
+          : null,
         azure: azures.get(account.id) ?? null,
       };
     });

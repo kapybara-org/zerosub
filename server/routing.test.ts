@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Usage } from "../shared/model";
 import { applyEnv } from "./adapter";
 import { parseRateLimits } from "./codex";
-import { canStandIn, chooseAccount, fiveHourGated, isLastResort, mostAvailable, paceScore } from "./routing";
+import { canStandIn, chooseAccount, fiveHourGated, isLastResort, mostAvailable, paceScore, paceView } from "./routing";
 import { emptyState, type StoredAccount, type StoredState } from "./state";
 
 const NOW = Date.parse("2026-09-23T12:00:00Z");
@@ -686,6 +686,30 @@ describe("pacing", () => {
     expect(score("claude-personal").score).toBeCloseTo(245, 5);
     expect(score("claude-work", 1).score).toBeCloseTo(66.25, 5);
     expect(score("claude-work", 2).score).toBeCloseTo(76.25, 5);
+  });
+
+  it("breaks the score into card parts", () => {
+    expect(paceView(readings["claude-main"], 0, PNOW)).toMatchObject({
+      fiveHourUsed: 30, fiveHourProjected: 90, pendingFiveHour: 0, weeklyUsed: 25, weekElapsed: 50, pending: 0, gated: true,
+    });
+    const work = paceView(readings["claude-work"], 2, PNOW);
+    expect(work).toMatchObject({ fiveHourUsed: 45, pendingFiveHour: 20, pendingWeekly: 4, gated: false });
+    expect(work.fiveHourProjected).toBeCloseTo(76.25, 5);
+    expect(work.weekElapsed).toBeCloseTo(85.71, 2);
+    expect(paceView(undefined, 0, PNOW)).toMatchObject({
+      fiveHourUsed: null, fiveHourProjected: 50, weeklyUsed: null, weekElapsed: null, gated: false,
+    });
+  });
+
+  it("agrees with paceScore for every example account", () => {
+    for (const id of Object.keys(readings)) {
+      for (const pending of [0, 1, 2]) {
+        const view = paceView(readings[id], pending, PNOW);
+        const score = paceScore(readings[id], pending, PNOW);
+        expect(view.fiveHourProjected).toBe(score.fiveHour);
+        expect(view.gated).toBe(score.gated);
+      }
+    }
   });
 
   it("places three paced creates on work, work, spare, where the unpaced pick is main", () => {
