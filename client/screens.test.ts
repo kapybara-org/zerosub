@@ -247,6 +247,7 @@ describe("the accounts screen", () => {
       agentCount: 0,
       home: null,
       externalHome: false,
+      sessionsShared: null,
       proxy: null,
       proxyEditable: false,
       inheritedProxy: null,
@@ -507,6 +508,27 @@ describe("the accounts screen", () => {
     expect(opened).toEqual(expect.arrayContaining(["Proxy", "Rename", "Remove"]));
     (find(render(), named("IconButton", "Fewer actions")).props.onPress as () => void)();
     expect(labels(render())).toEqual(closed);
+  });
+
+  it("shares an added Claude account's sessions from its card, or gives it its own again, once confirmed", async () => {
+    const { card, store } = setUp({
+      accounts: [account("work", { isDefault: true }), account("home", { sessionsShared: false }), account("shared", { sessionsShared: true })],
+    });
+    store.rpc.mockResolvedValue({ ok: true, shared: true });
+    const button = cardButton;
+    const confirm = (render: () => Element, label: string) => find(render(), (element) => element.type === "Button" && element.props.label === label);
+    const home = card("home");
+    // The card's button only asks.
+    (button(home, "Use the default sessions folder")!.props.onPress as () => void)();
+    expect(store.rpc).not.toHaveBeenCalled();
+    await (confirm(home, "Use the default folder").props.onPress as () => Promise<void>)();
+    expect(store.rpc).toHaveBeenLastCalledWith(expect.anything(), { accountId: "home", shared: true });
+    const shared = card("shared");
+    (button(shared, "Use its own sessions folder")!.props.onPress as () => void)();
+    await (confirm(shared, "Use its own folder").props.onPress as () => Promise<void>)();
+    expect(store.rpc).toHaveBeenLastCalledWith(expect.anything(), { accountId: "shared", shared: false });
+    // Where the server doesn't offer it (the CLI login, another provider, an older server), there's none.
+    expect(button(card("work"), "Use the default sessions folder")).toBeUndefined();
   });
 
   it("says a removal Paseo stopped waiting for goes on, rather than that it failed", async () => {

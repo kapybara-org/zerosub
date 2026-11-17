@@ -9,6 +9,7 @@ import { ApiAccountForm } from "./api-account";
 import { AzureAccountForm } from "./azure-account";
 import { BedrockAccountForm } from "./bedrock-account";
 import { useInputStyle } from "./pi-accounts";
+import { SessionsSwitch } from "./sessions-switch";
 import { describe, useStore, type ZeroSubStore } from "./store";
 import { Button, useText } from "./ui";
 
@@ -47,6 +48,8 @@ export function AddAccountModal({
   // A new Claude account can get a proxy of its own first, so the sign-in itself goes through it.
   const askProxy = family === "claude" && !accountId;
   const [proxy, setProxy] = useState("");
+  // And it can start on the default sessions folder (see `SessionsSwitch`).
+  const [shareSessions, setShareSessions] = useState(false);
   const [proxyDone, setProxyDone] = useState(!askProxy);
   // A new Claude account is a subscription to sign in, an API key or token, a folder that's signed
   // in already, or AWS Bedrock; a new ChatGPT one, a subscription or an Azure OpenAI key. Asked first.
@@ -67,7 +70,13 @@ export function AddAccountModal({
       setStartError(null);
       setLoginId(null);
       try {
-        const login = await store.rpc(startLogin, { family, accountId, method: next, proxy: askProxy && proxy.trim() ? proxy.trim() : undefined });
+        const login = await store.rpc(startLogin, {
+          family,
+          accountId,
+          method: next,
+          proxy: askProxy && proxy.trim() ? proxy.trim() : undefined,
+          shareSessions: askProxy && shareSessions ? true : undefined,
+        });
         // The modal closed (or a newer start replaced this one) before the daemon answered.
         if (closed.current || mine !== attempt.current) {
           void store.rpc(cancelLogin, { loginId: login.id }).catch(() => undefined);
@@ -78,7 +87,7 @@ export function AddAccountModal({
         if (!closed.current && mine === attempt.current) setStartError(describe(error));
       }
     },
-    [store, family, accountId, askProxy, proxy],
+    [store, family, accountId, askProxy, proxy, shareSessions],
   );
 
   useEffect(() => {
@@ -206,7 +215,17 @@ export function AddAccountModal({
       <ApiAccountForm theme={theme} store={store} onDone={setApiAdded} onCancel={close} />
     );
   } else if (!proxyDone) {
-    body = <ProxyStep theme={theme} proxy={proxy} onChange={setProxy} onCancel={close} onContinue={() => setProxyDone(true)} />;
+    body = (
+      <ProxyStep
+        theme={theme}
+        proxy={proxy}
+        onChange={setProxy}
+        shareSessions={shareSessions}
+        onShareSessions={setShareSessions}
+        onCancel={close}
+        onContinue={() => setProxyDone(true)}
+      />
+    );
   } else if (startError) {
     body = (
       <>
@@ -667,17 +686,21 @@ function ImportStep({ theme, store, onDone, onCancel }: { theme: Theme; store: Z
   );
 }
 
-/** A new Claude account's optional proxy, asked before its sign-in starts. */
+/** A new Claude account's optional proxy, and whether it uses the default sessions folder, asked before its sign-in starts. */
 function ProxyStep({
   theme,
   proxy,
   onChange,
+  shareSessions,
+  onShareSessions,
   onCancel,
   onContinue,
 }: {
   theme: Theme;
   proxy: string;
   onChange(proxy: string): void;
+  shareSessions: boolean;
+  onShareSessions(share: boolean): void;
   onCancel(): void;
   onContinue(): void;
 }) {
@@ -703,6 +726,7 @@ function ProxyStep({
         http:// or https://, with user:password@ if the proxy needs it. The CLI signs in through it, and the account's agents use it too.
         Leave it empty to use the network the daemon has; you can set one later from the account's card.
       </Text>
+      <SessionsSwitch value={shareSessions} onValueChange={onShareSessions} />
       <Row>
         <Button theme={theme} label="Cancel" tooltip="Close without adding an account" tooltipAlign="end" onPress={onCancel} />
         <Button

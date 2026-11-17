@@ -240,6 +240,7 @@ const CLAUDE_PRIVATE = new Set([
   "mcp-discovery-cache",
   "gh-pr-status-cache.json",
   "jobs",
+  // Each account's own unless it's shared with main's (see `shareClaudeSessions`): the sync never links it.
   "sessions",
   "teams",
   "ide",
@@ -935,6 +936,48 @@ export function prepareClaudeHome(home: string, force = false, wanted?: () => Pr
     await syncClaudeGlobalConfig(home);
     await syncClaudeSettings(home);
     lastSync.set(home, Date.now());
+  });
+}
+
+/** Whether a Claude home's `sessions` is main's, through a link (see `shareClaudeSessions`). */
+export async function claudeSessionsShared(home: string): Promise<boolean> {
+  const sessions = join(home, "sessions");
+  if (!(await lstat(sessions).catch(() => null))?.isSymbolicLink()) return false;
+  const target = await realpath(join(mainClaudeDir(), "sessions")).catch(() => null);
+  return target !== null && (await realpath(sessions).catch(() => null)) === target;
+}
+
+/**
+ * Shares a Claude home's `sessions` with main's, or gives it its own again. A home keeps its own
+ * unless the user shares it: the sync leaves it as it is either way. Sharing puts a link in place of
+ * the home's folder; what the folder held is copied into main's first, a file of the same name there
+ * staying as it is, and the folder is kept beside it as `sessions.bak-<time>`. Unsharing replaces the
+ * link with an empty folder; what was written through it stays in main's.
+ */
+export function shareClaudeSessions(home: string, share: boolean, wanted?: () => Promise<boolean>): Promise<void> {
+  return withHome(home, async () => {
+    await stillWanted(wanted);
+    const sessions = join(home, "sessions");
+    const main = join(mainClaudeDir(), "sessions");
+    await mkdir(home, { recursive: true, mode: 0o700 });
+    await mkdir(main, { recursive: true, mode: 0o700 });
+    const target = await realpath(main);
+    const current = await lstat(sessions).catch(() => null);
+    const linked = current?.isSymbolicLink() ? (await realpath(sessions).catch(() => null)) === target : false;
+    if (current?.isSymbolicLink() && !linked) throw new Error(`${sessions} is a link to another folder. Remove it by hand first.`);
+    if (share) {
+      if (linked) return;
+      if (current && !current.isDirectory()) throw new Error(`${sessions} isn't a folder. Remove it by hand first.`);
+      if (current && !(await rmdir(sessions).then(() => true, () => false))) {
+        await cp(sessions, target, { recursive: true, verbatimSymlinks: true, preserveTimestamps: true, force: false, errorOnExist: false });
+        await rename(sessions, `${sessions}.bak-${new Date().toISOString().replace(/[:.]/g, "-")}`);
+      }
+      await symlink(target, sessions, process.platform === "win32" ? "junction" : undefined);
+    } else {
+      if (!linked) return;
+      await unlink(sessions);
+      await mkdir(sessions, { mode: 0o700 });
+    }
   });
 }
 

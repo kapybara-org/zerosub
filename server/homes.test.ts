@@ -1,9 +1,10 @@
-import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   accountSettings,
+  claudeSessionsShared,
   codexSessionsShared,
   mergeSettings,
   mergeShared,
@@ -13,6 +14,7 @@ import {
   readAccountApi,
   readAccountProxy,
   removeHome,
+  shareClaudeSessions,
   writeAccountApi,
   writeAccountProxy,
 } from "./homes";
@@ -323,6 +325,122 @@ describe("prepareClaudeHome", () => {
     expect((await lstat(join(home, "plans"))).isSymbolicLink()).toBe(false);
     expect(await readFile(join(home, "plans", "mine.md"), "utf8")).toBe("keep me");
   });
+
+  describe("sessions", () => {
+    const backups = async (home: string) => (await readdir(home)).filter((name) => name.startsWith("sessions.bak-"));
+    function paths(name: string, parent = "homes") {
+      const main = join(root, "main");
+      process.env.CLAUDE_CONFIG_DIR = main;
+      return { main, home: join(root, parent, name) };
+    }
+
+    it("are each account's own unless shared: a sync never links them", async () => {
+      const { main, home } = paths("claude-d");
+      await mkdir(join(main, "sessions"), { recursive: true });
+      await prepareClaudeHome(home, true);
+      expect(await lstat(join(home, "sessions")).catch(() => null)).toBeNull();
+      expect(await claudeSessionsShared(home)).toBe(false);
+      await mkdir(join(home, "sessions"), { recursive: true });
+      await prepareClaudeHome(home, true);
+      expect((await lstat(join(home, "sessions"))).isDirectory()).toBe(true);
+    });
+
+    it("stay shared once shared: a sync keeps the link", async () => {
+      const { main, home } = paths("claude-e");
+      await shareClaudeSessions(home, true);
+      await prepareClaudeHome(home, true);
+      expect(await isLinkTo(join(home, "sessions"), join(main, "sessions"))).toBe(true);
+      expect(await claudeSessionsShared(home)).toBe(true);
+    });
+
+    it("go back to a folder of the account's own, empty, when unshared; main's keep what was written", async () => {
+      const { main, home } = paths("claude-e");
+      await shareClaudeSessions(home, true);
+      await writeFile(join(home, "sessions", "1.json"), "{}");
+      await shareClaudeSessions(home, false);
+      expect((await lstat(join(home, "sessions"))).isDirectory()).toBe(true);
+      expect(await readdir(join(home, "sessions"))).toEqual([]);
+      expect(await readFile(join(main, "sessions", "1.json"), "utf8")).toBe("{}");
+      expect(await claudeSessionsShared(home)).toBe(false);
+      // Again changes nothing.
+      await shareClaudeSessions(home, false);
+      expect((await lstat(join(home, "sessions"))).isDirectory()).toBe(true);
+    });
+
+    it("are shared the same in a home that isn't ZeroSub's own", async () => {
+      const { main, home } = paths("claude-f", "elsewhere");
+      process.env.PASEO_HOME = join(root, "paseo");
+      await mkdir(join(home, "sessions"), { recursive: true });
+      await shareClaudeSessions(home, true);
+      expect(await isLinkTo(join(home, "sessions"), join(main, "sessions"))).toBe(true);
+      expect(await backups(home)).toEqual([]);
+    });
+
+    it("an account had are copied to main when shared, never over main's, and kept as a backup", async () => {
+      const { main, home } = paths("claude-g");
+      await mkdir(join(home, "sessions", "nested"), { recursive: true });
+      await mkdir(join(main, "sessions"), { recursive: true });
+      await writeFile(join(home, "sessions", "2.json"), "running");
+      await writeFile(join(home, "sessions", "2.abc.key"), "secret", { mode: 0o600 });
+      await writeFile(join(home, "sessions", "nested", "note"), "deep");
+      await writeFile(join(home, "sessions", "3.json"), "account");
+      await writeFile(join(main, "sessions", "3.json"), "main");
+      await shareClaudeSessions(home, true);
+
+      expect(await isLinkTo(join(home, "sessions"), join(main, "sessions"))).toBe(true);
+      expect(await readFile(join(main, "sessions", "2.json"), "utf8")).toBe("running");
+      expect(await readFile(join(main, "sessions", "nested", "note"), "utf8")).toBe("deep");
+      expect((await stat(join(main, "sessions", "2.abc.key"))).mode & 0o777).toBe(0o600);
+      expect(await readFile(join(main, "sessions", "3.json"), "utf8")).toBe("main");
+      const [backup, ...others] = await backups(home);
+      expect(others).toEqual([]);
+      expect(await readFile(join(home, backup!, "2.json"), "utf8")).toBe("running");
+      expect(await readFile(join(home, backup!, "3.json"), "utf8")).toBe("account");
+      // Sharing again changes nothing.
+      await shareClaudeSessions(home, true);
+      expect(await backups(home)).toHaveLength(1);
+    });
+
+    it("stay exactly as they are when the copy fails", async () => {
+      const { main, home } = paths("claude-g");
+      await mkdir(join(home, "sessions"), { recursive: true });
+      await mkdir(join(main, "sessions"), { recursive: true });
+      await writeFile(join(home, "sessions", "5.json"), "running");
+      await chmod(join(main, "sessions"), 0o500);
+      try {
+        await expect(shareClaudeSessions(home, true)).rejects.toThrow();
+      } finally {
+        await chmod(join(main, "sessions"), 0o700);
+      }
+      expect((await lstat(join(home, "sessions"))).isDirectory()).toBe(true);
+      expect(await readFile(join(home, "sessions", "5.json"), "utf8")).toBe("running");
+      expect(await backups(home)).toEqual([]);
+    });
+
+    it("that are a link of the user's elsewhere, or a file, are left alone", async () => {
+      const { home } = paths("claude-i");
+      const theirs = join(root, "theirs");
+      await mkdir(theirs, { recursive: true });
+      await mkdir(home, { recursive: true });
+      await symlink(theirs, join(home, "sessions"));
+      await expect(shareClaudeSessions(home, true)).rejects.toThrow(/link to another folder/);
+      await expect(shareClaudeSessions(home, false)).rejects.toThrow(/link to another folder/);
+      expect(await isLinkTo(join(home, "sessions"), theirs)).toBe(true);
+      const other = paths("claude-j").home;
+      await mkdir(other, { recursive: true });
+      await writeFile(join(other, "sessions"), "not a folder");
+      await expect(shareClaudeSessions(other, true)).rejects.toThrow(/isn't a folder/);
+      expect(await readFile(join(other, "sessions"), "utf8")).toBe("not a folder");
+    });
+
+    it("are never written for an account removed meanwhile", async () => {
+      const { home } = paths("claude-k");
+      await expect(shareClaudeSessions(home, true, async () => false)).rejects.toThrow(/no longer exists/);
+      expect(await lstat(home).catch(() => null)).toBeNull();
+    });
+  });
+
+
 });
 
 describe("prepareCodexHome", () => {

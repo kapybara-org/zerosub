@@ -37,6 +37,7 @@ function account(id: string, overrides: Partial<AccountView> = {}): AccountView 
     agentCount: 0,
     home: null,
     externalHome: false,
+    sessionsShared: null,
     proxy: null,
     proxyEditable: false,
     inheritedProxy: null,

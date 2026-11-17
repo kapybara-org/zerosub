@@ -34,6 +34,7 @@ function account(id: string, fields: Partial<AccountView> = {}): AccountView {
     organization: null,
     status: "ready",
     disabled: false,
+    sessionsShared: null,
     isDefault: false,
     limitedUntil: null,
     usage: null,

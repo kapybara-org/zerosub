@@ -32,6 +32,7 @@ function account(status: AccountView["status"], nextAgentUntil: string | null): 
     launcher: null,
     egress: null,
     externalHome: false,
+    sessionsShared: null,
     moving: null,
     pace: null,
     azure: null,
