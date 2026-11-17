@@ -2351,7 +2351,8 @@ export class Service {
     };
     // Paseo keeps a failed create's request under its key: the same request may use that key again,
     // and any other request needs new IDs. The failed one can't land later, so this can't double.
-    const reuse = retry !== undefined && sameCreate(retry.config, config);
+    // A key Paseo answers with outcome unknown stays failed for good, so it is never reused.
+    const reuse = retry !== undefined && !retry.createOutcomeUnknown && sameCreate(retry.config, config);
     const targetId = reuse ? retry.targetId : randomUUID();
     const messageId = reuse ? retry.messageId : `${MESSAGE_PREFIX}${randomUUID()}`;
     const why = (reuse ? retry.config?.why : undefined) ?? (source === "auto" ? "every Claude account reached its usage limit" : "the work was moved to OpenCode");
@@ -2379,10 +2380,12 @@ export class Service {
     config: OpenCodeCreateConfig & { title: string },
     outcomeUnknown: boolean,
   ): Promise<ForkOutcome> {
-    const markFailed = () =>
+    const markFailed = (keyLost = false) =>
       this.store.update((draft) => {
         const pending = draft.opencodeForks[agentId]?.pending;
-        if (pending?.messageId === messageId) pending.createFailed = true;
+        if (pending?.messageId !== messageId) return;
+        pending.createFailed = true;
+        if (keyLost) pending.createOutcomeUnknown = true;
       });
     let sending = false;
     try {

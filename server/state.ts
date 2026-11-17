@@ -108,6 +108,8 @@ export const OpenCodeForkSchema = z.object({
        * reserved request may be sent again.
        */
       createFailed: z.boolean().optional(),
+      /** Paseo answered the create's key with outcome unknown, which it keeps for good: that key can never land. */
+      createOutcomeUnknown: z.boolean().optional(),
     })
     .optional(),
 });

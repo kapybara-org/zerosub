@@ -329,9 +329,10 @@ export async function continueInNewAgent(options: {
   /**
    * Called when Paseo answered the create with a failure, before the error is thrown on: its failed
    * creation result, or its key bound to another request. A client-side error such as "Daemon client
-   * closed" isn't Paseo's answer, so the create may still land.
+   * closed" isn't Paseo's answer, so the create may still land. `outcomeUnknown`: Paseo lost the
+   * create mid-run and answers its key with that failure for good.
    */
-  onCreateRejected?: () => Promise<unknown>;
+  onCreateRejected?: (outcomeUnknown: boolean) => Promise<unknown>;
 }): Promise<Continuation> {
   const { paseo, sourceAgentId, reserved } = options;
   const refreshed = await paseo.agents.ref(sourceAgentId).refresh();
@@ -377,6 +378,7 @@ export async function continueInNewAgent(options: {
         ...(source.features ? { featureValues: Object.fromEntries(source.features.map((feature) => [feature.id, feature.value])) } : {}),
       };
   let failed = false;
+  let outcomeUnknown = false;
   const request = {
     agentId,
     ...(options.agentId ? { idempotencyKey: options.agentId } : {}),
@@ -387,14 +389,21 @@ export async function continueInNewAgent(options: {
       : {}),
     labels: { [CONTINUED_FROM_LABEL]: sourceAgentId, ...(options.parentId ? { [PARENT_LABEL]: options.parentId } : {}) },
     // Paseo's creation snapshots; the client throws a failed result as a plain error.
-    ...(options.onCreateRejected ? { onEvent: (snapshot: { phase: string }) => { failed = snapshot.phase === "failed"; } } : {}),
+    ...(options.onCreateRejected
+      ? {
+          onEvent: (snapshot: { phase: string; outcomeUnknown?: boolean }) => {
+            failed = snapshot.phase === "failed";
+            outcomeUnknown = snapshot.outcomeUnknown === true;
+          },
+        }
+      : {}),
   };
   // A reserved request's location was checked against this snapshot above, so the two agree.
   try {
     if (source.workspaceId) await paseo.workspaces.ref(source.workspaceId).agents.create(request);
     else await paseo.agents.create({ ...request, cwd: source.cwd });
   } catch (error) {
-    if (failed || (error instanceof Error && error.message === "agent_request_key_conflict")) await options.onCreateRejected?.();
+    if (failed || (error instanceof Error && error.message === "agent_request_key_conflict")) await options.onCreateRejected?.(failed && outcomeUnknown);
     throw error;
   }
   return { agentId, title };

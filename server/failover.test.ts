@@ -796,9 +796,13 @@ describe("forking to the other provider", () => {
       createError?: string;
       /** Makes every create throw this client-side error, with no answer from Paseo. */
       clientError?: string;
+      /** The daemon stops mid-create: the client fails with no answer, and Paseo keeps the key's outcome unknown. */
+      lostCreate?: boolean;
     } = {};
     /** Paseo's creation receipts: each idempotency key's first request fingerprint. */
     const receipts = new Map<string, string>();
+    /** Keys whose create Paseo lost mid-run: it answers them with the same failed snapshot for good. */
+    const unknownKeys = new Set<string>();
     const fingerprintOf = (value: unknown) =>
       JSON.stringify(value, (_key, entry) =>
         entry && typeof entry === "object" && !Array.isArray(entry) ? Object.fromEntries(Object.entries(entry).sort(([a], [b]) => a.localeCompare(b))) : entry,
@@ -878,7 +882,10 @@ describe("forking to the other provider", () => {
       workspaces: {
         ref: (workspaceId: string) => ({
           agents: {
-            create: async ({ onEvent, ...request }: (typeof created)[number] & { onEvent?: (snapshot: { phase: string; error: string | null }) => void }) => {
+            create: async ({
+              onEvent,
+              ...request
+            }: (typeof created)[number] & { onEvent?: (snapshot: { phase: string; error: string | null; outcomeUnknown?: boolean }) => void }) => {
               // The client fails on its own, as on "Daemon client closed": Paseo's answer is never seen.
               if (hooks.clientError) throw new Error(hooks.clientError);
               // Paseo ties an idempotency key to its first request, failed or not: the same key with
@@ -890,6 +897,14 @@ describe("forking to the other provider", () => {
                 if (first !== undefined && first !== fingerprint) throw new Error("agent_request_key_conflict");
                 receipts.set(request.idempotencyKey, fingerprint);
                 if (byId.has(request.agentId)) return;
+                if (hooks.lostCreate) {
+                  unknownKeys.add(request.idempotencyKey);
+                  throw new Error("Daemon client closed");
+                }
+                if (unknownKeys.has(request.idempotencyKey)) {
+                  onEvent?.({ phase: "failed", error: "agent_request_outcome_unknown", outcomeUnknown: true });
+                  throw new Error("agent_request_outcome_unknown");
+                }
               }
               if (hooks.createError) {
                 // Paseo answers with its failed creation result, which the client throws as its error.
@@ -1422,6 +1437,24 @@ describe("forking to the other provider", () => {
       await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
       expect(setup.created).toHaveLength(1);
       expect(setup.created[0]).toMatchObject({ agentId: reserved.targetId, config: { provider: "opencode/opencode/glm-5p3-flash" } });
+    });
+
+    it("starts again under new IDs once Paseo answers a lost create's key with outcome unknown", async () => {
+      const setup = await setUpFork("bypassPermissions", [], {}, [], { prefs: PREFS });
+      setup.hooks.lostCreate = true;
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/Daemon client closed/);
+      delete setup.hooks.lostCreate;
+      const reserved = (await setup.store.read()).opencodeForks[AGENT]!.pending!;
+      // The reserved request goes again; Paseo keeps that key failed for good, so it can never land.
+      await expect(setup.service.forkAgent(setup.paseo, AGENT, "opencode")).rejects.toThrow(/agent_request_outcome_unknown/);
+      expect((await setup.store.read()).opencodeForks[AGENT]!.pending).toMatchObject({ targetId: reserved.targetId, createFailed: true });
+      const done = await setup.service.forkAgent(setup.paseo, AGENT, "opencode");
+      expect(done.delivery).toBe("sent");
+      expect(setup.created).toHaveLength(1);
+      expect(setup.created[0]!.agentId).not.toBe(reserved.targetId);
+      expect(setup.created[0]!.idempotencyKey).toBe(setup.created[0]!.agentId);
+      expect(setup.sends).toHaveLength(1);
+      expect(setup.sends[0]!.messageId).not.toBe(reserved.messageId);
     });
 
     it("marks a create failed when Paseo refuses its key for another request", async () => {
