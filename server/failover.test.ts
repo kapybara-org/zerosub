@@ -4548,6 +4548,44 @@ describe("AWS Bedrock as the last resort", () => {
     expect(notes.at(-1)).toMatchObject({ reason: "room", to: "main" });
   });
 
+  it("keeps its agents there when it throttles while every subscription is out, rather than sending them back to a limited one", async () => {
+    const OTHER = "agent-2";
+    const at = new Date().toISOString();
+    const { service, store, reopened, notes, paseo } = await setUp(
+      {
+        ...onlyMain,
+        accounts: [{ ...account(MAIN, "main", "main"), limitedUntil: inFuture(), limitKind: "window", limitedAt: at }, bedrock] as never,
+        sessions: { [AGENT]: { accountId: bedrock.id, family: "claude", openedAt: at }, [OTHER]: { accountId: bedrock.id, family: "claude", openedAt: at } },
+      },
+      window,
+    );
+    service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+    // A second agent, idle on Bedrock, that moving idle agents off a throttled account looks at.
+    const { agent } = await paseo.agents.ref().refresh();
+    const other = { ...agent, id: OTHER };
+    paseo.agents.list = async () => ({ entries: [{ agent }, { agent: other }], pageInfo: { hasMore: false, nextCursor: null } });
+    const { ref } = paseo.agents;
+    paseo.agents.ref = ((id: string) => {
+      const handle = ref();
+      return { ...handle, refresh: async () => ({ agent: id === OTHER ? other : agent }) };
+    }) as typeof ref;
+    const idle = vi.spyOn(service as unknown as { moveIdleAgentsOff: () => Promise<void> }, "moveIdleAgentsOff");
+    await service.onTurnEnded(
+      { agent: { id: AGENT, provider: "claude" }, turnId: null, outcome: { kind: "failed", error: { message: "ThrottlingException: Rate exceeded" } }, timeline: [] } as never,
+      { paseo } as never,
+    );
+    expect(idle).toHaveBeenCalledTimes(1);
+    await idle.mock.results[0]!.value;
+    const state = await store.read();
+    expect(state.accounts.find((entry) => entry.id === bedrock.id)?.limitedUntil).not.toBeNull();
+    expect(reopened).toEqual([]);
+    expect(state.sessions[AGENT]?.accountId).toBe(bedrock.id);
+    expect(state.sessions[OTHER]?.accountId).toBe(bedrock.id);
+    // The throttled agent's timeline says every account is at its limit; the idle one gets nothing.
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toMatchObject({ reason: "exhausted", outcome: "stayed", to: "bedrock" });
+  });
+
   describe("with banked resets used automatically too", () => {
     const redeeming = (outcome: "reset" | "none", calls: Array<string | null>) => ({
       claude: { redeemReset: async (home: string | null) => (calls.push(home), outcome === "reset" ? { outcome, message: "Limits reset.", left: 0 } : { outcome, message: "No banked resets.", left: 0 }) },

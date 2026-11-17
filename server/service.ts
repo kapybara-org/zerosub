@@ -1989,7 +1989,10 @@ export class Service {
    * account as chosen (one picked for it, perhaps while its turn ran, or the default it follows),
    * else the roomiest other one, which it's then pinned to. Undefined when there's none. `paid`: a
    * paid stand-in (Bedrock) may be chosen by itself, as `paidApiFallback` allows; failover asks
-   * without it first, so a banked reset comes before one (see `failover`).
+   * without it first, so a banked reset comes before one (see `failover`). Where it's routed only
+   * counts when that account can take it now: with every subscription out, a throttled stand-in's
+   * route is the limited subscription it stood in for, and its agents stay put rather than go back.
+   * Moving idle agents off an account (`moveIdleAgentsOff`) asks here too.
    */
   private nextAccount(
     state: StoredState,
@@ -1999,7 +2002,7 @@ export class Service {
     paid = this.paidFor(family, agentId),
   ): { account: StoredAccount; pin: boolean } | undefined {
     const routed = this.routeFor(state, agentId, family, exhausted, paid);
-    if (routed && routed.account.id !== exhausted && !routed.skipped) return { account: routed.account, pin: false };
+    if (routed && routed.account.id !== exhausted && !routed.skipped && isUsable(routed.account, Date.now())) return { account: routed.account, pin: false };
     const roomiest = mostAvailable(state, family, (id) => this.usage.get(id), Date.now(), new Set([exhausted]), paid);
     return roomiest && { account: roomiest, pin: true };
   }
