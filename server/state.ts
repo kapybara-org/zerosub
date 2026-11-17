@@ -190,6 +190,11 @@ export const CleanupSchema = z.object({
   /** `removed`: the user removed the account. `unfinished`: a new account whose sign-in hasn't been saved yet. */
   why: z.enum(["removed", "unfinished"]),
   at: z.string(),
+  /**
+   * Only sign it out: the home of a removed account the user asked to sign out, kept outside
+   * ZeroSub's own `homes/`, so its folder is theirs and stays.
+   */
+  signOutOnly: z.boolean().optional(),
 });
 export type Cleanup = z.infer<typeof CleanupSchema>;
 

@@ -117,8 +117,8 @@ export default function contribute(server: PluginServerContext) {
     await service.rename(accountId, label);
     return { ok: true as const };
   });
-  server.handle(removeAccount, async ({ accountId }, { paseo }) => {
-    const { affected, moves } = await service.remove(paseo, accountId);
+  server.handle(removeAccount, async ({ accountId, signOut }, { paseo }) => {
+    const { affected, moves } = await service.remove(paseo, accountId, signOut === true);
     return { ok: true as const, movedAgents: affected, moves };
   });
   server.handle(setNextAgentAccount, ({ accountId, enabled }) => service.setNextAgent(accountId, enabled));

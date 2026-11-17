@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { lstat, readdir, readFile } from "node:fs/promises";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type {
   PluginBeforeRequests,
   PluginHookContext,
@@ -94,7 +94,7 @@ import { Mutex } from "./json-file";
 import { detectAzureLimit, detectAzureSignOut, detectBedrockAutoModeRefusal, detectBedrockLimit, detectBedrockModelUnavailable, detectBedrockRefusal, turnRows } from "./limits";
 import { canSignInWithBrowser } from "./machine";
 import { equivalentMode, withinMode } from "./modes";
-import { homesDir, inHomesDir, isOwnHome, shownPath } from "./paths";
+import { homesDir, inHomesDir, isOwnHome, reachesCliHome, shownPath } from "./paths";
 import { chooseHomesDir, chooseImportedHome, chooseImportedPiHome, homesDirFor, PLACED, placeFor, type PlacedFamily } from "./placement";
 import { maskProxy, normalizeProxy } from "./proxy";
 import { Reopener, hostCanReload } from "./reopen";
@@ -856,7 +856,9 @@ export class Service {
     for (const home of this.creatingHomes) busy.add(home);
     for (const [home, entry] of Object.entries(state.cleanup)) {
       if (busy.has(home)) continue;
-      if (!isAccountHome(home, entry.family)) {
+      // A removed account's folder of the user's is only signed out, and never a CLI's own login.
+      const signOutOnly = entry.signOutOnly === true && entry.why === "removed" && isAbsolute(home) && !(await reachesCliHome(home));
+      if (!signOutOnly && !isAccountHome(home, entry.family)) {
         // Only a folder ZeroSub made in homes/ is ever signed out or deleted. An entry naming anything
         // else (a hand edit, say) could otherwise sign out the CLI's own login, keychain entry and all.
         await this.store.update((draft) => {
@@ -900,7 +902,9 @@ export class Service {
       (entry.family === "claude" && isBedrockHome(home)) ||
       (await this.adapters[entry.family].api?.(home).catch(() => null)) != null;
     const earlier = entry.why === "unfinished" && !apiHome && !this.endedHere(home);
-    let deleteFolder = true;
+    // The user's folder stays (see `remove`); only its sign-in goes.
+    const keep = entry.signOutOnly === true;
+    let deleteFolder = !keep;
     let outcome: string;
     try {
       if (earlier) {
@@ -911,7 +915,14 @@ export class Service {
           : `deleted ${home}, left by a sign-in that never finished`;
       } else {
         await this.adapters[entry.family].logout(home);
-        outcome = entry.why === "unfinished" && apiHome ? `deleted ${home}, left by an API account that was never saved` : `signed out and deleted ${home}`;
+        // The folder stays, so a sign-out that didn't take would leave the account working: one that
+        // still reads as signed in (or can't be read) fails like a sign-out that threw, and is retried.
+        if (keep && (await this.adapters[entry.family].identity(home)).signedIn) throw new Error(`${home} is still signed in after signing out`);
+        outcome = keep
+          ? `signed out ${home}; its folder is the user's, so it stays`
+          : entry.why === "unfinished" && apiHome
+            ? `deleted ${home}, left by an API account that was never saved`
+            : `signed out and deleted ${home}`;
       }
     } catch (error) {
       const failures = (this.cleanupFailures.get(home) ?? 0) + 1;
@@ -922,7 +933,9 @@ export class Service {
       if (earlier) deleteFolder = false;
       outcome = earlier
         ? `gave up checking whether ${home} is signed in, and left it alone`
-        : `gave up signing out ${home}, so its sign-in may still be valid; deleted it anyway`;
+        : keep
+          ? `gave up signing out ${home}, so its sign-in may still be valid; its folder stays`
+          : `gave up signing out ${home}, so its sign-in may still be valid; deleted it anyway`;
     }
     this.cleanupFailures.delete(home);
     // Checked again just before the folder goes: signing out can take a while too.
@@ -4497,7 +4510,7 @@ export class Service {
   }
 
   /** Removes an account. Moving its agents can outlast the RPC: see `answerBy`. */
-  async remove(paseo: PaseoApi, accountId: string): Promise<{ affected: number; moves: ReopenSummary }> {
+  async remove(paseo: PaseoApi, accountId: string, signOut = false): Promise<{ affected: number; moves: ReopenSummary }> {
     const replyBy = Date.now() + REPLY_WAIT_MS;
     this.attach(paseo);
     const state = await this.store.read();
@@ -4530,11 +4543,15 @@ export class Service {
       .map(([agentId]) => agentId);
     // A home kept outside ZeroSub's own `homes/` (where added Claude and Pi accounts are kept) is the
     // user's: removing its account only takes it out of ZeroSub, and its folder, sign-in or key and
-    // script stay.
+    // script stay. Asked to, it's signed out too, once nothing runs on it. A Pi or Claude API account's
+    // sign-in is the key in its folder, which stays, so there's nothing to sign out.
     const kept = account.home !== null && !(await isOwnHome(account.home));
+    const signsOut = kept && signOut && account.family !== "pi" && account.auth !== "api" && !(await reachesCliHome(account.home!));
     await this.store.update((draft) => {
       draft.accounts = draft.accounts.filter((entry) => entry.id !== accountId);
-      if (account.home && !kept) draft.cleanup[account.home] = { family: account.family, accountId, why: "removed", at: new Date().toISOString() };
+      if (account.home && (!kept || signsOut)) {
+        draft.cleanup[account.home] = { family: account.family, accountId, why: "removed", at: new Date().toISOString(), ...(signsOut ? { signOutOnly: true } : {}) };
+      }
       for (const [agentId, binding] of Object.entries(draft.bindings)) {
         if (binding.accountId === accountId) delete draft.bindings[agentId];
       }
@@ -4548,7 +4565,10 @@ export class Service {
     this.setUsage(accountId, null);
     this.egress.delete(accountId);
     if (isLastResort(account)) await this.apiUsage.forget(accountId).catch((error: unknown) => log(`could not forget ${account.label}'s token counts`, error));
-    if (account.home && kept) console.log(`[ZeroSub] removed ${account.label} from ZeroSub only: ${account.home} isn't a folder ZeroSub made in ${homesDir()}, so its files and script stay`);
+    if (account.home && kept) {
+      const what = signsOut ? "it's signed out once nothing runs on it, and its files and script stay" : "its files and script stay";
+      console.log(`[ZeroSub] removed ${account.label} from ZeroSub only: ${account.home} isn't a folder ZeroSub made in ${homesDir()}; ${what}`);
+    }
     // Its script is released rather than deleted when its home stays (see writeLaunchers).
     await this.refreshLaunchers(account.home && !kept ? [account.home] : []).catch((error: unknown) => log("could not write the shell launchers", error));
     // Idle agents move now and busy ones after their turn. The home is signed out and deleted by the

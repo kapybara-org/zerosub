@@ -55,12 +55,29 @@ function conversationsMove(family: AccountView["family"]): boolean {
   return family === "claude" || family === "pi";
 }
 
-/** What the Remove dialog says, and its button's tooltip. */
-export function removeText(account: Pick<AccountView, "family" | "auth" | "home" | "externalHome" | "launcher" | "azure" | "bedrock">): { body: string; tooltip: string } {
+/**
+ * Whether the Remove dialog asks about signing the account out: its folder is outside ZeroSub's own,
+ * so it stays, signed in unless the user says otherwise. A Pi account's key is in that folder.
+ */
+export function offersSignOut(account: Pick<AccountView, "family" | "auth" | "externalHome">): boolean {
+  return account.externalHome && account.family !== "pi" && account.auth !== "api";
+}
+
+/** What the Remove dialog says, and its button's tooltip; `signOut`, when it's asked to sign the account out too. */
+export function removeText(
+  account: Pick<AccountView, "family" | "auth" | "home" | "externalHome" | "launcher" | "azure" | "bedrock">,
+  signOut = false,
+): { body: string; tooltip: string } {
   const moves = conversationsMove(account.family);
   const keyed = account.family === "pi" || account.auth === "api";
-  const what = account.externalHome
-    ? `This only removes the account from ZeroSub. Its folder${account.home ? ` (${account.home})` : ""} is outside ZeroSub's own, so its sign-in${
+  const folder = `Its folder${account.home ? ` (${account.home})` : ""} is outside ZeroSub's own`;
+  const signingOut = signOut && offersSignOut(account);
+  const what = signingOut
+    ? `This removes the account from ZeroSub and signs it out on this machine once no agent runs on it. ${folder}, so its files${
+        account.launcher ? ` and its terminal script ${account.launcher}` : ""
+      } stay.`
+    : account.externalHome
+    ? `This only removes the account from ZeroSub. ${folder}, so its sign-in${
         account.launcher ? `, its files and its terminal script ${account.launcher}` : " and its files"
       } stay as they are, and you can add it back by hand.`
     : account.bedrock
@@ -73,13 +90,15 @@ export function removeText(account: Pick<AccountView, "family" | "auth" | "home"
   const agents = moves
     ? "Agents using it move to the default account; their conversations are kept."
     : `New agents use the default account. Existing ${FAMILY_LABEL[account.family]} conversations on it can't move, so start new agents for them.`;
-  const action = account.externalHome
-    ? "Remove it from ZeroSub only"
-    : account.bedrock
-      ? "Delete its AWS settings"
-      : keyed
-        ? "Delete its saved key"
-        : "Sign it out and delete its saved login";
+  const action = signingOut
+    ? "Remove it from ZeroSub and sign it out"
+    : account.externalHome
+      ? "Remove it from ZeroSub only"
+      : account.bedrock
+        ? "Delete its AWS settings"
+        : keyed
+          ? "Delete its saved key"
+          : "Sign it out and delete its saved login";
   return { body: `${what} ${agents}`, tooltip: `${action}; ${moves ? "its agents move to the default" : "new agents use the default"}` };
 }
 

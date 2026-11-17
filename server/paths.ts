@@ -1,4 +1,4 @@
-import { lstat } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -100,18 +100,46 @@ export function inHomesDir(home: string): boolean {
 }
 
 /**
+ * Whether `home` is a CLI's own home, or holds what a Cursor account's home mirrors (which could be
+ * pointed inside one): never signed out or deleted for an added account.
+ */
+export function holdsCliHome(home: string): boolean {
+  const path = resolve(home);
+  if (path === mainClaudeDir() || path === mainCodexHome() || path === mainPiDir() || path === mainGrokHome()) return true;
+  for (const main of [mainCursorConfigDir(), mainConfigHome()]) {
+    const inside = relative(path, main);
+    if (inside === "" || (!inside.startsWith("..") && !isAbsolute(inside))) return true;
+  }
+  return false;
+}
+
+/**
+ * `holdsCliHome`, also through links: `home`, or what it links to, is a CLI's own home or holds what a
+ * Cursor home mirrors, compared by real path (by the path itself where it doesn't exist). For signing
+ * out a folder that isn't ZeroSub's own, which may be a link to the CLI's.
+ */
+export async function reachesCliHome(home: string): Promise<boolean> {
+  const real = (path: string) => realpath(path).catch(() => resolve(path));
+  const path = await real(home);
+  if (holdsCliHome(home) || holdsCliHome(path)) return true;
+  for (const main of [mainClaudeDir(), mainCodexHome(), mainPiDir(), mainGrokHome()]) {
+    if ((await real(main)) === path) return true;
+  }
+  for (const main of [mainCursorConfigDir(), mainConfigHome()]) {
+    const inside = relative(path, await real(main));
+    if (inside === "" || (!inside.startsWith("..") && !isAbsolute(inside))) return true;
+  }
+  return false;
+}
+
+/**
  * Whether ZeroSub may delete `home`: a folder of its own directly in `homesDir()`, not a link to one
  * elsewhere and never a CLI's own home. Every other home (where added Pi accounts are kept, say)
  * belongs to the user: removing its account only unregisters it.
  */
 export async function isOwnHome(home: string): Promise<boolean> {
   const path = resolve(home);
-  if (!inHomesDir(path) || path === mainClaudeDir() || path === mainCodexHome() || path === mainPiDir() || path === mainGrokHome()) return false;
-  // What a Cursor account's home mirrors could be pointed inside one: never delete a home holding it.
-  for (const main of [mainCursorConfigDir(), mainConfigHome()]) {
-    const inside = relative(path, main);
-    if (inside === "" || (!inside.startsWith("..") && !isAbsolute(inside))) return false;
-  }
+  if (!inHomesDir(path) || holdsCliHome(path)) return false;
   const entry = await lstat(path).catch(() => null);
   return !entry?.isSymbolicLink();
 }

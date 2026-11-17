@@ -531,6 +531,28 @@ describe("the accounts screen", () => {
     expect(button(card("work"), "Use the default sessions folder")).toBeUndefined();
   });
 
+  it("asks whether to sign out an account whose folder stays, off each time the dialog opens", async () => {
+    const { card, store } = setUp({ accounts: [account("work", { isDefault: true }), account("home", { externalHome: true }), account("own")] });
+    store.rpc.mockResolvedValue({ ok: true, movedAgents: 0 });
+    const signOutSwitch = (render: () => Element) => [...elements(render())].find((element) => element.type === "SettingsSwitch" && element.props.label === "Also sign it out");
+    const removeButton = (render: () => Element) => find(render(), (element) => element.type === "Button" && element.props.label === "Remove");
+    const render = card("home");
+    (cardButton(render, "Remove")!.props.onPress as () => void)();
+    expect(signOutSwitch(render)!.props.value).toBe(false);
+    (signOutSwitch(render)!.props.onValueChange as (value: boolean) => void)(true);
+    expect(removeButton(render).props.tooltip).toContain("sign it out");
+    await (removeButton(render).props.onPress as () => Promise<void>)();
+    expect(store.rpc).toHaveBeenLastCalledWith(expect.anything(), { accountId: "home", signOut: true });
+    // Opened again, it starts off.
+    (cardButton(render, "Remove")!.props.onPress as () => void)();
+    expect(signOutSwitch(render)!.props.value).toBe(false);
+    // A folder ZeroSub deletes is always signed out: nothing to ask.
+    const own = card("own");
+    expect(signOutSwitch(own)).toBeUndefined();
+    await (removeButton(own).props.onPress as () => Promise<void>)();
+    expect(store.rpc).toHaveBeenLastCalledWith(expect.anything(), { accountId: "own" });
+  });
+
   it("says a removal Paseo stopped waiting for goes on, rather than that it failed", async () => {
     const { card, store } = setUp();
     store.rpc.mockRejectedValue(new Error("Plugin RPC timed out after 30000ms"));
