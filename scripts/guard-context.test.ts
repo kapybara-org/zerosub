@@ -30,7 +30,9 @@ afterEach(async () => {
 });
 
 describe("guard:context", () => {
-  it.each([".context/x", "client/.context/x", "a/b/.context/é", "client/.context/a\nb"])("rejects a staged %j", async (path) => {
+  // Windows filenames can't hold a newline.
+  const staged = [".context/x", "client/.context/x", "a/b/.context/é", ...(process.platform === "win32" ? [] : ["client/.context/a\nb"])];
+  it.each(staged)("rejects a staged %j", async (path) => {
     await put(path);
     git("add", "-f", "--", path);
     expect(guard()).toBe(1);
