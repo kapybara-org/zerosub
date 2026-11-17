@@ -86,7 +86,7 @@ async function menu(route: Partial<AgentRoute>, family: "claude" | "codex" = "co
 }
 
 /** The buttons added for one Claude agent on `work`, with `home` to move to, as the app and daemon are. */
-async function buttons(options: { inComposer: boolean; agentMetadata?: boolean; route?: Partial<AgentRoute> | null; work?: Partial<AccountView> }): Promise<PluginButton[]> {
+async function buttons(options: { inComposer: boolean; agentMetadata?: boolean; route?: Partial<AgentRoute> | null; work?: Partial<AccountView>; openCodeAvailable?: boolean }): Promise<PluginButton[]> {
   const claude = (id: string, isDefault: boolean, fields: Partial<AccountView> = {}): AccountView => ({ ...account(id, isDefault), family: "claude", ...fields });
   const route: AgentRoute = { agentId: "agent-1", family: "claude", accountId: "work", pinned: false, pendingAccountId: null, waiting: null, movable: true, ...options.route };
   const state: StateView = {
@@ -101,6 +101,7 @@ async function buttons(options: { inComposer: boolean; agentMetadata?: boolean; 
     piHomes: null,
     claudeHomes: null,
     showComposerPill: true,
+    openCodeAvailable: options.openCodeAvailable ?? false,
     autoSwitch: true,
     agentMetadata: options.agentMetadata,
     warnings: [],
@@ -156,6 +157,18 @@ describe("the account button, where the composer has the Account control", () =>
     expect(behavior.kind === "menu" ? behavior.items.map((entry) => entry.id) : []).toContain("use-reset");
     // At its limit with nothing to offer, the control says so and the button has nothing to add.
     expect(await buttons({ inComposer: true, agentMetadata: true, route: { inComposer: true }, work: { status: "limited" } })).toHaveLength(0);
+  });
+});
+
+describe("the account button, where the composer has the Account control and the host has OpenCode", () => {
+  it("stays for a Claude agent, to keep Continue on OpenCode within reach", async () => {
+    // The entry opens a confirmation, which the control can't, so it lives on the button alone.
+    const kept = await buttons({ inComposer: true, agentMetadata: true, route: { inComposer: true }, openCodeAvailable: true });
+    expect(kept).toHaveLength(1);
+    const behavior = kept[0]!.behavior;
+    expect(behavior.kind === "menu" ? behavior.items.map((entry) => entry.id) : []).toContain("fork-opencode");
+    // Also for an agent the daemon hasn't listed yet.
+    expect(await buttons({ inComposer: true, agentMetadata: true, route: null, openCodeAvailable: true })).toHaveLength(1);
   });
 });
 

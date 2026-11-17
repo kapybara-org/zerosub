@@ -51,6 +51,7 @@ function account(id: string, fields: Partial<AccountView> = {}): AccountView {
     egress: null,
     externalHome: false,
     moving: null,
+    azure: null,
     ...fields,
   };
 }
@@ -77,7 +78,9 @@ function view(accounts: AccountView[], fields: Partial<StateView> = {}): StateVi
     piHomes: null,
     claudeHomes: null,
     showComposerPill: true,
+    openCodeAvailable: false,
     autoSwitch: true,
+    agentMetadata: true,
     warnings: [],
     ...fields,
   };
@@ -110,6 +113,12 @@ describe("the accounts a composer without an agent offers", () => {
     for (const chosen of ["gone", "chatgpt", "out", "main", "", 7, null, { id: "work" }]) {
       expect(accountChoices(state, "claude", chosen)?.value, String(chosen)).toBe(FOLLOW);
     }
+  });
+
+  it("offers nothing where the host's Paseo keeps no agent metadata to carry the choice in", () => {
+    // An app from 0.16 with a host before it, or a ZeroSub on the host from before it said.
+    expect(accountChoices(view([main, work], { agentMetadata: false }), "claude", undefined)).toBeNull();
+    expect(accountChoices(view([main, work], { agentMetadata: undefined }), "claude", undefined)).toBeNull();
   });
 
   it("offers nothing without a second account, with the account button off, or for a provider ZeroSub doesn't route", () => {
@@ -246,11 +255,11 @@ describe("the account control for an agent that doesn't exist yet", () => {
     expect(setMetadata).toHaveBeenLastCalledWith({ [ACCOUNT_METADATA_KEY]: null });
   });
 
-  it("hands Paseo a refusal to show, as when the host has no metadata", async () => {
-    const { render, setMetadata } = setUp(view([main, work]), { context: "draft" });
-    setMetadata.mockRejectedValueOnce(new Error("Update the host to use metadata."));
-    const change = render()!.props.onValueChange as (event: { value: string }) => Promise<void>;
-    await expect(change({ value: "work" })).rejects.toThrow("Update the host to use metadata.");
+  it("doesn't show on a host without metadata support, where choosing would fail the agent's creation", () => {
+    for (const context of ["draft", "new-workspace"]) {
+      expect(setUp(view([main, work], { agentMetadata: false }), { context }).render(), context).toBeNull();
+      expect(setUp(view([main, work], { agentMetadata: undefined }), { context }).render(), context).toBeNull();
+    }
   });
 });
 
