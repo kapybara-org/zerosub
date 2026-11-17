@@ -142,6 +142,11 @@ const ALIGN_RETRY_MS = 30 * 60_000;
  */
 const TURN_SETTLE_MS = 60_000;
 /**
+ * An agent idle this long has no warm prompt cache on any account (Anthropic keeps one 5 minutes,
+ * or an hour), so moving it costs its next turn nothing extra. A pacing move only takes these.
+ */
+const CACHE_COLD_MS = 60 * 60_000;
+/**
  * How long an RPC that moves agents or spends a reset waits for that before answering, since Paseo
  * gives up on an RPC after 30 s. The work carries on, and timeline notes and the state say how it went.
  */
@@ -213,6 +218,8 @@ interface AgentInfo {
   continuedFrom: string | null;
   /** When the user last sent it a message (ms), or 0. */
   lastMessageAt: number;
+  /** When Paseo last changed the agent (ms), or 0. */
+  updatedAt: number;
   /** Shells and monitors it left running after its turn (Paseo 0.16+; 0 before). A reload cancels them. */
   backgroundWork: number;
   /** Its metadata holds its own ID (see `AGENT_METADATA_KEY`). Null when Paseo sends no metadata (before 0.16). */
@@ -1929,18 +1936,22 @@ export class Service {
     });
   }
 
-  /** Idle agents still on an exhausted account would fail on their next turn; move them now. */
+  /**
+   * Idle agents still on an exhausted account would fail on their next turn; move them now.
+   * With `pacing`, the account still works but is projected past the 5-hour gate. Only agents whose
+   * prompt cache is cold move, and only to an account that stays under the gate with them.
+   */
   private async moveIdleAgentsOff(
     paseo: PaseoApi,
     accountId: string,
     family: Family,
     except: string,
-    reason: "limit" | "signed_out",
+    reason: "limit" | "signed_out" | "pacing",
   ): Promise<void> {
     const state = await this.store.read();
     const from = findAccount(state, accountId);
     // One a reset refilled just before this turn's limit came in still has room (see `failover`).
-    if (!from || isUsable(from, Date.now())) return;
+    if (!from || (reason === "pacing" ? !this.paced(from, Date.now()) : isUsable(from, Date.now()))) return;
     const families = await this.families.resolve(paseo);
     const candidates = (await this.cachedAgents(paseo))
       .filter(
@@ -1948,14 +1959,22 @@ export class Service {
           agent.id !== except &&
           !agent.archived &&
           families[agent.provider] === family &&
-          this.runningOn(state, agent.id, family) === accountId,
+          this.runningOn(state, agent.id, family) === accountId &&
+          !(reason === "pacing" && state.bindings[agent.id]?.source === "user"),
       )
       .map((agent) => agent.id);
     for (const agentId of candidates) {
       if (!this.switchGuard.allows(agentId, Date.now())) continue;
       const info = await agentInfo(paseo, agentId);
       // One the user is using right now is left for alignment to move once it's quiet.
-      if (!info || info.archived || !settled(info.status) || busy(info) || hasBackgroundWork(info) || this.recentlyActive(info, Date.now())) continue;
+      if (
+        !info ||
+        info.archived ||
+        !settled(info.status) ||
+        busy(info) ||
+        hasBackgroundWork(info) ||
+        (reason === "pacing" ? !this.cacheCold(info, Date.now()) : this.recentlyActive(info, Date.now()))
+      ) continue;
       // Left for its own failover, or alone when that can't be told.
       if ((await this.lastTurnHitLimit(paseo, agentId, family)) !== false) continue;
       const release = this.tryClaim(agentId);
@@ -1964,9 +1983,20 @@ export class Service {
         const now = Date.now();
         const latest = await this.store.read();
         if (this.runningOn(latest, agentId, family) !== accountId) continue;
-        const move = this.nextAccount(latest, agentId, family, accountId);
+        let move: { account: StoredAccount; pin: boolean } | undefined;
+        if (reason === "pacing") {
+          // Turning either preference off stops a pass that's already running.
+          if (!this.prefs.balanceNewAgents || !this.prefs.autoSwitch || !this.paced(findAccount(latest, accountId), now)) return;
+          const next = mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([accountId]), false, this.pacing(now));
+          if (!next || paceScore(this.usage.get(next.id), this.pendingOn(next.id, now) + 1, now).gated) return;
+          move = { account: next, pin: true };
+          this.logPlacement(latest, family, agentId, next, now, "pacing move");
+        } else {
+          move = this.nextAccount(latest, agentId, family, accountId);
+        }
         if (!move) return;
         const next = move.account;
+        this.notePlacement(next.id, now);
         if (move.pin) await this.pin(agentId, next.id, latest.bindings[agentId]);
         this.switchGuard.note(agentId, now);
         const row: SwitchRow = {
@@ -1974,7 +2004,7 @@ export class Service {
           from: from?.label ?? null,
           to: next.label,
           reason,
-          resetsAt: findAccount(latest, accountId)?.limitedUntil ?? null,
+          resetsAt: reason === "pacing" ? null : (findAccount(latest, accountId)?.limitedUntil ?? null),
           continued: false,
           continuedIn: null,
           toFamily: null,
@@ -2978,6 +3008,38 @@ export class Service {
     return now - Math.max(this.turnAt.get(agent.id) ?? 0, agent.lastMessageAt) < TURN_SETTLE_MS;
   }
 
+  /** Nothing touched the agent for `CACHE_COLD_MS`: no turn, message or other change. */
+  private cacheCold(agent: AgentInfo, now: number): boolean {
+    return now - Math.max(this.turnAt.get(agent.id) ?? 0, agent.lastMessageAt, agent.updatedAt) >= CACHE_COLD_MS;
+  }
+
+  /** The account can still take agents but is projected past the 5-hour gate. */
+  private paced(account: StoredAccount | undefined, now: number): account is StoredAccount {
+    return !!account && canStandIn(account, now) &&
+      paceScore(this.usage.get(account.id), this.pendingOn(account.id, now), now).gated;
+  }
+
+  /** Accounts a pacing pass is moving agents off now. */
+  private readonly relieving = new Set<string>();
+
+  /**
+   * After a live reading: with spreading and automatic switching on, moves cold idle agents off a
+   * portable account projected past the 5-hour gate (see `moveIdleAgentsOff`).
+   */
+  private relieveIfPaced(accountId: string): void {
+    const paseo = this.paseo;
+    if (!paseo || !this.prefs.balanceNewAgents || !this.prefs.autoSwitch || this.relieving.has(accountId)) return;
+    this.relieving.add(accountId);
+    void (async () => {
+      const state = await this.store.read();
+      const from = findAccount(state, accountId);
+      if (!this.paced(from, Date.now()) || !this.adapters[from.family].portable) return;
+      await this.moveIdleAgentsOff(paseo, accountId, from.family, "", "pacing");
+    })()
+      .catch((error: unknown) => log("moving idle agents off a busy account failed", error))
+      .finally(() => this.relieving.delete(accountId));
+  }
+
   /**
    * Reopens an idle agent now, or defers a busy one until its turn ends. `settle` waits a moment for
    * an agent whose turn just ended to report idle, since nothing else would reopen it later. A reload
@@ -3381,6 +3443,7 @@ export class Service {
           target.limitKind = null;
         });
       }
+      this.relieveIfPaced(accountId);
     })().finally(() => this.usageInFlight.delete(accountId));
     this.usageInFlight.set(accountId, task);
     return task;
@@ -5164,6 +5227,7 @@ function toAgentInfo(agent: AgentSnapshot): AgentInfo {
     title: agent.title ?? null,
     continuedFrom: agent.labels?.[CONTINUED_FROM_LABEL] ?? null,
     lastMessageAt: Date.parse(agent.lastUserMessageAt ?? "") || 0,
+    updatedAt: Date.parse(agent.updatedAt) || 0,
     backgroundWork: (agent as { backgroundWork?: { count?: number } }).backgroundWork?.count ?? 0,
     named: metadata ? metadata[AGENT_METADATA_KEY] === agent.id : null,
   };
