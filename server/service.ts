@@ -111,6 +111,8 @@ const CLEANUP_TRIES = 3;
 /** After a reset, limit notices from turns that were already running are stale. */
 const RESET_GRACE_MS = 5 * 60_000;
 const AGENT_LIST_MS = 3_000;
+/** Paseo answers an availability read by probing every provider, so the state view reuses one for this long. */
+const OPENCODE_AVAILABLE_MS = 60_000;
 /** How long a default change waits for sessions already being routed to record their account. */
 const ROUTING_WAIT_MS = 5_000;
 /** How long the end of a turn waits for Paseo to page the agent's timeline. The SDK itself waits 60 s. */
@@ -466,6 +468,7 @@ export class Service {
   private readonly redeeming = new Set<string>();
   private readonly browserSignIn = canSignInWithBrowser();
   private agentCache: { at: number; agents: Promise<AgentInfo[]> } | null = null;
+  private openCodeCache: { at: number; available: boolean } | null = null;
   private lastPrune = 0;
   private cleaning: Promise<void> | null = null;
   /** Failed cleanup attempts this run, by home. */
@@ -3364,12 +3367,20 @@ export class Service {
     };
   }
 
-  /** Whether Paseo lists OpenCode as available. A failed read must not break the whole state view. */
+  /**
+   * Whether Paseo lists OpenCode as available, read at most once a minute. A failed read keeps the last good
+   * answer and must not break the whole state view. Only the menu entry uses this; the fork checks again itself.
+   */
   private async openCodeAvailable(paseo: PaseoApi): Promise<boolean> {
+    if (this.openCodeCache && Date.now() - this.openCodeCache.at < OPENCODE_AVAILABLE_MS) return this.openCodeCache.available;
     try {
-      return Boolean((await paseo.providers.listAvailable()).providers?.some((entry) => entry.provider === OPENCODE_PROVIDER && entry.available));
+      const result = await paseo.providers.listAvailable();
+      if (result.error) throw new Error(result.error);
+      const available = Boolean(result.providers?.some((entry) => entry.provider === OPENCODE_PROVIDER && entry.available));
+      this.openCodeCache = { at: Date.now(), available };
+      return available;
     } catch {
-      return false;
+      return this.openCodeCache?.available ?? false;
     }
   }
 

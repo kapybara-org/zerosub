@@ -2435,6 +2435,37 @@ describe("forking to the other provider", () => {
       const { service, paseo } = await setUpFork("default", [], {}, [], { opencodeAvailable: present });
       expect((await service.view(paseo)).openCodeAvailable).toBe(present);
     });
+
+    it("reads availability once a minute and keeps the last good answer through a failed read", async () => {
+      const { service, paseo } = await setUpFork("default");
+      const answers: Array<() => Promise<unknown>> = [
+        async () => ({ providers: [{ provider: "opencode", available: true }] }),
+        async () => {
+          throw new Error("daemon unreachable");
+        },
+        async () => ({ providers: [], error: "probe failed" }),
+        async () => ({ providers: [{ provider: "opencode", available: false }] }),
+      ];
+      const listAvailable = vi.fn(() => answers.shift()!());
+      (paseo as { providers: { listAvailable: unknown } }).providers.listAvailable = listAvailable;
+      const start = Date.now();
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        vi.setSystemTime(start);
+        expect((await service.view(paseo)).openCodeAvailable).toBe(true);
+        vi.setSystemTime(start + 59_000);
+        expect((await service.view(paseo)).openCodeAvailable).toBe(true);
+        expect(listAvailable).toHaveBeenCalledTimes(1);
+        // Past a minute it reads again; a thrown read or an error answer keeps the last good value.
+        vi.setSystemTime(start + 61_000);
+        expect((await service.view(paseo)).openCodeAvailable).toBe(true);
+        expect((await service.view(paseo)).openCodeAvailable).toBe(true);
+        expect((await service.view(paseo)).openCodeAvailable).toBe(false);
+        expect(listAvailable).toHaveBeenCalledTimes(4);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   describe("a failed catalog read", () => {
