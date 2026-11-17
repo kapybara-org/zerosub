@@ -157,6 +157,11 @@ export interface RouteInput {
    */
   current?: string;
   /**
+   * The account named for this agent when it was created (`ACCOUNT_METADATA_KEY` in its metadata):
+   * chosen in its composer before it existed. Only a new agent without an account takes it.
+   */
+  requested?: string;
+  /**
    * Whether this session may take the one-time "next new agent" pick: one the user's own agents
    * open, not Paseo's helpers (see `takesNextPick` in service.ts). Only a new agent takes it.
    */
@@ -177,7 +182,8 @@ export interface RouteDecision {
 }
 
 /**
- * Which account a session opens on: the agent's own binding, else (for balanced new agents) the
+ * Which account a session opens on: the agent's own binding, else (for a new agent) the account
+ * named for it or the one-time pick, else (for balanced new agents) the
  * roomiest account, else the default (the CLI login for an existing Codex thread ZeroSub never
  * routed). An exhausted or signed-out choice is swapped for the roomiest usable account when
  * automatic switching is on — for new agents always, and for existing ones only when their
@@ -196,13 +202,23 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   let account = bound && bound.family === input.family ? bound : undefined;
   let bind: Binding | null = null;
 
+  // The account named for this very agent outranks the pick, which waits for an agent that names
+  // none. One that can't take the agent is passed over, and the agent routes as usual.
+  const takes = (candidate: StoredAccount | undefined): candidate is StoredAccount =>
+    candidate?.family === input.family && candidate.signedIn && !candidate.disabled && !(input.autoSwitch && isLimited(candidate, input.now));
+  const requested = !account && fresh ? findAccount(state, input.requested) : undefined;
+  if (takes(requested)) {
+    account = requested;
+    bind = { accountId: requested.id, source: "user", at };
+  }
+
   // A pick whose account can't take the agent (at its limit, signed out, disabled, removed) is spent
   // all the same, and the agent routes as usual: kept, it would send every new agent to whichever
   // account stands in for its own until it expires.
   const nextPick = !account && fresh && input.allowNextPick ? (state.nextAgent?.[input.family] ?? undefined) : undefined;
   if (nextPick && Date.parse(nextPick.until) > input.now) {
     const picked = findAccount(state, nextPick.accountId);
-    if (picked?.family === input.family && picked.signedIn && !picked.disabled && !(input.autoSwitch && isLimited(picked, input.now))) {
+    if (takes(picked)) {
       account = picked;
       bind = { accountId: picked.id, source: "user", at };
     }

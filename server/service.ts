@@ -7,6 +7,7 @@ import type {
   PluginSessionOpenRequest,
 } from "@getpaseo/plugin/server";
 import {
+  ACCOUNT_METADATA_KEY,
   FAMILIES,
   FAMILY_LABEL,
   HAND_OFF,
@@ -298,6 +299,16 @@ function dropNextPick(state: StoredState, account: StoredAccount): void {
 function takesNextPick(request: PluginSessionOpenRequest): boolean {
   const { background } = request as { background?: unknown };
   return request.purpose === "interactive" && Boolean(request.workspaceId) && (background === undefined || background === false);
+}
+
+/**
+ * The account named in a new agent's metadata: the one its composer's account control was set to
+ * before the agent existed. A Paseo before 0.16 sends no metadata.
+ */
+function requestedAccount(request: PluginSessionOpenRequest): string | undefined {
+  const { metadata } = request as { metadata?: Readonly<Record<string, unknown>> | null };
+  const value = metadata?.[ACCOUNT_METADATA_KEY];
+  return typeof value === "string" && value ? value : undefined;
 }
 
 export class Service {
@@ -916,6 +927,7 @@ export class Service {
       usageOf: (id) => this.usage.get(id),
       // Alignment and the account button decide with the same stand-in rule, so a reopen lands where they expect.
       current: request.reason === "create" ? undefined : this.standingIn(state, request.agentId, family, request.reason === "refresh"),
+      requested: request.reason === "create" ? requestedAccount(request) : undefined,
       allowNextPick: takesNextPick(request),
     };
     const first = chooseAccount(state, input);
@@ -962,6 +974,9 @@ export class Service {
     if (account.id !== first.account.id) await prepare(account);
     if (decision.nextPick && Date.parse(decision.nextPick.until) > now) {
       console.log(`[ZeroSub] next-agent pick ${decision.bind?.source === "user" ? "used" : "dropped, as its account can't take agents now"}: ${request.agentId}`);
+    }
+    if (input.requested && seenBinding === undefined && !(decision.bind?.source === "user" && account.id === input.requested)) {
+      console.log(`[ZeroSub] the account chosen for ${request.agentId} before it started can't take it now, so it starts as any new agent would`);
     }
     this.activeAt.set(account.id, now);
     console.log(
@@ -2682,6 +2697,7 @@ export class Service {
       browserSignIn: this.browserSignIn,
       showComposerPill: this.prefs.showComposerPill,
       autoSwitch: this.prefs.autoSwitch,
+      balanceNewAgents: this.prefs.balanceNewAgents,
       warnings: await this.warnings(),
       launchers: claudeScripts.length > 0 ? launcherDir() : null,
       piLaunchers: piScripts.length > 0 ? piLauncherDir() : null,
