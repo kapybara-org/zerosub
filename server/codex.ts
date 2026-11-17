@@ -234,8 +234,8 @@ export class CodexAdapter implements FamilyAdapter {
     return { ok: false, detail: (result.stderr || result.stdout).trim().split("\n")[0] || `${command} not found` };
   }
 
-  prepareHome(home: string): Promise<void> {
-    return prepareCodexHome(home);
+  prepareHome(home: string, wanted?: () => Promise<boolean>): Promise<void> {
+    return prepareCodexHome(home, false, wanted);
   }
 
   async identity(home: string | null): Promise<Identity> {

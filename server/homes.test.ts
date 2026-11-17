@@ -414,6 +414,15 @@ describe("removeHome", () => {
 
     expect(await lstat(home).catch(() => null)).toBeNull();
   });
+
+  it("leaves a Codex home alone once its account has gone", async () => {
+    const main = join(root, "codex-main");
+    const home = join(root, "zerosub", "homes", "codex-y");
+    process.env.CODEX_HOME = main;
+    await mkdir(main, { recursive: true });
+    await prepareCodexHome(home, true, async () => false);
+    expect(await lstat(home).catch(() => null)).toBeNull();
+  });
 });
 
 describe("mergeShared", () => {

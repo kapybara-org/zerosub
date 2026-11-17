@@ -966,23 +966,27 @@ function codexPrivate(name: string): boolean {
 }
 
 /**
- * An Azure OpenAI account's home (see azure.ts) also keeps `config.toml` to itself: it's the shared
- * one with ZeroSub's Azure provider set, remade here and at each session open.
+ * Brings a Codex home's shared entries in step with main; `wanted` as for `prepareClaudeHome`. An
+ * Azure OpenAI account's home (see azure.ts) also keeps `config.toml` to itself: it's the shared one
+ * with ZeroSub's Azure provider set, remade here and at each session open.
  */
-export async function prepareCodexHome(home: string, force = false): Promise<void> {
-  const azure = isAzureHome(home);
-  const last = lastSync.get(home);
-  if (!force && last && Date.now() - last < SYNC_TTL_MS) {
+export function prepareCodexHome(home: string, force = false, wanted?: () => Promise<boolean>): Promise<void> {
+  return withHome(home, async () => {
+    if (wanted && !(await wanted())) return;
+    const azure = isAzureHome(home);
+    const last = lastSync.get(home);
+    if (!force && last && Date.now() - last < SYNC_TTL_MS) {
+      if (azure) await syncAzureConfig(home);
+      return;
+    }
+    await syncOverlay(home, {
+      main: mainCodexHome(),
+      shareDirs: ["sessions", "archived_sessions"],
+      isPrivate: azure ? (name) => codexPrivate(name) || name === "config.toml" : codexPrivate,
+    });
     if (azure) await syncAzureConfig(home);
-    return;
-  }
-  await syncOverlay(home, {
-    main: mainCodexHome(),
-    shareDirs: ["sessions", "archived_sessions"],
-    isPrivate: azure ? (name) => codexPrivate(name) || name === "config.toml" : codexPrivate,
+    lastSync.set(home, Date.now());
   });
-  if (azure) await syncAzureConfig(home);
-  lastSync.set(home, Date.now());
 }
 
 /**
