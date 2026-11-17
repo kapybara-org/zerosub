@@ -76,7 +76,7 @@ import { maskProxy, normalizeProxy } from "./proxy";
 import { Reopener, hostCanReload } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
-import { chooseAccount, isLastResort, isLimited, isUsable, mostAvailable, type RouteDecision, type RouteInput } from "./routing";
+import { chooseAccount, isLastResort, isLimited, isUsable, mostAvailable, withBankedReset, type RouteDecision, type RouteInput } from "./routing";
 import {
   ALL_SOURCES,
   MAIN_ACCOUNT_ID,
@@ -1013,6 +1013,7 @@ export class Service {
       autoSwitch: this.prefs.autoSwitch,
       balanceNewAgents: this.prefs.balanceNewAgents,
       paidFallback: this.prefs.paidApiFallback,
+      autoRedeem: this.prefs.autoRedeem,
       portable: adapter.portable,
       usageOf: (id) => this.usage.get(id),
       // Alignment and the account button decide with the same stand-in rule, so a reopen lands where they expect.
@@ -1950,7 +1951,11 @@ export class Service {
       : false;
     if (!provider || !available) return { skipped: `${name} isn't available in Paseo on this host.` };
     const now = Date.now();
-    const account = mostAvailable(state, other, (id) => this.usage.get(id), now, new Set(), this.prefs.paidApiFallback);
+    let account = mostAvailable(state, other, (id) => this.usage.get(id), now, new Set(), this.prefs.paidApiFallback);
+    // A fork is a new agent that can't change accounts later, so a free banked reset goes before a paid stand-in here too.
+    if (account && isLastResort(account) && this.prefs.autoRedeem) {
+      account = withBankedReset(state, other, (id) => this.usage.get(id), now) ?? account;
+    }
     if (!account) {
       // API accounts are billed per use, so they never take work over by themselves; say so rather than "at its limit".
       const apiOnly = accountsOf(state, other).some((entry) => entry.auth === "api" && isUsable(entry, now));
@@ -2853,6 +2858,7 @@ export class Service {
       autoSwitch: this.prefs.autoSwitch,
       balanceNewAgents: false,
       paidFallback: this.prefs.paidApiFallback,
+      autoRedeem: this.prefs.autoRedeem,
       portable: this.adapters[family].portable,
       usageOf: (id) => this.usage.get(id),
       current,

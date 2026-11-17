@@ -130,6 +130,34 @@ export function mostAvailable(
   return candidates[0];
 }
 
+/**
+ * A subscription account at a usage-window limit (5-hour or weekly) whose latest reading shows a
+ * banked reset it can spend right now. With `autoRedeem` on, a new agent opens on it rather than on
+ * a paid stand-in: its first turn hits the limit and spends the reset, as it would with paid fallback
+ * off. Signed-out, disabled and budget-limited accounts never count, nor does any API account.
+ * Preferred: the default, then the CLI login, then the most resets left.
+ */
+export function withBankedReset(
+  state: StoredState,
+  family: Family,
+  usageOf: (accountId: string) => Usage | null | undefined,
+  now: number,
+): StoredAccount | undefined {
+  const preferred = defaultAccount(state, family)?.id;
+  const left = (account: StoredAccount) => usageOf(account.id)?.resets?.available ?? 0;
+  return accountsOf(state, family)
+    .filter((account) => account.family !== "pi" && account.auth !== "api" && !isLastResort(account) &&
+      account.signedIn && !account.disabled && account.limitKind === "window" && isLimited(account, now))
+    .filter((account) => {
+      const resets = usageOf(account.id)?.resets;
+      return !!resets && resets.available > 0 && resets.usableNow;
+    })
+    .sort((a, b) =>
+      (a.id === preferred ? 0 : 1) - (b.id === preferred ? 0 : 1) ||
+      (a.kind === "main" ? 0 : 1) - (b.kind === "main" ? 0 : 1) ||
+      left(b) - left(a))[0];
+}
+
 /** Prefer a weekly reset within a day only when every usable account has fresh, complete usage. */
 function soonestWeeklyReset(state: StoredState, family: Family, usageOf: RouteInput["usageOf"], now: number): StoredAccount | undefined {
   // An API account has no plan windows, and is never preferred for a reset coming up.
@@ -174,6 +202,11 @@ export interface RouteInput {
   current?: string;
   /** A paid API account may stand in once every subscription account is out (`paidApiFallback`). */
   paidFallback?: boolean;
+  /**
+   * Banked resets are spent when every account is out (`autoRedeem`). With it, a new agent opens on a
+   * limited subscription with a usable reset before a paid stand-in (see `withBankedReset`).
+   */
+  autoRedeem?: boolean;
   /**
    * Whether this session may take the one-time "next new agent" pick: one the user's own agents
    * open, not Paseo's helpers (see `takesNextPick` in service.ts). Only a new agent takes it.
@@ -228,6 +261,10 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   if (!account && fresh && input.balanceNewAgents && accounts.length > 1) {
     const nearReset = input.family === "codex" ? soonestWeeklyReset(state, input.family, input.usageOf, input.now) : undefined;
     account = nearReset ?? mostAvailable(state, input.family, input.usageOf, input.now, new Set(), input.paidFallback);
+    // A banked reset is free, so it goes before a paid stand-in, as it does when a turn hits a limit.
+    if (account && isLastResort(account) && input.autoRedeem) {
+      account = withBankedReset(state, input.family, input.usageOf, input.now) ?? account;
+    }
     if (account) bind = { accountId: account.id, source: "balance", at, selectionReason: nearReset ? "weekly_reset" : "headroom" };
   }
   if (!account) {
@@ -249,10 +286,16 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
     // A paid stand-in is only kept while no subscription account could take over from it.
     const keeps = (stand: StoredAccount) =>
       !isLastResort(stand) || !accountsOf(state, input.family).some((other) => other.id !== account!.id && canStandIn(other, input.now));
-    const alternative =
+    let alternative =
       staying && staying.family === input.family && staying.id !== account.id && isUsable(staying, input.now) && keeps(staying)
         ? staying
         : mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]), input.paidFallback);
+    // Before a paid stand-in, a limited subscription with a usable banked reset: the account itself
+    // (it stays, and its first turn spends the reset) or another one.
+    if (alternative && isLastResort(alternative) && input.autoRedeem) {
+      const banked = withBankedReset(state, input.family, input.usageOf, input.now);
+      if (banked) alternative = banked.id === account.id ? undefined : banked;
+    }
     if (alternative) {
       skipped = { account, why };
       account = alternative;

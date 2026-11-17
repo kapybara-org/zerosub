@@ -600,6 +600,47 @@ describe("Azure OpenAI accounts", () => {
       expect(chooseAccount(state, { ...on, reason: "create", now: later, usageOf })?.account.id).toBe(cli.id);
     });
 
+    describe("and a banked reset with automatic resets on", () => {
+      const banked = (available: number, usableNow: boolean) => (id: string): Usage | null =>
+        id === azure.id ? null : { ...usage(100), resets: { available, usableNow, blockedReason: null, expiresAt: null, refills: [], label: null } };
+      const redeem = { ...on, reason: "create" as const, autoRedeem: true };
+
+      it("open a new agent on the limited subscription, whose first turn spends the reset", () => {
+        const state = stateWith([out(cli), azure]);
+        for (const balanceNewAgents of [false, true]) {
+          const decision = chooseAccount(state, { ...redeem, balanceNewAgents, usageOf: banked(1, true) });
+          expect(decision?.account.id).toBe(cli.id);
+          expect(decision?.skipped).toBeNull();
+        }
+        // Another limited subscription with a reset goes before Azure too, when the default has none.
+        const usageOf = (id: string) => (id === sub.id ? banked(2, true)(id) : banked(0, true)(id));
+        expect(chooseAccount(stateWith([out(cli), out(sub), azure]), { ...redeem, usageOf })?.account.id).toBe(sub.id);
+      });
+
+      it("still go to Azure when the reset can't be used now, none is banked, or automatic resets are off", () => {
+        const state = stateWith([out(cli), azure]);
+        expect(chooseAccount(state, { ...redeem, usageOf: banked(1, false) })?.account.id).toBe(azure.id);
+        expect(chooseAccount(state, { ...redeem, usageOf: banked(0, true) })?.account.id).toBe(azure.id);
+        expect(chooseAccount(state, { ...redeem, autoRedeem: false, usageOf: banked(1, true) })?.account.id).toBe(azure.id);
+        expect(chooseAccount(state, { ...redeem, autoRedeem: false, balanceNewAgents: true, usageOf: banked(1, true) })?.account.id).toBe(azure.id);
+      });
+
+      it("only count for an account at a window limit, never a signed-out, disabled or budget-limited one", () => {
+        for (const other of [{ ...out(sub), signedIn: false }, { ...out(sub), disabled: true }, { ...out(sub), limitKind: "budget" as const }]) {
+          const decision = chooseAccount(stateWith([{ ...cli, signedIn: false }, other, azure]), { ...redeem, usageOf: banked(1, true) });
+          expect(decision?.account.id).toBe(azure.id);
+        }
+      });
+
+      it("never beat a subscription account with room", () => {
+        const usageOf = (id: string) => (id === sub.id ? usage(40) : banked(1, true)(id));
+        for (const balanceNewAgents of [false, true]) {
+          expect(chooseAccount(stateWith([out(cli), sub, azure]), { ...redeem, balanceNewAgents, usageOf })?.account.id).toBe(sub.id);
+        }
+        expect(chooseAccount(stateWith([cli, out(sub), azure]), { ...redeem, usageOf })?.account.id).toBe(cli.id);
+      });
+    });
+
     it("aren't kept as a stand-in once a subscription account could take over", () => {
       const bindings = { "agent-1": { accountId: cli.id, source: "user" as const, at: "2026-09-23T00:00:00Z" } };
       const portable = { ...on, portable: true };

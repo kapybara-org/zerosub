@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { PluginHookContext } from "@getpaseo/plugin/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { preferences } from "../shared/preferences";
+import type { Usage } from "../shared/model";
 import type { SwitchRow } from "../shared/timeline";
 import type { AgentTimelineItem, FamilyAdapter } from "./adapter";
 import { ApiUsageStore } from "./api-usage";
@@ -419,6 +420,33 @@ describe("a banked reset and Azure, both on", () => {
     expect(t.created).toEqual([]);
     expect(t.notes.at(-1)).toMatchObject({ outcome: "reset", to: "A" });
     expect((await t.store.read()).bindings.root?.accountId).toBe("a");
+  });
+
+  it("opens a new agent on a limited subscription with a usable banked reset, not on Azure", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const t = await failoverSetUp(true, true, "reset");
+    await t.store.update((draft) => {
+      Object.assign(draft.accounts.find((account) => account.id === "a")!, {
+        limitedUntil: new Date(Date.now() + 3 * 60 * 60_000).toISOString(), limitKind: "window", limitedAt: new Date().toISOString(),
+      });
+    });
+    const reading = (usableNow: boolean): Usage => ({
+      fetchedAt: new Date().toISOString(), windows: [{ id: "primary", label: "5-hour", usedPercent: 100, resetsAt: null, minutes: 300 }],
+      error: null, cached: false, credits: null, resets: { available: 1, usableNow, blockedReason: null, expiresAt: null, refills: [], label: null },
+    });
+    const usage = (t.service as unknown as { usage: Map<string, Usage> }).usage;
+    const open = (agentId: string) => t.service.onSessionOpen(
+      { agentId, provider: "codex", reason: "create", purpose: "interactive", env: {}, workspaceId: "w", cwd: root } as never,
+      { paseo: t.paseo } as never,
+    );
+    usage.set("a", reading(true));
+    await open("fresh");
+    expect((await t.store.read()).bindings.fresh?.accountId).toBe("a");
+    expect((await t.store.read()).sessions.fresh?.accountId).toBe("a");
+    // A reset that can't be used right now doesn't hold a new agent back from Azure.
+    usage.set("a", reading(false));
+    await open("later");
+    expect((await t.store.read()).bindings.later?.accountId).toBe("azure");
   });
 
   it("moves onto Azure only once no reset could be spent", async () => {
