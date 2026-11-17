@@ -170,6 +170,8 @@ async function storeWith(state: Partial<StoredState>): Promise<StateStore> {
 }
 
 interface Options {
+  /** Whether the host's Paseo keeps agent metadata (0.16 and later): its SDK can then write it. */
+  metadata?: boolean;
   /** Runs when routing prepares an added account's home, after it has decided and before it records where the agent opens. */
   prepareHome?: () => Promise<void>;
   /** What the CLI says about the sign-in of a home (`null`: the CLI login). */
@@ -186,6 +188,7 @@ function setUp(store: StateStore, options: Options = {}) {
       ref: () => ({
         refresh: async () => ({ agent: null }),
         timeline: { append: async () => undefined, refetch: async () => ({ entries: [] }) },
+        ...(options.metadata ? { setMetadata: async () => undefined } : {}),
       }),
     },
   };
@@ -406,6 +409,14 @@ describe("the next new agent pick, as sessions open", () => {
     await service.onSessionOpen(session("resume"), context);
     expect((await store.read()).sessions.kept?.accountId).toBe(MAIN);
     expect((await store.read()).bindings.kept).toBeUndefined();
+  });
+
+  it("says whether the host's Paseo keeps agent metadata, which the Account control needs", async () => {
+    const stored = { accounts: accounts(), defaults: { claude: MAIN, codex: null, pi: null } };
+    const older = setUp(await storeWith(stored));
+    expect((await older.service.view(older.paseo)).agentMetadata).toBe(false);
+    const newer = setUp(await storeWith(stored), { metadata: true });
+    expect((await newer.service.view(newer.paseo)).agentMetadata).toBe(true);
   });
 
   it("starts out empty with a state file from before picks, which StateStore reads whole", async () => {
