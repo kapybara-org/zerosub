@@ -92,8 +92,9 @@ function fakePaseo(recent: readonly Row[] | (() => Promise<{ entries: readonly R
     config: { get: async () => ({ config: { providers: {} } }) },
     agents: {
       list: async () => ({ entries: [{ agent }], pageInfo: { hasMore: false, nextCursor: null } }),
-      ref: () => ({
-        refresh: async () => ({ agent }),
+      // Only the agent Paseo has: a new one's session opens before Paseo can say anything about it.
+      ref: (id: string = AGENT) => ({
+        refresh: async () => ({ agent: id === agent.id ? agent : null }),
         send: async (text: string) => void sent.push(text),
         timeline: {
           append: async (item: { data: { from: string | null; to: string; outcome: string; detail: string | null } }) =>
@@ -3653,7 +3654,7 @@ describe("a limit hit while the agent is being moved", () => {
       hit,
       { claude: { redeemReset: async () => ({ outcome: "reset", message: "Limits reset", left: 0 }) } },
     );
-    const { agent } = await paseo.agents.ref().refresh();
+    const agent = (await paseo.agents.ref().refresh()).agent!;
     const other = { ...agent, id: OTHER };
     paseo.agents.list = async () => ({ entries: [{ agent }, { agent: other }], pageInfo: { hasMore: false, nextCursor: null } });
     const { ref } = paseo.agents;
@@ -4575,6 +4576,12 @@ describe("an API account at a limit with every other account out", () => {
   });
 });
 
+/** What a Claude agent's create request comes out of ZeroSub as, created in `modeId`; `metadata` null is a Paseo before 0.16, which has none. */
+async function createdIn(service: Service, paseo: unknown, modeId: string | undefined, metadata: Record<string, unknown> | null = {}) {
+  const request = { config: { provider: "claude", cwd: root, ...(modeId ? { modeId } : {}) }, ...(metadata ? { metadata } : {}) };
+  return ((await service.onAgentCreate(request as never, { paseo } as never)) ?? request) as { metadata?: Record<string, unknown> };
+}
+
 describe("AWS Bedrock as the last resort", () => {
   const window = () => ({ kind: "window" as const, resetsAt: inFuture(), message: "You've hit your session limit" });
   const bedrock = { ...account("claude-bedrock", "bedrock", "managed"), auth: "api" as const, provider: "bedrock" as const, identity: "bedrock|eu-central-1|host" };
@@ -4650,7 +4657,7 @@ describe("AWS Bedrock as the last resort", () => {
     );
     service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
     // A second agent, idle on Bedrock, that moving idle agents off a throttled account looks at.
-    const { agent } = await paseo.agents.ref().refresh();
+    const agent = (await paseo.agents.ref().refresh()).agent!;
     const other = { ...agent, id: OTHER };
     paseo.agents.list = async () => ({ entries: [{ agent }, { agent: other }], pageInfo: { hasMore: false, nextCursor: null } });
     const { ref } = paseo.agents;
@@ -4714,8 +4721,15 @@ describe("AWS Bedrock as the last resort", () => {
         error: null, cached: false, credits: null, resets: { available: 1, usableNow, blockedReason: null, expiresAt: null, refills: [], label: null },
       };
       (t.service as unknown as { usage: Map<string, Usage> }).usage.set(MAIN, reading);
-      const open = (agentId: string, reason: "create" | "resume" | "refresh") =>
-        t.service.onSessionOpen({ agentId, provider: "claude", reason, purpose: "interactive", env: {}, workspaceId: "w", cwd: root } as never, { paseo: t.paseo } as never);
+      // A new agent is created in Accept File Edits, as Paseo 0.16 does it: its create request goes
+      // through ZeroSub first, and the session opens with the metadata it came out with.
+      const open = async (agentId: string, reason: "create" | "resume" | "refresh") => {
+        const created = reason === "create" ? await createdIn(t.service, t.paseo, "acceptEdits") : undefined;
+        await t.service.onSessionOpen(
+          { agentId, provider: "claude", reason, purpose: "interactive", env: {}, workspaceId: "w", cwd: root, metadata: created?.metadata ?? {} } as never,
+          { paseo: t.paseo } as never,
+        );
+      };
       return { ...t, open };
     }
 
@@ -4816,6 +4830,40 @@ describe("AWS Bedrock as the last resort", () => {
       agent.currentModeId = "acceptEdits";
       await open(AGENT, "resume");
       expect((await store.read()).sessions[AGENT]?.accountId).toBe(bedrock.id);
+    });
+
+    it("opens a new agent on it by the mode it was created in, which Paseo can't say before the agent exists", async () => {
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const { service, store, paseo } = await setUp(onlyMain, window);
+      service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+      await store.update((draft) => {
+        Object.assign(draft.accounts.find((entry) => entry.id === MAIN)!, { limitedUntil: inFuture(), limitKind: "window", limitedAt: new Date().toISOString() });
+      });
+      const open = (agentId: string, metadata: Record<string, unknown> | undefined) =>
+        service.onSessionOpen(
+          { agentId, provider: "claude", reason: "create", purpose: "interactive", env: {}, workspaceId: "w", cwd: root, ...(metadata ? { metadata } : {}) } as never,
+          { paseo } as never,
+        );
+      const where = async (agentId: string) => (await store.read()).sessions[agentId]?.accountId;
+      await open("edits", (await createdIn(service, paseo, "acceptEdits")).metadata);
+      expect(await where("edits")).toBe(bedrock.id);
+      // Auto mode, no mode named (Paseo's default is Auto), or a Paseo before 0.16 with no metadata to carry it in.
+      await open("auto", (await createdIn(service, paseo, "auto")).metadata);
+      await open("unnamed", (await createdIn(service, paseo, undefined)).metadata);
+      await open("older", (await createdIn(service, paseo, "acceptEdits", null)).metadata);
+      expect({ auto: await where("auto"), unnamed: await where("unnamed"), older: await where("older") }).toEqual({ auto: MAIN, unnamed: MAIN, older: MAIN });
+    });
+
+    it("notes a new agent's mode in its create request only for Claude, with paid fallback on and a Bedrock account", async () => {
+      const { service, paseo } = await setUp(onlyMain, window);
+      const request = (provider: string) => ({ config: { provider, cwd: root, modeId: "acceptEdits" }, metadata: { "zerosub.account": "x" } });
+      expect(await service.onAgentCreate(request("claude") as never, { paseo } as never)).toBeUndefined();
+      service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+      expect(await service.onAgentCreate(request("codex") as never, { paseo } as never)).toBeUndefined();
+      expect(((await service.onAgentCreate(request("claude") as never, { paseo } as never)) as { metadata?: unknown } | undefined)?.metadata).toEqual({ "zerosub.account": "x", "zerosub.created-mode": "acceptEdits" });
+      const noBedrock = await setUp({ ...onlyMain, accounts: [account(MAIN, "main", "main")] as never }, window);
+      noBedrock.service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+      expect(await noBedrock.service.onAgentCreate(request("claude") as never, { paseo } as never)).toBeUndefined();
     });
 
     it("doesn't align an Auto-mode agent onto it, but does one in another mode", async () => {

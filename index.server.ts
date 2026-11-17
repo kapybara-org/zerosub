@@ -69,6 +69,17 @@ export default function contribute(server: PluginServerContext) {
     }
   });
 
+  // A new Claude agent's mode is carried to its first session, where Paseo can't say it yet. Creating
+  // the agent never fails for this: on any error the request goes on unchanged.
+  server.before("agent.create", async ({ request }, context) => {
+    try {
+      return await service.onAgentCreate(request, context);
+    } catch (error) {
+      console.error("[ZeroSub] could not note a new agent's mode", describe(error));
+      return undefined;
+    }
+  });
+
   server.on("agent.turn_started", (event, context) => {
     void service.onTurnStarted(event.agent, context).catch(() => undefined);
   });

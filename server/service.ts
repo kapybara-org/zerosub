@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { lstat, readdir, readFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import type {
+  PluginBeforeRequests,
   PluginHookContext,
   PluginLifecycleEvents,
   PluginSessionOpenRequest,
@@ -423,6 +424,22 @@ function takesAgentMetadata(paseo: PaseoApi): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Agent metadata (Paseo 0.16 and later) carrying the permission mode a new Claude agent was created
+ * in, from `agent.create` to its first session: Paseo can't say the mode of an agent it hasn't made
+ * yet, and Bedrock can't run Claude's Auto mode (see `paidFor`). Only read when that session opens.
+ */
+const CREATED_MODE_METADATA_KEY = "zerosub.created-mode";
+
+type AgentCreateRequest = PluginBeforeRequests["agent.create"];
+
+/** The mode a new agent's create request stashed in its metadata (see `CREATED_MODE_METADATA_KEY`). */
+function createdMode(request: PluginSessionOpenRequest): string | undefined {
+  const { metadata } = request as { metadata?: Readonly<Record<string, unknown>> | null };
+  const value = metadata?.[CREATED_MODE_METADATA_KEY];
+  return typeof value === "string" && value ? value : undefined;
 }
 
 /**
@@ -943,6 +960,21 @@ export class Service {
    * routing fails, or `abandoned` says Paseo stopped waiting for it, Paseo opens an interactive
    * session as it asked: on the CLI login. Then nothing routing recorded for it stands.
    */
+  /**
+   * Before Paseo creates an agent: a new Claude agent's mode goes into its metadata, so routing knows
+   * it when the first session opens (see `CREATED_MODE_METADATA_KEY`). Only while paid fallback could
+   * put it on Bedrock, and only on a Paseo that keeps metadata (0.16 and later, where the request
+   * always carries it); otherwise the request is left as it is.
+   */
+  async onAgentCreate(request: AgentCreateRequest, context: PluginHookContext): Promise<AgentCreateRequest | undefined> {
+    const { metadata } = request as { metadata?: Record<string, unknown> | null };
+    const modeId = request.config.modeId;
+    if (!metadata || typeof metadata !== "object" || typeof modeId !== "string" || !modeId) return undefined;
+    if (!this.prefs.paidApiFallback || !(await this.store.read()).accounts.some((account) => isBedrockAccount(account))) return undefined;
+    if ((await this.families.resolve(context.paseo))[request.config.provider] !== "claude") return undefined;
+    return { ...request, metadata: { ...metadata, [CREATED_MODE_METADATA_KEY]: modeId } } as AgentCreateRequest;
+  }
+
   async onSessionOpen(
     request: PluginSessionOpenRequest,
     context: PluginHookContext,
@@ -1077,7 +1109,7 @@ export class Service {
     // can't run (see `paidFor`). Its mode is asked for only then.
     if (first && family === "claude" && input.paidFallback && isBedrockAccount(first.account)) {
       const unpaid = chooseAccount(state, { ...input, paidFallback: false });
-      if (unpaid?.account.id !== first.account.id && runsAutoMode(await this.modeOf(context.paseo, request.agentId))) {
+      if (unpaid?.account.id !== first.account.id && runsAutoMode(await this.modeAtOpen(context.paseo, request))) {
         console.log(`[ZeroSub] ${request.agentId} not routed to ${first.account.label}: it's in Claude's Auto mode, which Bedrock can't run`);
         input.paidFallback = false;
         first = unpaid;
@@ -1974,6 +2006,17 @@ export class Service {
    */
   private paidFor(family: Family, agentId: string): boolean {
     return this.prefs.paidApiFallback && !(family === "claude" && runsAutoMode(this.agentModes.get(agentId)));
+  }
+
+  /**
+   * The mode of an agent whose session is opening. Paseo can't say a brand-new agent's (it doesn't
+   * exist yet), so that comes from what its create request stashed, when there is one.
+   */
+  private async modeAtOpen(paseo: PaseoApi, request: PluginSessionOpenRequest): Promise<string | null> {
+    const stashed = request.reason === "create" ? createdMode(request) : undefined;
+    if (stashed === undefined) return this.modeOf(paseo, request.agentId);
+    this.agentModes.set(request.agentId, stashed);
+    return stashed;
   }
 
   /** The agent's permission mode now (null when it can't be told), noted for `paidFor`. */
