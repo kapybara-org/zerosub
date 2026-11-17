@@ -16,6 +16,7 @@ import {
   writeAccountApi,
   writeAccountProxy,
 } from "./homes";
+import { isAzureHome, writeAzureAccount } from "./azure";
 
 let root: string;
 const saved = {
@@ -293,6 +294,26 @@ describe("prepareCodexHome", () => {
     for (const name of ["auth.json", "models_cache.json", "state_5.sqlite", "state_5.sqlite-wal", "..codex-global-state.json.tmp-1"]) {
       expect(await lstat(join(home, name)).catch(() => null)).toBeNull();
     }
+  });
+
+  it("never links azure.json into any Codex home, and gives an Azure account's home a config.toml of its own", async () => {
+    const main = join(root, "codex");
+    process.env.CODEX_HOME = main;
+    await mkdir(main, { recursive: true });
+    await writeFile(join(main, "config.toml"), 'model = "gpt-5"\n');
+    await writeFile(join(main, "azure.json"), '{"endpoint":"https://example.invalid/openai/v1","key":"not-this-one"}');
+    const subscription = join(root, "homes", "codex-sub");
+    await prepareCodexHome(subscription, true);
+    expect(await lstat(join(subscription, "azure.json")).catch(() => null)).toBeNull();
+    expect(isAzureHome(subscription)).toBe(false);
+    expect(await isLinkTo(join(subscription, "config.toml"), join(main, "config.toml"))).toBe(true);
+
+    const azure = join(root, "homes", "codex-azure");
+    await writeAzureAccount(azure, { endpoint: "https://example-resource.openai.azure.com/openai/v1", key: "own-key-0123456789", prices: {} });
+    await prepareCodexHome(azure, true);
+    expect(JSON.parse(await readFile(join(azure, "azure.json"), "utf8"))).toMatchObject({ key: "own-key-0123456789" });
+    expect((await lstat(join(azure, "config.toml"))).isSymbolicLink()).toBe(false);
+    expect(await readFile(join(azure, "config.toml"), "utf8")).toContain('model_provider = "zerosub_azure"');
   });
 
   it("treats a plain sessions directory as private, including one a failed junction would leave", async () => {

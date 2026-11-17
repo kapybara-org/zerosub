@@ -1,7 +1,7 @@
 import { chmod, copyFile, readdir, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { z } from "zod";
-import { AccountKindSchema, AuthKindSchema, FamilySchema, type Family } from "../shared/model";
+import { AccountKindSchema, ApiProviderSchema, AuthKindSchema, FamilySchema, type Family } from "../shared/model";
 import { Mutex, readJson, readText, writeJsonAtomic } from "./json-file";
 import { statePath } from "./paths";
 
@@ -14,6 +14,11 @@ export const StoredAccountSchema = z.object({
   kind: AccountKindSchema,
   /** How it signs in. `api` accounts (added Pi accounts) are only used when chosen, never by automatic routing. */
   auth: AuthKindSchema.default("subscription"),
+  /**
+   * The paid API an `api` account stands in for a subscription on (an Azure OpenAI account's
+   * `azure`), set when it's added. Missing for every other account, API-key ones included.
+   */
+  provider: ApiProviderSchema.optional(),
   /** Credential home (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`). `null` for the CLI's own login. */
   home: z.string().nullable(),
   email: z.string().nullable().default(null),

@@ -6,6 +6,7 @@ import { formatPlan } from "../shared/format";
 import { FAMILY_LABEL, type AccountView, type Family, type LoginMethod, type LoginView } from "../shared/model";
 import { cancelLogin, importAccount, startLogin, submitLoginCode } from "../shared/rpc";
 import { ApiAccountForm } from "./api-account";
+import { AzureAccountForm } from "./azure-account";
 import { useInputStyle } from "./pi-accounts";
 import { describe, useStore, type ZeroSubStore } from "./store";
 import { Button, useText } from "./ui";
@@ -47,9 +48,11 @@ export function AddAccountModal({
   const [proxy, setProxy] = useState("");
   const [proxyDone, setProxyDone] = useState(!askProxy);
   // A new Claude account is a subscription to sign in, an API key or token, or a folder that's
-  // signed in already; asked first.
-  const [mode, setMode] = useState<"ask" | "subscription" | "api" | "import">(askProxy ? "ask" : "subscription");
+  // signed in already; a new ChatGPT one, a subscription or an Azure OpenAI key. Asked first.
+  const askMode = askProxy || (family === "codex" && !accountId);
+  const [mode, setMode] = useState<"ask" | "subscription" | "api" | "import">(askMode ? "ask" : "subscription");
   const [apiAdded, setApiAdded] = useState<string | null>(null);
+  const [apiWarning, setApiWarning] = useState<string | null>(null);
   const [imported, setImported] = useState<string | null>(null);
   // Each start gets a number; only the newest one's answer counts.
   const attempt = useRef(0);
@@ -78,10 +81,10 @@ export function AddAccountModal({
   );
 
   useEffect(() => {
-    if (!proxyDone || started.current) return;
+    if (!proxyDone || mode !== "subscription" || started.current) return;
     started.current = true;
     void begin(method);
-  }, [proxyDone, begin, method]);
+  }, [proxyDone, mode, begin, method]);
 
   useEffect(() => store.watchClosely(), [store]);
 
@@ -115,10 +118,13 @@ export function AddAccountModal({
     setProxyDone(false);
   }, [loginId, finished, store]);
 
+  const azure = family === "codex";
   const title = accountId
     ? "Sign in again"
     : mode === "api"
-      ? "Add Claude API account"
+      ? azure
+        ? "Add Azure OpenAI account"
+        : "Add Claude API account"
       : mode === "import"
         ? "Add a signed-in folder"
         : `Add ${FAMILY_LABEL[family]} account`;
@@ -127,7 +133,9 @@ export function AddAccountModal({
     body = (
       <ModeStep
         theme={theme}
+        family={azure ? "codex" : "claude"}
         autoSwitch={state?.autoSwitch ?? true}
+        paidFallback={state?.paidApiFallback ?? false}
         onSubscription={() => setMode("subscription")}
         onApi={() => setMode("api")}
         onImport={() => setMode("import")}
@@ -158,12 +166,27 @@ export function AddAccountModal({
         <Text style={text.heading}>Account added</Text>
         <Text style={text.body}>
           {added?.label ?? "The account"} is ready. Make it the default, or pick it for an agent from the account button in
-          the message box; ZeroSub never moves agents onto it by itself.
+          the message box;{" "}
+          {azure && state?.paidApiFallback
+            ? "ZeroSub moves agents onto it by itself only when every ChatGPT subscription account is out."
+            : "ZeroSub never moves agents onto it by itself."}
         </Text>
+        {apiWarning ? <Text style={text.warning}>{apiWarning}</Text> : null}
         <Row>
           <Button theme={theme} tone="primary" label="Done" tooltip="Close this window" tooltipAlign="end" onPress={onClose} />
         </Row>
       </>
+    ) : azure ? (
+      <AzureAccountForm
+        theme={theme}
+        store={store}
+        paidFallback={state?.paidApiFallback ?? false}
+        onDone={(id, warning) => {
+          setApiWarning(warning);
+          setApiAdded(id);
+        }}
+        onCancel={close}
+      />
     ) : (
       <ApiAccountForm theme={theme} store={store} onDone={setApiAdded} onCancel={close} />
     );
@@ -456,7 +479,6 @@ function Step({ theme, number, title, children }: { theme: Theme; number: number
   );
 }
 
-/** How a new Claude account connects: a subscription to sign in, or an API key or token. */
 /** "work (work@acme.com) · Max": an account as the finished steps name it. */
 function describeAccount(account: AccountView): string {
   return `${account.label}${account.email && account.email !== account.label ? ` (${account.email})` : ""}${
@@ -464,48 +486,71 @@ function describeAccount(account: AccountView): string {
   }`;
 }
 
+/**
+ * How a new account connects: a Claude one, a subscription to sign in, an API key or token, or a
+ * folder that's signed in already; a ChatGPT one, a subscription to sign in or an Azure OpenAI key.
+ */
 function ModeStep({
   theme,
+  family,
   autoSwitch,
+  paidFallback,
   onSubscription,
   onApi,
   onImport,
   onCancel,
 }: {
   theme: Theme;
+  family: "claude" | "codex";
   /** Agents move off an account at its limit by themselves only with automatic switching on. */
   autoSwitch: boolean;
+  /** Paid API accounts may take work over by themselves once every subscription is out. */
+  paidFallback: boolean;
   onSubscription(): void;
   onApi(): void;
   onImport(): void;
   onCancel(): void;
 }) {
   const text = useText(theme);
+  const claude = family === "claude";
   return (
     <View style={{ gap: 12 }}>
       <Text style={text.strong}>How does this account connect?</Text>
       <Choice
         theme={theme}
-        title="Claude subscription"
-        detail={`Sign in with a Claude Pro or Max account. Usage limits are tracked${
+        title={claude ? "Claude subscription" : "ChatGPT subscription"}
+        detail={`Sign in with a ${claude ? "Claude Pro or Max" : "ChatGPT Plus, Pro, Team or Business"} account. Usage limits are tracked${
           autoSwitch
             ? " and agents move between accounts automatically."
             : "; turn on automatic switching to have agents move between accounts by themselves."
         }`}
         onPress={onSubscription}
       />
-      <Choice
-        theme={theme}
-        title="API key or token"
-        detail="An Anthropic API key, or a key for another endpoint via its base URL. Billed per use; used only when you choose it."
-        onPress={onApi}
-      />
-      <Choice
-        theme={theme}
-        title="A folder that's signed in already"
-        detail="A Claude Code folder (its CLAUDE_CONFIG_DIR) signed in with a subscription: one you set up yourself, or one kept when you removed its account here. No sign-in; it stays where it is."
-        onPress={onImport}
-      />
+      {claude ? (
+        <>
+          <Choice
+            theme={theme}
+            title="API key or token"
+            detail="An Anthropic API key, or a key for another endpoint via its base URL. Billed per use; used only when you choose it."
+            onPress={onApi}
+          />
+          <Choice
+            theme={theme}
+            title="A folder that's signed in already"
+            detail="A Claude Code folder (its CLAUDE_CONFIG_DIR) signed in with a subscription: one you set up yourself, or one kept when you removed its account here. No sign-in; it stays where it is."
+            onPress={onImport}
+          />
+        </>
+      ) : (
+        <Choice
+          theme={theme}
+          title="Azure OpenAI (API key)"
+          detail={`Codex on your Azure OpenAI resource, with its endpoint and key. Billed per token; ${
+            paidFallback ? "used by itself only when every ChatGPT subscription account is out, or when you choose it." : "used only when you choose it."
+          }`}
+          onPress={onApi}
+        />
+      )}
       <Row>
         <Button theme={theme} label="Cancel" tooltip="Close without adding an account" tooltipAlign="end" onPress={onCancel} />
       </Row>

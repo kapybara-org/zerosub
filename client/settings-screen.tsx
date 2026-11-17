@@ -133,6 +133,13 @@ export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurface
             onValueChange={(useCredits) => save({ useCredits })}
           />
           <SettingsSwitch
+            label="Use paid API accounts when every subscription is out"
+            hint="Off unless you turn it on. When every ChatGPT subscription account is at its limit, signed out or disabled, agents may move to an Azure OpenAI account, billed per token (after a banked reset, if those are used automatically). Off, it's used only as the default or when you pick it for an agent."
+            value={settings.values.paidApiFallback}
+            disabled={settings.saving}
+            onValueChange={(paidApiFallback) => save({ paidApiFallback })}
+          />
+          <SettingsSwitch
             label="When every account is out, fork the chat to the other provider"
             hint="A stopped Claude chat carries on in a new ChatGPT or OpenCode agent (pick the destination below) with the conversation so far. ChatGPT gets a mode no looser than this agent's. OpenCode gets Plan or Build under the host's own permission policy, which can allow more than Claude does. The original stays as it was."
             value={settings.values.forkOtherProvider}

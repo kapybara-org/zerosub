@@ -1,5 +1,5 @@
 import { accountPeak } from "../shared/format";
-import type { Family, Usage, UsageWindow } from "../shared/model";
+import { isAzureAccount, type Family, type Usage, type UsageWindow } from "../shared/model";
 import { FIVE_HOUR_MINUTES, WEEK_MINUTES } from "./codex";
 import {
   accountsOf,
@@ -45,6 +45,16 @@ export function canStandIn(account: StoredAccount, now: number): boolean {
 }
 
 /**
+ * A paid API account that stands in for a subscription (an Azure OpenAI account), marked so when it
+ * was added. Like any API account it's billed per use, so routing never puts agents on it by itself
+ * unless `paidApiFallback` is on, and then only as a last resort: once no subscription account of the
+ * family can stand in (see `mostAvailable`). It can always be picked by hand, or made the default.
+ */
+export function isLastResort(account: StoredAccount): boolean {
+  return isAzureAccount(account);
+}
+
+/**
  * Lower is better. Unknown usage ranks in the middle so a known-quiet account wins over a mystery.
  * A full window of one model only, such as "Weekly · Opus", leaves the account its room for the rest.
  * A window whose reset has passed since the reading starts again empty, so an account that just
@@ -80,6 +90,9 @@ export function fiveHourGated(usage: Usage | null | undefined, now: number): boo
  * the lowest peak, preferring the default, then the CLI login, on ties. An account with a full window
  * that caps it ranks last, gate or not, though it's usable: its limit lifted at the 5-hour reset with
  * its week still full, say, or ChatGPT credits keep it going.
+ *
+ * With `paidFallback` (the `paidApiFallback` preference), a usable paid API account (`isLastResort`)
+ * is chosen once no subscription account can stand in; without it, never.
  */
 export function mostAvailable(
   state: StoredState,
@@ -87,11 +100,13 @@ export function mostAvailable(
   usageOf: (accountId: string) => Usage | null | undefined,
   now: number,
   exclude: ReadonlySet<string> = new Set(),
+  paidFallback = false,
 ): StoredAccount | undefined {
   const preferred = defaultAccount(state, family)?.id;
-  const candidates = accountsOf(state, family).filter(
-    (account) => !exclude.has(account.id) && canStandIn(account, now),
-  );
+  const open = accountsOf(state, family).filter((account) => !exclude.has(account.id));
+  const subscriptions = open.filter((account) => canStandIn(account, now));
+  const candidates =
+    subscriptions.length > 0 || !paidFallback ? subscriptions : open.filter((account) => isLastResort(account) && isUsable(account, now));
   const rank = (account: StoredAccount) => {
     const usage = usageOf(account.id);
     const score = headroomScore(usage, now);
@@ -115,9 +130,38 @@ export function mostAvailable(
   return candidates[0];
 }
 
+/**
+ * A subscription account at a usage-window limit (5-hour or weekly) whose latest reading shows a
+ * banked reset it can spend right now. With `autoRedeem` on, a new agent opens on it rather than on
+ * a paid stand-in: its first turn hits the limit and spends the reset, as it would with paid fallback
+ * off. Signed-out, disabled and budget-limited accounts never count, nor does any API account.
+ * Preferred: the default, then the CLI login, then the most resets left.
+ */
+export function withBankedReset(
+  state: StoredState,
+  family: Family,
+  usageOf: (accountId: string) => Usage | null | undefined,
+  now: number,
+): StoredAccount | undefined {
+  const preferred = defaultAccount(state, family)?.id;
+  const left = (account: StoredAccount) => usageOf(account.id)?.resets?.available ?? 0;
+  return accountsOf(state, family)
+    .filter((account) => account.family !== "pi" && account.auth !== "api" && !isLastResort(account) &&
+      account.signedIn && !account.disabled && account.limitKind === "window" && isLimited(account, now))
+    .filter((account) => {
+      const resets = usageOf(account.id)?.resets;
+      return !!resets && resets.available > 0 && resets.usableNow;
+    })
+    .sort((a, b) =>
+      (a.id === preferred ? 0 : 1) - (b.id === preferred ? 0 : 1) ||
+      (a.kind === "main" ? 0 : 1) - (b.kind === "main" ? 0 : 1) ||
+      left(b) - left(a))[0];
+}
+
 /** Prefer a weekly reset within a day only when every usable account has fresh, complete usage. */
 function soonestWeeklyReset(state: StoredState, family: Family, usageOf: RouteInput["usageOf"], now: number): StoredAccount | undefined {
-  const candidates = accountsOf(state, family).filter((account) => isUsable(account, now));
+  // An API account has no plan windows, and is never preferred for a reset coming up.
+  const candidates = accountsOf(state, family).filter((account) => isUsable(account, now) && account.auth !== "api");
   const readings = candidates.map((account) => ({ account, usage: usageOf(account.id) }));
   const complete = readings.every(({ usage }) => {
     if (!usage || usage.error || usage.cached) return false;
@@ -156,6 +200,13 @@ export interface RouteInput {
    * first at the moment, which would move it again each time two accounts swap places.
    */
   current?: string;
+  /** A paid API account may stand in once every subscription account is out (`paidApiFallback`). */
+  paidFallback?: boolean;
+  /**
+   * Banked resets are spent when every account is out (`autoRedeem`). With it, a new agent opens on a
+   * limited subscription with a usable reset before a paid stand-in (see `withBankedReset`).
+   */
+  autoRedeem?: boolean;
   /**
    * Whether this session may take the one-time "next new agent" pick: one the user's own agents
    * open, not Paseo's helpers (see `takesNextPick` in service.ts). Only a new agent takes it.
@@ -209,7 +260,11 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   }
   if (!account && fresh && input.balanceNewAgents && accounts.length > 1) {
     const nearReset = input.family === "codex" ? soonestWeeklyReset(state, input.family, input.usageOf, input.now) : undefined;
-    account = nearReset ?? mostAvailable(state, input.family, input.usageOf, input.now);
+    account = nearReset ?? mostAvailable(state, input.family, input.usageOf, input.now, new Set(), input.paidFallback);
+    // A banked reset is free, so it goes before a paid stand-in, as it does when a turn hits a limit.
+    if (account && isLastResort(account) && input.autoRedeem) {
+      account = withBankedReset(state, input.family, input.usageOf, input.now) ?? account;
+    }
     if (account) bind = { accountId: account.id, source: "balance", at, selectionReason: nearReset ? "weekly_reset" : "headroom" };
   }
   if (!account) {
@@ -228,10 +283,19 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   const mayMove = fresh || input.portable;
   if (why && mayMove && (input.autoSwitch || why !== "limited")) {
     const staying = findAccount(state, input.current);
-    const alternative =
-      staying && staying.family === input.family && staying.id !== account.id && isUsable(staying, input.now)
+    // A paid stand-in is only kept while no subscription account could take over from it.
+    const keeps = (stand: StoredAccount) =>
+      !isLastResort(stand) || !accountsOf(state, input.family).some((other) => other.id !== account!.id && canStandIn(other, input.now));
+    let alternative =
+      staying && staying.family === input.family && staying.id !== account.id && isUsable(staying, input.now) && keeps(staying)
         ? staying
-        : mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]));
+        : mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]), input.paidFallback);
+    // Before a paid stand-in, a limited subscription with a usable banked reset: the account itself
+    // (it stays, and its first turn spends the reset) or another one.
+    if (alternative && isLastResort(alternative) && input.autoRedeem) {
+      const banked = withBankedReset(state, input.family, input.usageOf, input.now);
+      if (banked) alternative = banked.id === account.id ? undefined : banked;
+    }
     if (alternative) {
       skipped = { account, why };
       account = alternative;

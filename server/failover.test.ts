@@ -1004,6 +1004,29 @@ describe("forking to the other provider", () => {
     expect(notes.at(-1)).toMatchObject({ outcome: "continued", toFamily: "codex", to: "hello", continuedIn: { agentId: fork?.agentId } });
   });
 
+  it("opens a ChatGPT fork on a limited subscription with a usable banked reset before a paid Azure account", async () => {
+    const prefs = { paidApiFallback: true, autoRedeem: true };
+    const limit = { limitedUntil: inFuture(), limitKind: "window" as const, limitedAt: new Date().toISOString() };
+    const reading = (usableNow: boolean) => ({
+      fetchedAt: new Date().toISOString(), windows: [{ id: "primary", label: "5-hour", usedPercent: 100, resetsAt: null, minutes: 300 }],
+      error: null, cached: false, credits: null, resets: { available: 1, usableNow, blockedReason: null, expiresAt: null, refills: [], label: null },
+    });
+    for (const usableNow of [true, false]) {
+      const { service, store, created, notes, limitTurn } = await setUpFork("bypassPermissions", [], {}, [], { prefs });
+      await store.update((draft) => {
+        Object.assign(draft.accounts.find((entry) => entry.id === CODEX_MAIN)!, limit);
+        draft.accounts.push({ ...account("azure", "Azure", "managed"), family: "codex", auth: "api", provider: "azure" } as never);
+      });
+      (service as unknown as { usage: Map<string, unknown> }).usage.set(CODEX_MAIN, reading(usableNow));
+      await limitTurn();
+      expect(created).toHaveLength(1);
+      const bound = (await store.read()).bindings[created[0]?.agentId ?? ""]?.accountId;
+      // A usable reset is free, and the fork's first turn spends it; without one, the paid account takes the fork and its note says so.
+      expect(bound).toBe(usableNow ? CODEX_MAIN : "azure");
+      expect(notes.at(-1)?.detail ?? null).toEqual(usableNow ? null : expect.stringMatching(/Azure OpenAI, a paid API/));
+    }
+  });
+
   it.each([
     ["its parent", [], "lead"],
     ["where its parent's own work went on ChatGPT", [{ id: "lead-on-chatgpt", provider: "codex", labels: { "zerosub.continued-from": "lead" } }], "lead-on-chatgpt"],

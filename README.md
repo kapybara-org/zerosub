@@ -13,6 +13,7 @@ Use several Claude, ChatGPT (Codex), Grok and Cursor subscriptions side by side 
 - **Fork to the other provider (optional).** When every Claude account is out, a stopped chat can carry on in a new ChatGPT agent, and the other way round. A stopped Claude chat can instead continue on the host's OpenCode.
 - **Grok accounts.** Sign in several Grok (SuperGrok, X Premium+) accounts for Paseo's Grok agents and pick the one each new agent starts on. See [Grok accounts](#grok-accounts).
 - **Cursor accounts.** Sign in several Cursor accounts for Paseo's Cursor agents (`cursor-agent`) and pick the one each new agent starts on (Linux only for now). See [Cursor accounts](#cursor-accounts).
+- **Azure OpenAI accounts.** Add an Azure OpenAI key under ChatGPT (Codex) and pick it for an agent or make it the default. ZeroSub only moves work onto it by itself if you turn that on, and then only when every ChatGPT subscription is out (after a banked reset, if you let ZeroSub spend those). See [Azure OpenAI accounts](#azure-openai-accounts).
 - **Pi accounts.** Add Anthropic API keys for Paseo's Pi agents, each with an optional base URL and its own proxy, and pick one per Pi agent. See [Pi accounts](#pi-accounts).
 - **Everything else stays the same.** Every account shares your settings, skills, plugins, MCP servers, `CLAUDE.md`/`AGENTS.md` and conversation history.
 
@@ -116,17 +117,68 @@ When a Claude account has extra usage turned on (pay-as-you-go past the plan's l
 
 ### When every account of a provider is out
 
-ZeroSub tries these in order, and a timeline note says which one happened:
+ZeroSub tries these in order, and a timeline note says which one happened.
 
 1. **Use a banked reset**, if you turned on **Use banked resets when every account is out**.
-2. **Fork the chat to the other provider**, if you turned on **When every account is out, fork the chat to the other provider** (off by default). A stopped Claude chat continues in a new ChatGPT agent, or the other way round:
+2. **Move to an [Azure OpenAI account](#azure-openai-accounts)** with room, for a ChatGPT agent, if you turned on **Use paid API accounts when every subscription is out**, as it would to another ChatGPT account. A free reset always goes first: Azure is billed per token.
+3. **Fork the chat to the other provider**, if you turned on **When every account is out, fork the chat to the other provider** (off by default). A stopped Claude chat continues in a new ChatGPT agent, or the other way round:
    - The new agent opens in the same workspace (under the same parent, for a sub-agent) with the conversation so far and goes straight back to work. If that conversation began as a hand-off itself, only the start and end of the earlier one are quoted. It uses the other provider's default model and its account with the most room left.
    - **OpenCode instead:** in the settings under the fork switch, **Fork a stopped Claude chat to** can point at **OpenCode** rather than ChatGPT. A stopped Claude chat then continues on this host's OpenCode, using the model and thinking option picked there from OpenCode's catalog (or the host's default when the host marks one). OpenCode is a harness, not an account provider: the fork uses no ZeroSub account, and nothing is added to your accounts. If the saved model or thinking option is no longer in the host's catalog, the fork is refused with a note rather than falling back to another model.
    - On ChatGPT the fork gets a mode no looser than the original's. Bypass becomes Full Access, and Accept File Edits becomes Default Permissions. Codex has no read-only or ask-first mode, so a Claude agent in Plan Mode or Always Ask isn't forked to ChatGPT. On OpenCode the fork gets Plan (for a Claude agent in Plan or Default mode) or Build, under the host's own permission policy, where Build edits files and runs shell without asking. That can allow more than the original's Claude mode; hosts that want it tighter can restrict `permissions` in their `opencode.jsonc`. Choosing OpenCode as the destination is the opt-in.
    - The original agent stays as it was, and prompting it again while its provider is still out points to the same fork rather than starting another.
    - With the option off, a stopped agent's account button offers **Continue on ChatGPT (new agent)…** (or Claude) instead, with a confirmation.
    - By hand, a stopped Claude chat can also continue on OpenCode at any time: its account button offers **Continue on OpenCode (new agent)…**, with or without the automatic fork turned on, using the OpenCode model and thinking option picked in the settings.
-3. **Stop and say so**, with the time the account frees up.
+4. **Stop and say so**, with the time the account frees up.
+
+## Azure OpenAI accounts
+
+A ChatGPT (Codex) account can also be an Azure OpenAI resource with its API key: Codex agents then run on your Azure deployments, billed per token by Azure, and ZeroSub manages the account like any other.
+
+**Add one.** Under ChatGPT (Codex), click **Add account → Azure OpenAI (API key)** and enter:
+
+- **Name**, as for any account.
+- **Endpoint**: your resource's v1 API, `https://<resource>.openai.azure.com/openai/v1`. It must be `https://`. A trailing slash is dropped, and a bare resource URL (or one ending in `/openai`) gets `/openai/v1` added.
+- **API key**: Key 1 or Key 2 of the resource.
+
+There's no sign-in. ZeroSub checks the key by listing the endpoint's models (`GET {endpoint}/models` with an `api-key` header) from the daemon, only when you add the account or change its endpoint or key. A refused key (HTTP 401/403) isn't saved. If the endpoint can't be reached, or answers otherwise, the account is saved anyway and a warning says so. The key button on its card changes the endpoint, the key (empty keeps it; a new endpoint needs the key typed again) and the price table. Removing the account deletes its home, key included, and its token counts. Like any ChatGPT account, it can't be removed while ChatGPT conversations still run on it.
+
+**Models.** Your Azure deployments must be named after the models (`gpt-5.1-codex`, say): the model Paseo picks for the agent is sent as the deployment name, unchanged.
+
+**When it's used.** It's billed per use, so by default ZeroSub never moves work onto it by itself, like any API-key account:
+
+- Pick it for an agent (the account button, `/account <name>`, the next-new-agent pick), or make it the default; then new agents start on it.
+- Automatic choices (failover at a limit, **Spread new agents across accounts**, a default that's out, **Fork the chat to the other provider**) skip it.
+
+Turn on **Use paid API accounts when every subscription is out** (off by default; in Accounts, or **Settings → Plugins → zerosub → ZeroSub preferences**) to let it take over as a last resort:
+
+- Automatic choices then use it only when every ChatGPT subscription account is at its limit, disabled or signed out. A ChatGPT agent that hits its limit first spends a banked reset if **Use banked resets when every account is out** is on and one can be spent; otherwise it carries on in its continuation tab on Azure, as it would on another ChatGPT account, and its timeline says it moved to Azure OpenAI, a paid API, because every subscription account is out. A stopped Claude chat forked to ChatGPT (**Fork the chat to the other provider**) can likewise land on Azure when no ChatGPT subscription has room, and its note says so; a fork to OpenCode uses no ZeroSub account, so Azure plays no part there.
+- With **Use banked resets when every account is out** on too, a new ChatGPT agent (a fork from Claude included) opens on a subscription account at its limit rather than on Azure when that account's latest reading shows a banked reset it can use now, so its first turn spends the reset. Only when no reset can be spent does a new agent start on Azure.
+- Once a subscription account has room again, new agents go back to it. Agents already on Azure stay there, like any ChatGPT conversation.
+
+Either way, Azure has no 5-hour or weekly limits, so the account counts as available unless Azure turns a turn down. A rate limit (HTTP 429) sets it aside for a minute, or for as long as Azure's "retry after" says (10 minutes at most); an exhausted quota (`insufficient_quota`) for 30 minutes. Only a failed turn is read for these: a turn that finished can carry another service's errors in its warnings (an MCP server's "HTTP 401 Unauthorized", say), and they never touch the account. When a failed turn looks like a refused key (401/403), ZeroSub asks Azure about the key first, and marks the account signed out until you fix the key only if Azure refuses it too; if Azure can't be reached to ask, the account is left as it is.
+
+**Where the key is.** Only in the account's home, `$PASEO_HOME/zerosub/homes/codex-<id>/azure.json` (with the endpoint and prices), readable only by you. Unlike Claude and Pi accounts' folders, an Azure account's home stays in `homes/`, managed by ZeroSub: it's never moved out or given a terminal script, and removing the account deletes it, key and all, once no open agent uses it. (**A folder that's signed in already** is for Claude Code folders: to add an Azure account back, enter its key again.) `azure.json` is never linked into or out of any Codex home. The registry marks the account as Azure and keeps a short hash of the key, to spot the same key added twice; the app only ever gets its last four characters; ZeroSub never logs it.
+
+**How it runs.** The home is a Codex home like any added account's: sessions, `AGENTS.md`, skills and the rest are links to `~/.codex`, and there's no `auth.json`. Its `config.toml` is its own: a copy of `~/.codex/config.toml` with `model_provider = "zerosub_azure"` put first (a top-level `model_provider` there is taken out) and this table added at the end:
+
+```toml
+[model_providers.zerosub_azure]
+name = "Azure OpenAI"
+base_url = "https://<resource>.openai.azure.com/openai/v1"
+env_key = "ZEROSUB_AZURE_OPENAI_API_KEY"
+wire_api = "responses"
+```
+
+It's remade whenever `~/.codex/config.toml` has changed, checked each time a session opens on the account. When Paseo opens a session there, ZeroSub sets `CODEX_HOME` to the home and `ZEROSUB_AZURE_OPENAI_API_KEY` to the key, read from `azure.json` right then; Codex sends it as `Authorization: Bearer`, which Azure's v1 API accepts.
+
+**Usage.** In place of usage bars, the card shows the tokens used this calendar month (UTC): input (with how much of it was cached) and output, and an estimated cost. At the end of each turn on the account, ZeroSub reads the agent's Codex session file (`~/.codex/sessions/…/rollout-…-<thread>.jsonl`) and adds what the thread used since it was last counted. Totals are kept by model in `$PASEO_HOME/zerosub/api-usage.json` and start again each month. The cost comes from the price table in the account's settings (USD per million input, cached input and output tokens, per model; cached input without a price counts at the input price). With no prices it says "cost unknown". It's an estimate from Codex's own counts, not Azure's bill.
+
+**Limitations.**
+
+- A `profile` in `~/.codex/config.toml` that sets its own `model_provider` still wins over the Azure provider, as it would in Codex. An inline `model_providers = { … }` table isn't changed. What Codex itself writes to `config.toml` while running on the account (a project's trust level, say) goes to the generated copy and is lost when it's remade: set it in `~/.codex/config.toml`.
+- The key reaches Codex through the session's environment, which Paseo starts the agent with; anything that can read that process's environment can read it.
+- Token counts need the Codex session file. A turn whose file isn't found (a thread whose file is more than 120 days of folders back, or a Codex that keeps sessions elsewhere) is counted as "couldn't be counted", and the card says the totals are short. Turns run on the account from a terminal aren't seen.
+- ChatGPT conversations can't change accounts, so a task that moved to Azure keeps its Azure tab; new agents go to a ChatGPT account once one has room, not that tab.
 
 ## Pi accounts
 
@@ -240,6 +292,7 @@ ZeroSub never implements OAuth itself and never copies credentials between accou
 - Using a banked reset calls the provider's own reset endpoint with that account's sign-in, and only after you confirm (or turn on automatic use).
 - Removing an account moves its agents to the default account, then signs it out (`claude auth logout` / `codex` logout / `grok logout` / `cursor-agent logout`) and deletes its home. This happens once no agent is mid-turn on it. Abandoned sign-ins are cleaned up the same way; one a restart interrupted is deleted only if it isn't signed in.
 - ZeroSub only signs out or deletes homes it recorded for cleanup when you removed the account or started the sign-in, never a home just because the registry doesn't list it: a damaged or hand-edited registry may simply be missing accounts. Folders in `homes/` that no account uses are left alone and named in the log at startup.
+- An Azure OpenAI account's key is in its home's `azure.json` only (see [Azure OpenAI accounts](#azure-openai-accounts)), and is sent nowhere but its endpoint.
 - An account that still has ChatGPT conversations on it can't be removed until you archive them or continue them elsewhere, because they can't move. Grok and Cursor conversations can only be archived.
 - Your CLI login can't be removed from ZeroSub.
 
