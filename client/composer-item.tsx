@@ -46,12 +46,14 @@ export const FOLLOW = "follow";
 
 /**
  * What the account control offers in a composer whose agent doesn't exist yet, or null when there's
- * nothing to choose: fewer than two accounts, the account button turned off, or a provider ZeroSub
- * doesn't route. Only accounts that can take a new agent are offered, as routing would pass over
- * the others. The first option names none and says where the agent starts then.
+ * nothing to choose: fewer than two accounts, the account button turned off, a provider ZeroSub
+ * doesn't route, or a host whose Paseo keeps no agent metadata to carry the choice in (an app from
+ * 0.16 can be talking to an older host, which would then fail to create the agent). Only accounts
+ * that can take a new agent are offered, as routing would pass over the others. The first option
+ * names none and says where the agent starts then.
  */
 export function accountChoices(state: StateView, provider: string | null, chosen: unknown): AccountChoices | null {
-  if (!state.showComposerPill || !provider) return null;
+  if (!state.showComposerPill || state.agentMetadata !== true || !provider) return null;
   const family = state.providers[provider];
   if (!family) return null;
   const accounts = state.accounts.filter((account) => account.family === family);
