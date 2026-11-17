@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Usage } from "../shared/model";
 import { applyEnv } from "./adapter";
 import { parseRateLimits } from "./codex";
-import { canStandIn, chooseAccount, fiveHourGated, isLastResort, mostAvailable, paceScore, paceView } from "./routing";
+import { canStandIn, chooseAccount, fiveHourGated, isLastResort, isLimitedFor, mostAvailable, paceScore, paceView, scopeCoversModel } from "./routing";
 import { emptyState, type StoredAccount, type StoredState } from "./state";
 
 const NOW = Date.parse("2026-09-23T12:00:00Z");
@@ -24,6 +24,7 @@ function account(partial: Partial<StoredAccount> & Pick<StoredAccount, "id">): S
     limitedUntil: null,
     limitKind: null,
     limitedAt: null,
+    modelLimits: {},
     createdAt: "2026-09-01T00:00:00Z",
     ...partial,
   };
@@ -753,5 +754,67 @@ describe("pacing", () => {
     });
     expect(decision(false)?.account.id).toBe("claude-main");
     expect(decision(true)?.account.id).toBe("claude-spare");
+  });
+});
+
+describe("limits of one model's own window", () => {
+  const fableLimit = { fable: { until: "2026-09-25T12:00:00Z", at: "2026-09-23T11:00:00Z", source: "turn" as const } };
+  const main = account({ id: "claude-main", kind: "main", home: null });
+  const work = account({ id: "claude-work", modelLimits: fableLimit });
+  const open = stateWith([main, work], { defaults: { claude: "claude-work", codex: null, pi: null } });
+  const input = { ...base, reason: "resume" as const, usageOf: () => null };
+
+  it("matches a scope to the models whose name holds all its words", () => {
+    expect(scopeCoversModel("fable", "claude-fable-5-2")).toBe(true);
+    expect(scopeCoversModel("fable", "fable")).toBe(true);
+    expect(scopeCoversModel("Fable", "Claude-Fable-5.2")).toBe(true);
+    expect(scopeCoversModel("opus", "claude-fable-5-2")).toBe(false);
+    expect(scopeCoversModel("fable", "claude-fables")).toBe(false);
+    expect(scopeCoversModel("fable", null)).toBe(false);
+    expect(scopeCoversModel("fable", undefined)).toBe(false);
+    expect(scopeCoversModel("fable", "default")).toBe(false);
+    expect(scopeCoversModel("", "claude-fable-5-2")).toBe(false);
+  });
+
+  it("limits an account only for the model it covers, and only until it expires", () => {
+    expect(isLimitedFor(work, NOW, "claude-fable-5-2")).toBe(true);
+    expect(isLimitedFor(work, NOW, "claude-opus-4-1")).toBe(false);
+    expect(isLimitedFor(work, NOW, null)).toBe(false);
+    expect(isLimitedFor(work, NOW)).toBe(false);
+    expect(isLimitedFor(work, Date.parse("2026-09-26T00:00:00Z"), "claude-fable-5-2")).toBe(false);
+    expect(canStandIn(work, NOW, "claude-fable-5-2")).toBe(false);
+    expect(canStandIn(work, NOW, "claude-opus-4-1")).toBe(true);
+  });
+
+  it("routes an agent on that model away, and leaves other models and unknown ones where they are", () => {
+    const fable = chooseAccount(open, { ...input, model: "claude-fable-5-2" });
+    expect(fable?.account.id).toBe("claude-main");
+    expect(fable?.skipped).toMatchObject({ why: "limited" });
+    for (const model of ["claude-opus-4-1", null, undefined]) {
+      const decision = chooseAccount(open, { ...input, model });
+      expect(decision?.account.id).toBe("claude-work");
+      expect(decision?.skipped).toBeNull();
+    }
+  });
+
+  it("ignores a limit that has expired", () => {
+    const expired = account({ id: "claude-work", modelLimits: { fable: { until: "2026-09-23T11:00:00Z", at: "x", source: "turn" } } });
+    const state = stateWith([main, expired], { defaults: { claude: "claude-work", codex: null, pi: null } });
+    expect(chooseAccount(state, { ...input, model: "claude-fable-5-2" })?.account.id).toBe("claude-work");
+  });
+
+  it("keeps an agent where it stands in only while that account takes its model", () => {
+    const stateAB = stateWith([main, work, account({ id: "claude-third" })], { defaults: { claude: "claude-main", codex: null, pi: null } });
+    const fable = chooseAccount({ ...stateAB, bindings: { "agent-1": { accountId: "claude-work", source: "user", at: "x" } } }, { ...input, current: "claude-work", model: "claude-fable-5-2" });
+    expect(fable?.account.id).not.toBe("claude-work");
+  });
+
+  it("spreads a new agent of that model off the account", () => {
+    const state = stateWith([main, work]);
+    const pick = (model: string | null) => mostAvailable(state, "claude", () => null, NOW, new Set(), false, undefined, model)?.id;
+    expect(pick("claude-fable-5-2")).toBe("claude-main");
+    // Same headroom: the default (main) wins for an unaffected model too, so exclude it to see work is still usable.
+    expect(mostAvailable(state, "claude", () => null, NOW, new Set(["claude-main"]), false, undefined, "claude-opus-4-1")?.id).toBe("claude-work");
+    expect(mostAvailable(state, "claude", () => null, NOW, new Set(["claude-main"]), false, undefined, "claude-fable-5-2")).toBeUndefined();
   });
 });

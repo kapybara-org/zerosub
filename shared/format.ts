@@ -69,6 +69,15 @@ export function capsAccount(window: UsageWindow): boolean {
   return ACCOUNT_WINDOWS.has(window.id);
 }
 
+/**
+ * The model or surface a narrower window belongs to, lowercase: "fable" for "Weekly · Fable", else
+ * the window's id. It names the key of an account's `modelLimits`.
+ */
+export function windowScope(window: UsageWindow): string {
+  const named = window.label.match(/^Weekly\s*·\s*(.+)$/i)?.[1]?.trim();
+  return (named || window.id).toLowerCase();
+}
+
 /** The busiest window that caps the whole account: how much room it has left for any model. */
 export function accountPeak(windows: readonly UsageWindow[]): UsageWindow | null {
   return peakUsage(windows.filter(capsAccount));
@@ -161,6 +170,12 @@ export function moveProblem(summary: ReopenSummary, to: string): string | null {
 /** Why an agent can't be moved onto an account at its limit while automatic switching is on. */
 export function limitedPick(label: string): string {
   return `${label} is at its limit, and with automatic switching on the agent would move straight off it again. Pick another account, or mark ${label} as available again on its card in Accounts if it has room.`;
+}
+
+/** Why an agent can't be moved onto an account whose limit for its model is reached, while others can run there. */
+export function limitedModelPick(label: string, scope: string): string {
+  const name = scope.charAt(0).toUpperCase() + scope.slice(1);
+  return `${label} has reached its ${name} limit, so this agent's model can't run there now. Pick another account or another model.`;
 }
 
 /** One line summarising an account's headroom, e.g. "42% of 5-hour used · resets in 2h". */

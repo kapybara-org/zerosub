@@ -47,8 +47,33 @@ export function isLimited(account: StoredAccount, now: number): boolean {
   return Number.isFinite(until) && until > now;
 }
 
-export function isUsable(account: StoredAccount, now: number): boolean {
-  return account.signedIn && !account.disabled && !isLimited(account, now);
+function tokens(text: string): string[] {
+  return text.toLowerCase().split(/[^a-z0-9]+/).filter((token) => token.length > 0);
+}
+
+/**
+ * Whether a model limit's scope ("fable") covers a model id ("claude-fable-5-2"): every word of the
+ * scope is a word of the model. An unknown or default model is covered by nothing, so it's never
+ * kept off an account for a limit of one model.
+ */
+export function scopeCoversModel(scope: string, model: string | null | undefined): boolean {
+  if (!model || model.toLowerCase() === "default") return false;
+  const wanted = tokens(scope);
+  if (wanted.length === 0) return false;
+  const have = new Set(tokens(model));
+  return wanted.every((token) => have.has(token));
+}
+
+/** The account is at a limit of its own, or at the limit of a model window that covers `model`. */
+export function isLimitedFor(account: StoredAccount, now: number, model?: string | null): boolean {
+  if (isLimited(account, now)) return true;
+  return Object.entries(account.modelLimits ?? {}).some(
+    ([scope, limit]) => Date.parse(limit.until) > now && scopeCoversModel(scope, model),
+  );
+}
+
+export function isUsable(account: StoredAccount, now: number, model?: string | null): boolean {
+  return account.signedIn && !account.disabled && !isLimitedFor(account, now, model);
 }
 
 /**
@@ -56,8 +81,8 @@ export function isUsable(account: StoredAccount, now: number): boolean {
  * account is ever picked that way: an added one is an API key, and Pi's own login may be one too,
  * so moving work onto either would move it onto a bill nobody chose.
  */
-export function canStandIn(account: StoredAccount, now: number): boolean {
-  return account.family !== "pi" && account.auth !== "api" && isUsable(account, now);
+export function canStandIn(account: StoredAccount, now: number, model?: string | null): boolean {
+  return account.family !== "pi" && account.auth !== "api" && isUsable(account, now, model);
 }
 
 /**
@@ -205,12 +230,13 @@ export function mostAvailable(
   exclude: ReadonlySet<string> = new Set(),
   paidFallback = false,
   pacing?: Pacing,
+  model?: string | null,
 ): StoredAccount | undefined {
   const preferred = defaultAccount(state, family)?.id;
   const open = accountsOf(state, family).filter((account) => !exclude.has(account.id));
-  const subscriptions = open.filter((account) => canStandIn(account, now));
+  const subscriptions = open.filter((account) => canStandIn(account, now, model));
   const candidates =
-    subscriptions.length > 0 || !paidFallback ? subscriptions : open.filter((account) => isLastResort(account) && isUsable(account, now));
+    subscriptions.length > 0 || !paidFallback ? subscriptions : open.filter((account) => isLastResort(account) && isUsable(account, now, model));
   const rank = (account: StoredAccount) => {
     const usage = usageOf(account.id);
     const score = headroomScore(usage, now);
@@ -324,6 +350,11 @@ export interface RouteInput {
   allowNextPick?: boolean;
   /** Agents recently placed on an account; only read while `balanceNewAgents` is on. */
   pendingOf?(accountId: string): number;
+  /**
+   * The model the agent runs, when known. A limit of that model's own window keeps the agent off the
+   * account; without it only limits of the whole account count.
+   */
+  model?: string | null;
 }
 
 export interface RouteDecision {
@@ -366,7 +397,7 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   // The account named for this very agent outranks the pick, which waits for an agent that names
   // none. One that can't take the agent is passed over, and the agent routes as usual.
   const takes = (candidate: StoredAccount | undefined): candidate is StoredAccount =>
-    candidate?.family === input.family && candidate.signedIn && !candidate.disabled && !(input.autoSwitch && isLimited(candidate, input.now));
+    candidate?.family === input.family && candidate.signedIn && !candidate.disabled && !(input.autoSwitch && isLimitedFor(candidate, input.now, input.model));
   const requested = !account && fresh ? findAccount(state, input.requested) : undefined;
   if (takes(requested)) {
     account = requested;
@@ -386,7 +417,7 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   }
   if (!account && fresh && input.balanceNewAgents && accounts.length > 1) {
     const nearReset = input.family === "codex" ? soonestWeeklyReset(state, input.family, input.usageOf, input.now) : undefined;
-    account = nearReset ?? mostAvailable(state, input.family, input.usageOf, input.now, new Set(), input.paidFallback, pacing);
+    account = nearReset ?? mostAvailable(state, input.family, input.usageOf, input.now, new Set(), input.paidFallback, pacing, input.model);
     // A banked reset is free, so it goes before a paid stand-in, as it does when a turn hits a limit.
     if (account && isLastResort(account) && input.autoRedeem) {
       account = withBankedReset(state, input.family, input.usageOf, input.now) ?? account;
@@ -405,17 +436,17 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   if (!account) return null;
 
   let skipped: RouteDecision["skipped"] = null;
-  const why = !account.signedIn ? "signed_out" : account.disabled ? "disabled" : isLimited(account, input.now) ? "limited" : null;
+  const why = !account.signedIn ? "signed_out" : account.disabled ? "disabled" : isLimitedFor(account, input.now, input.model) ? "limited" : null;
   const mayMove = fresh || input.portable;
   if (why && mayMove && (input.autoSwitch || why !== "limited")) {
     const staying = findAccount(state, input.current);
     // A paid stand-in is only kept while no subscription account could take over from it.
     const keeps = (stand: StoredAccount) =>
-      !isLastResort(stand) || !accountsOf(state, input.family).some((other) => other.id !== account!.id && canStandIn(other, input.now));
+      !isLastResort(stand) || !accountsOf(state, input.family).some((other) => other.id !== account!.id && canStandIn(other, input.now, input.model));
     let alternative =
-      staying && staying.family === input.family && staying.id !== account.id && isUsable(staying, input.now) && keeps(staying)
+      staying && staying.family === input.family && staying.id !== account.id && isUsable(staying, input.now, input.model) && keeps(staying)
         ? staying
-        : mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]), input.paidFallback, pacing);
+        : mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]), input.paidFallback, pacing, input.model);
     // Before a paid stand-in, a limited subscription with a usable banked reset: the account itself
     // (it stays, and its first turn spends the reset) or another one.
     if (alternative && isLastResort(alternative) && input.autoRedeem) {
