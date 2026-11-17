@@ -290,6 +290,16 @@ describe("the accounts a running agent's composer offers", () => {
     });
   });
 
+  it("says by the agent's account when the agent started there because its weekly reset was near", () => {
+    const near = agentChoices(running([main, work], { selectionReason: "weekly_reset" }), "agent-1")!;
+    expect(near.options[0]).toEqual({ value: "main", label: "main", description: "Weekly reset was near · 42% used" });
+    // Only by its own account, and with no usage reading the note stands alone.
+    expect(near.options[1]!.description).toBe("7% used");
+    const unread = agentChoices(running([home, work], { accountId: "home", selectionReason: "weekly_reset" }), "agent-1")!;
+    expect(unread.options[0]!.description).toBe("Weekly reset was near");
+    expect(agentChoices(running([main, work]), "agent-1")!.options[0]!.description).toBe("42% used");
+  });
+
   it("offers the way back to the default to an agent that was given an account", () => {
     const options = agentChoices(running([main, work], { accountId: "work", pinned: true }), "agent-1")!.options;
     expect(options.map((option) => option.label)).toEqual(["work", "main", "Follow default (main)", "Manage accounts…"]);
