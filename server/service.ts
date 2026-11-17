@@ -4865,6 +4865,7 @@ export class Service {
       return { account, proxy, kept };
     });
     if (account.kind === "main" && account.family === "pi") {
+      void this.checkEgress(account);
       await this.followMainSettings(account.family);
     } else {
       void this.checkEgress(account);
@@ -4877,8 +4878,9 @@ export class Service {
   /**
    * A new proxy on the CLI login is also every added account's without one of its own, so it's
    * refused while one of those sends its key over plain http:// through it: to this machine too,
-   * unless the no-proxy list keeps it direct, since Pi adds nothing to that list for the login's
-   * proxy (see `crossesInheritedProxy`).
+   * unless the no-proxy list keeps it direct. ZeroSub gives Paseo's agents this machine's addresses
+   * as direct, but the proxy also reaches the account as `httpProxy` in its settings, which Pi
+   * applies without that list wherever the variables are missing (see `crossesInheritedProxy`).
    */
   private async refuseClearTextFollowers(family: Family): Promise<void> {
     const adapter = this.adapters[family];
@@ -4947,13 +4949,15 @@ export class Service {
 
   /**
    * Checks where an account's requests come from; a failed check keeps the last address it saw.
-   * Pi's own login is never checked: only an added Pi account's requests are ZeroSub's to place, so
-   * nothing is sent while none is added. Claude's CLI login is, as its proxy can be set here too.
+   * The CLI logins are checked too, as their proxies can be set here; Pi's only while a proxy is set
+   * on it, and not while its `models.json` sends Anthropic's requests somewhere else (see
+   * `PiAdapter.egress`).
    */
   private async checkEgress(account: StoredAccount): Promise<void> {
     const adapter = this.adapters[account.family];
     if (!adapter.egress || !account.signedIn) return;
-    if (account.kind === "main" ? account.family !== "claude" : !account.home) return;
+    // ZeroSub checks Pi's CLI login too: its proxy reaches its agents (see `PiAdapter.env`).
+    if (account.kind === "main" ? account.family !== "claude" && account.family !== "pi" : !account.home) return;
     this.egressCheckedAt.set(account.id, Date.now());
     const checkedAt = new Date().toISOString();
     try {

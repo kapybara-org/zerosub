@@ -5,7 +5,7 @@ import type { ApiKeyKind, ApiSummary, Family, TrafficSwitches } from "../shared/
 import { AZURE_FILE, isAzureHome, syncAzureConfig } from "./azure";
 import { BEDROCK_FILE, bedrockSettings, isBedrockHome, readBedrockAccount } from "./bedrock";
 import { Mutex, readJson } from "./json-file";
-import { NO_PROXY_KEYS, PROXY_KEYS, REQUIRED_NO_PROXY, bypassesProxy, maskProxy, noProxyFromEnv, proxyFromEnv, withClaudeNoProxy, withoutClaudeDomains } from "./proxy";
+import { NO_PROXY_KEYS, PROXY_KEYS, REQUIRED_NO_PROXY, bypassesProxy, maskProxy, noProxyFromEnv, proxyFromEnv, withClaudeNoProxy, withRequiredNoProxy, withoutClaudeDomains, withoutDomains } from "./proxy";
 import { providerEnv } from "./provider-env";
 import { homesDir, isOwnHome, mainClaudeDir, mainClaudeGlobalConfig, mainCodexHome, mainConfigHome, mainCursorConfigDir, mainGrokHome, mainPiDir } from "./paths";
 
@@ -1530,6 +1530,9 @@ export async function clearTextProviders(login: boolean): Promise<string[]> {
   const providers = isObject(models) && isObject(models.providers) ? models.providers : {};
   const env: Record<string, string | undefined> = { ...process.env, ...providerEnv("pi") };
   const inEnv = (name: string) => (name === "anthropic" ? PI_ANTHROPIC_CREDENTIAL_ENV : [PI_KEY_ENV[name] ?? []].flat()).some((key) => env[key]?.trim());
+  // The login's proxy is also `httpProxy` in Pi's own settings, which a `pi` run from a terminal
+  // applies without ZeroSub's no-proxy list, and Pi adds none of its own: so for the login, this
+  // machine's addresses count too unless the no-proxy list keeps them direct.
   const clear = (value: unknown) => typeof value === "string" && (login ? crossesInheritedProxy(value, env) : sentInTheClear(value));
   // Set to something: an empty key or header list, or `authHeader: false`, sends nothing.
   const set = (value: unknown) => (isObject(value) ? Object.keys(value).length > 0 : value !== undefined && value !== null && value !== false && value !== "");
@@ -1575,13 +1578,34 @@ export function plainHttp(baseUrl: string | null): boolean {
   }
 }
 
+/** Where Anthropic's API and sign-in live; a proxy set for Pi must not be gone around for them. */
+const PI_ANTHROPIC_DOMAINS = ["anthropic.com", "claude.ai", "claude.com"];
+
+/**
+ * The no-proxy list ZeroSub gives a Pi agent it sends through a proxy: the one in `env`, the agent's
+ * environment otherwise, without anything that would send Anthropic's traffic, or `baseHost`'s, past
+ * the proxy (`*`, or an entry like `.com`; see `withoutDomains`), plus this machine's addresses.
+ */
+export function piAgentNoProxy(env: Record<string, string | undefined>, baseHost: string | null = null): string {
+  return withRequiredNoProxy(withoutDomains(noProxyFromEnv(env), baseHost ? [...PI_ANTHROPIC_DOMAINS, baseHost] : PI_ANTHROPIC_DOMAINS));
+}
+
+/**
+ * Whether a Pi process goes straight to `target` past a proxy it inherits. Only when both no-proxy
+ * lists keep it direct: the one in `env`, as a `pi` run from a terminal reads it (as undici does:
+ * `no_proxy` wherever it's set, even empty, else `NO_PROXY`), and the one ZeroSub gives its agents
+ * (`piAgentNoProxy`), which drops `*` and entries like `.com`.
+ */
+export function piKeepsDirect(target: string, env: Record<string, string | undefined>): boolean {
+  return bypassesProxy(env.no_proxy ?? env.NO_PROXY ?? null, target) && bypassesProxy(piAgentNoProxy(env), target);
+}
+
 /**
  * Whether requests to `baseUrl` would cross a proxy Pi takes from `httpProxy` or the environment
- * (`env`, the one Pi starts with) unencrypted: plain http:// that the no-proxy list doesn't keep
- * direct. Pi adds nothing to that list, and undici, which Pi sends its requests with, keeps no host
- * direct without it, this machine included. The list is read as undici reads it: `no_proxy` wherever
- * it's set, even empty, else `NO_PROXY`.
+ * (`env`, the one Pi starts with) unencrypted: plain http:// that the no-proxy lists don't keep
+ * direct (see `piKeepsDirect`). Pi adds nothing to the list a `pi` from a terminal reads, and undici,
+ * which Pi sends its requests with, keeps no host direct without it, this machine included.
  */
 export function crossesInheritedProxy(baseUrl: string | null, env: Record<string, string | undefined> = { ...process.env, ...providerEnv("pi") }): boolean {
-  return baseUrl !== null && plainHttp(baseUrl) && !bypassesProxy(env.no_proxy ?? env.NO_PROXY ?? null, baseUrl);
+  return baseUrl !== null && plainHttp(baseUrl) && !piKeepsDirect(baseUrl, env);
 }
