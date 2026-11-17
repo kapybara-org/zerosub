@@ -78,7 +78,7 @@ import { maskProxy, normalizeProxy } from "./proxy";
 import { Reopener, hostCanReload } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
-import { chooseAccount, isLastResort, isLimited, isUsable, mostAvailable, withBankedReset, type RouteDecision, type RouteInput } from "./routing";
+import { canStandIn, chooseAccount, fiveHourWindow, isLastResort, isLimited, isUsable, mostAvailable, paceScore, PENDING_MS, weeklyWindow, withBankedReset, type Pacing, type RouteDecision, type RouteInput } from "./routing";
 import {
   ALL_SOURCES,
   MAIN_ACCOUNT_ID,
@@ -155,6 +155,7 @@ const USAGE_REPLY_MS = 15_000;
 const EGRESS_MS = 30 * 60_000;
 /** A home an agent was routed to this recently isn't moved yet: its session may only now be starting. */
 const ROUTED_SETTLE_MS = 30_000;
+const USAGE_HISTORY_SIZE = 12;
 
 const DEFAULT_PREFERENCES: Preferences = {
   autoSwitch: true,
@@ -989,6 +990,42 @@ export class Service {
     });
   }
 
+  /** Agents placed on an account in the last `PENDING_MS`, which its latest usage reading may not show yet. */
+  private readonly placements: { accountId: string; at: number }[] = [];
+
+  private notePlacement(accountId: string, now: number): void {
+    this.placements.push({ accountId, at: now });
+    while (this.placements.length > 0 && this.placements[0]!.at <= now - PENDING_MS) this.placements.shift();
+  }
+
+  private pendingOn(accountId: string, now: number): number {
+    return this.placements.filter((placement) => placement.accountId === accountId && placement.at > now - PENDING_MS).length;
+  }
+
+  private pacing(now: number): Pacing | undefined {
+    return this.prefs.balanceNewAgents ? { pendingOf: (id) => this.pendingOn(id, now) } : undefined;
+  }
+
+  /** The latest live readings per account, oldest first, for tuning the pacing constants from the log. */
+  private readonly usageHistory = new Map<string, { at: number; fiveHour: number | null; weekly: number | null }[]>();
+
+  private noteHistory(accountId: string, usage: Usage): void {
+    const list = this.usageHistory.get(accountId) ?? [];
+    list.push({ at: Date.parse(usage.fetchedAt) || Date.now(), fiveHour: fiveHourWindow(usage)?.usedPercent ?? null, weekly: weeklyWindow(usage)?.usedPercent ?? null });
+    while (list.length > USAGE_HISTORY_SIZE) list.shift();
+    this.usageHistory.set(accountId, list);
+  }
+
+  /** One log line per balanced placement: every candidate's pace scores and recent 5-hour readings. */
+  private logPlacement(state: StoredState, family: Family, agentId: string, chosen: StoredAccount, now: number, why: string): void {
+    const parts = accountsOf(state, family).filter((account) => canStandIn(account, now)).map((account) => {
+      const pace = paceScore(this.usage.get(account.id), this.pendingOn(account.id, now), now);
+      const seen = (this.usageHistory.get(account.id) ?? []).slice(-4).map((entry) => entry.fiveHour ?? "?").join("/") || "none";
+      return `${account.label} 5h ${pace.fiveHour.toFixed(1)} wk ${pace.weekly.toFixed(1)} score ${pace.score.toFixed(1)} gated ${pace.gated ? "yes" : "no"} pending ${this.pendingOn(account.id, now)} seen 5h ${seen}`;
+    });
+    console.log(`[ZeroSub] placed ${agentId} on ${chosen.label} (${why}): ${parts.join("; ")}`);
+  }
+
   /**
    * A session of a family that isn't available here runs on the CLI login, like any session ZeroSub
    * didn't route: so the account recorded for the session before goes, unless a session opened since
@@ -1047,9 +1084,13 @@ export class Service {
       current: request.reason === "create" ? undefined : this.standingIn(state, request.agentId, family, request.reason === "refresh"),
       requested: request.reason === "create" ? requestedAccount(request) : undefined,
       allowNextPick: takesNextPick(request),
+      pendingOf: (id) => this.pendingOn(id, now),
     };
     const first = chooseAccount(state, input);
     if (!first) return undefined;
+    if (first.bind?.source === "balance") this.logPlacement(state, family, request.agentId, first.account, now, "new agent");
+    // Recorded before any await, so concurrent creates see each other's placements.
+    if (interactive && (request.reason === "create" || first.skipped)) this.notePlacement(first.account.id, now);
     let decision = first;
     const prepare = async (account: StoredAccount) => {
       // Taken before anything else waits, so a move of this home that hasn't finished gives way (see
@@ -1482,7 +1523,7 @@ export class Service {
     const move = adapter.portable ? this.nextAccount(latest, agentId, family, account.id) : null;
     // Another subscription account comes first, then a banked reset (free), and a paid Azure account
     // (with `paidApiFallback` on) only once neither is to be had.
-    let next = adapter.portable ? move?.account : mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]));
+    let next = adapter.portable ? move?.account : mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]), false, this.pacing(now));
     if (!next) {
       if (problem.kind === "limit" && problem.hit.kind === "window" && this.prefs.autoRedeem && !account.disabled && account.auth !== "api") {
         // Opt-in: every subscription account is out, so spend a banked reset rather than stop (or pay).
@@ -1554,6 +1595,8 @@ export class Service {
       await this.appendRow(paseo, agentId, { ...base, to: account.label, reason: "exhausted", outcome: "stayed", detail });
       return;
     }
+
+    this.notePlacement(next.id, now);
 
     if (!adapter.portable && (await this.keptSameConversation(paseo, agentId, account, next, problem, base, reason, endedAt))) return;
 
@@ -1874,7 +1917,8 @@ export class Service {
   private nextAccount(state: StoredState, agentId: string, family: Family, exhausted: string): { account: StoredAccount; pin: boolean } | undefined {
     const routed = this.routeFor(state, agentId, family, exhausted);
     if (routed && routed.account.id !== exhausted && !routed.skipped) return { account: routed.account, pin: false };
-    const roomiest = mostAvailable(state, family, (id) => this.usage.get(id), Date.now(), new Set([exhausted]), this.prefs.paidApiFallback);
+    const now = Date.now();
+    const roomiest = mostAvailable(state, family, (id) => this.usage.get(id), now, new Set([exhausted]), this.prefs.paidApiFallback, this.pacing(now));
     return roomiest && { account: roomiest, pin: true };
   }
 
@@ -1998,7 +2042,7 @@ export class Service {
       : false;
     if (!provider || !available) return { skipped: `${name} isn't available in Paseo on this host.` };
     const now = Date.now();
-    let account = mostAvailable(state, other, (id) => this.usage.get(id), now, new Set(), this.prefs.paidApiFallback);
+    let account = mostAvailable(state, other, (id) => this.usage.get(id), now, new Set(), this.prefs.paidApiFallback, this.pacing(now));
     // A fork is a new agent that can't change accounts later, so a free banked reset goes before a paid stand-in here too.
     if (account && isLastResort(account) && this.prefs.autoRedeem) {
       account = withBankedReset(state, other, (id) => this.usage.get(id), now) ?? account;
@@ -2897,18 +2941,20 @@ export class Service {
    * `current` is the account its session runs on, which it keeps while that can stand in.
    */
   private routeFor(state: StoredState, agentId: string, family: Family, current?: string): RouteDecision | null {
+    const now = Date.now();
     return chooseAccount(state, {
       agentId,
       family,
       reason: "refresh",
-      now: Date.now(),
+      now,
       autoSwitch: this.prefs.autoSwitch,
-      balanceNewAgents: false,
+      balanceNewAgents: this.prefs.balanceNewAgents,
       paidFallback: this.prefs.paidApiFallback,
       autoRedeem: this.prefs.autoRedeem,
       portable: this.adapters[family].portable,
       usageOf: (id) => this.usage.get(id),
       current,
+      pendingOf: (id) => this.pendingOn(id, now),
     });
   }
 
@@ -3302,6 +3348,7 @@ export class Service {
         return;
       }
       this.usageLive.add(accountId);
+      this.noteHistory(accountId, usage);
       const now = Date.now();
       // With "Use ChatGPT credits when a limit is reached" on, credits keep an account going past a
       // full window, so a full window alone isn't a limit then.
