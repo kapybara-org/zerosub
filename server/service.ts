@@ -87,7 +87,7 @@ import { CONTINUED_FROM_LABEL, PARENT_LABEL, buildTranscript, continueInNewAgent
 import { launcherDir, launcherNames, piLauncherDir, writeLaunchers, type LauncherAccount, type LauncherKind } from "./launchers";
 import { PI_ACCOUNT_FILE, codexSessionsShared, prepareClaudeHome, crossesInheritedProxy, isAccountHome, moveHome, normalizeBaseUrl, plainHttp, readPiAccount, readPiAccountForAgents, removeHome, sentInTheClear } from "./homes";
 import { Mutex } from "./json-file";
-import { detectAzureLimit, detectAzureSignOut, detectBedrockLimit, detectBedrockModelUnavailable, detectBedrockRefusal, turnRows } from "./limits";
+import { detectAzureLimit, detectAzureSignOut, detectBedrockAutoModeRefusal, detectBedrockLimit, detectBedrockModelUnavailable, detectBedrockRefusal, turnRows } from "./limits";
 import { canSignInWithBrowser } from "./machine";
 import { equivalentMode, withinMode } from "./modes";
 import { homesDir, inHomesDir, isOwnHome, shownPath } from "./paths";
@@ -152,6 +152,8 @@ const OPENCODE_AVAILABLE_MS = 60_000;
 const ROUTING_WAIT_MS = 5_000;
 /** How long the end of a turn waits for Paseo to page the agent's timeline. The SDK itself waits 60 s. */
 const TURN_READ_MS = 10_000;
+/** How long routing waits for Paseo to say an agent's mode before taking it for Auto (see `paidFor`). */
+const MODE_READ_MS = 3_000;
 /** An agent whose move to an account didn't land isn't moved there again for this long. */
 const ALIGN_RETRY_MS = 30 * 60_000;
 /**
@@ -232,6 +234,8 @@ interface AgentInfo {
   lastMessageAt: number;
   /** Shells and monitors it left running after its turn (Paseo 0.16+; 0 before). A reload cancels them. */
   backgroundWork: number;
+  /** Its permission mode now, as Paseo names it (Claude's `auto`, say), or null when Paseo gives none. */
+  modeId: string | null;
 }
 
 /**
@@ -525,6 +529,8 @@ export class Service {
   private readonly redeeming = new Set<string>();
   private readonly browserSignIn = canSignInWithBrowser();
   private agentCache: { at: number; agents: Promise<AgentInfo[]> } | null = null;
+  /** Each agent's permission mode as last seen, for routing that can't take some modes (Bedrock and Claude's Auto mode). */
+  private readonly agentModes = new Map<string, string | null>();
   private openCodeCache: { at: number; available: boolean } | null = null;
   private lastPrune = 0;
   private cleaning: Promise<void> | null = null;
@@ -1066,7 +1072,17 @@ export class Service {
       requested: request.reason === "create" ? requestedAccount(request) : undefined,
       allowNextPick: takesNextPick(request),
     };
-    const first = chooseAccount(state, input);
+    let first = chooseAccount(state, input);
+    // Paid fallback would put a Claude agent on Bedrock by itself: not one in Auto mode, which Bedrock
+    // can't run (see `paidFor`). Its mode is asked for only then.
+    if (first && family === "claude" && input.paidFallback && isBedrockAccount(first.account)) {
+      const unpaid = chooseAccount(state, { ...input, paidFallback: false });
+      if (unpaid?.account.id !== first.account.id && runsAutoMode(await this.modeOf(context.paseo, request.agentId))) {
+        console.log(`[ZeroSub] ${request.agentId} not routed to ${first.account.label}: it's in Claude's Auto mode, which Bedrock can't run`);
+        input.paidFallback = false;
+        first = unpaid;
+      }
+    }
     if (!first) return undefined;
     let decision = first;
     const prepare = async (account: StoredAccount) => {
@@ -1183,6 +1199,15 @@ export class Service {
       const conversation = event.timeline.length > 0 ? event.timeline : undefined;
       // A model the account's region doesn't offer is that model's problem, not the account's: the
       // agent stays, and its timeline says how to fix it (see `detectBedrockModelUnavailable`).
+      // Paseo refuses Claude's Auto mode on Bedrock. The account is fine: the agent's mode isn't.
+      const autoRefused = bedrock ? detectBedrockAutoModeRefusal(turn) : null;
+      if (autoRefused && ranAccount) {
+        console.log(`[ZeroSub] ${agentId} can't run in Auto mode on ${ranAccount.label}: ${autoRefused}`);
+        this.agentModes.set(agentId, CLAUDE_AUTO_MODE);
+        await this.noteBedrockTurn(context.paseo, agentId, ranAccount, autoModeRefusedNote(ranAccount.label));
+        if (this.deferred.has(agentId)) await this.finishDeferred(context.paseo, agentId, family);
+        return;
+      }
       const unavailable = bedrock ? detectBedrockModelUnavailable(turn) : null;
       if (unavailable && ranAccount) {
         console.log(`[ZeroSub] ${agentId}'s model isn't available on ${ranAccount.label}: ${unavailable.message}`);
@@ -1544,6 +1569,7 @@ export class Service {
     // Another subscription account comes first, then a banked reset (free), and a paid Azure or
     // Bedrock account (with `paidApiFallback` on) only once neither is to be had.
     let move = adapter.portable ? this.nextAccount(latest, agentId, family, account.id, false) : null;
+    let autoModeSkip: string | null = null;
     let next = adapter.portable ? move?.account : mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]));
     if (!next) {
       if (problem.kind === "limit" && problem.hit.kind === "window" && this.prefs.autoRedeem && !account.disabled && account.auth !== "api") {
@@ -1577,6 +1603,13 @@ export class Service {
       if (adapter.portable && this.prefs.paidApiFallback) {
         move = this.nextAccount(await this.store.read(), agentId, family, account.id, true);
         next = move?.account;
+        // Bedrock can't run Claude's Auto mode: an agent in it would fail every turn there.
+        if (next && isBedrockAccount(next) && runsAutoMode(await this.modeOf(paseo, agentId))) {
+          console.log(`[ZeroSub] not moving ${agentId} onto ${next.label}: it's in Claude's Auto mode, which Bedrock can't run`);
+          autoModeSkip = autoModeSkipNote(next.label);
+          move = undefined;
+          next = undefined;
+        }
       } else if (this.prefs.paidApiFallback) {
         next = mostAvailable(await this.store.read(), family, (id) => this.usage.get(id), Date.now(), new Set([account.id]), true);
       }
@@ -1607,7 +1640,7 @@ export class Service {
             continuedIn: result.fork,
             outcome: result.delivery === "sent" ? "continued" : "stayed",
             delivery: result.delivery,
-            detail: result.detail ?? null,
+            detail: joinDetails(autoModeSkip, result.detail ?? null),
           });
           return;
         }
@@ -1616,7 +1649,7 @@ export class Service {
       } else if (otherFamily && mostAvailable(latest, otherFamily, (id) => this.usage.get(id), now, new Set(), this.prefs.paidApiFallback)) {
         detail = `Or continue on ${FAMILY_LABEL[otherFamily]} in a new agent from the account button.`;
       }
-      await this.appendRow(paseo, agentId, { ...base, to: account.label, reason: "exhausted", outcome: "stayed", detail });
+      await this.appendRow(paseo, agentId, { ...base, to: account.label, reason: "exhausted", outcome: "stayed", detail: joinDetails(autoModeSkip, detail) });
       return;
     }
 
@@ -1934,6 +1967,24 @@ export class Service {
   }
 
   /**
+   * Whether a paid stand-in may take this agent by itself (`paidApiFallback`). Bedrock can't run
+   * Claude's Auto mode (Paseo refuses to start the turn: "Claude Auto mode requires the Anthropic
+   * API"), so a Claude agent in Auto mode never goes there by itself, nor one whose mode isn't known
+   * yet: Auto is Paseo's default Claude mode. Picking Bedrock by hand, or as the default, still works.
+   */
+  private paidFor(family: Family, agentId: string): boolean {
+    return this.prefs.paidApiFallback && !(family === "claude" && runsAutoMode(this.agentModes.get(agentId)));
+  }
+
+  /** The agent's permission mode now (null when it can't be told), noted for `paidFor`. */
+  private async modeOf(paseo: PaseoApi, agentId: string): Promise<string | null> {
+    const info = await deadline(agentInfo(paseo, agentId), MODE_READ_MS, "Paseo didn't say the agent's mode in time").catch(() => null);
+    const modeId = info?.modeId ?? null;
+    this.agentModes.set(agentId, modeId);
+    return modeId;
+  }
+
+  /**
    * Where an agent moves off an `exhausted` account: where it's routed now when that's another
    * account as chosen (one picked for it, perhaps while its turn ran, or the default it follows),
    * else the roomiest other one, which it's then pinned to. Undefined when there's none. `paid`: a
@@ -1945,7 +1996,7 @@ export class Service {
     agentId: string,
     family: Family,
     exhausted: string,
-    paid = this.prefs.paidApiFallback,
+    paid = this.paidFor(family, agentId),
   ): { account: StoredAccount; pin: boolean } | undefined {
     const routed = this.routeFor(state, agentId, family, exhausted, paid);
     if (routed && routed.account.id !== exhausted && !routed.skipped) return { account: routed.account, pin: false };
@@ -1987,6 +2038,7 @@ export class Service {
       const info = await agentInfo(paseo, agentId);
       // One the user is using right now is left for alignment to move once it's quiet.
       if (!info || info.archived || !settled(info.status) || busy(info) || hasBackgroundWork(info) || this.recentlyActive(info, Date.now())) continue;
+      this.agentModes.set(agentId, info.modeId);
       // Left for its own failover, or alone when that can't be told.
       if ((await this.lastTurnHitLimit(paseo, agentId, family)) !== false) continue;
       const release = this.tryClaim(agentId);
@@ -2100,6 +2152,12 @@ export class Service {
       return {
         skipped: `${name} has no mode as careful as this agent's${current ? ` (“${current}”)` : ""}, so ZeroSub didn't continue it there.`,
       };
+    }
+    // A fork in Claude's Auto mode can't run on Bedrock (see `paidFor`): a subscription account, or none.
+    if (other === "claude" && isBedrockAccount(account) && runsAutoMode(modeId)) {
+      const subscription = mostAvailable(state, other, (id) => this.usage.get(id), now, new Set(), false);
+      if (!subscription) return { skipped: autoModeSkipNote(account.label) };
+      account = subscription;
     }
 
     // Every check that can refuse has passed, so the stale reservation goes now.
@@ -2971,7 +3029,7 @@ export class Service {
    * How routing would open this agent's next session now, including skipping exhausted accounts.
    * `current` is the account its session runs on, which it keeps while that can stand in.
    */
-  private routeFor(state: StoredState, agentId: string, family: Family, current?: string, paid = this.prefs.paidApiFallback): RouteDecision | null {
+  private routeFor(state: StoredState, agentId: string, family: Family, current?: string, paid = this.paidFor(family, agentId)): RouteDecision | null {
     return chooseAccount(state, {
       agentId,
       family,
@@ -3631,7 +3689,10 @@ export class Service {
 
   private cachedAgents(paseo: PaseoApi): Promise<AgentInfo[]> {
     if (this.agentCache && Date.now() - this.agentCache.at < AGENT_LIST_MS) return this.agentCache.agents;
-    const agents = listAgents(paseo, false).then((result) => result.agents);
+    const agents = listAgents(paseo, false).then((result) => {
+      for (const agent of result.agents) this.agentModes.set(agent.id, agent.modeId);
+      return result.agents;
+    });
     this.agentCache = { at: Date.now(), agents };
     agents.catch(() => {
       this.agentCache = null;
@@ -5294,6 +5355,29 @@ function trafficSwitches(input: Partial<TrafficSwitches>): TrafficSwitches {
   };
 }
 
+/** Claude's Auto mode, as Paseo names it: Paseo's default Claude mode, which Bedrock can't run. */
+const CLAUDE_AUTO_MODE = "auto";
+
+/** Whether a Claude agent runs in Auto mode. One whose mode isn't known counts too: Auto is Paseo's default. */
+function runsAutoMode(modeId: string | null | undefined): boolean {
+  return modeId === undefined || modeId === null || modeId === CLAUDE_AUTO_MODE;
+}
+
+/** The timeline's word when paid fallback left Bedrock out for an agent in Auto mode. */
+function autoModeSkipNote(label: string): string {
+  return `${label} (AWS Bedrock) wasn't used: Bedrock can't run Claude's Auto mode, which needs the Anthropic API. Switch this agent to another mode (Accept File Edits, say) to let it move there.`;
+}
+
+/** The timeline's word when Paseo refused Auto mode on a Bedrock account the agent was put on by hand or as the default. */
+function autoModeRefusedNote(label: string): string {
+  return `Claude's Auto mode can't run on ${label}: on AWS Bedrock it needs the Anthropic API, so Paseo didn't start the turn. Pick another mode for this agent (Accept File Edits, say), or move it to a Claude subscription account. ${label} stays usable.`;
+}
+
+function joinDetails(...details: Array<string | null>): string | null {
+  const text = details.filter((detail): detail is string => !!detail).join(" ");
+  return text || null;
+}
+
 /** What to do when Claude Code finds the agent's model missing in a Bedrock account's region. */
 function bedrockModelNote(label: string, model: string): string {
   return `Bedrock in ${label}'s region doesn't offer ${model}, which Claude Code picked for this agent's model. Claude Code's built-in Bedrock defaults for the opus, sonnet and haiku aliases can be older than a region offers: set the Opus, Sonnet and Haiku models in ${label}'s Bedrock settings (an inference profile your AWS account has, such as global.anthropic.claude-sonnet-5-5), or pick another model for this agent. ${label} stays usable for other models.`;
@@ -5416,6 +5500,7 @@ function toAgentInfo(agent: AgentSnapshot): AgentInfo {
     continuedFrom: agent.labels?.[CONTINUED_FROM_LABEL] ?? null,
     lastMessageAt: Date.parse(agent.lastUserMessageAt ?? "") || 0,
     backgroundWork: (agent as { backgroundWork?: { count?: number } }).backgroundWork?.count ?? 0,
+    modeId: agent.currentModeId ?? null,
   };
 }
 

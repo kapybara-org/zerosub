@@ -23,7 +23,7 @@ import {
 } from "./bedrock";
 import { ClaudeAdapter } from "./claude";
 import { accountSettings, prepareClaudeHome, writeAccountProxy } from "./homes";
-import { BEDROCK_QUOTA_MS, BEDROCK_THROTTLE_MS, detectBedrockLimit, detectBedrockModelUnavailable, detectBedrockRefusal } from "./limits";
+import { BEDROCK_QUOTA_MS, BEDROCK_THROTTLE_MS, detectBedrockAutoModeRefusal, detectBedrockLimit, detectBedrockModelUnavailable, detectBedrockRefusal } from "./limits";
 import type { RunResult } from "./process";
 import { canStandIn, isLastResort, mostAvailable } from "./routing";
 import { emptyState, StoredAccountSchema, type StoredAccount } from "./state";
@@ -386,6 +386,16 @@ describe("Bedrock errors", () => {
       expect(detectBedrockLimit(turn(text, failed), now)).toBeNull();
     }
     expect(detectBedrockModelUnavailable(turn("I checked: the model isn't available on your bedrock deployment, so I used Opus."))).toBeNull();
+  });
+
+  it("tells Paseo's refusal of Claude's Auto mode, in a failed or completed turn, from a refusal or a limit", () => {
+    const text = "Claude Auto mode requires the Anthropic API. Switch this agent to another mode to use Bedrock.";
+    for (const failed of [false, true]) {
+      expect(detectBedrockAutoModeRefusal(turn(text, failed))).toBe(text);
+      expect(detectBedrockRefusal(turn(text, failed))).toBeNull();
+      expect(detectBedrockLimit(turn(text, failed), now)).toBeNull();
+    }
+    expect(detectBedrockAutoModeRefusal(turn("API Error: 429 Too many tokens, please wait before trying again.", true))).toBeNull();
   });
 
   it("ignores ordinary replies that only talk about these errors", () => {

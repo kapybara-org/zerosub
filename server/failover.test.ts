@@ -79,12 +79,14 @@ function fakePaseo(recent: readonly Row[] | (() => Promise<{ entries: readonly R
   const sent: string[] = [];
   const notes: Array<{ from: string | null; to: string; outcome: string; detail: string | null }> = [];
   const refetches: Array<{ direction?: string; limit?: number }> = [];
-  const agent: { id: string; provider: string; status: string; archivedAt: null; lastUserMessageAt: string } = {
+  const agent: { id: string; provider: string; status: string; archivedAt: null; lastUserMessageAt: string; currentModeId?: string | null } = {
     id: AGENT,
     provider: "claude",
     status: "idle",
     archivedAt: null,
     lastUserMessageAt: "2026-09-23T07:00:00.000Z",
+    // Not Auto mode, which Bedrock can't run (see "Claude's Auto mode and Bedrock").
+    currentModeId: "acceptEdits",
   };
   const paseo = {
     config: { get: async () => ({ config: { providers: {} } }) },
@@ -4653,6 +4655,81 @@ describe("AWS Bedrock as the last resort", () => {
       await limitTurn();
       expect(calls).toEqual([]);
       expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+    });
+  });
+
+  describe("and Claude's Auto mode, which Bedrock can't run", () => {
+    for (const [what, mode] of [["in Auto mode", "auto"], ["whose mode Paseo doesn't say (Auto is its default)", null]] as const) {
+      it(`never moves an agent ${what} onto it by itself, and says why`, async () => {
+        const { service, store, reopened, notes, limitTurn, agent } = await setUp(onlyMain, window);
+        agent.currentModeId = mode;
+        service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+        await limitTurn();
+        expect((await store.read()).sessions[AGENT]?.accountId).not.toBe(bedrock.id);
+        expect(reopened).toEqual([]);
+        expect(notes.at(-1)).toMatchObject({ outcome: "stayed" });
+        expect(notes.at(-1)?.detail).toMatch(/bedrock \(AWS Bedrock\) wasn't used: Bedrock can't run Claude's Auto mode/);
+      });
+    }
+
+    it("doesn't open or keep an Auto-mode agent on it by itself, but does once the agent is in another mode", async () => {
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const { service, store, agent, paseo } = await setUp(onlyMain, window);
+      service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+      await store.update((draft) => {
+        Object.assign(draft.accounts.find((entry) => entry.id === MAIN)!, { limitedUntil: inFuture(), limitKind: "window", limitedAt: new Date().toISOString() });
+      });
+      const open = (agentId: string, reason: "create" | "resume") =>
+        service.onSessionOpen({ agentId, provider: "claude", reason, purpose: "interactive", env: {}, workspaceId: "w", cwd: root } as never, { paseo } as never);
+      agent.currentModeId = "auto";
+      await open("fresh", "create");
+      await open(AGENT, "resume");
+      expect((await store.read()).sessions.fresh?.accountId).toBe(MAIN);
+      expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+      agent.currentModeId = "acceptEdits";
+      await open(AGENT, "resume");
+      expect((await store.read()).sessions[AGENT]?.accountId).toBe(bedrock.id);
+    });
+
+    it("doesn't align an Auto-mode agent onto it, but does one in another mode", async () => {
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      for (const mode of ["auto", "acceptEdits"]) {
+        const { service, store, reopened, agent, paseo } = await setUp(onlyMain, window);
+        service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+        agent.currentModeId = mode;
+        await store.update((draft) => {
+          Object.assign(draft.accounts.find((entry) => entry.id === MAIN)!, { limitedUntil: inFuture(), limitKind: "window", limitedAt: new Date().toISOString() });
+          draft.sessions[AGENT] = { accountId: MAIN, family: "claude", openedAt: new Date().toISOString() };
+        });
+        vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + 2 * 60_000 });
+        try {
+          await service.alignSessions(paseo as never);
+        } finally {
+          vi.useRealTimers();
+        }
+        expect(reopened).toEqual(mode === "auto" ? [] : [AGENT]);
+        expect((await store.read()).sessions[AGENT]?.accountId).toBe(mode === "auto" ? MAIN : bedrock.id);
+      }
+    });
+
+    it("still runs one put there by hand or as the default, and Paseo's refusal isn't taken for a limit or a refusal", async () => {
+      const { service, store, notes, agent, paseo } = await setUp({ ...onlyMain, defaults: { claude: bedrock.id, codex: null, pi: null } } as never, window, {
+        detectLimit: () => null,
+      });
+      agent.currentModeId = "auto";
+      const open = () =>
+        service.onSessionOpen({ agentId: AGENT, provider: "claude", reason: "resume", purpose: "interactive", env: {}, workspaceId: "w", cwd: root } as never, { paseo } as never);
+      await open();
+      expect((await store.read()).sessions[AGENT]?.accountId).toBe(bedrock.id);
+      await service.onTurnEnded(
+        { agent: { id: AGENT, provider: "claude" }, turnId: null, outcome: { kind: "failed", error: { message: "Claude Auto mode requires the Anthropic API. Choose another mode to use Bedrock." } }, timeline: [] } as never,
+        { paseo } as never,
+      );
+      const account = (await store.read()).accounts.find((entry) => entry.id === bedrock.id)!;
+      expect(account).toMatchObject({ signedIn: true, limitedUntil: null });
+      expect((await store.read()).sessions[AGENT]?.accountId).toBe(bedrock.id);
+      expect(notes.at(-1)).toMatchObject({ outcome: "stayed", to: "bedrock" });
+      expect(notes.at(-1)?.detail).toMatch(/Auto mode can't run on bedrock.*Pick another mode/);
     });
   });
 

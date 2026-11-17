@@ -297,6 +297,19 @@ export function detectBedrockModelUnavailable(event: TurnEvent): { message: stri
   return null;
 }
 
+/** Paseo refusing to start a turn in Claude's Auto mode where Claude Code runs on Bedrock (`CLAUDE_CODE_USE_BEDROCK`). */
+const BEDROCK_AUTO_MODE = /Claude Auto mode requires the Anthropic API/i;
+
+/**
+ * A turn on an AWS Bedrock account Paseo wouldn't start because the agent is in Claude's Auto mode,
+ * which needs the Anthropic API: Paseo's message. Read like main's Claude notices (the failure, error
+ * rows and the last two replies, of a failed or completed turn); the wording is Paseo's own.
+ */
+export function detectBedrockAutoModeRefusal(event: TurnEvent): string | null {
+  for (const text of notices(event, true)) if (BEDROCK_AUTO_MODE.test(text)) return firstLine(text);
+  return null;
+}
+
 // --------------------------------------------------------------------------- reset times
 
 const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
