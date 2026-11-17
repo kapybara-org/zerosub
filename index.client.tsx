@@ -30,12 +30,12 @@ export default function contribute(client: PluginClientContext) {
   });
 
   const stopCommands = contributeCommands(client, store);
-  const stopPills = contributePills(client, store);
-  const stopComposerItem = contributeComposerItem(client, store);
+  const control = contributeComposerItem(client, store);
+  const stopPills = contributePills(client, store, control.added);
 
   return () => {
-    stopComposerItem();
     stopPills();
+    control.stop();
     stopCommands();
     store.stop();
   };

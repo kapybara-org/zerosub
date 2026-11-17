@@ -372,6 +372,12 @@ export const AgentRouteSchema = z.object({
   movable: z.boolean(),
   /** The agent started on this account because its weekly reset was near, and is still on it. */
   selectionReason: z.literal("weekly_reset").optional(),
+  /**
+   * Whether the Account control can show in this agent's composer: its metadata holds its ID (see
+   * `AGENT_METADATA_KEY`), or is being given it. False for an agent from before the control that
+   * hasn't opened a session since, and for one that couldn't be given it: the account button stands in.
+   */
+  inComposer: z.boolean().optional(),
 });
 export type AgentRoute = z.infer<typeof AgentRouteSchema>;
 
@@ -419,6 +425,13 @@ export type LoginView = z.infer<typeof LoginViewSchema>;
  */
 export const ACCOUNT_METADATA_KEY = "zerosub.account";
 
+/**
+ * Agent metadata holding the agent's own ID. Paseo doesn't tell a composer item which agent's
+ * composer it sits in, only that agent's metadata, so the daemon writes the ID there and the
+ * Account control reads it back to find the agent's account.
+ */
+export const AGENT_METADATA_KEY = "zerosub.agent";
+
 export const StateViewSchema = z.object({
   accounts: z.array(AccountViewSchema),
   agents: z.array(AgentRouteSchema),
@@ -449,7 +462,8 @@ export const StateViewSchema = z.object({
   balanceNewAgents: z.boolean().optional(),
   /**
    * This host's Paseo keeps agent metadata (0.16 and later), which carries the Account control's
-   * choice. Without it the control isn't shown: an app from 0.16 would take the choice and then fail
+   * choice for a new agent and tells it which running agent it belongs to. Without it the control
+   * isn't shown, and the account button stays: an app from 0.16 would take the choice and then fail
    * to create the agent on an older host.
    */
   agentMetadata: z.boolean().optional(),
