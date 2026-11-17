@@ -702,4 +702,61 @@ describe("AWS Bedrock accounts", () => {
     expect(chooseAccount(stateWith([out(cli), sub, bedrock], { bindings }), { ...on, reason: "refresh", current: bedrock.id, usageOf })?.account.id).toBe(sub.id);
     expect(chooseAccount(stateWith([out(cli), out(sub), bedrock], { bindings }), { ...on, reason: "refresh", current: bedrock.id, usageOf })?.account.id).toBe(bedrock.id);
   });
+
+  describe("with it on and a banked reset with automatic resets on", () => {
+    const banked = (available: number, usableNow: boolean) => (id: string): Usage | null =>
+      id === bedrock.id ? null : { ...usage(100), resets: { available, usableNow, blockedReason: null, expiresAt: null, refills: [], label: null } };
+    const redeem = { ...on, autoRedeem: true };
+    const bindings = { "agent-1": { accountId: cli.id, source: "user" as const, at: "2026-09-23T00:00:00Z" } };
+
+    it("open a new agent on the limited subscription, whose first turn spends the reset", () => {
+      const state = stateWith([out(cli), bedrock]);
+      for (const balanceNewAgents of [false, true]) {
+        const decision = chooseAccount(state, { ...redeem, reason: "create", balanceNewAgents, usageOf: banked(1, true) });
+        expect(decision?.account.id).toBe(cli.id);
+        expect(decision?.skipped).toBeNull();
+      }
+      // Another limited subscription with a reset goes before Bedrock too, when the default has none.
+      const usageOf = (id: string) => (id === sub.id ? banked(2, true)(id) : banked(0, true)(id));
+      expect(chooseAccount(stateWith([out(cli), out(sub), bedrock]), { ...redeem, reason: "create", usageOf })?.account.id).toBe(sub.id);
+    });
+
+    it("keep an existing agent on its limited subscription, so its next turn spends the reset, rather than move it to Bedrock", () => {
+      const state = stateWith([out(cli), bedrock], { bindings });
+      for (const reason of ["resume", "refresh"] as const) {
+        const decision = chooseAccount(state, { ...redeem, reason, current: cli.id, usageOf: banked(1, true) });
+        expect(decision?.account.id).toBe(cli.id);
+        expect(decision?.skipped).toBeNull();
+      }
+      // One already standing in on Bedrock goes back to the account whose reset it can spend.
+      expect(chooseAccount(state, { ...redeem, reason: "refresh", current: bedrock.id, usageOf: banked(1, true) })?.account.id).toBe(cli.id);
+    });
+
+    it("still go to Bedrock when the reset can't be used now, none is banked, or automatic resets are off", () => {
+      const fresh = stateWith([out(cli), bedrock]);
+      const bound = stateWith([out(cli), bedrock], { bindings });
+      for (const usageOf of [banked(1, false), banked(0, true)]) {
+        expect(chooseAccount(fresh, { ...redeem, reason: "create", usageOf })?.account.id).toBe(bedrock.id);
+        expect(chooseAccount(bound, { ...redeem, reason: "resume", usageOf })?.account.id).toBe(bedrock.id);
+      }
+      expect(chooseAccount(fresh, { ...redeem, autoRedeem: false, reason: "create", usageOf: banked(1, true) })?.account.id).toBe(bedrock.id);
+      expect(chooseAccount(fresh, { ...redeem, autoRedeem: false, reason: "create", balanceNewAgents: true, usageOf: banked(1, true) })?.account.id).toBe(bedrock.id);
+      expect(chooseAccount(bound, { ...redeem, autoRedeem: false, reason: "resume", usageOf: banked(1, true) })?.account.id).toBe(bedrock.id);
+    });
+
+    it("only count for an account at a window limit, never a signed-out, disabled or budget-limited one", () => {
+      for (const other of [{ ...out(sub), signedIn: false }, { ...out(sub), disabled: true }, { ...out(sub), limitKind: "budget" as const }]) {
+        const decision = chooseAccount(stateWith([{ ...cli, signedIn: false }, other, bedrock]), { ...redeem, reason: "create", usageOf: banked(1, true) });
+        expect(decision?.account.id).toBe(bedrock.id);
+      }
+    });
+
+    it("never beat a subscription account with room", () => {
+      const usageOf = (id: string) => (id === sub.id ? usage(40) : banked(1, true)(id));
+      for (const balanceNewAgents of [false, true]) {
+        expect(chooseAccount(stateWith([out(cli), sub, bedrock]), { ...redeem, reason: "create", balanceNewAgents, usageOf })?.account.id).toBe(sub.id);
+      }
+      expect(chooseAccount(stateWith([out(cli), sub, bedrock], { bindings }), { ...redeem, reason: "resume", usageOf })?.account.id).toBe(sub.id);
+    });
+  });
 });

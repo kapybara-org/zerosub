@@ -13,6 +13,7 @@ import { MAIN_ACCOUNT_ID, StateStore, type OpenCodeFork, type StoredAccount, typ
 import { buildTranscript, continuationPrompt } from "./handoff";
 import { saveReadings } from "./usage";
 import { preferences } from "../shared/preferences";
+import type { Usage } from "../shared/model";
 import { absentPi } from "./fakes.test-support";
 
 const MAIN = MAIN_ACCOUNT_ID.claude;
@@ -4570,6 +4571,75 @@ describe("AWS Bedrock as the last resort", () => {
       expect((await store.read()).sessions[AGENT]?.accountId).toBe(bedrock.id);
       expect(reopened).toEqual([AGENT]);
       expect(notes.at(-1)).toMatchObject({ to: "bedrock", outcome: "switched" });
+    });
+
+    /** `MAIN` at its 5-hour limit, whose latest reading shows a banked reset (`usableNow` says whether it can be spent now). */
+    async function limitedWithReset(usableNow: boolean, prefs: Record<string, unknown>, accounts: unknown[] = [account(MAIN, "main", "main"), bedrock]) {
+      const t = await setUp({ ...onlyMain, accounts: accounts as never }, window);
+      t.service.setPreferences(preferences.schema.parse({ paidApiFallback: true, autoRedeem: true, ...prefs }));
+      await t.store.update((draft) => {
+        Object.assign(draft.accounts.find((entry) => entry.id === MAIN)!, { limitedUntil: inFuture(), limitKind: "window", limitedAt: new Date().toISOString() });
+      });
+      const reading: Usage = {
+        fetchedAt: new Date().toISOString(), windows: [{ id: "five_hour", label: "5-hour", usedPercent: 100, resetsAt: null }],
+        error: null, cached: false, credits: null, resets: { available: 1, usableNow, blockedReason: null, expiresAt: null, refills: [], label: null },
+      };
+      (t.service as unknown as { usage: Map<string, Usage> }).usage.set(MAIN, reading);
+      const open = (agentId: string, reason: "create" | "resume" | "refresh") =>
+        t.service.onSessionOpen({ agentId, provider: "claude", reason, purpose: "interactive", env: {}, workspaceId: "w", cwd: root } as never, { paseo: t.paseo } as never);
+      return { ...t, open };
+    }
+
+    it("opens a new agent on a limited subscription with a usable banked reset, not on Bedrock", async () => {
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const t = await limitedWithReset(true, {});
+      await t.open("fresh", "create");
+      expect((await t.store.read()).sessions.fresh?.accountId).toBe(MAIN);
+      // With "Spread new agents across accounts" on too.
+      t.service.setPreferences(preferences.schema.parse({ paidApiFallback: true, autoRedeem: true, balanceNewAgents: true }));
+      await t.open("spread", "create");
+      expect((await t.store.read()).sessions.spread?.accountId).toBe(MAIN);
+    });
+
+    it("keeps an existing agent on its limited subscription when it resumes or is aligned, so its next turn spends the reset", async () => {
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const t = await limitedWithReset(true, {});
+      await t.store.update((draft) => {
+        draft.bindings[AGENT] = { accountId: MAIN, source: "user", at: new Date().toISOString() };
+      });
+      for (const reason of ["resume", "refresh"] as const) {
+        await t.open(AGENT, reason);
+        expect((await t.store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+      }
+      vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + 2 * 60_000 });
+      try {
+        await t.service.alignSessions(t.paseo as never);
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(t.reopened).toEqual([]);
+      expect((await t.store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+    });
+
+    it("still uses Bedrock when the reset can't be spent now, or automatic resets are off", async () => {
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      for (const [usableNow, autoRedeem] of [[false, true], [true, false]] as const) {
+        const t = await limitedWithReset(usableNow, { autoRedeem });
+        await t.open("fresh", "create");
+        expect((await t.store.read()).sessions.fresh?.accountId).toBe(bedrock.id);
+        await t.store.update((draft) => {
+          draft.bindings[AGENT] = { accountId: MAIN, source: "user", at: new Date().toISOString() };
+        });
+        await t.open(AGENT, "resume");
+        expect((await t.store.read()).sessions[AGENT]?.accountId).toBe(bedrock.id);
+      }
+    });
+
+    it("prefers a subscription with room over one with a banked reset", async () => {
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const t = await limitedWithReset(true, {}, [account(MAIN, "main", "main"), account(HELLO, "hello", "managed"), bedrock]);
+      await t.open("fresh", "create");
+      expect((await t.store.read()).sessions.fresh?.accountId).toBe(HELLO);
     });
 
     it("still moves to another Claude subscription with room before spending a reset", async () => {
