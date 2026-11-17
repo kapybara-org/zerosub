@@ -1,6 +1,7 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
 import { AccountsSurface } from "./client/accounts-surface";
 import { contributeCommands } from "./client/commands";
+import { contributeComposerItem } from "./client/composer-item";
 import { contributePills } from "./client/pills";
 import { PreferencesScreen } from "./client/settings-screen";
 import { createZeroSubStore } from "./client/store";
@@ -30,8 +31,10 @@ export default function contribute(client: PluginClientContext) {
 
   const stopCommands = contributeCommands(client, store);
   const stopPills = contributePills(client, store);
+  const stopComposerItem = contributeComposerItem(client, store);
 
   return () => {
+    stopComposerItem();
     stopPills();
     stopCommands();
     store.stop();

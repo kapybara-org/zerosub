@@ -8,6 +8,7 @@ import type { Reopener } from "./reopen";
 import { chooseAccount } from "./routing";
 import { Service } from "./service";
 import { MAIN_ACCOUNT_ID, StateStore, emptyState, findAccount, type StoredAccount, type StoredState } from "./state";
+import { ACCOUNT_METADATA_KEY } from "../shared/model";
 import { preferences } from "../shared/preferences";
 
 const NOW = Date.parse("2026-11-09T12:00:00Z");
@@ -80,6 +81,55 @@ describe("next new agent pick", () => {
   });
 });
 
+describe("an account named for a new agent", () => {
+  const home = account("home");
+  const three = (next: StoredState["nextAgent"]["claude"] = null) => withPick(next, [main, work, home]);
+
+  it("starts the agent there, even when spreading, and leaves the pick for an agent that names none", () => {
+    for (const balanceNewAgents of [false, true]) {
+      const d = chooseAccount(three(pick), { ...base, balanceNewAgents, reason: "create", allowNextPick: true, requested: "home" });
+      expect(d?.account.id).toBe("home");
+      expect(d?.bind).toMatchObject({ accountId: "home", source: "user" });
+      expect(d?.nextPick).toBeUndefined();
+    }
+  });
+
+  it("is passed over for a resumed agent and for an agent that has an account", () => {
+    expect(chooseAccount(three(), { ...base, reason: "resume", requested: "home" })?.account.id).toBe("claude-main");
+    const bound = { ...three(), bindings: { a1: { accountId: "work", source: "user" as const, at: "2026-11-09T11:00:00Z" } } };
+    const own = chooseAccount(bound, { ...base, reason: "create", requested: "home" });
+    expect(own?.account.id).toBe("work");
+    expect(own?.bind).toBeNull();
+  });
+
+  it("is passed over when its account can't take the agent, which then starts as any new agent would", () => {
+    const cases: Array<[string, StoredAccount[]]> = [
+      ["at its limit", [main, work, { ...home, limitedUntil: later(30 * 60_000), limitKind: "window" as const }]],
+      ["signed out", [main, work, { ...home, signedIn: false }]],
+      ["disabled", [main, work, { ...home, disabled: true }]],
+      ["removed", [main, work]],
+      ["another provider's", [main, work, account("home", "codex")]],
+    ];
+    for (const [why, accounts] of cases) {
+      const usual = chooseAccount(withPick(null, accounts), { ...base, reason: "create", allowNextPick: true, requested: "home" });
+      expect(usual?.account.id, why).toBe("claude-main");
+      expect(usual?.bind, why).toBeNull();
+      expect(usual?.skipped, why).toBeNull();
+      // The pick is next in line, as for any new agent.
+      const picked = chooseAccount(withPick(pick, accounts), { ...base, reason: "create", allowNextPick: true, requested: "home" });
+      expect(picked?.account.id, why).toBe("work");
+      expect(picked?.nextPick, why).toEqual(pick);
+    }
+  });
+
+  it("with automatic switching off, still starts the agent on a named account at its limit", () => {
+    const state = withPick(null, [main, { ...home, limitedUntil: later(30 * 60_000), limitKind: "window" as const }]);
+    const d = chooseAccount(state, { ...base, autoSwitch: false, reason: "create", requested: "home" });
+    expect(d?.account.id).toBe("home");
+    expect(d?.bind).toMatchObject({ accountId: "home", source: "user" });
+  });
+});
+
 // The same pick, as the daemon's sessions open: Paseo asks where each one goes as it starts.
 
 const MAIN = MAIN_ACCOUNT_ID.claude;
@@ -120,6 +170,8 @@ async function storeWith(state: Partial<StoredState>): Promise<StateStore> {
 }
 
 interface Options {
+  /** Whether the host's Paseo keeps agent metadata (0.16 and later): its SDK can then write it. */
+  metadata?: boolean;
   /** Runs when routing prepares an added account's home, after it has decided and before it records where the agent opens. */
   prepareHome?: () => Promise<void>;
   /** What the CLI says about the sign-in of a home (`null`: the CLI login). */
@@ -136,6 +188,7 @@ function setUp(store: StateStore, options: Options = {}) {
       ref: () => ({
         refresh: async () => ({ agent: null }),
         timeline: { append: async () => undefined, refetch: async () => ({ entries: [] }) },
+        ...(options.metadata ? { setMetadata: async () => undefined } : {}),
       }),
     },
   };
@@ -168,7 +221,7 @@ function setUp(store: StateStore, options: Options = {}) {
   service.attach(paseo as never);
   const context = { paseo } as never;
   /** A new agent's first session, by default one the user starts in a workspace. Returns the account it opened on. */
-  const open = async (agentId: string, request: { workspaceId?: string | null; background?: boolean } = {}) => {
+  const open = async (agentId: string, request: { workspaceId?: string | null; background?: boolean; metadata?: Record<string, unknown> } = {}) => {
     await service.onSessionOpen(
       { agentId, provider: "claude", cwd: "/repo", workspaceId: WORKSPACE, reason: "create", purpose: "interactive", env: {}, ...request } as never,
       context,
@@ -320,6 +373,50 @@ describe("the next new agent pick, as sessions open", () => {
       }
       expect((await store.read()).nextAgent.claude, how).toBeNull();
     }
+  });
+
+  it("waits while a new agent starts on the account its composer named, and goes to the next one that names none", async () => {
+    const three = [...(accounts() as never[]), stored(WORK, "work", "managed") as never] as never;
+    const { service, store, open } = setUp(await storeWith({ accounts: three, defaults: { claude: MAIN, codex: null, pi: null } }));
+    await service.setNextAgent(WORK, true);
+
+    expect(await open("named", { metadata: { [ACCOUNT_METADATA_KEY]: HELLO } })).toBe(HELLO);
+    let state = await store.read();
+    expect(state.bindings.named).toMatchObject({ accountId: HELLO, source: "user" });
+    expect(state.nextAgent.claude).toMatchObject({ accountId: WORK });
+
+    expect(await open("unnamed")).toBe(WORK);
+    state = await store.read();
+    expect(state.nextAgent.claude).toBeNull();
+    expect(await open("later")).toBe(MAIN);
+  });
+
+  it("starts a new agent as usual when its metadata names no account that can take it", async () => {
+    const signedOut = [stored(MAIN, "marketing", "main"), stored(HELLO, "hello", "managed", { signedIn: false })] as never;
+    const { store, open } = setUp(await storeWith({ accounts: signedOut, defaults: { claude: MAIN, codex: null, pi: null } }));
+    const named: unknown[] = [HELLO, "claude-gone", "", 7, null, { id: HELLO }];
+    for (const [index, value] of named.entries()) {
+      expect(await open(`agent-${index}`, { metadata: { [ACCOUNT_METADATA_KEY]: value } }), String(value)).toBe(MAIN);
+    }
+    expect((await store.read()).bindings).toEqual({});
+  });
+
+  it("names an account only as the agent is created: a later session of it opens where the agent is", async () => {
+    const { service, store, paseo } = setUp(await storeWith({ accounts: accounts(), defaults: { claude: MAIN, codex: null, pi: null } }));
+    const context = { paseo } as never;
+    const session = (reason: string) =>
+      ({ agentId: "kept", provider: "claude", cwd: "/repo", workspaceId: WORKSPACE, reason, purpose: "interactive", env: {}, metadata: { [ACCOUNT_METADATA_KEY]: HELLO } }) as never;
+    await service.onSessionOpen(session("resume"), context);
+    expect((await store.read()).sessions.kept?.accountId).toBe(MAIN);
+    expect((await store.read()).bindings.kept).toBeUndefined();
+  });
+
+  it("says whether the host's Paseo keeps agent metadata, which the Account control needs", async () => {
+    const stored = { accounts: accounts(), defaults: { claude: MAIN, codex: null, pi: null } };
+    const older = setUp(await storeWith(stored));
+    expect((await older.service.view(older.paseo)).agentMetadata).toBe(false);
+    const newer = setUp(await storeWith(stored), { metadata: true });
+    expect((await newer.service.view(newer.paseo)).agentMetadata).toBe(true);
   });
 
   it("starts out empty with a state file from before picks, which StateStore reads whole", async () => {
