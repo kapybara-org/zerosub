@@ -78,7 +78,7 @@ import { maskProxy, normalizeProxy } from "./proxy";
 import { Reopener, hostCanReload } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
-import { canStandIn, chooseAccount, fiveHourWindow, isLastResort, isLimited, isUsable, mostAvailable, paceScore, PENDING_MS, weeklyWindow, withBankedReset, type Pacing, type RouteDecision, type RouteInput } from "./routing";
+import { canStandIn, chooseAccount, fiveHourWindow, headroomScore, isLastResort, isLimited, isUsable, mostAvailable, paceScore, PENDING_MS, weeklyWindow, withBankedReset, type Pacing, type RouteDecision, type RouteInput } from "./routing";
 import {
   ALL_SOURCES,
   MAIN_ACCOUNT_ID,
@@ -1988,12 +1988,16 @@ export class Service {
         const now = Date.now();
         const latest = await this.store.read();
         if (this.runningOn(latest, agentId, family) !== accountId) continue;
+        // The user may have picked its account since the pass listed it.
+        if (reason === "pacing" && latest.bindings[agentId]?.source === "user") continue;
         let move: { account: StoredAccount; pin: boolean } | undefined;
         if (reason === "pacing") {
           // Turning either preference off stops a pass that's already running.
           if (!this.prefs.balanceNewAgents || !this.prefs.autoSwitch || !this.paced(findAccount(latest, accountId), now)) return;
           const next = mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([accountId]), false, this.pacing(now));
-          if (!next || paceScore(this.usage.get(next.id), this.pendingOn(next.id, now) + 1, now).gated) return;
+          // Only to an account with room in both windows that stays under the gate with this agent.
+          if (!next || headroomScore(this.usage.get(next.id), now) >= 100) return;
+          if (paceScore(this.usage.get(next.id), this.pendingOn(next.id, now) + 1, now).gated) return;
           move = { account: next, pin: true };
           this.logPlacement(latest, family, agentId, next, now, "pacing move");
         } else {

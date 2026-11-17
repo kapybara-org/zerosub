@@ -11,7 +11,9 @@ import type { SwitchGuard } from "./switch-guard";
 import { Service } from "./service";
 import { MAIN_ACCOUNT_ID, StateStore, type OpenCodeFork, type StoredAccount, type StoredState } from "./state";
 import { buildTranscript, continuationPrompt } from "./handoff";
+import { paceScore } from "./routing";
 import { saveReadings } from "./usage";
+import type { Usage } from "../shared/model";
 import { preferences } from "../shared/preferences";
 import { absentPi } from "./fakes.test-support";
 
@@ -2937,7 +2939,7 @@ describe("changing the default account", () => {
   async function setUpAgents(
     state: Partial<StoredState>,
     listed: Array<{ id: string; status: string; provider?: string; archived?: boolean; backgroundWork?: number; updatedAt?: string }>,
-    options: { claude?: Partial<FamilyAdapter>; codex?: Partial<FamilyAdapter>; onList?: (service: Service, context: never) => void } = {},
+    options: { claude?: Partial<FamilyAdapter>; codex?: Partial<FamilyAdapter>; onList?: (service: Service, context: never) => void | Promise<void> } = {},
   ) {
     const store = new StateStore(join(root, "state.json"));
     await store.update((draft) => Object.assign(draft, state));
@@ -2956,7 +2958,7 @@ describe("changing the default account", () => {
       config: { get: async () => ({ config: { providers: {} } }) },
       agents: {
         list: async () => {
-          options.onList?.(service, context);
+          await options.onList?.(service, context);
           return { entries: agents.map((agent) => ({ agent })), pageInfo: { hasMore: false, nextCursor: null } };
         },
         ref: (id: string) => ({
@@ -3012,17 +3014,22 @@ describe("changing the default account", () => {
         personal?: number;
         prefs?: Record<string, unknown>;
         bindings?: StoredState["bindings"];
-        onList?: (service: Service) => void;
+        onList?: (service: Service) => void | Promise<void>;
+        /** More agents on `work`, idle as long as `agentId`. */
+        others?: string[];
+        /** Agents just placed on `personal`, which its reading doesn't show yet. */
+        pending?: number;
       } = {},
     ) {
+      const ids = [agentId, ...(options.others ?? [])];
       const setup = await setUpAgents(
         {
           accounts: [account(MAIN, "work", "main"), account(HELLO, "personal", "managed")] as never,
           defaults: { claude: MAIN, codex: null, pi: null },
-          sessions: { [agentId]: session(MAIN) },
+          sessions: Object.fromEntries(ids.map((id) => [id, session(MAIN)])),
           bindings: options.bindings ?? {},
         },
-        [{ id: agentId, status: "idle", updatedAt }],
+        ids.map((id) => ({ id, status: "idle", updatedAt })),
         {
           claude: { usage: async (home: string | null) => (home ? reading(options.personal ?? 20) : reading(60)) } as Partial<FamilyAdapter>,
           onList: options.onList,
@@ -3031,6 +3038,7 @@ describe("changing the default account", () => {
       setup.service.setPreferences(
         preferences.schema.parse({ autoSwitch: true, balanceNewAgents: true, autoContinue: false, ...options.prefs }),
       );
+      for (let n = 0; n < (options.pending ?? 0); n += 1) placed(setup.service, HELLO);
       await setup.service.view(setup.paseo, true);
       // The pass runs after the readings land; wait until it's done.
       await vi.waitFor(() => expect((setup.service as unknown as { relieving: Set<string> }).relieving.size).toBe(0));
@@ -3054,6 +3062,44 @@ describe("changing the default account", () => {
     it("leaves an agent the user put there", async () => {
       const { store, reopened } = await setUpBusy("fix-build", ago(120), {
         bindings: { "fix-build": { accountId: MAIN, source: "user", at: openedAt } },
+      });
+      expect(reopened).toEqual([]);
+      expect((await store.read()).bindings["fix-build"]).toMatchObject({ accountId: MAIN, source: "user" });
+    });
+
+    it("moves nothing with automatic switching off", async () => {
+      const { reopened } = await setUpBusy("fix-build", ago(120), { prefs: { autoSwitch: false } });
+      expect(reopened).toEqual([]);
+    });
+
+    it("moves nothing to an account that pending placements alone push past the gate", async () => {
+      // `personal` reads 20% two hours in: projected 30%, and 70% with four agents just placed there.
+      const { reopened } = await setUpBusy("fix-build", ago(120), { pending: 4 });
+      expect(reopened).toEqual([]);
+    });
+
+    it("stops moving agents once the account they go to would reach the gate", async () => {
+      const others = ["agent-2", "agent-3", "agent-4", "agent-5", "agent-6"];
+      const { service, reopened } = await setUpBusy("fix-build", ago(120), { others });
+      expect(reopened.length).toBeGreaterThan(0);
+      expect(reopened.length).toBeLessThan(others.length + 1);
+      const usage = (service as unknown as { usage: Map<string, Usage> }).usage.get(HELLO);
+      const pending = pendingOn(service, HELLO);
+      expect(pending).toBe(reopened.length);
+      expect(paceScore(usage, pending, Date.now()).gated).toBe(false);
+      expect(paceScore(usage, pending + 1, Date.now()).gated).toBe(true);
+    });
+
+    it("leaves an agent the user puts on the account during the pass", async () => {
+      const relieving = (service: Service) => (service as unknown as { relieving: Set<string> }).relieving;
+      const { store, reopened } = await setUpBusy("fix-build", ago(120), {
+        // The pass reads the bindings before it lists agents, so this pick lands after that read.
+        onList: async (service) => {
+          if (relieving(service).size === 0) return;
+          await (service as unknown as { store: StateStore }).store.update((draft) => {
+            draft.bindings["fix-build"] = { accountId: MAIN, source: "user", at: openedAt };
+          });
+        },
       });
       expect(reopened).toEqual([]);
       expect((await store.read()).bindings["fix-build"]).toMatchObject({ accountId: MAIN, source: "user" });
