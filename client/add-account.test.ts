@@ -54,6 +54,7 @@ vi.mock("@getpaseo/plugin/client/react-native", () => ({
 }));
 vi.mock("./ui", () => ({ Button: "Button", useText: () => new Proxy({}, { get: () => ({}) }) }));
 vi.mock("./api-account", () => ({ ApiAccountForm: "ApiAccountForm" }));
+vi.mock("./azure-account", () => ({ AzureAccountForm: "AzureAccountForm" }));
 vi.mock("./pi-accounts", () => ({ useInputStyle: () => ({}) }));
 vi.mock("./store", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./store")>()),
@@ -190,5 +191,46 @@ describe("adding a folder that's signed in already", () => {
     await vi.waitFor(() => expect(textOf(fill())).toContain("Claude Code isn't signed in with ~/somewhere."));
     expect(textOf(fill())).not.toContain("requestType");
     expect(find(fill(), (element) => element.type === "TextInput").props.value).toBe("~/somewhere");
+  });
+});
+
+describe("adding a ChatGPT account", () => {
+  function setUp() {
+    const store = {
+      state: { accounts: [] as Partial<AccountView>[], logins: [], autoSwitch: true, browserSignIn: true },
+      rpc: vi.fn(async () => ({ id: "login-1" })),
+      refresh: vi.fn(async () => undefined),
+      watchClosely: () => () => undefined,
+    };
+    const draw = mount(AddAccountModal, {
+      theme,
+      layout: { platform: "web", compact: false },
+      host: { label: "This Mac" },
+      multiHost: false,
+      store,
+      family: "codex",
+      onClose: () => undefined,
+    } as never);
+    const step = (name: string) => find(draw(), (element) => typeof element.type === "function" && element.type.name === name);
+    return { store, draw, step };
+  }
+
+  it("asks first whether it's a subscription or an Azure OpenAI key", () => {
+    const { store, step } = setUp();
+    const modes = step("ModeStep");
+    const choices = [...elements(mount(modes.type as (props: unknown) => ReactNode, modes.props)())].flatMap((element) =>
+      typeof element.props.title === "string" ? [element.props.title] : [],
+    );
+    expect(choices).toEqual(["ChatGPT subscription", "Azure OpenAI (API key)"]);
+    expect(store.rpc).not.toHaveBeenCalled();
+  });
+
+  it("takes an Azure OpenAI key in its own form, without starting a sign-in", () => {
+    const { store, draw, step } = setUp();
+    (step("ModeStep").props.onApi as () => void)();
+    const tree = draw();
+    expect(find(tree, (element) => element.type === "AzureAccountForm")).toBeTruthy();
+    expect([...elements(tree)].some((element) => element.type === "ApiAccountForm")).toBe(false);
+    expect(store.rpc).not.toHaveBeenCalled();
   });
 });

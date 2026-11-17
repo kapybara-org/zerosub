@@ -1,4 +1,4 @@
-import type { AccountView, AgentRoute, Credits, Egress, ExtraUsage, UsageWindow } from "./model";
+import { estimateApiCost, totalTokens, type AccountView, type AgentRoute, type AzureSummary, type Credits, type Egress, type ExtraUsage, type UsageWindow } from "./model";
 import type { ReopenSummary } from "./rpc";
 
 /** "in 2h 14m", "in 3d 4h", "now". */
@@ -216,4 +216,33 @@ export function staleNotice(updatedAt: number | null, error: string, now: number
   if (updatedAt === null) return `Couldn't refresh: ${error}`;
   const age = formatAge(new Date(updatedAt).toISOString(), now);
   return `Showing data from ${age === "just now" ? "a moment ago" : age} · couldn't refresh: ${error}`;
+}
+
+/** "1,234", "56.7K", "8.90M" tokens. */
+export function formatTokens(count: number): string {
+  if (count < 10_000) return Math.round(count).toLocaleString("en-US");
+  if (count < 1_000_000) return `${(count / 1_000).toFixed(count < 100_000 ? 1 : 0)}K`;
+  return `${(count / 1_000_000).toFixed(count < 100_000_000 ? 2 : 0)}M`;
+}
+
+/**
+ * A paid API account's month, as its card shows it: its tokens, and the cost estimated from its price
+ * table ("cost unknown" while no model that used tokens has a price).
+ */
+export function apiUsageLines(account: Pick<AzureSummary, "prices" | "usage">, now: number = Date.now()): { tokens: string; cost: string; note: string | null } {
+  const month = account.usage;
+  const name = new Date(now).toLocaleString("en-US", { month: "long", timeZone: "UTC" });
+  const total = totalTokens(month);
+  const cache = total.cacheWrite > 0 ? `${formatTokens(total.cachedInput)} cache read, ${formatTokens(total.cacheWrite)} cache write` : `${formatTokens(total.cachedInput)} cached`;
+  const tokens = `${name}: ${formatTokens(total.input)} input (${cache}) · ${formatTokens(total.output)} output tokens`;
+  const { usd, complete } = estimateApiCost(month, account.prices);
+  const cost =
+    usd === null
+      ? total.input + total.output > 0
+        ? "Cost unknown: add prices for its models in the account's settings"
+        : "No tokens used yet this month"
+      : `≈ $${usd.toFixed(usd < 10 ? 2 : 0)} this month${complete ? "" : " (some models have no price yet)"}`;
+  const uncounted = month?.uncounted ?? 0;
+  const note = uncounted > 0 ? `${uncounted} turn${uncounted === 1 ? "" : "s"} couldn't be counted (no session file found), so these totals are short.` : null;
+  return { tokens, cost, note };
 }

@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   accountSubtitle,
+  apiUsageLines,
   describeReopen,
   formatAge,
   formatCredits,
+  formatTokens,
   formatExtraUsage,
   formatPlan,
   formatResetIn,
@@ -93,6 +95,7 @@ describe("account presentation", () => {
     egress: null,
     externalHome: false,
     moving: null,
+    azure: null,
   };
 
   it("summarises the busiest window", () => {
@@ -189,5 +192,29 @@ describe("formatExtraUsage", () => {
   it("says only that it's on when the spend isn't known, and nothing when it's off", () => {
     expect(formatExtraUsage({ enabled: true, spend: null, limit: 5000, currency: "USD" })).toBe("Extra usage on");
     expect(formatExtraUsage({ enabled: false, spend: 0, limit: 5000, currency: "USD" })).toBeNull();
+  });
+});
+
+describe("Azure usage on the card", () => {
+  const NOW = Date.parse("2026-11-15T12:00:00Z");
+  const azure = {
+    prices: {},
+    usage: { month: "2026-11", models: { "gpt-5": { input: 2_500_000, cachedInput: 1_000_000, cacheWrite: 0, output: 42_000 } }, uncounted: 0, updatedAt: null },
+  };
+
+  it("shows this month's tokens, and a cost only once there are prices", () => {
+    expect(formatTokens(1234)).toBe("1,234");
+    expect(formatTokens(56_700)).toBe("56.7K");
+    expect(formatTokens(8_900_000)).toBe("8.90M");
+    const unpriced = apiUsageLines(azure, NOW);
+    expect(unpriced.tokens).toBe("November: 2.50M input (1.00M cached) · 42.0K output tokens");
+    expect(unpriced.cost).toMatch(/^Cost unknown/);
+    const priced = apiUsageLines({ ...azure, prices: { "gpt-5": { input: 1, cachedInput: 0.1, cacheWrite: null, output: 10 } } }, NOW);
+    expect(priced.cost).toBe("≈ $2.02 this month");
+    expect(apiUsageLines({ ...azure, usage: null }, NOW).cost).toBe("No tokens used yet this month");
+  });
+
+  it("says when some turns couldn't be counted", () => {
+    expect(apiUsageLines({ ...azure, usage: { ...azure.usage, uncounted: 2 } }, NOW).note).toMatch(/^2 turns couldn't be counted/);
   });
 });

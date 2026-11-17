@@ -26,6 +26,19 @@ describe("preferences", () => {
     expect(preferences.schema.parse(shipped.parse({})).useCredits).toBe(false);
   });
 
+  it("forks a stopped Claude chat to ChatGPT unless a destination was picked", () => {
+    const saved = preferences.schema.parse({});
+    expect(saved.claudeForkDestination).toBe("codex");
+    expect(saved.forkOpenCodeModel).toBe("");
+    expect(saved.forkOpenCodeThinking).toBe("");
+    expect(preferences.schema.parse(shipped.parse({})).claudeForkDestination).toBe("codex");
+  });
+
+  it("never falls back to paid API accounts unless that switch is turned on", () => {
+    expect(preferences.schema.parse({}).paidApiFallback).toBe(false);
+    expect(preferences.schema.parse(shipped.parse({ autoSwitch: true })).paidApiFallback).toBe(false);
+  });
+
   it("can still be read by 1.2.2 after a downgrade", () => {
     const saved = preferences.schema.parse({ autoSwitch: false, moveAgentsOnDefaultChange: false });
     expect(saved.codexSameConversation).toBe(false);

@@ -16,6 +16,8 @@ import {
 } from "../shared/rpc";
 import { AddAccountModal } from "./add-account";
 import { ApiAccountModal } from "./api-account";
+import { AzureAccountModal, AzureUsage, azureCardDetails } from "./azure-account";
+import { ForkDestinationRows, OpenCodeForkRows } from "./fork-settings";
 import { AddPiAccountModal, ApiKeyModal, HomesHint, PiSectionNotes, ProxyModal, ShellHint, piCardDetails } from "./pi-accounts";
 import { ResetConfirm, redeemToast, resetBadge } from "./reset-confirm";
 import { describe, stoppedWaiting, useStore, VISIBLE_POLL_MS, type ZeroSubStore } from "./store";
@@ -134,7 +136,7 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
             ))
           : null}
 
-        <AutomationSettings theme={theme} />
+        <AutomationSettings theme={theme} compact={layout.compact} />
       </ScrollView>
 
       {adding?.family === "pi" ? (
@@ -252,7 +254,13 @@ function FamilySection({
           icon="Plus"
           label={compact ? "Add" : "Add account"}
           accessibilityLabel={`Add ${FAMILY_LABEL[family]} account`}
-          tooltip={family === "pi" ? "Add a Pi account with an Anthropic API key and its own proxy" : `Sign in another ${FAMILY_LABEL[family]} account`}
+          tooltip={
+            family === "pi"
+              ? "Add a Pi account with an Anthropic API key and its own proxy"
+              : family === "codex"
+                ? "Sign in another ChatGPT account, or add an Azure OpenAI key"
+                : `Sign in another ${FAMILY_LABEL[family]} account`
+          }
           tooltipAlign="end"
           onPress={onAdd}
         />
@@ -285,6 +293,7 @@ function FamilySection({
               account={account}
               theme={theme}
               store={store}
+              paidFallback={state.paidApiFallback ?? false}
               onSignIn={() => onSignIn(account)}
             />
           ))}
@@ -299,11 +308,14 @@ function AccountCard({
   account,
   theme,
   store,
+  paidFallback,
   onSignIn,
 }: {
   account: AccountView;
   theme: Theme;
   store: ZeroSubStore;
+  /** Paid API accounts (Azure) may take work over by themselves once every subscription is out. */
+  paidFallback: boolean;
   onSignIn(): void;
 }) {
   const text = useText(theme);
@@ -313,13 +325,16 @@ function AccountCard({
   const [editingApi, setEditingApi] = useState(false);
   const [editingProxy, setEditingProxy] = useState(false);
   const api = account.auth === "api";
-  const details = piCardDetails(account) ?? claudeCardDetails(account);
+  // An Azure OpenAI account's endpoint, key and prices have a form of their own.
+  const azure = account.azure !== null;
+  const [editingAzure, setEditingAzure] = useState(false);
+  const details = piCardDetails(account) ?? claudeCardDetails(account) ?? azureCardDetails(account);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const resets = account.usage?.resets ?? null;
   const credits = account.usage?.credits ?? null;
   const extraUsage = account.usage?.extraUsage ? formatExtraUsage(account.usage.extraUsage) : null;
-  const plan = formatPlan(account.plan);
+  const plan = azure ? null : formatPlan(account.plan);
   const summary = usageSummary(account);
   const subtitle = accountSubtitle(account);
   const signedOut = account.status === "signed_out";
@@ -489,6 +504,9 @@ function AccountCard({
           {account.apiEditable ? (
             <IconButton theme={theme} icon="KeyRound" label="API settings" tooltip="API settings: key and base URL" onPress={() => setEditingApi(true)} />
           ) : null}
+          {azure ? (
+            <IconButton theme={theme} icon="KeyRound" label="Azure settings" tooltip="Azure settings: endpoint, key and prices" onPress={() => setEditingAzure(true)} />
+          ) : null}
           {account.proxyEditable ? (
             <IconButton theme={theme} icon="Globe" label="Proxy" tooltip="Proxy: the network this account uses" onPress={() => setEditingProxy(true)} />
           ) : null}
@@ -517,7 +535,7 @@ function AccountCard({
         {account.isDefault ? <Badge theme={theme} label="Default" tone="accent" /> : null}
         {disabled ? <Badge theme={theme} label="Disabled" /> : null}
         {plan ? <Badge theme={theme} label={plan} /> : null}
-        {api ? <Badge theme={theme} label="API" /> : null}
+        {azure ? <Badge theme={theme} label="Azure · API" /> : api ? <Badge theme={theme} label="API" /> : null}
         {account.kind === "main" ? <Badge theme={theme} label="CLI login" /> : null}
         {account.status === "limited" ? <Badge theme={theme} label="Limit reached" tone="danger" /> : null}
         {account.status === "signed_out" ? <Badge theme={theme} label="Signed out" tone="warning" /> : null}
@@ -540,6 +558,8 @@ function AccountCard({
       <View style={[{ gap: 10 }, faded]}>
         {signedOut ? (
           <Text style={text.small}>{api ? "The key was refused. Enter a working one to use this account." : "Sign in again to use this account."}</Text>
+        ) : azure ? (
+          <AzureUsage theme={theme} account={account} paidFallback={paidFallback} />
         ) : api ? (
           <Text style={text.small}>Billed per use · used only as the default or when picked for an agent</Text>
         ) : windows.length > 0 ? (
@@ -581,7 +601,7 @@ function AccountCard({
             label={api ? "Fix key" : "Sign in"}
             tooltip={api ? "Enter a working key for this account" : "Sign this account in again"}
             tooltipAlign="end"
-            onPress={api ? () => setEditingApi(true) : onSignIn}
+            onPress={azure ? () => setEditingAzure(true) : api ? () => setEditingApi(true) : onSignIn}
           />
         ) : disabled ? (
           <Button
@@ -637,6 +657,9 @@ function AccountCard({
           <ApiKeyModal theme={theme} store={store} account={account} onClose={() => setEditingApi(false)} />
         )
       ) : null}
+      {editingAzure ? (
+        <AzureAccountModal theme={theme} store={store} account={account} paidFallback={paidFallback} onClose={() => setEditingAzure(false)} />
+      ) : null}
       {editingProxy ? <ProxyModal theme={theme} store={store} account={account} onClose={() => setEditingProxy(false)} /> : null}
       <Modal title={`Remove ${account.label}?`} open={confirmRemove} onOpenChange={setConfirmRemove}>
         <Modal.Content>
@@ -645,7 +668,9 @@ function AccountCard({
               ? `This only removes the account from ZeroSub. Its folder${account.home ? ` (${account.home})` : ""}, its key${account.launcher ? ` and its terminal script ${account.launcher}` : ""} stay as they are, and you can add it back from Add account. Agents using it move to the default account; their conversations are kept.`
               : account.family === "pi"
                 ? "This deletes the account's folder and saved key on this machine. Agents using it move to the default account; their conversations are kept."
-                : account.family === "claude"
+                : azure
+                  ? "This deletes the account's saved key and endpoint on this machine, and its token counts. New agents use the default account. Existing ChatGPT conversations on it can't move, so start new agents for them."
+                  : account.family === "claude"
                   ? "This signs the account out on this machine and deletes its saved login. Agents using it move to the default account; their conversations are kept."
                   : `This signs the account out on this machine and deletes its saved login. New agents use the default account. Existing ${FAMILY_LABEL[account.family]} conversations on it can't move, so start new agents for them.`}
           </Text>
@@ -769,7 +794,7 @@ function Avatar({ theme, label }: { theme: Theme; label: string }) {
   );
 }
 
-function AutomationSettings({ theme }: { theme: Theme }) {
+function AutomationSettings({ theme, compact }: { theme: Theme; compact: boolean }) {
   const settings = useSettings(preferences);
   const text = useText(theme);
   if (settings.status === "loading") return null;
@@ -779,68 +804,87 @@ function AutomationSettings({ theme }: { theme: Theme }) {
   const save = (patch: Partial<typeof settings.values>) =>
     void settings.save({ ...settings.values, ...patch }, settings.revision);
   return (
-    <View style={{ gap: 10 }}>
-      <Text style={text.heading} accessibilityRole="header">
-        Automatic switching
-      </Text>
-      <SettingsCard>
-        <SettingsSwitch
-          label="Switch accounts when one hits its limit"
-          hint="Agents move to the account with the most room left."
-          value={settings.values.autoSwitch}
-          disabled={settings.saving}
-          onValueChange={(autoSwitch) => save({ autoSwitch })}
-        />
-        <SettingsSwitch
-          label="Keep going after a switch"
-          hint="Sends a short follow-up so the interrupted task continues."
-          value={settings.values.autoContinue}
-          disabled={settings.saving || !settings.values.autoSwitch}
-          onValueChange={(autoContinue) => save({ autoContinue })}
-        />
-        <SettingsSwitch
-          label="Spread new agents across accounts"
-          hint="New ChatGPT agents prefer a weekly reset within one day when both limits have at least 20% left. Otherwise, new agents use the account with the most room."
-          value={settings.values.balanceNewAgents}
-          disabled={settings.saving}
-          onValueChange={(balanceNewAgents) => save({ balanceNewAgents })}
-        />
-        <SettingsSwitch
-          label="Move open agents when the default changes"
-          hint="Off: open agents stay on the account they're using, even after they reopen. New agents, and agents that aren't open at the time, use the new default."
-          value={settings.values.moveAgentsOnDefaultChange}
-          disabled={settings.saving}
-          onValueChange={(moveAgentsOnDefaultChange) => save({ moveAgentsOnDefaultChange })}
-        />
-        <SettingsSwitch
-          label="Use banked resets when every account is out"
-          hint="Spends one of the account's banked resets instead of stopping. Resets are scarce, so this is off unless you turn it on."
-          value={settings.values.autoRedeem}
-          disabled={settings.saving || !settings.values.autoSwitch}
-          onValueChange={(autoRedeem) => save({ autoRedeem })}
-        />
-        <SettingsSwitch
-          label="Use ChatGPT credits when a limit is reached"
-          hint="A ChatGPT account at its limit stays in use while it has credits, so new agents may spend paid credits even while another account still has room."
-          value={settings.values.useCredits}
-          disabled={settings.saving}
-          onValueChange={(useCredits) => save({ useCredits })}
-        />
-        <SettingsSwitch
-          label="When every account is out, fork the chat to the other provider"
-          hint="A stopped Claude chat carries on in a new ChatGPT agent, or the other way round, with the conversation so far. The new agent gets no more permissions than the original; the original stays as it was."
-          value={settings.values.forkOtherProvider}
-          disabled={settings.saving || !settings.values.autoSwitch}
-          onValueChange={(forkOtherProvider) => save({ forkOtherProvider })}
-        />
-        <SettingsSwitch
-          label="Keep a Codex chat in the same conversation"
-          hint="Off unless you turn it on. Two ChatGPT accounts in one workspace reload this agent on the other account instead of opening a new tab. A different workspace, an email-only account, or a workspace that is out of credits still opens a new tab. If the first turn cannot resume the thread, this agent goes back and the new tab opens."
-          value={settings.values.codexSameConversation}
-          disabled={settings.saving || !settings.values.autoSwitch}
-          onValueChange={(codexSameConversation) => save({ codexSameConversation })}
-        />
-      </SettingsCard>
+    // Same gap as the page's other sections, so the OpenCode card reads as its own section.
+    <View style={{ gap: compact ? 20 : 28 }}>
+      <View style={{ gap: 10 }}>
+        <Text style={text.heading} accessibilityRole="header">
+          Automatic switching
+        </Text>
+        <SettingsCard>
+          <SettingsSwitch
+            label="Switch accounts when one hits its limit"
+            hint="Agents move to the account with the most room left."
+            value={settings.values.autoSwitch}
+            disabled={settings.saving}
+            onValueChange={(autoSwitch) => save({ autoSwitch })}
+          />
+          <SettingsSwitch
+            label="Keep going after a switch"
+            hint="Sends a short follow-up so the interrupted task continues."
+            value={settings.values.autoContinue}
+            disabled={settings.saving || !settings.values.autoSwitch}
+            onValueChange={(autoContinue) => save({ autoContinue })}
+          />
+          <SettingsSwitch
+            label="Spread new agents across accounts"
+            hint="New ChatGPT agents prefer a weekly reset within one day when both limits have at least 20% left. Otherwise, new agents use the account with the most room."
+            value={settings.values.balanceNewAgents}
+            disabled={settings.saving}
+            onValueChange={(balanceNewAgents) => save({ balanceNewAgents })}
+          />
+          <SettingsSwitch
+            label="Move open agents when the default changes"
+            hint="Off: open agents stay on the account they're using, even after they reopen. New agents, and agents that aren't open at the time, use the new default."
+            value={settings.values.moveAgentsOnDefaultChange}
+            disabled={settings.saving}
+            onValueChange={(moveAgentsOnDefaultChange) => save({ moveAgentsOnDefaultChange })}
+          />
+          <SettingsSwitch
+            label="Use banked resets when every account is out"
+            hint="Spends one of the account's banked resets instead of stopping. Resets are scarce, so this is off unless you turn it on."
+            value={settings.values.autoRedeem}
+            disabled={settings.saving || !settings.values.autoSwitch}
+            onValueChange={(autoRedeem) => save({ autoRedeem })}
+          />
+          <SettingsSwitch
+            label="Use ChatGPT credits when a limit is reached"
+            hint="A ChatGPT account at its limit stays in use while it has credits, so new agents may spend paid credits even while another account still has room."
+            value={settings.values.useCredits}
+            disabled={settings.saving}
+            onValueChange={(useCredits) => save({ useCredits })}
+          />
+          <SettingsSwitch
+            label="Use paid API accounts when every subscription is out"
+            hint="Off unless you turn it on. When every ChatGPT subscription account is at its limit, signed out or disabled, agents may move to an Azure OpenAI account, billed per token (after a banked reset, if those are used automatically). Off, it's used only as the default or when you pick it for an agent."
+            value={settings.values.paidApiFallback}
+            disabled={settings.saving}
+            onValueChange={(paidApiFallback) => save({ paidApiFallback })}
+          />
+          <SettingsSwitch
+            label="When every account is out, fork the chat to the other provider"
+            hint="A stopped Claude chat carries on in a new ChatGPT or OpenCode agent (pick the destination below) with the conversation so far. ChatGPT gets a mode no looser than this agent's. OpenCode gets Plan or Build under the host's own permission policy, which can allow more than Claude does. The original stays as it was."
+            value={settings.values.forkOtherProvider}
+            disabled={settings.saving || !settings.values.autoSwitch}
+            onValueChange={(forkOtherProvider) => save({ forkOtherProvider })}
+          />
+          <ForkDestinationRows values={settings.values} saving={settings.saving} onSave={save} />
+          <SettingsSwitch
+            label="Keep a Codex chat in the same conversation"
+            hint="Off unless you turn it on. Two ChatGPT accounts in one workspace reload this agent on the other account instead of opening a new tab. A different workspace, an email-only account, or a workspace that is out of credits still opens a new tab. If the first turn cannot resume the thread, this agent goes back and the new tab opens."
+            value={settings.values.codexSameConversation}
+            disabled={settings.saving || !settings.values.autoSwitch}
+            onValueChange={(codexSameConversation) => save({ codexSameConversation })}
+          />
+        </SettingsCard>
+      </View>
+      <View style={{ gap: 10 }}>
+        <Text style={text.heading} accessibilityRole="header">
+          Continue on OpenCode
+        </Text>
+        <SettingsCard>
+          <OpenCodeForkRows values={settings.values} saving={settings.saving} onSave={save} />
+        </SettingsCard>
+      </View>
       {settings.saveError ? <Text style={text.danger}>{settings.saveError}</Text> : null}
     </View>
   );
