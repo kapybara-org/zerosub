@@ -8,6 +8,7 @@ import type {
 } from "@getpaseo/plugin/server";
 import {
   ACCOUNT_METADATA_KEY,
+  AGENT_METADATA_KEY,
   FAMILIES,
   FAMILY_LABEL,
   HAND_OFF,
@@ -187,6 +188,8 @@ interface AgentInfo {
   lastMessageAt: number;
   /** Shells and monitors it left running after its turn (Paseo 0.16+; 0 before). A reload cancels them. */
   backgroundWork: number;
+  /** Its metadata holds its own ID (see `AGENT_METADATA_KEY`). Null when Paseo sends no metadata (before 0.16). */
+  named: boolean | null;
 }
 
 /** `unchecked`: Paseo couldn't say how the agent was doing, so it wasn't reloaded at all. */
@@ -316,6 +319,12 @@ export class Service {
   private paseo: PaseoApi | null = null;
   private prefs: Preferences = DEFAULT_PREFERENCES;
   private readonly usage = new Map<string, Usage>();
+  /** Paseo here has shown agent metadata (0.16 and later): on an agent, or as a session opened. */
+  private agentMetadata = false;
+  /** Agents whose metadata was asked to hold their ID, so each is asked once. */
+  private readonly naming = new Set<string>();
+  /** Those for which that failed: their composer can't show the Account control. */
+  private readonly unnamed = new Set<string>();
   private readonly usageAttemptAt = new Map<string, number>();
   private readonly usageInFlight = new Map<string, Promise<void>>();
   private readonly identityCheckedAt = new Map<string, number>();
@@ -975,6 +984,14 @@ export class Service {
     if (decision.nextPick && Date.parse(decision.nextPick.until) > now) {
       console.log(`[ZeroSub] next-agent pick ${decision.bind?.source === "user" ? "used" : "dropped, as its account can't take agents now"}: ${request.agentId}`);
     }
+    // An agent is named as its session opens rather than all of them at once: the write counts as
+    // a change to the agent, and would put every agent at the top of lists sorted by their last one.
+    // Not waited for: Paseo applies a write to the agent being opened once it has opened.
+    const { metadata } = request as { metadata?: Readonly<Record<string, unknown>> | null };
+    if (metadata) this.agentMetadata = true;
+    if (interactive && metadata && metadata[AGENT_METADATA_KEY] !== request.agentId) this.nameAgent(context.paseo, request.agentId);
+    // A new agent is in the next state the app reads, so its composer has its account at once.
+    if (request.reason === "create") this.agentCache = null;
     if (input.requested && seenBinding === undefined && !(decision.bind?.source === "user" && account.id === input.requested)) {
       console.log(`[ZeroSub] the account chosen for ${request.agentId} before it started can't take it now, so it starts as any new agent would`);
     }
@@ -2599,6 +2616,7 @@ export class Service {
     for (const agent of agents) {
       const family = families[agent.provider];
       if (!family || agent.archived) continue;
+      if (agent.named !== null) this.agentMetadata = true;
       const live = isLive(agent.status);
       const accountId = this.targetFor(state, agent.id, family, this.standingIn(state, agent.id, family, live));
       if (!accountId) continue;
@@ -2619,6 +2637,8 @@ export class Service {
         pendingAccountId: pending,
         waiting: !pending ? null : this.movesWhen(state, agent, family, pending, accountId, canReopen, now),
         movable: this.adapters[family].portable || !agent.hasHistory,
+        // Named, or being named as its session opened: the list read here may be from before that.
+        inComposer: agent.named === true || (agent.named === false && this.naming.has(agent.id) && !this.unnamed.has(agent.id)),
       });
     }
 
@@ -2698,6 +2718,7 @@ export class Service {
       showComposerPill: this.prefs.showComposerPill,
       autoSwitch: this.prefs.autoSwitch,
       balanceNewAgents: this.prefs.balanceNewAgents,
+      agentMetadata: this.agentMetadata,
       warnings: await this.warnings(),
       launchers: claudeScripts.length > 0 ? launcherDir() : null,
       piLaunchers: piScripts.length > 0 ? piLauncherDir() : null,
@@ -2717,6 +2738,23 @@ export class Service {
       ? (await Promise.all(agentIds.map((agentId) => agentInfo(paseo, agentId)))).filter((agent): agent is AgentInfo => agent !== null)
       : await this.cachedAgents(paseo);
     return agents.filter((agent) => !agent.archived && isLive(agent.status));
+  }
+
+  /**
+   * Writes an agent's ID into its own metadata (see `AGENT_METADATA_KEY`), once. The Account
+   * control in the agent's composer reads it from there, having no other way to tell which agent
+   * it belongs to. Until an agent from before this has opened a session, its account button stays.
+   */
+  private nameAgent(paseo: PaseoApi, agentId: string): void {
+    if (this.naming.has(agentId)) return;
+    this.naming.add(agentId);
+    const agent = paseo.agents.ref(agentId) as unknown as { setMetadata?(patch: Record<string, string>): Promise<unknown> };
+    const failed = (error: unknown) => {
+      this.unnamed.add(agentId);
+      log(`could not write ${agentId}'s ID to its metadata; its account button stays above the message box`, error);
+    };
+    if (typeof agent.setMetadata !== "function") return failed(new Error("this Paseo SDK has no setMetadata"));
+    void agent.setMetadata({ [AGENT_METADATA_KEY]: agentId }).catch(failed);
   }
 
   private cachedAgents(paseo: PaseoApi): Promise<AgentInfo[]> {
@@ -4148,6 +4186,7 @@ export function suggestLabel(account: StoredAccount, state: StoredState): string
 type AgentSnapshot = Awaited<ReturnType<PaseoApi["agents"]["list"]>>["entries"][number]["agent"];
 
 function toAgentInfo(agent: AgentSnapshot): AgentInfo {
+  const { metadata } = agent as { metadata?: Readonly<Record<string, unknown>> | null };
   return {
     id: agent.id,
     provider: agent.provider,
@@ -4158,6 +4197,7 @@ function toAgentInfo(agent: AgentSnapshot): AgentInfo {
     continuedFrom: agent.labels?.[CONTINUED_FROM_LABEL] ?? null,
     lastMessageAt: Date.parse(agent.lastUserMessageAt ?? "") || 0,
     backgroundWork: (agent as { backgroundWork?: { count?: number } }).backgroundWork?.count ?? 0,
+    named: metadata ? metadata[AGENT_METADATA_KEY] === agent.id : null,
   };
 }
 
