@@ -16,6 +16,17 @@ vi.mock("./proxy", async (original) => {
   return { ...actual, proxiedFetch: vi.fn(actual.proxiedFetch) };
 });
 
+// Never the real `security`: on macOS the token is looked for in the Keychain first, and a test's home
+// has no entry there (44, errSecItemNotFound), so it's read from the home's own file.
+vi.mock("./process", async (original) => {
+  const actual = await original<typeof import("./process")>();
+  return {
+    ...actual,
+    run: (...args: Parameters<typeof actual.run>) =>
+      args[0].endsWith("security") ? Promise.resolve({ code: 44, stdout: "", stderr: "", timedOut: false }) : actual.run(...args),
+  };
+});
+
 // A synthetic home with a made-up token; `fetch` is stubbed, so nothing real is read or called.
 let home: string;
 const calls: string[] = [];

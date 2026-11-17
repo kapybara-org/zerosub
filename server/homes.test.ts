@@ -46,6 +46,7 @@ afterEach(async () => {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
+  // Retried: a write the test set off in the background can still be landing in it.
   await rm(root, { recursive: true, force: true, maxRetries: 5 });
 });
 
@@ -286,6 +287,29 @@ describe("prepareClaudeHome", () => {
     const synced = JSON.parse(await readFile(join(home, ".claude.json"), "utf8"));
     expect(synced.oauthAccount).toEqual({ emailAddress: "d@example.com" });
     expect(synced.mcpServers).toEqual({ linear: { url: "https://mcp.linear.app" } });
+  });
+
+  it("leaves the user's own links alone in a home that isn't ZeroSub's own", async () => {
+    const main = join(root, "main");
+    const dotfiles = join(root, "dotfiles");
+    const elsewhere = join(root, "elsewhere", "claude-work");
+    const own = join(root, "zerosub", "homes", "claude-own");
+    process.env.CLAUDE_CONFIG_DIR = main;
+    process.env.PASEO_HOME = root;
+    await mkdir(join(main, "skills"), { recursive: true });
+    await mkdir(join(dotfiles, "skills"), { recursive: true });
+    for (const home of [elsewhere, own]) {
+      await mkdir(home, { recursive: true });
+      await symlink(join(dotfiles, "skills"), join(home, "skills"));
+      await symlink(join(dotfiles, "gone"), join(home, "notes"));
+      await symlink(join(main, "agents"), join(home, "agents")); // shared once, and gone from main since
+      await prepareClaudeHome(home, true);
+      expect(await lstat(join(home, "agents")).catch(() => null)).toBeNull();
+    }
+    expect(await isLinkTo(join(elsewhere, "skills"), join(dotfiles, "skills"))).toBe(true);
+    expect(await isLinkTo(join(elsewhere, "notes"), join(dotfiles, "gone"))).toBe(true);
+    expect(await isLinkTo(join(own, "skills"), join(main, "skills"))).toBe(true);
+    expect(await lstat(join(own, "notes")).catch(() => null)).toBeNull();
   });
 
   it("leaves entries the CLI created inside the home alone", async () => {

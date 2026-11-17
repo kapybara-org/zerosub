@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ClaudeAdapter } from "./claude";
 import type { FamilyResolver } from "./families";
 import { readAccountProxy } from "./homes";
+import { readMainProxy } from "./main-proxy";
 import type { Reopener } from "./reopen";
 import { Service } from "./service";
 import { MAIN_ACCOUNT_ID, StateStore } from "./state";
@@ -14,7 +15,7 @@ import { absentPi } from "./fakes.test-support";
 // proxy on the way reads it, so ZeroSub never sends one through a proxy it wasn't typed in with.
 // The real adapter writes the account's files here; nothing is started and nothing goes out.
 
-const VARIABLES = ["PASEO_HOME", "CLAUDE_CONFIG_DIR", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"];
+const VARIABLES = ["PASEO_HOME", "CLAUDE_CONFIG_DIR", "ZEROSUB_LAUNCHER_DIR", "ZEROSUB_PI_DIR", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"];
 const saved: Record<string, string | undefined> = {};
 let root: string;
 
@@ -24,6 +25,16 @@ class OfflineClaude extends ClaudeAdapter {
   }
   override async identity() {
     return { signedIn: false, email: null, plan: null, organization: null, identity: null };
+  }
+  // Never the real `security` or `ps`: a test's homes have no Keychain entries, and nothing runs on them.
+  override async logout() {}
+  override async homesInUse() {
+    return new Set<string>();
+  }
+  override async copyCredentials() {}
+  override async dropCopiedCredentials() {}
+  override async dropOldCredentials() {
+    return true;
   }
   override async usage() {
     return { fetchedAt: new Date().toISOString(), windows: [], error: null, cached: false, resets: null };
@@ -41,6 +52,9 @@ beforeEach(async () => {
   }
   process.env.PASEO_HOME = root;
   process.env.CLAUDE_CONFIG_DIR = join(root, "main");
+  // Added Claude accounts' homes and launchers go here, never the real ~/.claude-config or ~/.pi-config.
+  process.env.ZEROSUB_LAUNCHER_DIR = join(root, "launchers");
+  process.env.ZEROSUB_PI_DIR = join(root, "pi-launchers");
   await mkdir(join(root, "main"), { recursive: true });
 });
 
@@ -53,7 +67,10 @@ afterEach(async () => {
 });
 
 const mainSettings = (env: Record<string, string>) => writeFile(join(root, "main", "settings.json"), JSON.stringify({ env }));
-const homes = () => readdir(join(root, "zerosub", "homes")).catch(() => [] as string[]);
+const homes = async () => [
+  ...(await readdir(join(root, "zerosub", "homes")).catch(() => [] as string[])),
+  ...(await readdir(join(root, "launchers")).catch(() => [] as string[])),
+];
 const KEY = "sk-ant-api03-test-0123456789";
 const GATEWAY = "http://gw.example.com:4000";
 
@@ -119,5 +136,60 @@ describe("an API account with a plain http:// base URL", () => {
     await service.addApiAccount({ label: "Gateway", key: KEY, keyKind: "api_key", baseUrl: GATEWAY });
     await expect(service.setProxy(MAIN_ACCOUNT_ID.claude, "http://10.0.0.1:3128")).rejects.toThrow(/Gateway .*plain http:\/\//);
     expect(JSON.parse(await readFile(join(root, "main", "settings.json"), "utf8"))).toEqual({ env: {} });
+  });
+
+  it("lets the CLI login take a proxy no API account would send its key through", async () => {
+    const { service, store } = setUp();
+    await store.update((draft) => void draft.accounts.push({ id: MAIN_ACCOUNT_ID.claude, family: "claude", label: "CLI", kind: "main", home: null, createdAt: "2026-11-15T00:00:00.000Z" } as never));
+    await mainSettings({});
+    // Its own proxy is the one it goes through; https:// is read by nobody on the way.
+    await service.addApiAccount({ label: "Own", key: KEY, keyKind: "api_key", baseUrl: GATEWAY, proxy: "http://127.0.0.1:7890" });
+    await service.addApiAccount({ label: "Secure", key: `${KEY}-2`, keyKind: "api_key", baseUrl: "https://gw.example.com:4443" });
+    await service.setProxy(MAIN_ACCOUNT_ID.claude, "http://10.0.0.1:3128");
+    expect((await readMainProxy()).proxy).toBe("http://10.0.0.1:3128");
+  });
+
+  it("lets the CLI login keep the proxy it has, though an API account already follows it", async () => {
+    const { service, store } = setUp();
+    await store.update((draft) => void draft.accounts.push({ id: MAIN_ACCOUNT_ID.claude, family: "claude", label: "CLI", kind: "main", home: null, createdAt: "2026-11-15T00:00:00.000Z" } as never));
+    await mainSettings({});
+    await service.addApiAccount({ label: "Gateway", key: KEY, keyKind: "api_key", baseUrl: GATEWAY });
+    // Set in the file by hand afterwards: saving it again sends the key nowhere it doesn't go already.
+    await mainSettings({ HTTPS_PROXY: "http://10.0.0.1:3128" });
+    await service.setProxy(MAIN_ACCOUNT_ID.claude, "http://10.0.0.1:3128");
+    expect((await readMainProxy()).proxy).toBe("http://10.0.0.1:3128");
+  });
+
+  it("saves the proxy it was added with again, unchanged", async () => {
+    const { service, store } = setUp();
+    const id = await service.addApiAccount({ label: "Gateway", key: KEY, keyKind: "api_key", baseUrl: GATEWAY, proxy: "http://127.0.0.1:7890" });
+    await service.setProxy(id, "http://127.0.0.1:7890");
+    expect(await readAccountProxy((await store.read()).accounts.find((account) => account.id === id)!.home!)).toBe("http://127.0.0.1:7890");
+  });
+
+  it("is moved to plain http:// with a proxy of its own, whatever the CLI login's", async () => {
+    const { service, store } = setUp();
+    await mainSettings({ HTTPS_PROXY: "http://10.0.0.1:3128" });
+    const id = await service.addApiAccount({ label: "Gateway", key: KEY, keyKind: "api_key", baseUrl: "https://gw.example.com:4443", proxy: "http://127.0.0.1:7890" });
+    await service.updateApiAccount(id, { key: KEY, keyKind: "api_key", baseUrl: GATEWAY });
+    const home = (await store.read()).accounts.find((account) => account.id === id)!.home!;
+    expect(JSON.parse(await readFile(join(home, "settings.json"), "utf8")).env.ANTHROPIC_BASE_URL).toBe(GATEWAY);
+  });
+});
+
+describe("a key saved with Anthropic's API typed out", () => {
+  it("is the same key as one added without a base URL", async () => {
+    const { service, store } = setUp();
+    const id = await service.addApiAccount({ label: "First", key: KEY, keyKind: "api_key" });
+    // Saved by an earlier version, which kept the URL as typed.
+    await store.update((draft) => {
+      const account = draft.accounts.find((entry) => entry.id === id)!;
+      account.identity = account.identity!.replace("api|anthropic|", "api|https://api.anthropic.com|");
+    });
+    await expect(service.addApiAccount({ label: "Again", key: KEY, keyKind: "api_key" })).rejects.toThrow(/already added/);
+    await expect(service.addApiAccount({ label: "Typed", key: KEY, keyKind: "api_key", baseUrl: "https://api.anthropic.com" })).rejects.toThrow(/already added/);
+
+    const other = await service.addApiAccount({ label: "Other", key: `${KEY}-2`, keyKind: "api_key" });
+    await expect(service.updateApiAccount(other, { key: KEY, keyKind: "api_key" })).rejects.toThrow(/already added/);
   });
 });

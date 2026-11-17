@@ -22,10 +22,13 @@ const EARLIER = "2026-09-23T07:00:00.000Z";
 
 let root: string;
 let previousHome: string | undefined;
+let previousLaunchers: string | undefined;
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "zerosub-sessions-"));
   previousHome = process.env.PASEO_HOME;
+  previousLaunchers = process.env.ZEROSUB_LAUNCHER_DIR;
+  process.env.ZEROSUB_LAUNCHER_DIR = join(root, "launchers");
   process.env.PASEO_HOME = root;
 });
 
@@ -36,6 +39,8 @@ afterEach(async () => {
   await Promise.all(services.splice(0).map((service) => service.stop()));
   if (previousHome === undefined) delete process.env.PASEO_HOME;
   else process.env.PASEO_HOME = previousHome;
+  if (previousLaunchers === undefined) delete process.env.ZEROSUB_LAUNCHER_DIR;
+  else process.env.ZEROSUB_LAUNCHER_DIR = previousLaunchers;
   // Retried: a write the test set off in the background can still be landing in it.
   await rm(root, { recursive: true, force: true, maxRetries: 5 });
 });
