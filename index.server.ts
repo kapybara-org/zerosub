@@ -90,6 +90,10 @@ export default function contribute(server: PluginServerContext) {
       console.error(`[ZeroSub] failover for ${event.agent.id} failed`, describe(error));
     });
   });
+  // A new agent is in the next state the app reads, so its composer has its account at once.
+  server.on("agent.created", () => {
+    service.onAgentCreated();
+  });
   server.on("agent.archived", (event) => {
     void service.onAgentArchived(event.agent.id).catch(() => undefined);
   });

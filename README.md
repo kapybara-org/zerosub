@@ -4,7 +4,7 @@ Use several Claude, ChatGPT (Codex), Grok and Cursor subscriptions side by side 
 
 - **Add accounts in the app.** Click **Add account** under Claude or ChatGPT and sign in on any device, including your phone. You don't need a terminal, environment variables or config files.
 - **Your existing CLI logins show up automatically.** Nothing changes until you add a second account.
-- **Pick an account per agent.** An account button in the message box shows which account each Claude or Codex agent uses. Tap it to switch. On Paseo 0.16 and later, a new agent's message box has an **Account** control too, so you can pick before the first message.
+- **Pick an account per agent.** An account button in the message box shows which account each Claude or Codex agent uses. Tap it to switch. On Paseo 0.16 and later the account is an **Account** control in the message box itself, there before the first message too, so you can pick the account a new agent starts on.
 - **Automatic failover.** When an account hits its 5-hour or weekly limit, the agent moves to the account with the most room left and carries on. New agents skip exhausted accounts.
 - **Live usage.** Each account shows its own 5-hour and weekly usage and when they reset, plus any ChatGPT credits or Claude extra usage. Accounts in use refresh about every minute and after each turn, and a limit shows up the moment it hits.
 - **Banked resets.** If a provider has banked limit resets on an account, you can use one from the account card or the agent's account button.
@@ -64,7 +64,7 @@ Then open **Accounts (ZeroSub)** in the sidebar.
 
 Turn on **Spread new agents across accounts** to select an account from its usage. For ChatGPT agents, ZeroSub prefers an account when its weekly limit resets within one day and both limits have at least 20% left. Usage for every available account must be complete and less than 30 minutes old. Otherwise, ZeroSub selects the account with the most room. Claude agents use the account with the most room. An account that has used 80% of its 5-hour window counts as having less room than any account under that, so new agents don't land on an account that's about to run out; an account whose window has reset since its last reading counts by what it has left. Automatic switching picks the account to move to the same way. When a near weekly reset was the reason, the agent's account menu says **Started here: weekly reset was near**. Existing agents stay on their accounts.
 
-### Pick the account in a new agent's message box
+### The Account control in the message box
 
 On Paseo 0.16 and later, the message box of an agent that doesn't exist yet has an **Account** control: in a new agent's tab and on the New workspace screen. Both the app and the host need Paseo 0.16: the choice travels in the new agent's metadata, which an older host doesn't take, so with one the control isn't shown. Like the account button, it shows once the provider has more than one account, and the account button's preference turns it off too.
 
@@ -72,7 +72,12 @@ On Paseo 0.16 and later, the message box of an agent that doesn't exist yet has 
 - Any other choice starts this one agent on that account and keeps it there, as if you had picked it from the agent's account button. It outranks spreading and the next-new-agent pick, which waits for an agent that names no account.
 - Only accounts that can take a new agent are listed: none that are signed out or disabled, and none at their limit while automatic switching is on. If the chosen account can't take the agent by the time you send the message, the agent starts where it would have without a choice.
 
-The choice travels in the new agent's metadata as `zerosub.account`, holding the account's ID as in `$PASEO_HOME/zerosub/state.json`. Anything that creates an agent can set it, for example `paseo.agents.create({ …, metadata: { "zerosub.account": "claude-main" } })`. ZeroSub reads it once, when the agent is created.
+Once the first message is sent, the control stays where it is and shows the agent's account. Choosing another account there moves the agent, as the account button's menu does, and its last entries go back to the default and open the Accounts screen. The account button above the message box then shows only for what needs a confirmation, which the control can't ask for: when the agent's account is at its limit and there's a way out to offer (a banked reset, or carrying on with the other provider), and, for a Claude agent on a host that has OpenCode, to keep **Continue on OpenCode** within reach.
+
+- An agent from before this version keeps its account button until its session next opens (your next message to it, usually), and has the control from then on.
+- To find its agent, the control reads the agent's ID from the agent's metadata (`zerosub.agent`), which ZeroSub writes as the agent's session opens: Paseo tells a control in the message box nothing else about the agent it belongs to. If that can't be written, the agent keeps its account button.
+
+The choice for a new agent travels in its metadata as `zerosub.account`, holding the account's ID as in `$PASEO_HOME/zerosub/state.json`. Anything that creates an agent can set it, for example `paseo.agents.create({ …, metadata: { "zerosub.account": "claude-main" } })`. ZeroSub reads it once, when the agent is created.
 
 ### Pick the account for the next new agent
 
