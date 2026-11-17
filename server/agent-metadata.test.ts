@@ -39,7 +39,7 @@ interface Listed {
   metadata?: Record<string, unknown>;
 }
 
-async function setUp(listed: Listed[] = [], setMetadata = vi.fn(async (_agentId: string, _patch: Record<string, string>) => undefined)) {
+async function setUp(listed: Listed[] = [], setMetadata: ((agentId: string, patch: Record<string, string>) => Promise<undefined>) | null = vi.fn(async (_agentId: string, _patch: Record<string, string>) => undefined)) {
   const store = new StateStore(join(await mkdtemp(join(root, "state-")), "state.json"));
   const stored = (id: string, label: string, kind: "main" | "managed") =>
     ({ id, family: "claude", label, kind, home: kind === "main" ? null : join(tmpdir(), id), createdAt: "2026-09-23T00:00:00.000Z" });
@@ -52,7 +52,8 @@ async function setUp(listed: Listed[] = [], setMetadata = vi.fn(async (_agentId:
       ref: (agentId: string) => ({
         refresh: async () => ({ agent: null }),
         timeline: { append: async () => undefined, refetch: async () => ({ entries: [] }) },
-        setMetadata: (patch: Record<string, string>) => setMetadata(agentId, patch),
+        // A Paseo before 0.16 has no agent metadata, and its SDK no way to write it.
+        ...(setMetadata ? { setMetadata: (patch: Record<string, string>) => setMetadata(agentId, patch) } : {}),
       }),
     },
   };
@@ -144,10 +145,22 @@ describe("an agent's ID in its own metadata", () => {
   });
 
   it("isn't tried on a Paseo that keeps no agent metadata, where the account button stays", async () => {
-    const { service, paseo, setMetadata } = await setUp([{ id: "older" }]);
+    const { service, paseo, open } = await setUp([{ id: "older" }], null);
+    await open("older");
     const state = await service.view(paseo);
     expect(state.agentMetadata).toBe(false);
     expect(state.agents[0]?.inComposer).toBe(false);
-    expect(setMetadata).not.toHaveBeenCalled();
+  });
+
+  it("drops the list it read before Paseo listed a new agent, once Paseo says it has", async () => {
+    const listed: Listed[] = [];
+    const { service, paseo, open } = await setUp(listed);
+    await open("fresh", { metadata: {} });
+    // The app asks between the session opening and Paseo listing the agent: that list lacks it.
+    expect((await service.view(paseo)).agents).toEqual([]);
+    listed.push({ id: "fresh", metadata: {} });
+    expect((await service.view(paseo)).agents).toEqual([]);
+    service.onAgentCreated();
+    expect((await service.view(paseo)).agents.map((route) => [route.agentId, route.inComposer])).toEqual([["fresh", true]]);
   });
 });
