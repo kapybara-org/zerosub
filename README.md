@@ -65,7 +65,7 @@ Turn on **Spread new agents across accounts** to select an account from its usag
 
 ### Pick the account in a new agent's message box
 
-On Paseo 0.16 and later, the message box of an agent that doesn't exist yet has an **Account** control: in a new agent's tab and on the New workspace screen. Like the account button, it shows once the provider has more than one account, and the account button's preference turns it off too.
+On Paseo 0.16 and later, the message box of an agent that doesn't exist yet has an **Account** control: in a new agent's tab and on the New workspace screen. Both the app and the host need Paseo 0.16: the choice travels in the new agent's metadata, which an older host doesn't take, so with one the control isn't shown. Like the account button, it shows once the provider has more than one account, and the account button's preference turns it off too.
 
 - The first choice names no account, and says where the agent starts then: on the default, on the account picked for the next new agent, or, as **Automatic**, on the account with the most room (with **Spread new agents across accounts** on, or when the default can't take a new agent).
 - Any other choice starts this one agent on that account and keeps it there, as if you had picked it from the agent's account button. It outranks spreading and the next-new-agent pick, which waits for an agent that names no account.
