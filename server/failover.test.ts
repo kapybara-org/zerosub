@@ -1030,6 +1030,77 @@ describe("forking to the other provider", () => {
     }
   });
 
+  describe("a ChatGPT chat continued on Claude that lands on AWS Bedrock", () => {
+    const BEDROCK = "claude-bedrock";
+    /** Every subscription out, paid fallback on: a ChatGPT agent's limit continues it on Claude, on Bedrock. */
+    async function forkOntoBedrock(by: "auto" | "user") {
+      const t = await setUpFork("full-access", [], {}, [], { prefs: { paidApiFallback: true }, sourceProvider: "codex" });
+      const limit = { limitedUntil: inFuture(), limitKind: "window" as const, limitedAt: new Date().toISOString() };
+      await t.store.update((draft) => {
+        for (const entry of draft.accounts) Object.assign(entry, limit);
+        draft.accounts.push({ ...account(BEDROCK, "bedrock", "managed"), auth: "api", provider: "bedrock", identity: "bedrock|eu-central-1|host" } as never);
+        draft.sessions[AGENT] = { accountId: CODEX_MAIN, family: "codex", openedAt: new Date().toISOString() };
+      });
+      if (by === "auto") {
+        await t.service.onTurnEnded(
+          { agent: { id: AGENT, provider: "codex" }, turnId: "t", outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never,
+          { paseo: t.paseo } as never,
+        );
+      } else {
+        await t.service.forkAgent(t.paseo, AGENT);
+      }
+      expect(t.created).toHaveLength(1);
+      const forkId = t.created[0]!.agentId;
+      expect(t.created[0]!.config.provider.startsWith("claude")).toBe(true);
+      // Its session opens where it was bound.
+      await t.service.onSessionOpen({ agentId: forkId, provider: "claude", reason: "create", purpose: "interactive", env: {}, workspaceId: "ws-1", cwd: root } as never, { paseo: t.paseo } as never);
+      expect((await t.store.read()).sessions[forkId]?.accountId).toBe(BEDROCK);
+      return { ...t, forkId };
+    }
+
+    /** Alignment's pass once the agent has been quiet a while, with the Claude subscription back. */
+    async function alignWithRoom(t: Awaited<ReturnType<typeof forkOntoBedrock>>) {
+      await t.service.clearLimit(MAIN);
+      // Paseo's reload opens the agent's next session, which routing places.
+      const reopener = (t.service as unknown as { reopener: { reopen: (id: string) => Promise<{ ok: true }> } }).reopener;
+      reopener.reopen = async (id: string) => {
+        await t.service.onSessionOpen({ agentId: id, provider: "claude", reason: "refresh", purpose: "interactive", env: {}, workspaceId: "ws-1", cwd: root } as never, { paseo: t.paseo } as never);
+        return { ok: true as const };
+      };
+      vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + 2 * 60_000 });
+      try {
+        return await t.service.alignSessions(t.paseo);
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+
+    it.each(["auto", "user"] as const)("isn't pinned there (fork asked for by %s), and moves back once a Claude subscription has room", async (by) => {
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const t = await forkOntoBedrock(by);
+      // ZeroSub's own choice, not the user's: it only holds while no subscription can take the agent.
+      expect((await t.store.read()).bindings[t.forkId]).toMatchObject({ accountId: BEDROCK, source: "auto" });
+      expect(t.notes.at(-1)?.detail).toMatch(/It moves back to a Claude account once one has room/);
+      expect((await t.service.view(t.paseo)).agents.find((route) => route.agentId === t.forkId)).toMatchObject({ accountId: BEDROCK, pendingAccountId: null });
+      const summary = await alignWithRoom(t);
+      expect(summary.reopened).toEqual([t.forkId]);
+      expect((await t.store.read()).sessions[t.forkId]?.accountId).toBe(MAIN);
+      expect(t.notes.at(-1)).toMatchObject({ reason: "room", to: "marketing" });
+    });
+
+    it("stays when the user has since picked Bedrock for it", async () => {
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const t = await forkOntoBedrock("auto");
+      await t.store.update((draft) => {
+        draft.bindings[t.forkId] = { accountId: BEDROCK, source: "user", at: new Date().toISOString() };
+      });
+      const summary = await alignWithRoom(t);
+      expect(summary.reopened).toEqual([]);
+      expect((await t.store.read()).sessions[t.forkId]?.accountId).toBe(BEDROCK);
+      expect((await t.service.view(t.paseo)).agents.find((route) => route.agentId === t.forkId)?.accountId).toBe(BEDROCK);
+    });
+  });
+
   it.each([
     ["its parent", [], "lead"],
     ["where its parent's own work went on ChatGPT", [{ id: "lead-on-chatgpt", provider: "codex", labels: { "zerosub.continued-from": "lead" } }], "lead-on-chatgpt"],
@@ -4546,6 +4617,24 @@ describe("AWS Bedrock as the last resort", () => {
     expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
     expect(reopened).toEqual([AGENT, AGENT]);
     expect(notes.at(-1)).toMatchObject({ reason: "room", to: "main" });
+  });
+
+  it("when the default changes with open agents kept, keeps one on Bedrock as the user's pick only if Bedrock was the default", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const keep = preferences.schema.parse({ paidApiFallback: true, moveAgentsOnDefaultChange: false });
+    const at = new Date().toISOString();
+    const sessions = { [AGENT]: { accountId: bedrock.id, family: "claude" as const, openedAt: at } };
+    const accounts = [account(MAIN, "main", "main"), account(HELLO, "hello", "managed"), bedrock] as never;
+    // Bedrock was the default: the user chose it, so the agent stays there.
+    const chosen = await setUp({ accounts, defaults: { claude: bedrock.id, codex: null, pi: null }, sessions }, window);
+    chosen.service.setPreferences(keep);
+    await chosen.service.setDefault(chosen.paseo as never, MAIN);
+    expect((await chosen.store.read()).bindings[AGENT]).toMatchObject({ accountId: bedrock.id, source: "user" });
+    // Bedrock was only standing in: kept for now, and let go once a subscription can take the agent.
+    const standing = await setUp({ accounts, defaults: { claude: MAIN, codex: null, pi: null }, sessions, bindings: {} }, window);
+    standing.service.setPreferences(keep);
+    await standing.service.setDefault(standing.paseo as never, HELLO);
+    expect((await standing.store.read()).bindings[AGENT]).toMatchObject({ accountId: bedrock.id, source: "auto" });
   });
 
   it("keeps its agents there when it throttles while every subscription is out, rather than sending them back to a limited one", async () => {

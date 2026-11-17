@@ -2179,9 +2179,12 @@ export class Service {
       parentId: await this.continuations.parentFor(paseo, agentId),
       bind: async (newAgentId) => {
         await this.store.update((draft) => {
+          // A fork that lands on a paid stand-in (Bedrock) isn't the user's pick, even when they asked
+          // for the fork: it's held there only until a subscription account can take it (see `chooseAccount`).
+          const portable = this.adapters[other].portable;
           draft.bindings[newAgentId] = {
             accountId: account.id,
-            source: source === "user" ? "user" : this.adapters[other].portable ? "auto" : "thread",
+            source: portable && isLastResort(account) ? "auto" : source === "user" ? "user" : portable ? "auto" : "thread",
             at: new Date().toISOString(),
           };
         });
@@ -3787,7 +3790,7 @@ export class Service {
       if (portable && !this.prefs.moveAgentsOnDefaultChange) {
         // The new default is for what comes next: open agents stay on the account they run on. If they
         // can't be kept, the old default comes back, or alignment would move them all to the new one.
-        const { kept, moving } = await this.keepOpenAgents(paseo, account.family, account.id).catch(async (error: unknown) => {
+        const { kept, moving } = await this.keepOpenAgents(paseo, account.family, account.id, previous).catch(async (error: unknown) => {
           await this.store.update((draft) => {
             if (draft.defaults[account.family] === account.id) draft.defaults[account.family] = previous;
           });
@@ -3889,11 +3892,15 @@ export class Service {
    * that opened under the old one just before is kept too, even if its session was still being
    * routed. Agents already on the new default keep following it. An account that's gone, signed
    * out, disabled or at its limit is no place to keep work, so those agents come back in `moving`.
+   * One on a paid stand-in (Bedrock) is kept there as the user's pick when that was the old default
+   * (`previous`), which they chose; otherwise it was only standing in, and an "auto" binding there
+   * lets it go once a subscription account can take it (see `chooseAccount`).
    */
   private async keepOpenAgents(
     paseo: PaseoApi,
     family: Family,
     newDefault: string,
+    previous: string | null = null,
   ): Promise<{ kept: number; moving: string[] }> {
     // A session being routed may have gone by the old default: let it record where it opens first.
     if (this.routing.size > 0) await withTimeout(Promise.allSettled(this.routing.keys()), ROUTING_WAIT_MS);
@@ -3919,7 +3926,7 @@ export class Service {
         if (!current || current.family !== family || !isUsable(current, now)) moving.push(agent.id);
         else if (current.id !== newDefault) {
           // "auto", like a limit switch, so the account button still offers "Follow default".
-          draft.bindings[agent.id] = { accountId: current.id, source: "auto", at };
+          draft.bindings[agent.id] = { accountId: current.id, source: isLastResort(current) && current.id === previous ? "user" : "auto", at };
           kept += 1;
         }
       }

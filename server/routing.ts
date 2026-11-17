@@ -252,6 +252,16 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   const bound = findAccount(state, binding?.accountId);
   let account = bound && bound.family === input.family ? bound : undefined;
   let bind: Binding | null = null;
+  // A paid stand-in (Bedrock) that ZeroSub bound the agent to by itself (a ChatGPT chat continued on
+  // Claude while every subscription was out) only holds it until a subscription account can take it:
+  // one with room, or, with `autoRedeem`, a limited one with a banked reset to spend. Then the agent
+  // routes as an unbound one would, and alignment takes it off the bill. One the user put there stays.
+  if (
+    account && binding?.source === "auto" && input.portable && isLastResort(account) &&
+    (accounts.some((other) => canStandIn(other, input.now)) || (input.autoRedeem && withBankedReset(state, input.family, input.usageOf, input.now)))
+  ) {
+    account = undefined;
+  }
 
   // The account named for this very agent outranks the pick, which waits for an agent that names
   // none. One that can't take the agent is passed over, and the agent routes as usual.

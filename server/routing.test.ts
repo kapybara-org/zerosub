@@ -703,6 +703,27 @@ describe("AWS Bedrock accounts", () => {
     expect(chooseAccount(stateWith([out(cli), out(sub), bedrock], { bindings }), { ...on, reason: "refresh", current: bedrock.id, usageOf })?.account.id).toBe(bedrock.id);
   });
 
+  it("hold an agent ZeroSub bound there by itself (a ChatGPT chat continued on Claude) only until a subscription can take it", () => {
+    const bind = (source: "auto" | "user") => ({ "agent-1": { accountId: bedrock.id, source, at: "2026-09-23T00:00:00Z" } });
+    // While every subscription is out, it stays.
+    expect(chooseAccount(stateWith([out(cli), out(sub), bedrock], { bindings: bind("auto") }), { ...on, reason: "refresh", current: bedrock.id, usageOf })?.account.id).toBe(bedrock.id);
+    // Once one has room, it goes there, unpinned; the default first.
+    const back = chooseAccount(stateWith([cli, out(sub), bedrock], { bindings: bind("auto") }), { ...on, reason: "refresh", current: bedrock.id, usageOf });
+    expect(back?.account.id).toBe(cli.id);
+    expect(back?.bind).toBeNull();
+    expect(chooseAccount(stateWith([out(cli), sub, bedrock], { bindings: bind("auto") }), { ...on, reason: "refresh", current: bedrock.id, usageOf })?.account.id).toBe(sub.id);
+    // In Auto mode too (paid fallback withheld): leaving Bedrock is always fine.
+    expect(chooseAccount(stateWith([cli, out(sub), bedrock], { bindings: bind("auto") }), { ...base, reason: "resume", usageOf })?.account.id).toBe(cli.id);
+    // A limited subscription with a banked reset takes it with automatic resets on, not without.
+    const banked = (id: string): Usage | null =>
+      id === bedrock.id ? null : { ...usage(100), resets: { available: 1, usableNow: true, blockedReason: null, expiresAt: null, refills: [], label: null } };
+    const allOut = stateWith([out(cli), out(sub), bedrock], { bindings: bind("auto") });
+    expect(chooseAccount(allOut, { ...on, autoRedeem: true, reason: "refresh", current: bedrock.id, usageOf: banked })?.account.id).toBe(cli.id);
+    expect(chooseAccount(allOut, { ...on, reason: "refresh", current: bedrock.id, usageOf: banked })?.account.id).toBe(bedrock.id);
+    // One the user put there stays, room or not.
+    expect(chooseAccount(stateWith([cli, sub, bedrock], { bindings: bind("user") }), { ...on, reason: "refresh", current: bedrock.id, usageOf })?.account.id).toBe(bedrock.id);
+  });
+
   describe("with it on and a banked reset with automatic resets on", () => {
     const banked = (available: number, usableNow: boolean) => (id: string): Usage | null =>
       id === bedrock.id ? null : { ...usage(100), resets: { available, usableNow, blockedReason: null, expiresAt: null, refills: [], label: null } };
