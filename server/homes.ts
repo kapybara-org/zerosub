@@ -375,8 +375,11 @@ async function writeJsonAtomically(path: string, value: unknown): Promise<void> 
   await rename(temporary, path);
 }
 
-/** Claude Code guards `.claude.json` writes with a `<file>.lock` directory; take it too. */
-async function withClaudeConfigLock(file: string, action: () => Promise<void>): Promise<boolean> {
+/**
+ * Claude Code guards `.claude.json` writes with a `<file>.lock` directory; take it too. False while
+ * someone else holds it, else what `action` returns.
+ */
+async function withClaudeConfigLock(file: string, action: () => Promise<boolean>): Promise<boolean> {
   const lock = `${file}.lock`;
   try {
     await mkdir(lock);
@@ -391,8 +394,7 @@ async function withClaudeConfigLock(file: string, action: () => Promise<void>): 
     }
   }
   try {
-    await action();
-    return true;
+    return await action();
   } finally {
     await rmdir(lock).catch(() => undefined);
   }
@@ -401,6 +403,8 @@ async function withClaudeConfigLock(file: string, action: () => Promise<void>): 
 const lastMcpSync = new Map<string, number>();
 /** MCP server names each home last received from main, so removals in main propagate. */
 const lastMcpKeys = new Map<string, Set<string>>();
+/** Homes whose `.claude.json` didn't read at their last sync, so that's logged once. */
+const unreadableConfigs = new Set<string>();
 
 async function syncClaudeGlobalConfig(home: string): Promise<void> {
   const source = mainClaudeGlobalConfig();
@@ -423,7 +427,15 @@ async function syncClaudeGlobalConfig(home: string): Promise<void> {
 
   const mainServers = isObject(main.mcpServers) ? main.mcpServers : {};
   const synced = await withClaudeConfigLock(target, async () => {
-    const current = (await readJsonObject(target)) ?? {};
+    const current = await readJsonObject(target);
+    if (!current) {
+      // The account's identity lives in this file, so one that doesn't read (half written, damaged,
+      // unreadable) is never replaced by just what's shared. The next sync tries again.
+      if (!unreadableConfigs.has(home)) console.warn(`[ZeroSub] left ${target} alone: it doesn't read as a JSON object`);
+      unreadableConfigs.add(home);
+      return false;
+    }
+    unreadableConfigs.delete(home);
     const next: Json = { ...current };
     next.mcpServers = mergeShared(current.mcpServers, mainServers, lastMcpKeys.get(home));
     const projects: Json = isObject(current.projects) ? { ...current.projects } : {};
@@ -435,6 +447,7 @@ async function syncClaudeGlobalConfig(home: string): Promise<void> {
     }
     next.projects = projects;
     await writeJsonAtomically(target, next);
+    return true;
   });
   if (synced) {
     lastMcpSync.set(home, sourceStat.mtimeMs);
@@ -892,6 +905,7 @@ async function approveApiKey(home: string, key: string, replaced: string | null)
     const approved = list(responses.approved).filter((item) => item !== retire && item !== approve);
     const rejected = list(responses.rejected).filter((item) => item !== approve);
     await writeJsonAtomically(file, { ...config, customApiKeyResponses: { ...responses, approved: [...approved, approve], rejected } });
+    return true;
   });
   if (!done) throw new Error("Claude Code is writing this account's settings right now. Try again in a moment.");
 }
