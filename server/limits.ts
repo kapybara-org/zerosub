@@ -227,14 +227,16 @@ const BEDROCK_REFUSED =
 const API_ERROR = /^(?:\[System Error\]\s*)?API Error\b/i;
 
 /**
- * Notices from a failed turn on Bedrock: the failure, error rows and, as Claude Code reports an API
- * failure as a reply starting "API Error", final replies that do, never ordinary prose that mentions
- * a 429. A completed turn has none: its warnings (an MCP server's "HTTP 401 Unauthorized" while it
- * starts, an AccessDenied in a tool's output) are other services', not Bedrock's.
+ * Notices from a turn on Bedrock. A failed turn gives its failure and error rows. Either kind gives
+ * Claude Code's own error replies: of the turn's last two replies (the window main's Claude detectors
+ * read, see `notices`), those that start "API Error", as Claude Code words an API failure. Paseo before
+ * 0.16 reports such a turn as completed, so a completed turn is read for them too. Nothing else in a
+ * completed turn counts: its warnings and error rows (an MCP server's "HTTP 401 Unauthorized" while it
+ * starts, an AccessDenied in a tool's output) are other services', and an ordinary reply that only
+ * mentions a 429 isn't an error at all.
  */
 function apiNotices(event: TurnEvent): string[] {
-  if (event.outcome.kind !== "failed") return [];
-  const found = notices(event, false);
+  const found = event.outcome.kind === "failed" ? notices(event, false) : [];
   const timeline = event.turnId === null ? [] : event.timeline;
   let replies = 0;
   for (let index = timeline.length - 1; index >= 0 && replies < 2; index -= 1) {
@@ -249,7 +251,7 @@ function apiNotices(event: TurnEvent): string[] {
 }
 
 /**
- * A failed turn on an AWS Bedrock account, throttled or over a service quota. Bedrock has no 5-hour
+ * A turn on an AWS Bedrock account that failed throttled or over a service quota (see `apiNotices`). Bedrock has no 5-hour
  * or weekly windows, so either is a short cooldown, as for Azure (see `detectAzureLimit`).
  */
 export function detectBedrockLimit(event: TurnEvent, now: Date = new Date()): LimitHit | null {
@@ -261,13 +263,37 @@ export function detectBedrockLimit(event: TurnEvent, now: Date = new Date()): Li
 }
 
 /**
- * A failed turn on an AWS Bedrock account whose credentials, access or model were refused: what AWS
- * said, and whether it named the model (`model`), which needs no check of the credentials.
+ * A turn on an AWS Bedrock account that failed because its credentials, access or model were refused
+ * (see `apiNotices`): what AWS said, and whether it named the model (`model`), which needs no check of
+ * the credentials.
  */
 export function detectBedrockRefusal(event: TurnEvent): { message: string; model: boolean } | null {
   const texts = apiNotices(event).filter((text) => !BEDROCK_THROTTLED.test(text) && !BEDROCK_QUOTA.test(text));
   for (const text of texts) if (BEDROCK_MODEL_REFUSED.test(text)) return { message: firstLine(text), model: true };
   for (const text of texts) if (BEDROCK_REFUSED.test(text)) return { message: firstLine(text), model: false };
+  return null;
+}
+
+/**
+ * Claude Code's own words when the model it was asked for isn't offered in the account's region: "The
+ * model eu.anthropic.claude-sonnet-4-5-20250929-v1:0 is not available on your bedrock deployment. Try
+ * --model to switch to …". It says so for a model alias (`sonnet`) whose built-in Bedrock default is
+ * older than what the region has, so only that model is out, not the account.
+ */
+const BEDROCK_MODEL_UNAVAILABLE = /^The model (\S{1,200}) is not available on your bedrock deployment\b/i;
+
+/**
+ * A turn on an AWS Bedrock account whose model Claude Code found missing in the account's region (see
+ * `BEDROCK_MODEL_UNAVAILABLE`), and the model it named. Read like main's Claude notices: the failure,
+ * error rows and the last two replies, of a failed or completed turn. The wording is Claude Code's
+ * own, anchored at the start, so no other service's message or ordinary reply matches.
+ */
+export function detectBedrockModelUnavailable(event: TurnEvent): { message: string; model: string } | null {
+  for (const text of notices(event, true)) {
+    const line = firstLine(text);
+    const match = line.match(BEDROCK_MODEL_UNAVAILABLE);
+    if (match?.[1]) return { message: line, model: match[1] };
+  }
   return null;
 }
 

@@ -87,7 +87,7 @@ import { CONTINUED_FROM_LABEL, PARENT_LABEL, buildTranscript, continueInNewAgent
 import { launcherDir, launcherNames, piLauncherDir, writeLaunchers, type LauncherAccount, type LauncherKind } from "./launchers";
 import { PI_ACCOUNT_FILE, codexSessionsShared, prepareClaudeHome, crossesInheritedProxy, isAccountHome, moveHome, normalizeBaseUrl, plainHttp, readPiAccount, readPiAccountForAgents, removeHome, sentInTheClear } from "./homes";
 import { Mutex } from "./json-file";
-import { detectAzureLimit, detectAzureSignOut, detectBedrockLimit, detectBedrockRefusal, turnRows } from "./limits";
+import { detectAzureLimit, detectAzureSignOut, detectBedrockLimit, detectBedrockModelUnavailable, detectBedrockRefusal, turnRows } from "./limits";
 import { canSignInWithBrowser } from "./machine";
 import { equivalentMode, withinMode } from "./modes";
 import { homesDir, inHomesDir, isOwnHome, shownPath } from "./paths";
@@ -1181,6 +1181,15 @@ export class Service {
       if (probe) this.sameConversationProbe.delete(agentId);
       // A hand-off quotes the whole conversation, not just this turn. Paseo 0.13 sends none, so the hand-off pages it.
       const conversation = event.timeline.length > 0 ? event.timeline : undefined;
+      // A model the account's region doesn't offer is that model's problem, not the account's: the
+      // agent stays, and its timeline says how to fix it (see `detectBedrockModelUnavailable`).
+      const unavailable = bedrock ? detectBedrockModelUnavailable(turn) : null;
+      if (unavailable && ranAccount) {
+        console.log(`[ZeroSub] ${agentId}'s model isn't available on ${ranAccount.label}: ${unavailable.message}`);
+        await this.noteBedrockTurn(context.paseo, agentId, ranAccount, bedrockModelNote(ranAccount.label, unavailable.model));
+        if (this.deferred.has(agentId)) await this.finishDeferred(context.paseo, agentId, family);
+        return;
+      }
       const hit = azure ? detectAzureLimit(turn) : bedrock ? detectBedrockLimit(turn) : adapter.detectLimit(turn);
       const bedrockRefusal = bedrock ? detectBedrockRefusal(turn) : null;
       const refusal = azure ? detectAzureSignOut(turn) : bedrock ? (bedrockRefusal?.message ?? null) : adapter.detectSignOut(turn);
@@ -1269,6 +1278,24 @@ export class Service {
     if (!(await this.store.read()).sessions[agentId]) return;
     await this.store.update((draft) => {
       delete draft.sessions[agentId];
+    });
+  }
+
+  /** A note in the agent's timeline about a turn its Bedrock account couldn't run, which leaves the account as it is. */
+  private async noteBedrockTurn(paseo: PaseoApi, agentId: string, account: StoredAccount, detail: string): Promise<void> {
+    await this.appendRow(paseo, agentId, {
+      family: "claude",
+      from: account.label,
+      to: account.label,
+      reason: "manual",
+      resetsAt: null,
+      continued: false,
+      continuedIn: null,
+      toFamily: null,
+      toProvider: null,
+      outcome: "stayed",
+      detail,
+      at: new Date().toISOString(),
     });
   }
 
@@ -5265,6 +5292,11 @@ function trafficSwitches(input: Partial<TrafficSwitches>): TrafficSwitches {
     disableErrorReporting: input.disableErrorReporting === true,
     disableNonessentialTraffic: input.disableNonessentialTraffic === true,
   };
+}
+
+/** What to do when Claude Code finds the agent's model missing in a Bedrock account's region. */
+function bedrockModelNote(label: string, model: string): string {
+  return `Bedrock in ${label}'s region doesn't offer ${model}, which Claude Code picked for this agent's model. Claude Code's built-in Bedrock defaults for the opus, sonnet and haiku aliases can be older than a region offers: set the Opus, Sonnet and Haiku models in ${label}'s Bedrock settings (an inference profile your AWS account has, such as global.anthropic.claude-sonnet-5-5), or pick another model for this agent. ${label} stays usable for other models.`;
 }
 
 /** The timeline's word on work that moved onto a paid Azure or Bedrock account by itself (with `paidApiFallback` on). */

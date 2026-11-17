@@ -241,6 +241,57 @@ describe("AWS Bedrock accounts in the service", () => {
     expect(t.aws.check).not.toHaveBeenCalled();
   });
 
+  /** A turn Paseo before 0.16 reports as completed though Claude Code's last reply is its error. */
+  const completedTurn = (t: { service: Service; paseo: unknown }, reply: string) =>
+    t.service.onTurnEnded(
+      {
+        agent: { id: "agent-1", provider: "claude" },
+        turnId: "t1",
+        outcome: { kind: "completed" },
+        timeline: [
+          { type: "user_message", text: "Fix the build." },
+          { type: "notification", level: "warning", message: "MCP client for github failed to start: HTTP 401 Unauthorized" },
+          { type: "assistant_message", text: reply },
+        ],
+      } as never,
+      { paseo: t.paseo } as never,
+    );
+
+  it("reads Claude Code's API Error reply in a completed turn: throttling cools down, refused credentials are checked", async () => {
+    const t = await onBedrock();
+    const before = Date.now();
+    await completedTurn(t, "API Error: 429 Too many tokens, please wait before trying again.");
+    expect(Date.parse((await t.account()).limitedUntil ?? "") - before).toBeGreaterThanOrEqual(BEDROCK_THROTTLE_MS - 1_000);
+    await t.service.clearLimit((await t.account()).id);
+    t.aws.result = { ok: false, fatal: true, message: "AWS refused the credentials: ExpiredToken" };
+    await completedTurn(t, "API Error: 403 The security token included in the request is expired");
+    // The credentials are still checked first, as for a failed turn.
+    expect(t.aws.check).toHaveBeenCalledTimes(1);
+    expect(await t.account()).toMatchObject({ signedIn: false, apiError: "AWS refused the credentials: ExpiredToken" });
+  });
+
+  it("leaves the account as it is for a model the region doesn't offer, and tells the user how to fix it", async () => {
+    const aws = fakeAws();
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const { service, store } = setUp(aws);
+    const { accountId } = await service.addBedrockAccount({ label: "Bedrock", region: "eu-central-1", source: "host" });
+    const { paseo, notes } = fakePaseo();
+    await service.setAgentAccount(paseo as never, "agent-1", accountId).catch(() => undefined);
+    await open(service, paseo);
+    aws.check.mockClear();
+    notes.length = 0;
+    const text = "The model eu.anthropic.claude-sonnet-4-5-20250929-v1:0 is not available on your bedrock deployment. Try --model to switch to global.anthropic.claude-sonnet-5-5.";
+    await completedTurn({ service, paseo }, text);
+    await endTurn(service, paseo, text);
+    expect(findAccount(await store.read(), accountId)).toMatchObject({ signedIn: true, limitedUntil: null });
+    expect(findAccount(await store.read(), accountId)?.apiError ?? null).toBeNull();
+    expect(aws.check).not.toHaveBeenCalled();
+    expect(notes).toHaveLength(2);
+    expect(notes[0]).toMatchObject({
+      data: { outcome: "stayed", to: "Bedrock", detail: expect.stringMatching(/doesn't offer eu\.anthropic\.claude-sonnet-4-5-20250929-v1:0.*Sonnet.*Bedrock settings/) },
+    });
+  });
+
   it("checks the credentials again before taking a failed turn's refusal for signed out", async () => {
     // AWS still takes them: the 403 was another service's, so the account stays usable.
     const t = await onBedrock();

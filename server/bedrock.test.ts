@@ -23,7 +23,7 @@ import {
 } from "./bedrock";
 import { ClaudeAdapter } from "./claude";
 import { accountSettings, prepareClaudeHome, writeAccountProxy } from "./homes";
-import { BEDROCK_QUOTA_MS, BEDROCK_THROTTLE_MS, detectBedrockLimit, detectBedrockRefusal } from "./limits";
+import { BEDROCK_QUOTA_MS, BEDROCK_THROTTLE_MS, detectBedrockLimit, detectBedrockModelUnavailable, detectBedrockRefusal } from "./limits";
 import type { RunResult } from "./process";
 import { canStandIn, isLastResort, mostAvailable } from "./routing";
 import { emptyState, StoredAccountSchema, type StoredAccount } from "./state";
@@ -341,20 +341,51 @@ describe("Bedrock errors", () => {
     expect(detectBedrockRefusal(turn("API Error: 429 Too many tokens, please wait before trying again.", true))).toBeNull();
   });
 
-  it("reads only failed turns: a completed turn's warnings and replies are other services'", () => {
-    const completed: TurnEvent = {
+  it("reads Claude Code's API Error replies in a completed turn too, as Paseo before 0.16 reports them, but never its warnings or error rows", () => {
+    const completed = (reply: string): TurnEvent => ({
       outcome: { kind: "completed" },
       timeline: [
         { type: "user_message", text: "Fix the build." },
         { type: "notification", level: "warning", message: "MCP client for github failed to start: HTTP 401 Unauthorized" },
         { type: "error", message: "An error occurred (AccessDeniedException) when calling the ListBuckets operation: Access Denied" },
+        { type: "assistant_message", text: reply },
+      ] as never,
+      turnId: "t1",
+    });
+    expect(detectBedrockLimit(completed("API Error: 429 Too many tokens, please wait before trying again."), now)).toMatchObject({ kind: "window" });
+    expect(detectBedrockRefusal(completed("API Error: 403 The security token included in the request is expired"))).toMatchObject({ model: false });
+    expect(detectBedrockRefusal(completed(`API Error (${OPUS}): 400 The provided model identifier is invalid.`))).toMatchObject({ model: true });
+    expect(detectBedrockRefusal(turn("API Error: 403 AccessDeniedException: You don't have access to the model with the specified model ID."))).toMatchObject({ model: true });
+    // The warning and the tool's AccessDenied are other services': with an ordinary reply, nothing counts.
+    const ordinary = completed("The bucket listing was refused, so I used the cached list.");
+    expect(detectBedrockLimit(ordinary, now)).toBeNull();
+    expect(detectBedrockRefusal(ordinary)).toBeNull();
+    // Only the last reply or two: an API Error earlier in the turn was retried past.
+    const earlier: TurnEvent = {
+      outcome: { kind: "completed" },
+      timeline: [
+        { type: "user_message", text: "Fix the build." },
         { type: "assistant_message", text: "API Error: 429 Too many tokens, please wait before trying again." },
+        { type: "assistant_message", text: "Retrying." },
+        { type: "assistant_message", text: "The build passes now." },
       ] as never,
       turnId: "t1",
     };
-    expect(detectBedrockLimit(completed, now)).toBeNull();
-    expect(detectBedrockRefusal(completed)).toBeNull();
-    expect(detectBedrockRefusal(turn("API Error: 403 AccessDeniedException: You don't have access to the model with the specified model ID."))).toBeNull();
+    expect(detectBedrockLimit(earlier, now)).toBeNull();
+  });
+
+  it("tells a model the region doesn't offer, in a failed or completed turn, and names it", () => {
+    const text = "The model eu.anthropic.claude-sonnet-4-5-20250929-v1:0 is not available on your bedrock deployment. Try --model to switch to global.anthropic.claude-sonnet-5-5.";
+    for (const failed of [false, true]) {
+      expect(detectBedrockModelUnavailable(turn(text, failed))).toEqual({
+        message: text,
+        model: "eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+      });
+      // Not taken for a refusal or a limit, so it never signs the account out or sets it aside.
+      expect(detectBedrockRefusal(turn(text, failed))).toBeNull();
+      expect(detectBedrockLimit(turn(text, failed), now)).toBeNull();
+    }
+    expect(detectBedrockModelUnavailable(turn("I checked: the model isn't available on your bedrock deployment, so I used Opus."))).toBeNull();
   });
 
   it("ignores ordinary replies that only talk about these errors", () => {
