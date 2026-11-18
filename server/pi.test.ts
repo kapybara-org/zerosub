@@ -213,6 +213,16 @@ describe("a Pi account's home", () => {
   });
 });
 
+/** The variables ZeroSub sends a Pi process through `proxy` with, this machine kept direct. */
+const viaProxy = (P: string) => ({
+  https_proxy: P,
+  HTTPS_PROXY: P,
+  http_proxy: P,
+  HTTP_PROXY: P,
+  no_proxy: "localhost,127.0.0.1,::1",
+  NO_PROXY: "localhost,127.0.0.1,::1",
+});
+
 describe("PiAdapter", () => {
   it("starts an added account on its own agent directory, the CLI login's sessions and its own proxy", async () => {
     process.env.NO_PROXY = "localhost,.anthropic.com,gw.example.com,intranet.local";
@@ -233,15 +243,15 @@ describe("PiAdapter", () => {
     expect(env.no_proxy).toBe(env.NO_PROXY);
   });
 
-  it("leaves the sessions folder alone where it's set already, and an account without a proxy goes through the shared httpProxy", async () => {
+  it("leaves the sessions folder alone where it's set already, and gives an account without a proxy the CLI login's", async () => {
     await writeFile(join(main, "settings.json"), JSON.stringify({ sessionDir: "/somewhere", httpProxy: "http://10.0.0.1:3128" }));
     const home = join(root, "home");
     await writePiAccountApi(home, { key: KEY, baseUrl: null });
     const adapter = new PiAdapter();
     const env = await adapter.env(home, { cwd: "/work" });
     expect(env.PI_CODING_AGENT_SESSION_DIR).toBeUndefined();
-    // Pi applies httpProxy from the settings it shares; ZeroSub adds no proxy over it.
-    expect(env).toEqual({ PI_CODING_AGENT_DIR: home, ...BLANK_ANTHROPIC });
+    // ZeroSub: given as variables, with this machine kept direct, so nothing it inherits outranks it.
+    expect(env).toEqual({ PI_CODING_AGENT_DIR: home, ...BLANK_ANTHROPIC, ...viaProxy("http://10.0.0.1:3128") });
     expect(await adapter.proxyState(home)).toEqual({
       own: null,
       file: null,
@@ -249,9 +259,12 @@ describe("PiAdapter", () => {
     });
   });
 
-  it("leaves the CLI login as Paseo runs it without ZeroSub", async () => {
+  it("clears the agent directory for the CLI login, and gives its agents its own proxy with this machine kept direct", async () => {
+    // Cleared, so an agent moved back from an added account doesn't keep that account's directory.
+    expect(await new PiAdapter().env(null, { cwd: "/work" })).toEqual({ PI_CODING_AGENT_DIR: null });
+    expect(applyEnv(await new PiAdapter().env(null), { PI_CODING_AGENT_DIR: "/an/account", OTHER: "kept" })).toEqual({ OTHER: "kept" });
     await writeFile(join(main, "settings.json"), JSON.stringify({ defaultProvider: "anthropic", httpProxy: "http://10.0.0.1:3128" }));
-    expect(await new PiAdapter().env(null, { cwd: "/work" })).toEqual({});
+    expect(await new PiAdapter().env(null, { cwd: "/work" })).toEqual({ PI_CODING_AGENT_DIR: null, ...viaProxy("http://10.0.0.1:3128") });
   });
 
   it("keeps any other Anthropic key, token, headers or federation from an added account's agents, and leaves them to the CLI login's", async () => {
@@ -275,10 +288,10 @@ describe("PiAdapter", () => {
       ...BLANK_ANTHROPIC,
       OPENAI_API_KEY: "sk-openai",
     });
-    expect(await adapter.env(null)).toEqual({});
+    expect(await adapter.env(null)).toEqual({ PI_CODING_AGENT_DIR: null });
   });
 
-  it("changes the CLI login's proxy in Pi's own settings only when asked to, and still adds nothing to its agents", async () => {
+  it("changes the CLI login's proxy in Pi's own settings only when asked to, and gives it to its agents", async () => {
     const adapter = new PiAdapter();
     expect((await adapter.proxyState(null)).own).toBeNull();
 
@@ -286,11 +299,35 @@ describe("PiAdapter", () => {
     expect(JSON.parse(await readFile(join(main, "settings.json"), "utf8"))).toEqual({ defaultProvider: "anthropic", httpProxy: "http://127.0.0.1:7890" });
     expect((await readdir(join(root, "paseo", "zerosub", "backups"))).filter((name) => name.startsWith("pi-settings-"))).toHaveLength(1);
     expect(await adapter.proxyState(null)).toMatchObject({ own: "http://127.0.0.1:7890", file: expect.stringContaining("settings.json"), inherited: null });
-    // Pi reads httpProxy itself; the CLI login's agents start as Paseo starts them.
-    expect(await adapter.env(null, { cwd: "/work" })).toEqual({});
+    expect(await adapter.env(null, { cwd: "/work" })).toEqual({ PI_CODING_AGENT_DIR: null, ...viaProxy("http://127.0.0.1:7890") });
 
     await adapter.setProxy(null, null);
     expect(JSON.parse(await readFile(join(main, "settings.json"), "utf8"))).toEqual({ defaultProvider: "anthropic" });
+  });
+
+  it("gives agents a proxy already in Pi's settings only while a plain-http:// key in models.json wouldn't cross it", async () => {
+    const adapter = new PiAdapter();
+    // Set before ZeroSub checked anything, or by hand: nothing refused it.
+    await writeFile(join(main, "settings.json"), JSON.stringify({ defaultProvider: "anthropic", httpProxy: "http://10.0.0.1:3128" }));
+    const plain = { providers: { ollama: { baseUrl: "http://gw.example.com", apiKey: "k" } } };
+    await writeFile(join(main, "models.json"), JSON.stringify(plain));
+    // No proxy variables: Pi applies httpProxy itself with the environment's no-proxy list, as without ZeroSub.
+    expect(await adapter.env(null)).toEqual({ PI_CODING_AGENT_DIR: null });
+    // `*` and `.com` keep the gateway direct for a terminal's `pi`, but not in the list agents would get.
+    for (const noProxy of ["*", ".com"]) {
+      process.env.NO_PROXY = noProxy;
+      expect(await adapter.env(null), noProxy).toEqual({ PI_CODING_AGENT_DIR: null });
+    }
+    // Kept direct by both lists, the agents get it.
+    process.env.NO_PROXY = "gw.example.com";
+    expect((await adapter.env(null)).HTTPS_PROXY).toBe("http://10.0.0.1:3128");
+    // A models.json that doesn't parse can't be checked, so it counts as failing.
+    await writeFile(join(main, "models.json"), "{ not json");
+    expect(await adapter.env(null)).toEqual({ PI_CODING_AGENT_DIR: null });
+    // Over https:// nothing crosses it in the clear.
+    delete process.env.NO_PROXY;
+    await writeFile(join(main, "models.json"), JSON.stringify({ providers: { ollama: { baseUrl: "https://gw.example.com", apiKey: "k" } } }));
+    expect(await adapter.env(null)).toEqual({ PI_CODING_AGENT_DIR: null, ...viaProxy("http://10.0.0.1:3128") });
   });
 
   it("sets no new proxy on Pi's own login while an Anthropic credential of its own, wherever Pi takes it from, would cross it over plain http://", async () => {
@@ -329,16 +366,34 @@ describe("PiAdapter", () => {
     await writeFile(join(main, "auth.json"), "{}");
     await writeFile(join(main, "models.json"), JSON.stringify({ providers: { anthropic: { baseUrl: remote } } }));
     await adapter.setProxy(null, "http://10.0.0.1:3128");
-    // A gateway on this machine is no way around it: Pi adds nothing to NO_PROXY for httpProxy, and
-    // undici then sends every host through the proxy, this machine's included.
+    // A gateway on this machine is no way around it: ZeroSub keeps it direct for the agents it starts,
+    // but a `pi` run from a terminal applies httpProxy with no NO_PROXY of Pi's own, and undici then
+    // sends every host through the proxy, this machine's included.
     await writeFile(join(main, "auth.json"), JSON.stringify(keyed));
     await writeFile(join(main, "models.json"), JSON.stringify({ providers: { anthropic: { baseUrl: "http://127.0.0.1:4000", apiKey: "k" } } }));
     await expect(adapter.setProxy(null, "http://10.0.0.2:3128")).rejects.toThrow(/Anthropic.*plain http:\/\/.*NO_PROXY/);
     expect(JSON.parse(await readFile(join(main, "settings.json"), "utf8")).httpProxy).toBe("http://10.0.0.1:3128");
-    // Unless the environment's NO_PROXY keeps it direct.
+    // Unless the environment's NO_PROXY keeps it direct; the agents ZeroSub starts keep it direct too.
     process.env.NO_PROXY = "127.0.0.1";
     await adapter.setProxy(null, "http://10.0.0.2:3128");
     expect(JSON.parse(await readFile(join(main, "settings.json"), "utf8")).httpProxy).toBe("http://10.0.0.2:3128");
+    expect((await adapter.env(null)).NO_PROXY).toContain("127.0.0.1");
+  });
+
+  it("sets no new proxy on Pi's own login while a plain-http:// provider in its models.json is kept direct only by `*` or an entry like `.com`", async () => {
+    const adapter = new PiAdapter();
+    await writeFile(join(main, "models.json"), JSON.stringify({ providers: { ollama: { baseUrl: "http://gw.example.com", apiKey: "k" } } }));
+    // A `pi` from a terminal keeps it direct, but ZeroSub's agents get the list without these.
+    for (const noProxy of ["*", ".com", "localhost,.com"]) {
+      process.env.NO_PROXY = noProxy;
+      await expect(adapter.setProxy(null, "http://10.0.0.1:3128"), noProxy).rejects.toThrow(/ollama/);
+      expect(JSON.parse(await readFile(join(main, "settings.json"), "utf8")), noProxy).toEqual({ defaultProvider: "anthropic" });
+    }
+    // Kept direct by both lists, it's set.
+    process.env.NO_PROXY = "gw.example.com";
+    await adapter.setProxy(null, "http://10.0.0.1:3128");
+    expect(JSON.parse(await readFile(join(main, "settings.json"), "utf8")).httpProxy).toBe("http://10.0.0.1:3128");
+    expect((await adapter.env(null)).NO_PROXY?.split(",")).toContain("gw.example.com");
   });
 
   it("counts this machine's addresses as crossing a proxy Pi takes itself unless the no-proxy list, read as undici reads it, keeps them direct", () => {
@@ -349,6 +404,11 @@ describe("PiAdapter", () => {
     // undici reads no_proxy wherever it's set, even empty, and NO_PROXY only without it.
     expect(crossesInheritedProxy("http://127.0.0.1:4000", { no_proxy: "", NO_PROXY: "127.0.0.1" })).toBe(true);
     expect(crossesInheritedProxy("http://127.0.0.1:4000", { no_proxy: "intranet.example", NO_PROXY: "*" })).toBe(true);
+    // ZeroSub's agents get the list without `*` or entries that would also cover Anthropic (`.com`),
+    // so a host counts as direct only where both lists keep it so.
+    expect(crossesInheritedProxy("http://gw.example.com", { NO_PROXY: "*" })).toBe(true);
+    expect(crossesInheritedProxy("http://gw.example.com", { NO_PROXY: ".com" })).toBe(true);
+    expect(crossesInheritedProxy("http://gw.example.com", { NO_PROXY: "gw.example.com" })).toBe(false);
     // Encrypted, or nothing to send: nothing a proxy could read.
     expect(crossesInheritedProxy("https://127.0.0.1:4000", {})).toBe(false);
     expect(crossesInheritedProxy(null, {})).toBe(false);
@@ -533,8 +593,33 @@ describe("Pi's own login's key", () => {
     expect((await readdir(main)).concat(await readdir(join(root, "dotfiles"))).filter((name) => name.endsWith(".lock"))).toEqual([]);
   });
 
-  it("never checks the CLI login's address", async () => {
-    expect(await new PiAdapter().egress(null)).toBeNull();
+  it("checks the CLI login's address only while a proxy is set on it, and not while its models.json sends Anthropic's requests elsewhere", async () => {
+    const direct = vi.fn(async () => new Response("ip=203.0.113.7\nloc=NL\n"));
+    vi.stubGlobal("fetch", direct);
+    const tunnels: string[] = [];
+    const proxy = createServer();
+    proxy.on("connect", (req, socket) => {
+      tunnels.push(req.url ?? "");
+      socket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
+    });
+    await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+    try {
+      // No proxy on the login: nothing is sent, as on main.
+      expect(await new PiAdapter().egress(null)).toBeNull();
+      expect(direct).not.toHaveBeenCalled();
+      // With one, Anthropic is asked through it.
+      await writeFile(join(main, "settings.json"), JSON.stringify({ httpProxy: `http://127.0.0.1:${(proxy.address() as AddressInfo).port}` }));
+      await expect(new PiAdapter().egress(null)).rejects.toThrow(/refused the tunnel/);
+      expect(tunnels).toEqual(["api.anthropic.com:443"]);
+      // Unless Anthropic's requests go elsewhere.
+      await writeFile(join(main, "models.json"), JSON.stringify({ providers: { anthropic: { baseUrl: "https://gw.example.com" } } }));
+      expect(await new PiAdapter().egress(null)).toBeNull();
+      expect(tunnels).toHaveLength(1);
+      expect(direct).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+      await new Promise<void>((resolve) => proxy.close(() => resolve()));
+    }
   });
 });
 
@@ -616,9 +701,9 @@ describe("Pi accounts in the service", () => {
     try {
       expect((await store.read()).accounts.map((account) => [account.id, account.label])).toEqual([[MAIN_ACCOUNT_ID.pi, "Pi (CLI login)"]]);
       await expect(service.startLogin("pi", "browser")).rejects.toThrow(/API key/);
-      // With no account added, nothing is checked and no script is written.
+      // With no account added, only the CLI login's address is checked, and no script is written.
       await (service as unknown as { tick(): Promise<void> }).tick();
-      expect(pi.egressChecks).toEqual([]);
+      expect(pi.egressChecks.filter((home) => home !== null)).toEqual([]);
       await expect(stat(join(root, "pi-config"))).rejects.toThrow();
 
       const id = await service.addApiAccount({ label: "Work key", key: KEY, proxy: "http://127.0.0.1:7890" });
@@ -641,9 +726,7 @@ describe("Pi accounts in the service", () => {
       expect(await store.read()).toMatchObject({ cleanup: {}, moves: {} });
       expect((await store.read()).accounts.find((account) => account.id === id)).toMatchObject({ family: "pi", auth: "api", home, label: "Work key" });
       await expect(service.addApiAccount({ label: "Again", key: KEY })).rejects.toThrow(/already added/);
-      // Only the added account's address is checked, never the CLI login's.
       await vi.waitFor(() => expect(pi.egressChecks).toContain(home));
-      expect(pi.egressChecks).not.toContain(null);
 
       const view = await service.view(paseo as never);
       const card = view.accounts.find((account) => account.id === id);
@@ -725,6 +808,90 @@ describe("Pi accounts in the service", () => {
     }
   });
 
+  it("sets no new proxy on the CLI login while an added account's plain-http:// gateway is kept direct only by `*` or an entry like `.com`", async () => {
+    const store = new StateStore(join(root, "state.json"));
+    const service = piService(new InstalledPi(), store);
+    const paseo = { agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false } }) } };
+    service.attach(paseo as never);
+    await service.start();
+    try {
+      process.env.NO_PROXY = "gw.example.com";
+      const id = await service.addApiAccount({ label: "Gateway", key: KEY, baseUrl: "http://gw.example.com" });
+      const home = findAccount(await store.read(), id)!.home!;
+      // Its agents would get the CLI login's proxy with these left out of their list, and send the key through it.
+      for (const noProxy of ["*", ".com", "localhost,.com"]) {
+        process.env.NO_PROXY = noProxy;
+        await expect(service.setProxy(MAIN_ACCOUNT_ID.pi, "http://10.0.0.1:3128"), noProxy).rejects.toThrow(/Gateway has no proxy of its own/);
+        expect(JSON.parse(await readFile(join(main, "settings.json"), "utf8")), noProxy).toEqual({ defaultProvider: "anthropic" });
+      }
+      // Kept direct by both lists, the proxy is set, and its agents go straight to the gateway.
+      process.env.NO_PROXY = "gw.example.com";
+      await service.setProxy(MAIN_ACCOUNT_ID.pi, "http://10.0.0.1:3128");
+      expect(JSON.parse(await readFile(join(main, "settings.json"), "utf8")).httpProxy).toBe("http://10.0.0.1:3128");
+      expect((await new PiAdapter().env(home)).NO_PROXY?.split(",")).toContain("gw.example.com");
+    } finally {
+      await service.stop();
+    }
+  });
+
+  it("stops giving an account's agents the CLI login's proxy once NO_PROXY no longer keeps its plain-http:// gateway direct", async () => {
+    const store = new StateStore(join(root, "state.json"));
+    const service = piService(new InstalledPi(), store);
+    const paseo = { agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false } }) } };
+    service.attach(paseo as never);
+    await service.start();
+    try {
+      process.env.NO_PROXY = "gw.example.com";
+      const id = await service.addApiAccount({ label: "Gateway", key: KEY, baseUrl: "http://gw.example.com" });
+      const home = findAccount(await store.read(), id)!.home!;
+      await service.setProxy(MAIN_ACCOUNT_ID.pi, "http://10.0.0.1:3128");
+      expect((await new PiAdapter().env(home)).HTTPS_PROXY).toBe("http://10.0.0.1:3128");
+      // Changed after the proxy was accepted: its agents get no proxy variables, and go direct as on main.
+      for (const noProxy of ["*", ".com"]) {
+        process.env.NO_PROXY = noProxy;
+        const env = await new PiAdapter().env(home);
+        for (const key of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy"]) expect(env[key], `${noProxy} ${key}`).toBeUndefined();
+        // The CLI login sends nothing over plain http://, so its own agents still get it.
+        expect((await new PiAdapter().env(null)).HTTPS_PROXY, noProxy).toBe("http://10.0.0.1:3128");
+      }
+    } finally {
+      await service.stop();
+    }
+  });
+
+  it("gives an account added after the CLI login's proxy, on a plain-http:// gateway, no proxy variables, and its card says where it goes instead", async () => {
+    const store = new StateStore(join(root, "state.json"));
+    const service = piService(new InstalledPi(), store);
+    const paseo = { agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false } }) } };
+    service.attach(paseo as never);
+    await service.start();
+    try {
+      await service.setProxy(MAIN_ACCOUNT_ID.pi, "http://10.0.0.1:3128");
+      for (const noProxy of [undefined, "*", ".com"]) {
+        if (noProxy === undefined) delete process.env.NO_PROXY;
+        else process.env.NO_PROXY = noProxy;
+        const id = await service.addApiAccount({ label: `Gateway ${noProxy ?? "none"}`, key: `${KEY}-${noProxy ?? "none"}`, baseUrl: "http://gw.example.com" });
+        const home = findAccount(await store.read(), id)!.home!;
+        const env = await new PiAdapter().env(home);
+        expect(env.HTTPS_PROXY, String(noProxy)).toBeUndefined();
+        expect(env.NO_PROXY, String(noProxy)).toBeUndefined();
+        // Its card says where Pi then goes by itself: httpProxy past the environment's no-proxy list,
+        // so straight to the gateway with `*` or `.com`, and through httpProxy without either.
+        const { inherited } = await new PiAdapter().proxyState(home);
+        if (noProxy === undefined) expect(inherited, String(noProxy)).toEqual({ proxy: "http://10.0.0.1:3128", from: expect.stringMatching(/^httpProxy in /) });
+        else expect(inherited, String(noProxy)).toBeNull();
+      }
+      // On https:// it gets the login's proxy as before, and its card says so.
+      delete process.env.NO_PROXY;
+      const safe = await service.addApiAccount({ label: "Secure", key: `${KEY}-https`, baseUrl: "https://gw.example.com" });
+      const safeHome = findAccount(await store.read(), safe)!.home!;
+      expect((await new PiAdapter().env(safeHome)).HTTPS_PROXY).toBe("http://10.0.0.1:3128");
+      expect((await new PiAdapter().proxyState(safeHome)).inherited).toEqual({ proxy: "http://10.0.0.1:3128", from: expect.stringMatching(/^the CLI login \(httpProxy in /) });
+    } finally {
+      await service.stop();
+    }
+  });
+
   it("counts a follower's gateway on this machine as behind the CLI login's new proxy, unless NO_PROXY keeps it direct", async () => {
     const store = new StateStore(join(root, "state.json"));
     const service = piService(new InstalledPi(), store);
@@ -734,15 +901,28 @@ describe("Pi accounts in the service", () => {
     try {
       const id = await service.addApiAccount({ label: "Local", key: KEY, baseUrl: "http://127.0.0.1:4000" });
       const home = findAccount(await store.read(), id)!.home!;
-      // ZeroSub gives it no NO_PROXY, and Pi adds none for httpProxy: its key would cross the proxy.
-      await expect(service.setProxy(MAIN_ACCOUNT_ID.pi, "http://10.0.0.1:3128")).rejects.toThrow(/Local has no proxy of its own/);
-      expect(JSON.parse(await readFile(join(main, "settings.json"), "utf8"))).toEqual({ defaultProvider: "anthropic" });
-      // With the gateway in NO_PROXY, its key goes straight to it.
+      // ZeroSub keeps this machine direct for the agents it starts, but the login's proxy also reaches
+      // the account as httpProxy, which Pi applies elsewhere with nothing but the environment's NO_PROXY.
+      await expect(service.setProxy(MAIN_ACCOUNT_ID.pi, "http://10.0.0.1:3128")).rejects.toThrow(/Local.*plain http:\/\//);
+      expect(JSON.parse(await readFile(join(main, "settings.json"), "utf8")).httpProxy).toBeUndefined();
       process.env.NO_PROXY = "127.0.0.1";
       await service.setProxy(MAIN_ACCOUNT_ID.pi, "http://10.0.0.1:3128");
       expect(JSON.parse(await readFile(join(main, "settings.json"), "utf8")).httpProxy).toBe("http://10.0.0.1:3128");
+      // Its agents get the login's proxy, with this machine kept direct.
+      const env = await new PiAdapter().env(home);
+      expect(env.HTTPS_PROXY).toBe("http://10.0.0.1:3128");
+      expect(env.NO_PROXY).toContain("127.0.0.1");
 
-      // Its kept folder, added back once NO_PROXY no longer keeps it direct, would be behind that proxy.
+      // A gateway on another host that NO_PROXY keeps direct stays direct for its agents too, rather
+      // than crossing the login's proxy in the clear: the checks and the agents read the same list.
+      process.env.NO_PROXY = "127.0.0.1,gw.internal";
+      const remote = await service.addApiAccount({ label: "Intranet", key: `${KEY}-2`, baseUrl: "http://gw.internal:4000" });
+      const remoteEnv = await new PiAdapter().env(findAccount(await store.read(), remote)!.home!);
+      expect(remoteEnv.HTTPS_PROXY).toBe("http://10.0.0.1:3128");
+      expect(remoteEnv.NO_PROXY?.split(",")).toContain("gw.internal");
+      process.env.NO_PROXY = "127.0.0.1";
+
+      // Its kept folder comes back the same way: only while NO_PROXY keeps the gateway direct.
       await service.remove(paseo as never, id);
       delete process.env.NO_PROXY;
       await expect(service.importPiAccount(home)).rejects.toThrow(/plain http:\/\//);
@@ -757,6 +937,7 @@ describe("Pi accounts in the service", () => {
       await service.importPiAccount(home);
       expect((await store.read()).accounts.some((account) => account.home === home)).toBe(true);
     } finally {
+      delete process.env.NO_PROXY;
       await service.stop();
     }
   });
@@ -928,30 +1109,36 @@ describe("Pi accounts in the service", () => {
     }
   });
 
-  it("keeps an account's own proxy while clearing it would send its key to a gateway on this machine through the CLI login's", async () => {
+  it("keeps an account's own proxy while dropping it would send its key to a gateway on this machine through an inherited one, unless NO_PROXY keeps it direct", async () => {
     const store = new StateStore(join(root, "state.json"));
     const service = piService(new InstalledPi(), store);
     const paseo = { agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false } }) } };
     service.attach(paseo as never);
     await service.start();
     try {
-      // Its own proxy keeps this machine direct (ZeroSub's NO_PROXY); the CLI login's doesn't.
       const id = await service.addApiAccount({ label: "Local", key: KEY, baseUrl: "http://127.0.0.1:4000", proxy: "http://127.0.0.1:7890" });
       const home = findAccount(await store.read(), id)!.home!;
-      await writeFile(join(main, "settings.json"), JSON.stringify({ defaultProvider: "anthropic", httpProxy: "http://10.0.0.1:3128" }));
+      // Under a proxy from the daemon's environment nothing keeps this machine direct but NO_PROXY.
+      process.env.HTTPS_PROXY = "http://10.0.0.9:3128";
       await expect(service.setProxy(id, "")).rejects.toThrow(/plain http:\/\//);
-      expect(JSON.parse(await readFile(join(home, "zerosub.json"), "utf8")).proxy).toBe("http://127.0.0.1:7890");
-      // Nor with the gateway only in NO_PROXY while no_proxy, which Pi reads in its place, leaves it out.
       process.env.no_proxy = "intranet.example";
       process.env.NO_PROXY = "127.0.0.1";
       await expect(service.setProxy(id, "")).rejects.toThrow(/plain http:\/\//);
       expect(JSON.parse(await readFile(join(home, "zerosub.json"), "utf8")).proxy).toBe("http://127.0.0.1:7890");
       delete process.env.no_proxy;
-      // With the gateway in NO_PROXY, the key goes straight to it.
+      delete process.env.NO_PROXY;
+      delete process.env.HTTPS_PROXY;
+      // Nor under the CLI login's: its agents would keep this machine direct, but the account shares
+      // the login's httpProxy, which Pi applies elsewhere with nothing but the environment's NO_PROXY.
+      await writeFile(join(main, "settings.json"), JSON.stringify({ defaultProvider: "anthropic", httpProxy: "http://10.0.0.1:3128" }));
+      await expect(service.setProxy(id, "")).rejects.toThrow(/plain http:\/\//);
+      expect(JSON.parse(await readFile(join(home, "zerosub.json"), "utf8")).proxy).toBe("http://127.0.0.1:7890");
+      // Once NO_PROXY keeps the gateway direct, the proxy goes.
       process.env.NO_PROXY = "127.0.0.1";
       await service.setProxy(id, "");
       expect(JSON.parse(await readFile(join(home, "zerosub.json"), "utf8")).proxy).toBeUndefined();
     } finally {
+      delete process.env.HTTPS_PROXY;
       await service.stop();
     }
   });

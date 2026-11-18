@@ -4,7 +4,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import type { ApiSummary, LoginMethod } from "../shared/model";
 import type { EnvPatch, FamilyAdapter, Identity, LoginHandle, ProxyState, RedeemReply, TurnEvent, UsageRead } from "./adapter";
 import { providerCommand } from "./binaries";
-import { clearTextProviders, forgetSyncs, normalizeBaseUrl, piHomeHoldsAccount, piLiteral, preparePiHome, readPiAccount, readPiOwnJson, readPiAccountApi, readPiAccountForAgents, writePiAccountApi, writePiAccountProxy } from "./homes";
+import { clearTextProviders, crossesInheritedProxy, forgetSyncs, normalizeBaseUrl, piAgentNoProxy, piHomeHoldsAccount, piKeepsDirect, piLiteral, preparePiHome, readPiAccount, readPiOwnJson, readPiAccountApi, readPiAccountForAgents, writePiAccountApi, writePiAccountProxy } from "./homes";
 import { PI_LAUNCH_ENV } from "./launchers";
 import { Mutex, readJson, writeJsonAtomic } from "./json-file";
 import { eachProcessEnvironment, homesInEnvironment, parseTrace } from "./processes";
@@ -12,13 +12,11 @@ import { detectPiSignOut } from "./limits";
 import { dataDir, mainPiDir, shownPath } from "./paths";
 import { run } from "./process";
 import { providerEnv } from "./provider-env";
-import { NO_PROXY_KEYS, PROXY_KEYS, bypassesProxy, noProxyFromEnv, proxiedFetch, proxyFromEnv, withRequiredNoProxy, withoutDomains } from "./proxy";
+import { NO_PROXY_KEYS, PROXY_KEYS, bypassesProxy, proxiedFetch, proxyFromEnv } from "./proxy";
 
 const ANTHROPIC_API = "https://api.anthropic.com";
 /** Anthropic's edge answers this with the address it sees the request come from (see `PiAdapter.egress`). */
 const TRACE = `${ANTHROPIC_API}/cdn-cgi/trace`;
-/** Where Anthropic's API and sign-in live; a proxy set here must not be gone around for them. */
-const ANTHROPIC_DOMAINS = ["anthropic.com", "claude.ai", "claude.com"];
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -44,6 +42,25 @@ function mainSettingsPath(): string {
 async function settingsProxy(): Promise<string | null> {
   const settings = await readPiOwnJson(mainSettingsPath()).catch(() => undefined);
   return isObject(settings) && typeof settings.httpProxy === "string" && settings.httpProxy.trim() ? settings.httpProxy.trim() : null;
+}
+
+/**
+ * ZeroSub: the CLI login's proxy as its agents may get it as variables at launch, or null. Setting it
+ * is refused while a key would cross it over plain http:// (see `writePiMainProxy` and
+ * `Service.refuseClearTextFollowers`), but what those checks read can change after it's set: a
+ * `models.json` edited, the no-proxy list narrowed to `*`, an account added, or a proxy set before
+ * ZeroSub gave it out at all. So the same checks run again here, and while one fails agents get no
+ * proxy variables: Pi then applies `httpProxy` itself with the environment's no-proxy list, as it
+ * does without ZeroSub. A `models.json` that doesn't parse fails them. `account` is an added
+ * account's, for one without a proxy of its own.
+ */
+async function loginProxyForAgents(account?: { key: string | null; baseUrl: string | null }): Promise<string | null> {
+  const proxy = await settingsProxy();
+  if (!proxy) return null;
+  const clear = await clearTextProviders(true).catch(() => null);
+  if (clear === null || clear.length > 0) return null;
+  if (account?.key && crossesInheritedProxy(account.baseUrl)) return null;
+  return proxy;
 }
 
 /**
@@ -74,7 +91,7 @@ async function sessionDirConfigured(): Promise<boolean> {
 function proxyVariables(proxy: string, baseUrl: string | null): Record<string, string> {
   const inherited = { ...process.env, ...providerEnv("pi") };
   const base = hostOf(baseUrl);
-  const noProxy = withRequiredNoProxy(withoutDomains(noProxyFromEnv(inherited), base ? [...ANTHROPIC_DOMAINS, base] : ANTHROPIC_DOMAINS));
+  const noProxy = piAgentNoProxy(inherited, base);
   const env: Record<string, string> = {};
   for (const key of PROXY_KEYS) env[key] = proxy;
   for (const key of NO_PROXY_KEYS) env[key] = noProxy;
@@ -87,12 +104,27 @@ function proxyVariables(proxy: string, baseUrl: string | null): Record<string, s
  * settings, which the account shares. Null when it goes direct, or the no-proxy list sends `target`
  * past it.
  */
-export async function inheritedPiProxy(target = ANTHROPIC_API): Promise<{ proxy: string; from: string } | null> {
+export async function inheritedPiProxy(
+  target = ANTHROPIC_API,
+  account: { key: string | null; baseUrl: string | null } | null = null,
+): Promise<{ proxy: string; from: string } | null> {
   const provider = providerEnv("pi");
   const env: Record<string, string | undefined> = { ...process.env, ...provider };
+  // ZeroSub: where its agents are given the CLI login's proxy as variables (see `PiAdapter.env`), it
+  // outranks what they inherit, and `target` goes past it only where both lists keep it direct: the
+  // environment's, which a `pi` started elsewhere applies to `httpProxy` in the account's settings,
+  // and the one the agents get (see `proxyVariables`), which leaves out `*` and entries like `.com`.
+  // `account` is an added account's (null for the CLI login, whose own proxy doesn't count here).
+  if (account) {
+    const given = await loginProxyForAgents(account);
+    if (given) return piKeepsDirect(target, env) ? null : { proxy: given, from: `the CLI login (httpProxy in ${shownPath(mainSettingsPath())})` };
+  }
+  // Otherwise nothing is given, and Pi goes as it would without ZeroSub: the environment's proxy, else
+  // `httpProxy` in the settings, past the environment's no-proxy list.
   if (bypassesProxy(env.no_proxy ?? env.NO_PROXY ?? null, target)) return null;
   const key = PROXY_KEYS.find((name) => env[name]?.trim());
   if (key) return { proxy: env[key]!.trim(), from: key in provider ? "the Pi provider's env in Paseo's config" : "the daemon's environment" };
+  if (!account) return null;
   const own = await settingsProxy();
   return own ? { proxy: own, from: `httpProxy in ${shownPath(mainSettingsPath())}` } : null;
 }
@@ -224,11 +256,12 @@ const mainWrites = new Mutex();
 /**
  * Sets (or clears, with `null`) Pi's own login's proxy as `httpProxy` in its `settings.json`, which
  * Pi applies wherever it runs on that login while its environment names no proxy, and which added
- * accounts without a proxy of their own share. ZeroSub gives Pi agents nothing for it: Pi reads it
- * itself. Like an added account's, a new proxy is refused while a key or sign-in it would carry goes
- * over plain http://, wherever Pi takes it from (see `clearTextProviders`): to this machine too,
- * unless the no-proxy list keeps it direct, since Pi adds nothing to that list. The file is backed
- * up first and written under Pi's own lock.
+ * accounts without a proxy of their own share. ZeroSub gives it to Pi agents as variables too (see
+ * `PiAdapter.env`). Like an added account's, a new proxy is refused while a key or sign-in it would
+ * carry goes over plain http://, wherever Pi takes it from (see `clearTextProviders`): to this
+ * machine too, unless the no-proxy list keeps it direct, since a `pi` run from a terminal applies the
+ * setting without ZeroSub's variables and Pi adds nothing to that list. The file is backed up first
+ * and written under Pi's own lock.
  */
 async function writePiMainProxy(proxy: string | null): Promise<void> {
   await mainWrites.run(async () => {
@@ -384,8 +417,15 @@ export class PiAdapter implements FamilyAdapter {
   readonly mainApi = true;
 
   async env(home: string | null, session?: { cwd: string }): Promise<EnvPatch> {
-    // The CLI login runs as Paseo would run it without ZeroSub.
-    if (!home) return {};
+    // ZeroSub: the CLI login's own proxy (`httpProxy` in Pi's settings) is given as variables too, with
+    // this machine's addresses kept direct: Pi only applies the setting while its environment names no
+    // proxy, and adds no no-proxy list of its own. Only while the clear-text checks still pass (see
+    // `loginProxyForAgents`). The directory is cleared, so an agent moved back from an added account
+    // doesn't keep running on that account's.
+    if (!home) {
+      const mainProxy = await loginProxyForAgents();
+      return { PI_CODING_AGENT_DIR: null, ...(mainProxy ? proxyVariables(mainProxy, null) : {}) };
+    }
     // Throws while the folder is being moved: routing then opens the agent on the CLI login rather
     // than on the account without its proxy (see `readPiAccountForAgents`).
     const account = await readPiAccountForAgents(home);
@@ -400,7 +440,15 @@ export class PiAdapter implements FamilyAdapter {
     if (session && !(await sessionDirConfigured())) patch.PI_CODING_AGENT_SESSION_DIR = await piSessionDir(session.cwd);
     // Given as variables, so nothing the agent inherits outranks the account's own proxy. Without one,
     // it inherits whatever the daemon and Pi's own settings give it, as Pi does without ZeroSub.
+    // ZeroSub: without a proxy of its own it goes through the CLI login's, given the same way, while
+    // the clear-text checks still pass for it (see `loginProxyForAgents`), but with its base URL's
+    // host left in the no-proxy list: the checks take a host the list keeps direct as direct (see
+    // `crossesInheritedProxy`), so its agents must go direct to it too.
     if (account.proxy) Object.assign(patch, proxyVariables(account.proxy, account.baseUrl));
+    else {
+      const mainProxy = await loginProxyForAgents(account);
+      if (mainProxy) Object.assign(patch, proxyVariables(mainProxy, null));
+    }
     return patch;
   }
 
@@ -444,11 +492,11 @@ export class PiAdapter implements FamilyAdapter {
     });
     return found;
   }
-
   /** Everything a Pi account has is in its folder, so only the folder moves; its key says which one it is. */
   holdsAccount(home: string): Promise<boolean> {
     return piHomeHoldsAccount(home);
   }
+
 
   /**
    * The CLI login always counts as signed in: Pi picks a sign-in per model from everything it has.
@@ -482,23 +530,26 @@ export class PiAdapter implements FamilyAdapter {
       return { own, file: own ? shownPath(mainSettingsPath()) : null, inherited: own ? null : await inheritedPiProxy(ANTHROPIC_API) };
     }
     const account = await readPiAccount(home);
-    return { own: account.proxy, file: null, inherited: account.proxy ? null : await inheritedPiProxy(account.baseUrl ?? ANTHROPIC_API) };
+    return { own: account.proxy, file: null, inherited: account.proxy ? null : await inheritedPiProxy(account.baseUrl ?? ANTHROPIC_API, account) };
   }
 
   async setProxy(home: string | null, proxy: string | null, wanted?: () => Promise<boolean>): Promise<void> {
     if (!home) return writePiMainProxy(proxy);
-    await writePiAccountProxy(home, proxy, wanted, (baseUrl) => inheritedPiProxy(baseUrl ?? ANTHROPIC_API));
+    // What it would go through once its own is cleared: read now, as the account has it.
+    await writePiAccountProxy(home, proxy, wanted, async (baseUrl) => inheritedPiProxy(baseUrl ?? ANTHROPIC_API, await readPiAccount(home)));
     await this.writeLaunchEnv(home);
   }
 
   /**
    * The address Anthropic sees an added account's requests come from, asked of Anthropic's own host
    * the way the account's Pi reaches it. Null for an account with another base URL (whatever is there
-   * reaches Anthropic from its own address), and for the CLI login, which ZeroSub never checks.
+   * reaches Anthropic from its own address); for the CLI login that's an Anthropic base URL in its `models.json`.
    */
   async egress(home: string | null): Promise<{ ip: string; country: string | null } | null> {
-    if (!home) return null;
-    const { baseUrl } = await readPiAccount(home);
+    // ZeroSub: the CLI login's is checked too, but only while a proxy is set on it (`httpProxy`), and
+    // not while its `models.json` sends Anthropic's requests elsewhere. Without one nothing is sent.
+    if (!home && !(await settingsProxy())) return null;
+    const baseUrl = home ? (await readPiAccount(home)).baseUrl : await mainAnthropicBaseUrl();
     if (baseUrl && hostOf(baseUrl) !== hostOf(ANTHROPIC_API)) return null;
     const env: Record<string, string | undefined> = { ...process.env, ...providerEnv("pi") };
     for (const [key, value] of Object.entries(await this.env(home))) if (value !== null) env[key] = value;
