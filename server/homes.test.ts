@@ -1,7 +1,7 @@
 import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   accountSettings,
   codexSessionsShared,
@@ -261,6 +261,31 @@ describe("prepareClaudeHome", () => {
     });
     expect(synced.projects["/work"]).toEqual({ allowedTools: ["Bash(npm test)", "Bash(ls)"], hasTrustDialogAccepted: true });
     expect(await lstat(join(home, ".claude.json.lock")).catch(() => null)).toBeNull();
+  });
+
+  it("never replaces an account's .claude.json that doesn't read, and syncs it once it reads again", async () => {
+    const main = join(root, "main");
+    const home = join(root, "homes", "claude-d");
+    process.env.CLAUDE_CONFIG_DIR = main;
+    await mkdir(main, { recursive: true });
+    await sync(home, main, { mcpServers: { docs: { command: "docs-mcp" } } });
+
+    // Half written, say. The account's identity is in there, so it mustn't become just main's servers.
+    const damaged = '{"oauthAccount":{"emailAddress":"d@example.com"},"mcpServers":';
+    await writeFile(join(home, ".claude.json"), damaged);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const linear = { mcpServers: { linear: { url: "https://mcp.linear.app" } } };
+    await sync(home, main, linear, 5_000);
+    await sync(home, main, linear, 10_000);
+    expect(await readFile(join(home, ".claude.json"), "utf8")).toBe(damaged);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+
+    await writeFile(join(home, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "d@example.com" } }));
+    await sync(home, main, linear, 15_000);
+    const synced = JSON.parse(await readFile(join(home, ".claude.json"), "utf8"));
+    expect(synced.oauthAccount).toEqual({ emailAddress: "d@example.com" });
+    expect(synced.mcpServers).toEqual({ linear: { url: "https://mcp.linear.app" } });
   });
 
   it("leaves entries the CLI created inside the home alone", async () => {
