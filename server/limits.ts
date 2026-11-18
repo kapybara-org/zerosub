@@ -108,11 +108,17 @@ function firstLine(text: string): string {
   return (text.split("\n")[0] ?? text).trim();
 }
 
+/** The model a Claude limit notice names ("hit your Fable limit", "reached your Fable 5.2 limit"), lowercase. */
+const CLAUDE_SCOPE = new RegExp(`^You${APOSTROPHE}ve (?:hit|reached) your (Opus|Sonnet|Fable|Haiku)\\b`, "i");
+
 export function detectClaudeLimit(event: TurnEvent, now: Date = new Date()): LimitHit | null {
   for (const text of notices(event, true)) {
     const line = firstLine(text);
     const match = CLAUDE_LIMITS.find(({ pattern }) => pattern.test(line));
-    if (match) return { message: line, kind: match.kind, resetsAt: parseClaudeReset(line, now) };
+    if (match) {
+      const scope = match.kind === "window" ? (line.match(CLAUDE_SCOPE)?.[1]?.toLowerCase() ?? null) : null;
+      return { message: line, kind: match.kind, resetsAt: parseClaudeReset(line, now), scope };
+    }
   }
   return null;
 }
@@ -196,6 +202,117 @@ export function detectAzureLimit(event: TurnEvent, now: Date = new Date()): Limi
 export function detectAzureSignOut(event: TurnEvent): string | null {
   if (event.outcome.kind !== "failed") return null;
   for (const text of notices(event, false)) if (AZURE_REFUSED.test(text) && !AZURE_RATE_LIMIT.test(text)) return firstLine(text);
+  return null;
+}
+
+// --------------------------------------------------------------------------- AWS Bedrock (Claude on AWS)
+
+/** How long a Bedrock account is set aside after throttling (`ThrottlingException`, 429, "Too many tokens"). */
+export const BEDROCK_THROTTLE_MS = 60_000;
+/** How long after an exceeded service quota, which usually lifts within minutes. */
+export const BEDROCK_QUOTA_MS = 5 * 60_000;
+
+const BEDROCK_QUOTA = /ServiceQuotaExceeded|service quota|quota exceeded/i;
+const BEDROCK_THROTTLED = /ThrottlingException|Too many (?:tokens|requests)|\b429\b|rate (?:exceeded|limit)/i;
+/**
+ * Bedrock naming the model as one the account can't use: not enabled for it ("You don't have access
+ * to the model with the specified model ID"), a wrong ID ("The provided model identifier is invalid")
+ * or one that needs an inference profile. AWS's own wording, which no other service in a turn prints,
+ * so the account is marked without asking AWS about its credentials again.
+ */
+const BEDROCK_MODEL_REFUSED =
+  /don['’]t have access to the model with the specified model ID|provided model identifier is invalid|Invocation of model ID .{1,200} with on-demand throughput isn['’]t supported/i;
+/**
+ * Credentials or access refused. Only a hint: an AccessDenied or a 403 can be another service's (an
+ * MCP server's, a tool's), so the service asks AWS about the credentials before taking the account
+ * for signed out (see `confirmSignedOut`).
+ */
+const BEDROCK_REFUSED =
+  /AccessDeniedException|not authorized to perform|UnrecognizedClientException|InvalidSignatureException|security token included in the request is (?:invalid|expired)|ExpiredToken|Could not load credentials|Unable to locate credentials|\b40[13]\b/i;
+/** How Claude Code words an API failure in its reply: "API Error: 429 …", "API Error (model): 400 …". */
+const API_ERROR = /^(?:\[System Error\]\s*)?API Error\b/i;
+
+/**
+ * Notices from a turn on Bedrock. A failed turn gives its failure and error rows. Either kind gives
+ * Claude Code's own error replies: of the turn's last two replies (the window main's Claude detectors
+ * read, see `notices`), those that start "API Error", as Claude Code words an API failure. Paseo before
+ * 0.16 reports such a turn as completed, so a completed turn is read for them too. Nothing else in a
+ * completed turn counts: its warnings and error rows (an MCP server's "HTTP 401 Unauthorized" while it
+ * starts, an AccessDenied in a tool's output) are other services', and an ordinary reply that only
+ * mentions a 429 isn't an error at all.
+ */
+function apiNotices(event: TurnEvent): string[] {
+  const found = event.outcome.kind === "failed" ? notices(event, false) : [];
+  const timeline = event.turnId === null ? [] : event.timeline;
+  let replies = 0;
+  for (let index = timeline.length - 1; index >= 0 && replies < 2; index -= 1) {
+    const item = timeline[index];
+    if (!item) continue;
+    if (isTurnPrompt(item)) break;
+    if (item.type !== "assistant_message") continue;
+    replies += 1;
+    if (API_ERROR.test(item.text)) found.push(clean(item.text));
+  }
+  return found.filter((text) => text.length > 0 && text.length <= MAX_NOTICE);
+}
+
+/**
+ * A turn on an AWS Bedrock account that failed throttled or over a service quota (see `apiNotices`). Bedrock has no 5-hour
+ * or weekly windows, so either is a short cooldown, as for Azure (see `detectAzureLimit`).
+ */
+export function detectBedrockLimit(event: TurnEvent, now: Date = new Date()): LimitHit | null {
+  for (const text of apiNotices(event)) {
+    if (BEDROCK_QUOTA.test(text)) return { kind: "budget", message: firstLine(text), resetsAt: new Date(now.getTime() + BEDROCK_QUOTA_MS).toISOString() };
+    if (BEDROCK_THROTTLED.test(text)) return { kind: "window", message: firstLine(text), resetsAt: new Date(now.getTime() + BEDROCK_THROTTLE_MS).toISOString() };
+  }
+  return null;
+}
+
+/**
+ * A turn on an AWS Bedrock account that failed because its credentials, access or model were refused
+ * (see `apiNotices`): what AWS said, and whether it named the model (`model`), which needs no check of
+ * the credentials.
+ */
+export function detectBedrockRefusal(event: TurnEvent): { message: string; model: boolean } | null {
+  const texts = apiNotices(event).filter((text) => !BEDROCK_THROTTLED.test(text) && !BEDROCK_QUOTA.test(text));
+  for (const text of texts) if (BEDROCK_MODEL_REFUSED.test(text)) return { message: firstLine(text), model: true };
+  for (const text of texts) if (BEDROCK_REFUSED.test(text)) return { message: firstLine(text), model: false };
+  return null;
+}
+
+/**
+ * Claude Code's own words when the model it was asked for isn't offered in the account's region: "The
+ * model eu.anthropic.claude-sonnet-4-5-20250929-v1:0 is not available on your bedrock deployment. Try
+ * --model to switch to …". It says so for a model alias (`sonnet`) whose built-in Bedrock default is
+ * older than what the region has, so only that model is out, not the account.
+ */
+const BEDROCK_MODEL_UNAVAILABLE = /^The model (\S{1,200}) is not available on your bedrock deployment\b/i;
+
+/**
+ * A turn on an AWS Bedrock account whose model Claude Code found missing in the account's region (see
+ * `BEDROCK_MODEL_UNAVAILABLE`), and the model it named. Read like main's Claude notices: the failure,
+ * error rows and the last two replies, of a failed or completed turn. The wording is Claude Code's
+ * own, anchored at the start, so no other service's message or ordinary reply matches.
+ */
+export function detectBedrockModelUnavailable(event: TurnEvent): { message: string; model: string } | null {
+  for (const text of notices(event, true)) {
+    const line = firstLine(text);
+    const match = line.match(BEDROCK_MODEL_UNAVAILABLE);
+    if (match?.[1]) return { message: line, model: match[1] };
+  }
+  return null;
+}
+
+/** Paseo refusing to start a turn in Claude's Auto mode where Claude Code runs on Bedrock (`CLAUDE_CODE_USE_BEDROCK`). */
+const BEDROCK_AUTO_MODE = /Claude Auto mode requires the Anthropic API/i;
+
+/**
+ * A turn on an AWS Bedrock account Paseo wouldn't start because the agent is in Claude's Auto mode,
+ * which needs the Anthropic API: Paseo's message. Read like main's Claude notices (the failure, error
+ * rows and the last two replies, of a failed or completed turn); the wording is Paseo's own.
+ */
+export function detectBedrockAutoModeRefusal(event: TurnEvent): string | null {
+  for (const text of notices(event, true)) if (BEDROCK_AUTO_MODE.test(text)) return firstLine(text);
   return null;
 }
 

@@ -78,6 +78,17 @@ function TooltipBubble({
   );
 }
 
+/** A hover tip over any content (a long press shows it on touch), for what a bar can't say. */
+export function Hint({ theme, text, align = "center", children }: { theme: Theme; text: string; align?: TooltipAlign; children: ReactNode }) {
+  const tip = useTooltip(text);
+  return (
+    <Pressable accessible={false} {...tip.handlers} style={{ position: "relative", zIndex: tip.visible ? 1000 : undefined }}>
+      {children}
+      {tip.visible ? <TooltipBubble theme={theme} text={text} placement="top" align={align} /> : null}
+    </Pressable>
+  );
+}
+
 export function Button({
   theme,
   label,

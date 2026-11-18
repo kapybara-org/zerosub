@@ -1,7 +1,7 @@
 import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   accountSettings,
   codexSessionsShared,
@@ -46,6 +46,7 @@ afterEach(async () => {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
+  // Retried: a write the test set off in the background can still be landing in it.
   await rm(root, { recursive: true, force: true, maxRetries: 5 });
 });
 
@@ -263,6 +264,54 @@ describe("prepareClaudeHome", () => {
     expect(await lstat(join(home, ".claude.json.lock")).catch(() => null)).toBeNull();
   });
 
+  it("never replaces an account's .claude.json that doesn't read, and syncs it once it reads again", async () => {
+    const main = join(root, "main");
+    const home = join(root, "homes", "claude-d");
+    process.env.CLAUDE_CONFIG_DIR = main;
+    await mkdir(main, { recursive: true });
+    await sync(home, main, { mcpServers: { docs: { command: "docs-mcp" } } });
+
+    // Half written, say. The account's identity is in there, so it mustn't become just main's servers.
+    const damaged = '{"oauthAccount":{"emailAddress":"d@example.com"},"mcpServers":';
+    await writeFile(join(home, ".claude.json"), damaged);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const linear = { mcpServers: { linear: { url: "https://mcp.linear.app" } } };
+    await sync(home, main, linear, 5_000);
+    await sync(home, main, linear, 10_000);
+    expect(await readFile(join(home, ".claude.json"), "utf8")).toBe(damaged);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+
+    await writeFile(join(home, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "d@example.com" } }));
+    await sync(home, main, linear, 15_000);
+    const synced = JSON.parse(await readFile(join(home, ".claude.json"), "utf8"));
+    expect(synced.oauthAccount).toEqual({ emailAddress: "d@example.com" });
+    expect(synced.mcpServers).toEqual({ linear: { url: "https://mcp.linear.app" } });
+  });
+
+  it("leaves the user's own links alone in a home that isn't ZeroSub's own", async () => {
+    const main = join(root, "main");
+    const dotfiles = join(root, "dotfiles");
+    const elsewhere = join(root, "elsewhere", "claude-work");
+    const own = join(root, "zerosub", "homes", "claude-own");
+    process.env.CLAUDE_CONFIG_DIR = main;
+    process.env.PASEO_HOME = root;
+    await mkdir(join(main, "skills"), { recursive: true });
+    await mkdir(join(dotfiles, "skills"), { recursive: true });
+    for (const home of [elsewhere, own]) {
+      await mkdir(home, { recursive: true });
+      await symlink(join(dotfiles, "skills"), join(home, "skills"));
+      await symlink(join(dotfiles, "gone"), join(home, "notes"));
+      await symlink(join(main, "agents"), join(home, "agents")); // shared once, and gone from main since
+      await prepareClaudeHome(home, true);
+      expect(await lstat(join(home, "agents")).catch(() => null)).toBeNull();
+    }
+    expect(await isLinkTo(join(elsewhere, "skills"), join(dotfiles, "skills"))).toBe(true);
+    expect(await isLinkTo(join(elsewhere, "notes"), join(dotfiles, "gone"))).toBe(true);
+    expect(await isLinkTo(join(own, "skills"), join(main, "skills"))).toBe(true);
+    expect(await lstat(join(own, "notes")).catch(() => null)).toBeNull();
+  });
+
   it("leaves entries the CLI created inside the home alone", async () => {
     const main = join(root, "main");
     const home = join(root, "homes", "claude-c");
@@ -371,6 +420,32 @@ describe("removeHome", () => {
     await mkdir(join(root, "zerosub", "homes", "claude-x"), { recursive: true });
     await removeHome([join(root, "zerosub", "homes", "claude-x"), "..", "..", "elsewhere"].join(sep));
     expect((await lstat(outside)).isDirectory()).toBe(true);
+  });
+
+  it("isn't undone by a sync that was waiting for the home, once its account has gone", async () => {
+    process.env.PASEO_HOME = root;
+    const main = join(root, "main");
+    const home = join(root, "zerosub", "homes", "claude-y");
+    process.env.CLAUDE_CONFIG_DIR = main;
+    await mkdir(join(main, "projects"), { recursive: true });
+    await prepareClaudeHome(home, true);
+
+    let registered = true;
+    const removing = removeHome(home);
+    const syncing = prepareClaudeHome(home, true, async () => registered);
+    registered = false; // the account went before the sync got to the home
+    await Promise.all([removing, syncing]);
+
+    expect(await lstat(home).catch(() => null)).toBeNull();
+  });
+
+  it("leaves a Codex home alone once its account has gone", async () => {
+    const main = join(root, "codex-main");
+    const home = join(root, "zerosub", "homes", "codex-y");
+    process.env.CODEX_HOME = main;
+    await mkdir(main, { recursive: true });
+    await prepareCodexHome(home, true, async () => false);
+    expect(await lstat(home).catch(() => null)).toBeNull();
   });
 });
 
@@ -666,6 +741,26 @@ describe("an account's own proxy and the no-proxy list", () => {
     expect(JSON.parse(await readFile(join(home, "settings.json"), "utf8")).env).toMatchObject(NO_PROXY_PINNED);
     await writeAccountProxy(home, null);
     expect(JSON.parse(await readFile(join(home, "settings.json"), "utf8")).env).toBeUndefined();
+  });
+});
+
+describe("removeHome through a link", () => {
+  it("leaves the folder a link in homes/ points at, and everything in it, alone", async () => {
+    process.env.PASEO_HOME = root;
+    const real = join(root, "claude-config", "claude-mine");
+    const main = join(root, "main");
+    await mkdir(join(main, "projects"), { recursive: true });
+    await mkdir(real, { recursive: true });
+    await writeFile(join(real, ".claude.json"), "{}");
+    await symlink(join(main, "projects"), join(real, "projects"));
+    await mkdir(join(root, "zerosub", "homes"), { recursive: true });
+    const link = join(root, "zerosub", "homes", "claude-mine");
+    await symlink(real, link);
+
+    await removeHome(link);
+    expect(await isLinkTo(link, real)).toBe(true);
+    expect(await readFile(join(real, ".claude.json"), "utf8")).toBe("{}");
+    expect(await isLinkTo(join(real, "projects"), join(main, "projects"))).toBe(true);
   });
 });
 

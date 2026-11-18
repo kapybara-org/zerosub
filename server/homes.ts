@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { ApiKeyKind, ApiSummary, Family, TrafficSwitches } from "../shared/model";
 import { AZURE_FILE, isAzureHome, syncAzureConfig } from "./azure";
+import { BEDROCK_FILE, bedrockSettings, isBedrockHome, readBedrockAccount } from "./bedrock";
 import { Mutex, readJson } from "./json-file";
 import { NO_PROXY_KEYS, PROXY_KEYS, REQUIRED_NO_PROXY, bypassesProxy, maskProxy, noProxyFromEnv, proxyFromEnv, withClaudeNoProxy, withoutClaudeDomains } from "./proxy";
 import { providerEnv } from "./provider-env";
@@ -117,18 +118,17 @@ export function isAccountHome(home: string, family?: Family): boolean {
 
 /**
  * Deletes a managed home. Its top level holds symlinks into the user's real CLI home, so those are
- * unlinked first; nothing outside ZeroSub's own directory is ever followed or removed. It holds the
- * home's lock, so a sync never puts entries back while the home is being deleted.
+ * unlinked first; nothing outside ZeroSub's own directory is ever followed or removed: only a folder
+ * it made for an account (see `isAccountHome`) goes, and a link put in its place is left as it is.
+ * It holds the home's lock, so a sync never puts entries back while the home is being deleted.
  */
 export function removeHome(home: string): Promise<void> {
   return withHome(home, async () => {
-    if (!isAccountHome(home)) return;
-    for (const name of await readdir(home).catch(() => [] as string[])) {
-      const path = join(home, name);
-      const entry = await lstat(path).catch(() => null);
-      if (entry?.isSymbolicLink()) await unlink(path).catch(() => undefined);
-    }
-    await rm(home, { recursive: true, force: true });
+    if (!isAccountHome(home) || !(await isOwnHome(home))) return;
+    // Checked again right here: a link put in its place is never followed into the folder it points at.
+    const entry = await lstat(home).catch(() => null);
+    if (!entry?.isDirectory()) return;
+    await removeTree(home);
   });
 }
 
@@ -214,6 +214,8 @@ const GENERATED_SETTINGS = ".settings.generated.json";
  */
 const CLAUDE_PRIVATE = new Set([
   ".credentials.json",
+  // An AWS Bedrock account's region, credential source and (for an access key) key: never linked in from `~/.claude`.
+  BEDROCK_FILE,
   "settings.json",
   ACCOUNT_SETTINGS,
   GENERATED_SETTINGS,
@@ -375,8 +377,11 @@ async function writeJsonAtomically(path: string, value: unknown): Promise<void> 
   await rename(temporary, path);
 }
 
-/** Claude Code guards `.claude.json` writes with a `<file>.lock` directory; take it too. */
-async function withClaudeConfigLock(file: string, action: () => Promise<void>): Promise<boolean> {
+/**
+ * Claude Code guards `.claude.json` writes with a `<file>.lock` directory; take it too. False while
+ * someone else holds it, else what `action` returns.
+ */
+async function withClaudeConfigLock(file: string, action: () => Promise<boolean>): Promise<boolean> {
   const lock = `${file}.lock`;
   try {
     await mkdir(lock);
@@ -391,8 +396,7 @@ async function withClaudeConfigLock(file: string, action: () => Promise<void>): 
     }
   }
   try {
-    await action();
-    return true;
+    return await action();
   } finally {
     await rmdir(lock).catch(() => undefined);
   }
@@ -401,6 +405,8 @@ async function withClaudeConfigLock(file: string, action: () => Promise<void>): 
 const lastMcpSync = new Map<string, number>();
 /** MCP server names each home last received from main, so removals in main propagate. */
 const lastMcpKeys = new Map<string, Set<string>>();
+/** Homes whose `.claude.json` didn't read at their last sync, so that's logged once. */
+const unreadableConfigs = new Set<string>();
 
 async function syncClaudeGlobalConfig(home: string): Promise<void> {
   const source = mainClaudeGlobalConfig();
@@ -423,7 +429,15 @@ async function syncClaudeGlobalConfig(home: string): Promise<void> {
 
   const mainServers = isObject(main.mcpServers) ? main.mcpServers : {};
   const synced = await withClaudeConfigLock(target, async () => {
-    const current = (await readJsonObject(target)) ?? {};
+    const current = await readJsonObject(target);
+    if (!current) {
+      // The account's identity lives in this file, so one that doesn't read (half written, damaged,
+      // unreadable) is never replaced by just what's shared. The next sync tries again.
+      if (!unreadableConfigs.has(home)) console.warn(`[ZeroSub] left ${target} alone: it doesn't read as a JSON object`);
+      unreadableConfigs.add(home);
+      return false;
+    }
+    unreadableConfigs.delete(home);
     const next: Json = { ...current };
     next.mcpServers = mergeShared(current.mcpServers, mainServers, lastMcpKeys.get(home));
     const projects: Json = isObject(current.projects) ? { ...current.projects } : {};
@@ -435,6 +449,7 @@ async function syncClaudeGlobalConfig(home: string): Promise<void> {
     }
     next.projects = projects;
     await writeJsonAtomically(target, next);
+    return true;
   });
   if (synced) {
     lastMcpSync.set(home, sourceStat.mtimeMs);
@@ -539,7 +554,11 @@ async function syncClaudeSettings(home: string): Promise<void> {
   // Homes from earlier versions link to main's file; replace the link, never write through it.
   if (current?.isSymbolicLink()) await unlink(target);
   const inherited = { ...process.env, ...providerEnv("claude") };
-  const next = `${JSON.stringify(accountSettings(main, account, inherited), null, 2)}\n`;
+  // An AWS Bedrock account's settings are made to agree with its sessions' environment (see bedrock.ts);
+  // one whose bedrock.json can't be read keeps its last ones, as for overrides that don't parse.
+  const bedrock = isBedrockHome(home) ? await readBedrockAccount(home) : null;
+  const generatedSettings = accountSettings(main, account, inherited);
+  const next = `${JSON.stringify(bedrock ? bedrockSettings(generatedSettings, bedrock) : generatedSettings, null, 2)}\n`;
   const generated = join(home, GENERATED_SETTINGS);
   if (current?.isFile() && (await readFile(target, "utf8").catch(() => null)) === next) {
     if ((await readFile(generated, "utf8").catch(() => null)) !== next) await writeJsonAtomically(generated, JSON.parse(next));
@@ -892,6 +911,7 @@ async function approveApiKey(home: string, key: string, replaced: string | null)
     const approved = list(responses.approved).filter((item) => item !== retire && item !== approve);
     const rejected = list(responses.rejected).filter((item) => item !== approve);
     await writeJsonAtomically(file, { ...config, customApiKeyResponses: { ...responses, approved: [...approved, approve], rejected } });
+    return true;
   });
   if (!done) throw new Error("Claude Code is writing this account's settings right now. Try again in a moment.");
 }
@@ -953,23 +973,27 @@ function codexPrivate(name: string): boolean {
 }
 
 /**
- * An Azure OpenAI account's home (see azure.ts) also keeps `config.toml` to itself: it's the shared
- * one with ZeroSub's Azure provider set, remade here and at each session open.
+ * Brings a Codex home's shared entries in step with main; `wanted` as for `prepareClaudeHome`. An
+ * Azure OpenAI account's home (see azure.ts) also keeps `config.toml` to itself: it's the shared one
+ * with ZeroSub's Azure provider set, remade here and at each session open.
  */
-export async function prepareCodexHome(home: string, force = false): Promise<void> {
-  const azure = isAzureHome(home);
-  const last = lastSync.get(home);
-  if (!force && last && Date.now() - last < SYNC_TTL_MS) {
+export function prepareCodexHome(home: string, force = false, wanted?: () => Promise<boolean>): Promise<void> {
+  return withHome(home, async () => {
+    if (wanted && !(await wanted())) return;
+    const azure = isAzureHome(home);
+    const last = lastSync.get(home);
+    if (!force && last && Date.now() - last < SYNC_TTL_MS) {
+      if (azure) await syncAzureConfig(home);
+      return;
+    }
+    await syncOverlay(home, {
+      main: mainCodexHome(),
+      shareDirs: ["sessions", "archived_sessions"],
+      isPrivate: azure ? (name) => codexPrivate(name) || name === "config.toml" : codexPrivate,
+    });
     if (azure) await syncAzureConfig(home);
-    return;
-  }
-  await syncOverlay(home, {
-    main: mainCodexHome(),
-    shareDirs: ["sessions", "archived_sessions"],
-    isPrivate: azure ? (name) => codexPrivate(name) || name === "config.toml" : codexPrivate,
+    lastSync.set(home, Date.now());
   });
-  if (azure) await syncAzureConfig(home);
-  lastSync.set(home, Date.now());
 }
 
 /**

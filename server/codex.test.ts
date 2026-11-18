@@ -78,7 +78,7 @@ describe("an identity check while Codex can't read the rate limits", () => {
         id: MAIN_ACCOUNT_ID.codex, family: "codex", label: "first", autoLabel: false,
         kind: "main", auth: "subscription", home: null, email: "first@example.com", plan: "team", organization: null,
         identity, signedIn: true, disabled: false, limitedUntil, limitKind: "window",
-        limitedAt: new Date().toISOString(), limitSource: "turn", createdAt: new Date().toISOString(),
+        limitedAt: new Date().toISOString(), limitSource: "turn", modelLimits: {}, createdAt: new Date().toISOString(),
       });
     });
     responses.limitsFail = true;

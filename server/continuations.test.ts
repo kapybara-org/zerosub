@@ -19,9 +19,17 @@ type Entry = { item: AgentTimelineItem; timestamp: string; seqStart: number; seq
 let dir: string;
 /** The services the current test made, stopped once it ends. */
 const services: Service[] = [];
-beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "zerosub-continuations-")); });
+let previousLaunchers: string | undefined;
+beforeEach(async () => {
+  dir = await mkdtemp(join(tmpdir(), "zerosub-continuations-"));
+  previousLaunchers = process.env.ZEROSUB_LAUNCHER_DIR;
+  process.env.ZEROSUB_LAUNCHER_DIR = join(dir, "launchers");
+});
 afterEach(async () => {
   await Promise.all(services.splice(0).map((service) => service.stop()));
+  if (previousLaunchers === undefined) delete process.env.ZEROSUB_LAUNCHER_DIR;
+  else process.env.ZEROSUB_LAUNCHER_DIR = previousLaunchers;
+  // Retried: a write the test set off in the background can still be landing in it.
   await rm(dir, { recursive: true, force: true, maxRetries: 5 });
 });
 
@@ -288,6 +296,28 @@ describe("Codex account continuations", () => {
     expect(t.created).toHaveLength(1);
     expect(t.sent.at(-1)?.id).toBe("root");
     expect(t.sent.at(-1)?.text).toContain("Current user correction before the limit");
+  });
+
+  it("counts a limit hand-off to a new tab once, as that tab opens, and a stay not at all", async () => {
+    const pending = (service: Service) =>
+      ["a", "b", "c"].reduce((sum, id) => sum + (service as unknown as { pendingOn(id: string, now: number): number }).pendingOn(id, Date.now()), 0);
+    const t = await setup();
+    const service = t.service();
+    const limit = { agent: t.agents.get("root"), turnId: "limit-turn", outcome: { kind: "failed" }, timeline: [] };
+    service.setPreferences(preferences.schema.parse({ balanceNewAgents: true, autoContinue: false }));
+    await service.onTurnEnded(limit as never, { paseo: t.paseo } as never);
+    expect(t.created).toHaveLength(0);
+    expect(pending(service)).toBe(0);
+    service.setPreferences(preferences.schema.parse({ balanceNewAgents: true }));
+    await service.onTurnEnded({ ...limit, turnId: "limit-turn-2" } as never, { paseo: t.paseo } as never);
+    expect(t.created).toHaveLength(1);
+    expect(pending(service)).toBe(0);
+    const tab = t.created[0]!.agentId!;
+    await service.onSessionOpen(
+      { agentId: tab, provider: "codex", reason: "create", purpose: "interactive", workspaceId: "workspace-1", env: {} } as never,
+      { paseo: t.paseo } as never,
+    );
+    expect(pending(service)).toBe(1);
   });
 
   it("continues an account-limit turn in error status into an available account's existing error-status tab", async () => {

@@ -21,6 +21,10 @@ function cause(row: SwitchRow): string | null {
       return `${row.to} is enabled again.`;
     case "default":
       return "The default account changed.";
+    case "room":
+      return `A ${FAMILY_LABEL[row.family]} subscription account has room again, so this agent leaves ${from}, a paid API.`;
+    case "pacing":
+      return `${from} is close to its 5-hour limit.`;
     default:
       return null;
   }
@@ -79,10 +83,11 @@ export function describeRow(row: SwitchRow): string {
     case "pending":
       return `${lead}Moves to ${row.to} when its session next starts.${row.detail ? ` ${row.detail}` : ""}`;
     default: {
-      const from =
-        row.from && row.reason !== "limit" && row.reason !== "signed_out" && row.reason !== "disabled" ? `from ${row.from} ` : "";
+      const hidesFrom =
+        row.reason === "limit" || row.reason === "signed_out" || row.reason === "disabled" || row.reason === "room" || row.reason === "pacing";
+      const from = row.from && !hidesFrom ? `from ${row.from} ` : "";
       const place = row.sameConversation ? " in this conversation" : "";
-      return `${lead}Switched ${from}to ${row.to}${place}${row.continued ? " and carried on" : ""}.`;
+      return `${lead}Switched ${from}to ${row.to}${place}${row.continued ? " and carried on" : ""}.${row.detail ? ` ${row.detail}` : ""}`;
     }
   }
 }

@@ -117,4 +117,9 @@ describe("describing a switch row", () => {
       "Every Claude account is at its limit. Add another account, use a banked reset from the account button, or wait. The saved OpenCode model is no longer in this host's catalog. Pick one in ZeroSub's settings.",
     );
   });
+
+  it("says a pacing move left an account close to its 5-hour limit", () => {
+    const note = describeRow(row({ reason: "pacing", from: "work", to: "personal", continued: false }));
+    expect(note).toBe("work is close to its 5-hour limit. Switched to personal.");
+  });
 });

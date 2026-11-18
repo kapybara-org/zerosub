@@ -1,5 +1,5 @@
 import { accountPeak } from "../shared/format";
-import { isAzureAccount, type Family, type Usage, type UsageWindow } from "../shared/model";
+import { isAzureAccount, isBedrockAccount, PACE_GATE_PERCENT, type Family, type PaceView, type Usage, type UsageWindow } from "../shared/model";
 import { FIVE_HOUR_MINUTES, WEEK_MINUTES } from "./codex";
 import {
   accountsOf,
@@ -23,7 +23,23 @@ const NEAR_RESET_MAX_USED_PERCENT = 80;
  * new agents, any account under this ranks ahead of every account past it, unless a window that caps
  * it is full (see `mostAvailable`).
  */
-const FIVE_HOUR_GATE_PERCENT = 80;
+const FIVE_HOUR_GATE_PERCENT = PACE_GATE_PERCENT;
+
+const FIVE_HOUR_MS = FIVE_HOUR_MINUTES * 60_000;
+const WEEK_MS = WEEK_MINUTES * 60_000;
+/** Tunable: how far ahead the 5-hour use is projected. Rests on a low-confidence window size. */
+const PACE_HORIZON_MS = 3_600_000;
+/** Tunable: a young window's burn rate is measured over at least this long, so a first burst doesn't extrapolate wildly. */
+const MIN_FIVE_HOUR_ELAPSED_MS = 1_800_000;
+/** Tunable: the least share of the week that counts as elapsed, so a fresh week doesn't inflate the pace. */
+const MIN_WEEK_SHARE = 1 / 7;
+const UNKNOWN_SCORE = 50;
+/** Tunable: 5-hour percent charged for each agent placed on an account since its reading. */
+export const PENDING_FIVE_HOUR_PERCENT = 10;
+/** Tunable: weekly percent charged for each agent placed on an account since its reading. */
+export const PENDING_WEEKLY_PERCENT = 2;
+/** How long a placement counts as pending, until a usage reading can show it. */
+export const PENDING_MS = 600_000;
 
 export function isLimited(account: StoredAccount, now: number): boolean {
   if (!account.limitedUntil) return false;
@@ -31,8 +47,33 @@ export function isLimited(account: StoredAccount, now: number): boolean {
   return Number.isFinite(until) && until > now;
 }
 
-export function isUsable(account: StoredAccount, now: number): boolean {
-  return account.signedIn && !account.disabled && !isLimited(account, now);
+function tokens(text: string): string[] {
+  return text.toLowerCase().split(/[^a-z0-9]+/).filter((token) => token.length > 0);
+}
+
+/**
+ * Whether a model limit's scope ("fable") covers a model id ("claude-fable-5-2"): every word of the
+ * scope is a word of the model. An unknown or default model is covered by nothing, so it's never
+ * kept off an account for a limit of one model.
+ */
+export function scopeCoversModel(scope: string, model: string | null | undefined): boolean {
+  if (!model || model.toLowerCase() === "default") return false;
+  const wanted = tokens(scope);
+  if (wanted.length === 0) return false;
+  const have = new Set(tokens(model));
+  return wanted.every((token) => have.has(token));
+}
+
+/** The account is at a limit of its own, or at the limit of a model window that covers `model`. */
+export function isLimitedFor(account: StoredAccount, now: number, model?: string | null): boolean {
+  if (isLimited(account, now)) return true;
+  return Object.entries(account.modelLimits ?? {}).some(
+    ([scope, limit]) => Date.parse(limit.until) > now && scopeCoversModel(scope, model),
+  );
+}
+
+export function isUsable(account: StoredAccount, now: number, model?: string | null): boolean {
+  return account.signedIn && !account.disabled && !isLimitedFor(account, now, model);
 }
 
 /**
@@ -40,18 +81,18 @@ export function isUsable(account: StoredAccount, now: number): boolean {
  * account is ever picked that way: an added one is an API key, and Pi's own login may be one too,
  * so moving work onto either would move it onto a bill nobody chose.
  */
-export function canStandIn(account: StoredAccount, now: number): boolean {
-  return account.family !== "pi" && account.auth !== "api" && isUsable(account, now);
+export function canStandIn(account: StoredAccount, now: number, model?: string | null): boolean {
+  return account.family !== "pi" && account.auth !== "api" && isUsable(account, now, model);
 }
 
 /**
- * A paid API account that stands in for a subscription (an Azure OpenAI account), marked so when it
- * was added. Like any API account it's billed per use, so routing never puts agents on it by itself
+ * A paid API account that stands in for a subscription (an Azure OpenAI account under ChatGPT, an AWS
+ * Bedrock account under Claude), marked so when it was added. Like any API account it's billed per use, so routing never puts agents on it by itself
  * unless `paidApiFallback` is on, and then only as a last resort: once no subscription account of the
  * family can stand in (see `mostAvailable`). It can always be picked by hand, or made the default.
  */
 export function isLastResort(account: StoredAccount): boolean {
-  return isAzureAccount(account);
+  return isAzureAccount(account) || isBedrockAccount(account);
 }
 
 /**
@@ -68,7 +109,7 @@ export function headroomScore(usage: Usage | null | undefined, now = Date.now())
 }
 
 /** The 5-hour window: Codex says how long its windows are, Claude's is known by id. */
-function fiveHourWindow(usage: Usage): UsageWindow | undefined {
+export function fiveHourWindow(usage: Usage): UsageWindow | undefined {
   return usage.windows.find((window) => window.minutes === FIVE_HOUR_MINUTES) ??
     usage.windows.find((window) => window.minutes == null && (window.id === "five_hour" || window.id === "primary"));
 }
@@ -82,6 +123,93 @@ export function fiveHourGated(usage: Usage | null | undefined, now: number): boo
   if (!short || !Number.isFinite(short.usedPercent)) return false;
   if (short.resetsAt && Date.parse(short.resetsAt) <= now) return false;
   return short.usedPercent >= FIVE_HOUR_GATE_PERCENT;
+}
+
+/** Agents ZeroSub placed on an account that its latest usage reading may not show yet. */
+export interface Pacing {
+  pendingOf(accountId: string): number;
+}
+
+export interface PaceScore {
+  /** Projected 5-hour use an hour ahead, plus pending agents. */
+  fiveHour: number;
+  /** Weekly use against the share of the week that has passed, plus pending agents. */
+  weekly: number;
+  score: number;
+  gated: boolean;
+}
+
+export function weeklyWindow(usage: Usage): UsageWindow | undefined {
+  return usage.windows.find((window) => window.minutes === WEEK_MINUTES) ??
+    usage.windows.find((window) => window.minutes == null && (window.id === "seven_day" || window.id === "secondary"));
+}
+
+/** Lower is better. Combines the 5-hour projection and the weekly pace; see the README. */
+export function paceScore(usage: Usage | null | undefined, pending: number, now: number): PaceScore {
+  const fiveCharge = PENDING_FIVE_HOUR_PERCENT * pending;
+  const weekCharge = PENDING_WEEKLY_PERCENT * pending;
+  const short = usage ? fiveHourWindow(usage) : undefined;
+  const long = usage ? weeklyWindow(usage) : undefined;
+  if (!usage || usage.windows.length === 0 || (!short && !long)) {
+    const fiveHour = UNKNOWN_SCORE + fiveCharge;
+    return { fiveHour, weekly: 0, score: fiveHour, gated: fiveHour >= FIVE_HOUR_GATE_PERCENT };
+  }
+  const parsed = Date.parse(usage.fetchedAt);
+  const fetched = Number.isFinite(parsed) ? Math.min(parsed, now) : now;
+  const expired = (window: UsageWindow) => !!window.resetsAt && Date.parse(window.resetsAt) <= now;
+
+  let fiveHour = fiveCharge;
+  if (short && Number.isFinite(short.usedPercent) && !expired(short)) {
+    const reset = Date.parse(short.resetsAt ?? "");
+    if (!Number.isFinite(reset)) fiveHour = short.usedPercent + fiveCharge;
+    else {
+      const elapsed = Math.max(MIN_FIVE_HOUR_ELAPSED_MS, fetched - (reset - FIVE_HOUR_MS));
+      const ahead = Math.min(now + PACE_HORIZON_MS, reset) - fetched;
+      fiveHour = short.usedPercent + (short.usedPercent / elapsed) * ahead + fiveCharge;
+    }
+  }
+  let weekly = 0;
+  if (long && Number.isFinite(long.usedPercent) && !expired(long)) {
+    const reset = Date.parse(long.resetsAt ?? "");
+    if (!Number.isFinite(reset)) weekly = long.usedPercent + weekCharge;
+    else {
+      const share = 1 - (reset - fetched) / WEEK_MS;
+      weekly = (long.usedPercent + weekCharge) / Math.min(1, Math.max(MIN_WEEK_SHARE, share));
+    }
+  }
+  return {
+    fiveHour,
+    weekly,
+    score: Math.max(fiveHour, weekly),
+    gated: fiveHourGated(usage, now) || fiveHour >= FIVE_HOUR_GATE_PERCENT,
+  };
+}
+
+/** `paceScore` broken into the parts an account card draws. */
+export function paceView(usage: Usage | null | undefined, pending: number, now: number): PaceView {
+  const pace = paceScore(usage, pending, now);
+  const short = usage ? fiveHourWindow(usage) : undefined;
+  const long = usage ? weeklyWindow(usage) : undefined;
+  const expired = (window: UsageWindow) => !!window.resetsAt && Date.parse(window.resetsAt) <= now;
+  const used = (window: UsageWindow | undefined) =>
+    window && Number.isFinite(window.usedPercent) ? (expired(window) ? 0 : window.usedPercent) : null;
+  const parsed = usage ? Date.parse(usage.fetchedAt) : Number.NaN;
+  const fetched = Number.isFinite(parsed) ? Math.min(parsed, now) : now;
+  const weekReset = long?.resetsAt ? Date.parse(long.resetsAt) : Number.NaN;
+  const weekElapsed =
+    long && Number.isFinite(long.usedPercent) && !expired(long) && Number.isFinite(weekReset)
+      ? Math.min(100, Math.max(0, (1 - (weekReset - fetched) / WEEK_MS) * 100))
+      : null;
+  return {
+    fiveHourUsed: used(short),
+    fiveHourProjected: pace.fiveHour,
+    pendingFiveHour: PENDING_FIVE_HOUR_PERCENT * pending,
+    weeklyUsed: used(long),
+    pendingWeekly: PENDING_WEEKLY_PERCENT * pending,
+    weekElapsed,
+    pending,
+    gated: pace.gated,
+  };
 }
 
 /**
@@ -101,18 +229,21 @@ export function mostAvailable(
   now: number,
   exclude: ReadonlySet<string> = new Set(),
   paidFallback = false,
+  pacing?: Pacing,
+  model?: string | null,
 ): StoredAccount | undefined {
   const preferred = defaultAccount(state, family)?.id;
   const open = accountsOf(state, family).filter((account) => !exclude.has(account.id));
-  const subscriptions = open.filter((account) => canStandIn(account, now));
+  const subscriptions = open.filter((account) => canStandIn(account, now, model));
   const candidates =
-    subscriptions.length > 0 || !paidFallback ? subscriptions : open.filter((account) => isLastResort(account) && isUsable(account, now));
+    subscriptions.length > 0 || !paidFallback ? subscriptions : open.filter((account) => isLastResort(account) && isUsable(account, now, model));
   const rank = (account: StoredAccount) => {
     const usage = usageOf(account.id);
     const score = headroomScore(usage, now);
+    const pace = pacing ? paceScore(usage, pacing.pendingOf(account.id), now) : undefined;
     return [
-      score >= 100 ? 2 : fiveHourGated(usage, now) ? 1 : 0,
-      score,
+      score >= 100 ? 2 : (pace ? pace.gated : fiveHourGated(usage, now)) ? 1 : 0,
+      pace ? pace.score : score,
       account.id === preferred ? 0 : 1,
       account.kind === "main" ? 0 : 1,
       Date.parse(account.createdAt) || 0,
@@ -217,6 +348,13 @@ export interface RouteInput {
    * open, not Paseo's helpers (see `takesNextPick` in service.ts). Only a new agent takes it.
    */
   allowNextPick?: boolean;
+  /** Agents recently placed on an account; only read while `balanceNewAgents` is on. */
+  pendingOf?(accountId: string): number;
+  /**
+   * The model the agent runs, when known. A limit of that model's own window keeps the agent off the
+   * account; without it only limits of the whole account count.
+   */
+  model?: string | null;
 }
 
 export interface RouteDecision {
@@ -247,16 +385,29 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   if (accounts.length === 0) return null;
   const at = new Date(input.now).toISOString();
   const fresh = input.reason === "create";
+  const pacing: Pacing | undefined = input.balanceNewAgents
+    ? { pendingOf: (id) => input.pendingOf?.(id) ?? 0 }
+    : undefined;
 
   const binding = state.bindings[input.agentId];
   const bound = findAccount(state, binding?.accountId);
   let account = bound && bound.family === input.family ? bound : undefined;
   let bind: Binding | null = null;
+  // A paid stand-in (Bedrock) that ZeroSub bound the agent to by itself (a ChatGPT chat continued on
+  // Claude while every subscription was out) only holds it until a subscription account can take it:
+  // one with room, or, with `autoRedeem`, a limited one with a banked reset to spend. Then the agent
+  // routes as an unbound one would, and alignment takes it off the bill. One the user put there stays.
+  if (
+    account && binding?.source === "auto" && input.portable && isLastResort(account) &&
+    (accounts.some((other) => canStandIn(other, input.now, input.model)) || (input.autoRedeem && withBankedReset(state, input.family, input.usageOf, input.now)))
+  ) {
+    account = undefined;
+  }
 
   // The account named for this very agent outranks the pick, which waits for an agent that names
   // none. One that can't take the agent is passed over, and the agent routes as usual.
   const takes = (candidate: StoredAccount | undefined): candidate is StoredAccount =>
-    candidate?.family === input.family && candidate.signedIn && !candidate.disabled && !(input.autoSwitch && isLimited(candidate, input.now));
+    candidate?.family === input.family && candidate.signedIn && !candidate.disabled && !(input.autoSwitch && isLimitedFor(candidate, input.now, input.model));
   const requested = !account && fresh ? findAccount(state, input.requested) : undefined;
   if (takes(requested)) {
     account = requested;
@@ -276,12 +427,16 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   }
   if (!account && fresh && input.balanceNewAgents && accounts.length > 1) {
     const nearReset = input.family === "codex" ? soonestWeeklyReset(state, input.family, input.usageOf, input.now) : undefined;
-    account = nearReset ?? mostAvailable(state, input.family, input.usageOf, input.now, new Set(), input.paidFallback);
+    account = nearReset ?? mostAvailable(state, input.family, input.usageOf, input.now, new Set(), input.paidFallback, pacing, input.model);
     // A banked reset is free, so it goes before a paid stand-in, as it does when a turn hits a limit.
     if (account && isLastResort(account) && input.autoRedeem) {
       account = withBankedReset(state, input.family, input.usageOf, input.now) ?? account;
     }
-    if (account) bind = { accountId: account.id, source: "balance", at, selectionReason: nearReset ? "weekly_reset" : "headroom" };
+    // An agent that can move isn't bound to a paid stand-in (Bedrock): it's only there until a
+    // subscription account has room. A thread that can't move (Azure's) is, as it lives there.
+    if (account && !(input.portable && isLastResort(account))) {
+      bind = { accountId: account.id, source: "balance", at, selectionReason: nearReset ? "weekly_reset" : "headroom" };
+    }
   }
   if (!account) {
     // An existing Codex thread ZeroSub never routed (imported from the user's own CLI, or started
@@ -295,17 +450,17 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   if (!account) return null;
 
   let skipped: RouteDecision["skipped"] = null;
-  const why = !account.signedIn ? "signed_out" : account.disabled ? "disabled" : isLimited(account, input.now) ? "limited" : null;
+  const why = !account.signedIn ? "signed_out" : account.disabled ? "disabled" : isLimitedFor(account, input.now, input.model) ? "limited" : null;
   const mayMove = fresh || input.portable;
   if (why && mayMove && (input.autoSwitch || why !== "limited")) {
     const staying = findAccount(state, input.current);
     // A paid stand-in is only kept while no subscription account could take over from it.
     const keeps = (stand: StoredAccount) =>
-      !isLastResort(stand) || !accountsOf(state, input.family).some((other) => other.id !== account!.id && canStandIn(other, input.now));
+      !isLastResort(stand) || !accountsOf(state, input.family).some((other) => other.id !== account!.id && canStandIn(other, input.now, input.model));
     let alternative =
-      staying && staying.family === input.family && staying.id !== account.id && isUsable(staying, input.now) && keeps(staying)
+      staying && staying.family === input.family && staying.id !== account.id && isUsable(staying, input.now, input.model) && keeps(staying)
         ? staying
-        : mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]), input.paidFallback);
+        : mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]), input.paidFallback, pacing, input.model);
     // Before a paid stand-in, a limited subscription with a usable banked reset: the account itself
     // (it stays, and its first turn spends the reset) or another one.
     if (alternative && isLastResort(alternative) && input.autoRedeem) {
@@ -316,11 +471,12 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
       skipped = { account, why };
       account = alternative;
       // A thread that can't move lives where it starts. Otherwise a disabled account keeps its
-      // agents' bindings, so they return when it's enabled again; a limit re-pins them.
+      // agents' bindings, so they return when it's enabled again; a limit re-pins them, except onto
+      // a paid stand-in (Bedrock), which they leave again once a subscription account has room.
       bind =
         !input.portable
           ? { accountId: alternative.id, source: "thread", at }
-          : why === "disabled"
+          : why === "disabled" || isLastResort(alternative)
             ? null
             : { accountId: alternative.id, source: "auto", at };
     }
