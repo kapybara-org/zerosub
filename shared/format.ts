@@ -231,6 +231,22 @@ export function isDisabled(account: Pick<AccountView, "status" | "disabled">): b
   return account.disabled || account.status === "disabled";
 }
 
+/**
+ * ZeroSub may carry work on with this account by itself: it's ready, and not billed per use, or with
+ * paid API fallback on a paid stand-in (an Azure OpenAI or AWS Bedrock account); not a Pi account
+ * (Pi's own login may be an API key too). The app's side of `canStandIn` and `isLastResort` in
+ * server/routing.ts, which pick where forks and switches go: an API key without one of those markers
+ * is used only when picked.
+ */
+export function canStandIn(account: Pick<AccountView, "status" | "auth" | "family" | "azure" | "bedrock">, paidFallback = false): boolean {
+  return account.status === "ready" && account.family !== "pi" && (account.auth !== "api" || (paidFallback && paidStandIn(account)));
+}
+
+/** An Azure OpenAI or AWS Bedrock account: one "Use paid API accounts when every subscription is out" lets stand in. */
+export function paidStandIn(account: Pick<AccountView, "azure" | "bedrock">): boolean {
+  return Boolean(account.azure || account.bedrock);
+}
+
 /** The note over state the daemon stopped answering for: "Showing data from 3m ago · couldn't refresh: …". */
 export function staleNotice(updatedAt: number | null, error: string, now: number = Date.now()): string {
   if (updatedAt === null) return `Couldn't refresh: ${error}`;
