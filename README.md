@@ -2,6 +2,8 @@
 
 Use several Claude, ChatGPT (Codex), Grok and Cursor subscriptions side by side in [Paseo](https://paseo.sh), without logging in and out of the CLI, and run Paseo's Pi agents on several Anthropic API keys, each with its own proxy.
 
+![ZeroSub accounts dashboard showing Claude and ChatGPT (Codex) accounts, usage bars, and Automatic switching toggles](https://raw.githubusercontent.com/kapybara-org/zerosub/main/images/dashboard.png)
+
 - **Add accounts in the app.** Click **Add account** under Claude or ChatGPT and sign in on any device, including your phone. You don't need a terminal, environment variables or config files.
 - **Your existing CLI logins show up automatically.** Nothing changes until you add a second account.
 - **Pick an account per agent.** An account button in the message box shows which account each Claude or Codex agent uses. Tap it to switch. On Paseo 0.16 and later the account is an **Account** control in the message box itself, there before the first message too, so you can pick the account a new agent starts on.
