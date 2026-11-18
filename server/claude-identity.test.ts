@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // (locked keychain, `security` slower than its own 2 s limit). These run against stand-ins for both
 // commands, on every platform as if it were macOS; the real Keychain is never touched.
 
-let status = { loggedIn: false };
+let status: { loggedIn: boolean; subscriptionType?: string } = { loggedIn: false };
 let keychain: { code: number; stdout: string } = { code: 44, stdout: "" };
 
 vi.mock("./process", async (original) => ({
@@ -51,6 +51,16 @@ describe("whether a Claude account is signed out", () => {
     status = { loggedIn: true };
     keychain = { code: 36, stdout: "" };
     expect((await new ClaudeAdapter().identity(HOME)).signedIn).toBe(true);
+  });
+
+  it.each([
+    ["default_claude_max_20x", "ultra"],
+    ["default_claude_max_5x", "max"],
+    [undefined, "max"],
+  ])("distinguishes a legacy Max login with tier %s", async (rateLimitTier, plan) => {
+    status = { loggedIn: true, subscriptionType: "max" };
+    keychain = { code: 0, stdout: JSON.stringify({ claudeAiOauth: { rateLimitTier } }) };
+    expect((await new ClaudeAdapter().identity(HOME)).plan).toBe(plan);
   });
 
   it("takes Claude Code's answer off macOS, where the sign-in is a file in the home", async () => {

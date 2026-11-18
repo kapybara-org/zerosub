@@ -151,10 +151,16 @@ export class ClaudeAdapter implements FamilyAdapter {
     }
     const email = str(status.email);
     const orgId = str(status.orgId);
+    let plan = str(status.subscriptionType);
+    // Claude Code still reports the former Max 20x plan as "max".
+    if (signedIn && plan === "max") {
+      const credentials = await readCredentials(home).catch(() => null);
+      if (credentials?.rateLimitTier === "default_claude_max_20x") plan = "ultra";
+    }
     return {
       signedIn,
       email,
-      plan: str(status.subscriptionType),
+      plan,
       organization: str(status.orgName),
       identity: email ? `${orgId ?? "personal"}|${email.toLowerCase()}` : null,
     };
@@ -560,6 +566,7 @@ interface Credentials {
   accessToken: string | null;
   expiresAt: number | null;
   scopes: string[] | null;
+  rateLimitTier: string | null;
 }
 
 function keychainAccount(): string {
@@ -658,6 +665,7 @@ function parseCredentials(raw: string): Credentials | null {
   if (!oauth) return null;
   return {
     accessToken: str(oauth.accessToken),
+    rateLimitTier: str(oauth.rateLimitTier),
     expiresAt: typeof oauth.expiresAt === "number" ? oauth.expiresAt : null,
     scopes: Array.isArray(oauth.scopes) ? oauth.scopes.filter((scope): scope is string => typeof scope === "string") : null,
   };
