@@ -15,6 +15,7 @@ import {
   type RedeemReply,
   type UsageRead,
 } from "./adapter";
+import { bedrockEnv, bedrockIdentity, isBedrockHome, readBedrockAccount } from "./bedrock";
 import { browserCaptureScript, providerCommand } from "./binaries";
 import { CLAUDE_RESET_PROGRAM, describeResetBlock, parseClaudeResets, readClaimReply } from "./claude-resets";
 import { claudeClearTextProxy, claudeHomeHoldsAccount, prepareClaudeHome, readAccountApi, readAccountProxy, writeAccountApi, writeAccountProxy, type ApiConfig } from "./homes";
@@ -83,6 +84,9 @@ export class ClaudeAdapter implements FamilyAdapter {
     // daemon itself runs with CLAUDE_SECURESTORAGE_CONFIG_DIR set.
     const patch: EnvPatch = { CLAUDE_CONFIG_DIR: home, CLAUDE_SECURESTORAGE_CONFIG_DIR: home };
     for (const key of OVERRIDING_AUTH) if (process.env[key]) patch[key] = "";
+    // An AWS Bedrock account: Claude Code on Bedrock with its AWS credentials (see bedrock.ts). Throws
+    // when its settings can't be read, so the session isn't opened without them.
+    if (isBedrockHome(home)) Object.assign(patch, bedrockEnv(await readBedrockAccount(home)));
     return patch;
   }
 
@@ -108,6 +112,8 @@ export class ClaudeAdapter implements FamilyAdapter {
   }
 
   egress(home: string | null): Promise<{ ip: string; country: string | null } | null> {
+    // Bedrock's requests go to AWS, not Anthropic, so Anthropic's edge has nothing to say about them.
+    if (isBedrockHome(home)) return Promise.resolve(null);
     return claudeEgress(home);
   }
 
@@ -125,6 +131,11 @@ export class ClaudeAdapter implements FamilyAdapter {
   }
 
   async identity(home: string | null): Promise<Identity> {
+    if (isBedrockHome(home)) {
+      // Nothing signs in: the credentials are checked when they're saved, and a refusal is learned from a turn.
+      const account = await readBedrockAccount(home);
+      return { signedIn: true, email: null, plan: "AWS Bedrock", organization: null, identity: bedrockIdentity(account) };
+    }
     const { command, prefix } = await providerCommand("claude");
     const result = await run(command, [...prefix, "auth", "status", "--json"], {
       env: spawnEnv(await this.env(home), "claude"),
@@ -151,6 +162,8 @@ export class ClaudeAdapter implements FamilyAdapter {
 
   async usage(home: string | null, options: { renewLogin?: boolean } = {}): Promise<UsageRead> {
     const fetchedAt = new Date().toISOString();
+    // No plan windows: its tokens are counted per turn instead (see Service.countBedrockTurn).
+    if (isBedrockHome(home)) return { fetchedAt, windows: [], error: null, cached: false, resets: null, credits: null };
     let credentials = await readCredentials(home).catch(() => null);
     if (!isFresh(credentials) && options.renewLogin) credentials = await this.renewLogin(home);
     const profileScope = !credentials?.scopes || credentials.scopes.includes("user:profile");
@@ -227,6 +240,7 @@ export class ClaudeAdapter implements FamilyAdapter {
   }
 
   async redeemReset(home: string | null, options: { onlyAtLimit?: boolean } = {}): Promise<RedeemReply> {
+    if (isBedrockHome(home)) return { outcome: "none", message: "AWS Bedrock accounts have no banked resets.", left: 0 };
     let credentials = await readCredentials(home).catch(() => null);
     if (!isFresh(credentials)) credentials = await this.renewLogin(home);
     const token = credentials?.accessToken;
@@ -293,6 +307,7 @@ export class ClaudeAdapter implements FamilyAdapter {
   }
 
   async login(home: string | null, _method: LoginMethod): Promise<LoginHandle> {
+    if (isBedrockHome(home)) throw new Error("AWS Bedrock accounts use AWS credentials: change them from the account's card.");
     const { command, prefix } = await providerCommand("claude");
     const shim = await browserCaptureScript();
     const capture = join(tmpdir(), `zerosub-login-${randomBytes(6).toString("hex")}.url`);
@@ -305,6 +320,8 @@ export class ClaudeAdapter implements FamilyAdapter {
   }
 
   async logout(home: string): Promise<void> {
+    // Nothing is signed in: deleting the home (and its bedrock.json) is all removing it takes.
+    if (isBedrockHome(home)) return;
     const { command, prefix } = await providerCommand("claude");
     const result = await run(command, [...prefix, "auth", "logout"], { env: spawnEnv(await this.env(home), "claude"), timeoutMs: 30_000 });
     if (process.platform !== "darwin") return; // Elsewhere the login lives in the home itself.

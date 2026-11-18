@@ -86,19 +86,22 @@ function fakePaseo(recent: readonly Row[] | (() => Promise<{ entries: readonly R
   const sent: string[] = [];
   const notes: Array<{ from: string | null; to: string; outcome: string; detail: string | null }> = [];
   const refetches: Array<{ direction?: string; limit?: number }> = [];
-  const agent: { id: string; provider: string; status: string; archivedAt: null; lastUserMessageAt: string } = {
+  const agent: { id: string; provider: string; status: string; archivedAt: null; lastUserMessageAt: string; currentModeId?: string | null } = {
     id: AGENT,
     provider: "claude",
     status: "idle",
     archivedAt: null,
     lastUserMessageAt: "2026-09-23T07:00:00.000Z",
+    // Not Auto mode, which Bedrock can't run (see "Claude's Auto mode and Bedrock").
+    currentModeId: "acceptEdits",
   };
   const paseo = {
     config: { get: async () => ({ config: { providers: {} } }) },
     agents: {
       list: async () => ({ entries: [{ agent }], pageInfo: { hasMore: false, nextCursor: null } }),
-      ref: () => ({
-        refresh: async () => ({ agent }),
+      // Only the agent Paseo has: a new one's session opens before Paseo can say anything about it.
+      ref: (id: string = AGENT) => ({
+        refresh: async () => ({ agent: id === agent.id ? agent : null }),
         send: async (text: string) => void sent.push(text),
         timeline: {
           append: async (item: { data: { from: string | null; to: string; outcome: string; detail: string | null } }) =>
@@ -1039,6 +1042,77 @@ describe("forking to the other provider", () => {
       expect(bound).toBe(usableNow ? CODEX_MAIN : "azure");
       expect(notes.at(-1)?.detail ?? null).toEqual(usableNow ? null : expect.stringMatching(/Azure OpenAI, a paid API/));
     }
+  });
+
+  describe("a ChatGPT chat continued on Claude that lands on AWS Bedrock", () => {
+    const BEDROCK = "claude-bedrock";
+    /** Every subscription out, paid fallback on: a ChatGPT agent's limit continues it on Claude, on Bedrock. */
+    async function forkOntoBedrock(by: "auto" | "user") {
+      const t = await setUpFork("full-access", [], {}, [], { prefs: { paidApiFallback: true }, sourceProvider: "codex" });
+      const limit = { limitedUntil: inFuture(), limitKind: "window" as const, limitedAt: new Date().toISOString() };
+      await t.store.update((draft) => {
+        for (const entry of draft.accounts) Object.assign(entry, limit);
+        draft.accounts.push({ ...account(BEDROCK, "bedrock", "managed"), auth: "api", provider: "bedrock", identity: "bedrock|eu-central-1|host" } as never);
+        draft.sessions[AGENT] = { accountId: CODEX_MAIN, family: "codex", openedAt: new Date().toISOString() };
+      });
+      if (by === "auto") {
+        await t.service.onTurnEnded(
+          { agent: { id: AGENT, provider: "codex" }, turnId: "t", outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never,
+          { paseo: t.paseo } as never,
+        );
+      } else {
+        await t.service.forkAgent(t.paseo, AGENT);
+      }
+      expect(t.created).toHaveLength(1);
+      const forkId = t.created[0]!.agentId;
+      expect(t.created[0]!.config.provider.startsWith("claude")).toBe(true);
+      // Its session opens where it was bound.
+      await t.service.onSessionOpen({ agentId: forkId, provider: "claude", reason: "create", purpose: "interactive", env: {}, workspaceId: "ws-1", cwd: root } as never, { paseo: t.paseo } as never);
+      expect((await t.store.read()).sessions[forkId]?.accountId).toBe(BEDROCK);
+      return { ...t, forkId };
+    }
+
+    /** Alignment's pass once the agent has been quiet a while, with the Claude subscription back. */
+    async function alignWithRoom(t: Awaited<ReturnType<typeof forkOntoBedrock>>) {
+      await t.service.clearLimit(MAIN);
+      // Paseo's reload opens the agent's next session, which routing places.
+      const reopener = (t.service as unknown as { reopener: { reopen: (id: string) => Promise<{ ok: true }> } }).reopener;
+      reopener.reopen = async (id: string) => {
+        await t.service.onSessionOpen({ agentId: id, provider: "claude", reason: "refresh", purpose: "interactive", env: {}, workspaceId: "ws-1", cwd: root } as never, { paseo: t.paseo } as never);
+        return { ok: true as const };
+      };
+      vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + 2 * 60_000 });
+      try {
+        return await t.service.alignSessions(t.paseo);
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+
+    it.each(["auto", "user"] as const)("isn't pinned there (fork asked for by %s), and moves back once a Claude subscription has room", async (by) => {
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const t = await forkOntoBedrock(by);
+      // ZeroSub's own choice, not the user's: it only holds while no subscription can take the agent.
+      expect((await t.store.read()).bindings[t.forkId]).toMatchObject({ accountId: BEDROCK, source: "auto" });
+      expect(t.notes.at(-1)?.detail).toMatch(/It moves back to a Claude account once one has room/);
+      expect((await t.service.view(t.paseo)).agents.find((route) => route.agentId === t.forkId)).toMatchObject({ accountId: BEDROCK, pendingAccountId: null });
+      const summary = await alignWithRoom(t);
+      expect(summary.reopened).toEqual([t.forkId]);
+      expect((await t.store.read()).sessions[t.forkId]?.accountId).toBe(MAIN);
+      expect(t.notes.at(-1)).toMatchObject({ reason: "room", to: "marketing" });
+    });
+
+    it("stays when the user has since picked Bedrock for it", async () => {
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const t = await forkOntoBedrock("auto");
+      await t.store.update((draft) => {
+        draft.bindings[t.forkId] = { accountId: BEDROCK, source: "user", at: new Date().toISOString() };
+      });
+      const summary = await alignWithRoom(t);
+      expect(summary.reopened).toEqual([]);
+      expect((await t.store.read()).sessions[t.forkId]?.accountId).toBe(BEDROCK);
+      expect((await t.service.view(t.paseo)).agents.find((route) => route.agentId === t.forkId)?.accountId).toBe(BEDROCK);
+    });
   });
 
   it.each([
@@ -3103,6 +3177,16 @@ describe("changing the default account", () => {
       expect((await store.read()).bindings["fix-build"]).toMatchObject({ accountId: MAIN, source: "user" });
     });
 
+    it("never moves an agent onto AWS Bedrock, even with paid API fallback on", async () => {
+      const bedrock = { ...account("claude-bedrock", "bedrock", "managed"), auth: "api" as const, provider: "bedrock" as const, identity: "bedrock|eu-central-1|host" };
+      const { store, reopened } = await setUpBusy("fix-build", ago(120), {
+        accounts: [account(MAIN, "work", "main"), bedrock] as never,
+        prefs: { paidApiFallback: true },
+      });
+      expect(reopened).toEqual([]);
+      expect((await store.read()).sessions["fix-build"]?.accountId).toBe(MAIN);
+    });
+
     describe("with a model's own limit on an account", () => {
       const FABLE = "claude-fable-5-2";
       const OPUS = "claude-opus-4-1";
@@ -3892,7 +3976,7 @@ describe("a limit hit while the agent is being moved", () => {
       hit,
       { claude: { redeemReset: async () => ({ outcome: "reset", message: "Limits reset", left: 0 }) } },
     );
-    const { agent } = await paseo.agents.ref().refresh();
+    const agent = (await paseo.agents.ref().refresh()).agent!;
     const other = { ...agent, id: OTHER };
     paseo.agents.list = async () => ({ entries: [{ agent }, { agent: other }], pageInfo: { hasMore: false, nextCursor: null } });
     const { ref } = paseo.agents;
@@ -4895,6 +4979,395 @@ describe("an API account at a limit with every other account out", () => {
     service.setPreferences(preferences.schema.parse({ autoRedeem: true }));
     await limitTurn();
     expect(redeemed).toEqual([]);
+  });
+});
+
+/** What a Claude agent's create request comes out of ZeroSub as, created in `modeId`; `metadata` null is a Paseo before 0.16, which has none. */
+async function createdIn(service: Service, paseo: unknown, modeId: string | undefined, metadata: Record<string, unknown> | null = {}) {
+  const request = { config: { provider: "claude", cwd: root, ...(modeId ? { modeId } : {}) }, ...(metadata ? { metadata } : {}) };
+  return ((await service.onAgentCreate(request as never, { paseo } as never)) ?? request) as { metadata?: Record<string, unknown> };
+}
+
+describe("AWS Bedrock as the last resort", () => {
+  const window = () => ({ kind: "window" as const, resetsAt: inFuture(), message: "You've hit your session limit" });
+  const bedrock = { ...account("claude-bedrock", "bedrock", "managed"), auth: "api" as const, provider: "bedrock" as const, identity: "bedrock|eu-central-1|host" };
+  const onlyMain = { accounts: [account(MAIN, "main", "main"), bedrock] as never, defaults: { claude: MAIN, codex: null, pi: null }, sessions: {} };
+
+  it("isn't used with paid API fallback off (the default): the agent stays at its limit", async () => {
+    const { store, reopened, notes, limitTurn } = await setUp(onlyMain, window);
+    await limitTurn();
+    expect((await store.read()).sessions[AGENT]?.accountId).not.toBe(bedrock.id);
+    expect(reopened).toEqual([]);
+    expect(notes.at(-1)).toMatchObject({ outcome: "stayed" });
+  });
+
+  it("with it on, takes a limited agent over in place, says it's a paid API, and doesn't pin it there", async () => {
+    const { service, store, reopened, notes, limitTurn } = await setUp(onlyMain, window);
+    service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+    await limitTurn();
+    const state = await store.read();
+    expect(state.sessions[AGENT]?.accountId).toBe(bedrock.id);
+    expect(reopened).toEqual([AGENT]);
+    // Not pinned: once a subscription account has room again, routing takes the agent back.
+    expect(state.bindings[AGENT]?.accountId).not.toBe(bedrock.id);
+    expect(notes.at(-1)).toMatchObject({ to: "bedrock", outcome: "switched" });
+    expect(notes.at(-1)?.detail).toMatch(/AWS Bedrock, a paid API billed per token/);
+  });
+
+  it("with it on, moves the agent back off Bedrock once its subscription has room again", async () => {
+    const { service, store, reopened, notes, limitTurn, paseo } = await setUp(onlyMain, window);
+    service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+    await limitTurn();
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(bedrock.id);
+    await service.clearLimit(MAIN);
+    // Past the minute after its turn that alignment leaves an agent alone for.
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + 2 * 60_000 });
+    try {
+      await service.alignSessions(paseo as never);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+    expect(reopened).toEqual([AGENT, AGENT]);
+    expect(notes.at(-1)).toMatchObject({ reason: "room", to: "main" });
+  });
+
+  it("when the default changes with open agents kept, keeps one on Bedrock as the user's pick only if Bedrock was the default", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const keep = preferences.schema.parse({ paidApiFallback: true, moveAgentsOnDefaultChange: false });
+    const at = new Date().toISOString();
+    const sessions = { [AGENT]: { accountId: bedrock.id, family: "claude" as const, openedAt: at } };
+    const accounts = [account(MAIN, "main", "main"), account(HELLO, "hello", "managed"), bedrock] as never;
+    // Bedrock was the default: the user chose it, so the agent stays there.
+    const chosen = await setUp({ accounts, defaults: { claude: bedrock.id, codex: null, pi: null }, sessions }, window);
+    chosen.service.setPreferences(keep);
+    await chosen.service.setDefault(chosen.paseo as never, MAIN);
+    expect((await chosen.store.read()).bindings[AGENT]).toMatchObject({ accountId: bedrock.id, source: "user" });
+    // Bedrock was only standing in: kept for now, and let go once a subscription can take the agent.
+    const standing = await setUp({ accounts, defaults: { claude: MAIN, codex: null, pi: null }, sessions, bindings: {} }, window);
+    standing.service.setPreferences(keep);
+    await standing.service.setDefault(standing.paseo as never, HELLO);
+    expect((await standing.store.read()).bindings[AGENT]).toMatchObject({ accountId: bedrock.id, source: "auto" });
+  });
+
+  it("keeps its agents there when it throttles while every subscription is out, rather than sending them back to a limited one", async () => {
+    const OTHER = "agent-2";
+    const at = new Date().toISOString();
+    const { service, store, reopened, notes, paseo } = await setUp(
+      {
+        ...onlyMain,
+        accounts: [{ ...account(MAIN, "main", "main"), limitedUntil: inFuture(), limitKind: "window", limitedAt: at }, bedrock] as never,
+        sessions: { [AGENT]: { accountId: bedrock.id, family: "claude", openedAt: at }, [OTHER]: { accountId: bedrock.id, family: "claude", openedAt: at } },
+      },
+      window,
+    );
+    service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+    // A second agent, idle on Bedrock, that moving idle agents off a throttled account looks at.
+    const agent = (await paseo.agents.ref().refresh()).agent!;
+    const other = { ...agent, id: OTHER };
+    paseo.agents.list = async () => ({ entries: [{ agent }, { agent: other }], pageInfo: { hasMore: false, nextCursor: null } });
+    const { ref } = paseo.agents;
+    paseo.agents.ref = ((id: string) => {
+      const handle = ref();
+      return { ...handle, refresh: async () => ({ agent: id === OTHER ? other : agent }) };
+    }) as typeof ref;
+    const idle = vi.spyOn(service as unknown as { moveIdleAgentsOff: () => Promise<void> }, "moveIdleAgentsOff");
+    await service.onTurnEnded(
+      { agent: { id: AGENT, provider: "claude" }, turnId: null, outcome: { kind: "failed", error: { message: "ThrottlingException: Rate exceeded" } }, timeline: [] } as never,
+      { paseo } as never,
+    );
+    expect(idle).toHaveBeenCalledTimes(1);
+    await idle.mock.results[0]!.value;
+    const state = await store.read();
+    expect(state.accounts.find((entry) => entry.id === bedrock.id)?.limitedUntil).not.toBeNull();
+    expect(reopened).toEqual([]);
+    expect(state.sessions[AGENT]?.accountId).toBe(bedrock.id);
+    expect(state.sessions[OTHER]?.accountId).toBe(bedrock.id);
+    // The throttled agent's timeline says every account is at its limit; the idle one gets nothing.
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toMatchObject({ reason: "exhausted", outcome: "stayed", to: "bedrock" });
+  });
+
+  it("leaves an idle agent on a throttled Bedrock at the alignment check while its subscription is out too", async () => {
+    const at = new Date().toISOString();
+    const until = new Date(Date.now() + 10 * 60_000).toISOString();
+    const { service, store, reopened, notes, paseo } = await setUp(
+      {
+        ...onlyMain,
+        accounts: [
+          { ...account(MAIN, "main", "main"), limitedUntil: until, limitKind: "window", limitedAt: at },
+          { ...bedrock, limitedUntil: until, limitKind: "window", limitedAt: at },
+        ] as never,
+        sessions: { [AGENT]: { accountId: bedrock.id, family: "claude", openedAt: at } },
+      },
+      window,
+    );
+    service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+    // 30 s later, past the minute after its turn that alignment leaves an agent alone for.
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + 2 * 60_000 });
+    try {
+      await service.alignSessions(paseo as never);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(reopened).toEqual([]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(bedrock.id);
+    expect(notes).toEqual([]);
+  });
+
+  it("still moves an idle agent back off Bedrock while Bedrock is usable and the subscription has room", async () => {
+    const at = new Date().toISOString();
+    const { service, store, reopened, notes, paseo } = await setUp(
+      { ...onlyMain, sessions: { [AGENT]: { accountId: bedrock.id, family: "claude", openedAt: at } } },
+      window,
+    );
+    service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + 2 * 60_000 });
+    try {
+      await service.alignSessions(paseo as never);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+    expect(reopened).toEqual([AGENT]);
+    expect(notes.at(-1)).toMatchObject({ reason: "room", to: "main" });
+  });
+
+  describe("with banked resets used automatically too", () => {
+    const redeeming = (outcome: "reset" | "none", calls: Array<string | null>) => ({
+      claude: { redeemReset: async (home: string | null) => (calls.push(home), outcome === "reset" ? { outcome, message: "Limits reset.", left: 0 } : { outcome, message: "No banked resets.", left: 0 }) },
+    });
+
+    it("spends the free reset first, and doesn't move the agent onto Bedrock", async () => {
+      const calls: Array<string | null> = [];
+      const { service, store, reopened, notes, limitTurn } = await setUp(onlyMain, window, redeeming("reset", calls));
+      service.setPreferences(preferences.schema.parse({ paidApiFallback: true, autoRedeem: true }));
+      await limitTurn();
+      expect(calls).toHaveLength(1);
+      expect((await store.read()).sessions[AGENT]?.accountId).not.toBe(bedrock.id);
+      expect(reopened).toEqual([]);
+      expect(notes.at(-1)).toMatchObject({ outcome: "reset" });
+    });
+
+    it("moves onto Bedrock only once no reset could be spent", async () => {
+      const calls: Array<string | null> = [];
+      const { service, store, reopened, notes, limitTurn } = await setUp(onlyMain, window, redeeming("none", calls));
+      service.setPreferences(preferences.schema.parse({ paidApiFallback: true, autoRedeem: true }));
+      await limitTurn();
+      expect(calls).toHaveLength(1);
+      expect((await store.read()).sessions[AGENT]?.accountId).toBe(bedrock.id);
+      expect(reopened).toEqual([AGENT]);
+      expect(notes.at(-1)).toMatchObject({ to: "bedrock", outcome: "switched" });
+    });
+
+    /** `MAIN` at its 5-hour limit, whose latest reading shows a banked reset (`usableNow` says whether it can be spent now). */
+    async function limitedWithReset(usableNow: boolean, prefs: Record<string, unknown>, accounts: unknown[] = [account(MAIN, "main", "main"), bedrock]) {
+      const t = await setUp({ ...onlyMain, accounts: accounts as never }, window);
+      t.service.setPreferences(preferences.schema.parse({ paidApiFallback: true, autoRedeem: true, ...prefs }));
+      await t.store.update((draft) => {
+        Object.assign(draft.accounts.find((entry) => entry.id === MAIN)!, { limitedUntil: inFuture(), limitKind: "window", limitedAt: new Date().toISOString() });
+      });
+      const reading: Usage = {
+        fetchedAt: new Date().toISOString(), windows: [{ id: "five_hour", label: "5-hour", usedPercent: 100, resetsAt: null }],
+        error: null, cached: false, credits: null, resets: { available: 1, usableNow, blockedReason: null, expiresAt: null, refills: [], label: null },
+      };
+      (t.service as unknown as { usage: Map<string, Usage> }).usage.set(MAIN, reading);
+      // A new agent is created in Accept File Edits, as Paseo 0.16 does it: its create request goes
+      // through ZeroSub first, and the session opens with the metadata it came out with.
+      const open = async (agentId: string, reason: "create" | "resume" | "refresh") => {
+        const created = reason === "create" ? await createdIn(t.service, t.paseo, "acceptEdits") : undefined;
+        await t.service.onSessionOpen(
+          { agentId, provider: "claude", reason, purpose: "interactive", env: {}, workspaceId: "w", cwd: root, metadata: created?.metadata ?? {} } as never,
+          { paseo: t.paseo } as never,
+        );
+      };
+      return { ...t, open };
+    }
+
+    it("opens a new agent on a limited subscription with a usable banked reset, not on Bedrock", async () => {
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const t = await limitedWithReset(true, {});
+      await t.open("fresh", "create");
+      expect((await t.store.read()).sessions.fresh?.accountId).toBe(MAIN);
+      // With "Spread new agents across accounts" on too.
+      t.service.setPreferences(preferences.schema.parse({ paidApiFallback: true, autoRedeem: true, balanceNewAgents: true }));
+      await t.open("spread", "create");
+      expect((await t.store.read()).sessions.spread?.accountId).toBe(MAIN);
+    });
+
+    it("keeps an existing agent on its limited subscription when it resumes or is aligned, so its next turn spends the reset", async () => {
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const t = await limitedWithReset(true, {});
+      await t.store.update((draft) => {
+        draft.bindings[AGENT] = { accountId: MAIN, source: "user", at: new Date().toISOString() };
+      });
+      for (const reason of ["resume", "refresh"] as const) {
+        await t.open(AGENT, reason);
+        expect((await t.store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+      }
+      vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + 2 * 60_000 });
+      try {
+        await t.service.alignSessions(t.paseo as never);
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(t.reopened).toEqual([]);
+      expect((await t.store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+    });
+
+    it("still uses Bedrock when the reset can't be spent now, or automatic resets are off", async () => {
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      for (const [usableNow, autoRedeem] of [[false, true], [true, false]] as const) {
+        const t = await limitedWithReset(usableNow, { autoRedeem });
+        await t.open("fresh", "create");
+        expect((await t.store.read()).sessions.fresh?.accountId).toBe(bedrock.id);
+        await t.store.update((draft) => {
+          draft.bindings[AGENT] = { accountId: MAIN, source: "user", at: new Date().toISOString() };
+        });
+        await t.open(AGENT, "resume");
+        expect((await t.store.read()).sessions[AGENT]?.accountId).toBe(bedrock.id);
+      }
+    });
+
+    it("prefers a subscription with room over one with a banked reset", async () => {
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const t = await limitedWithReset(true, {}, [account(MAIN, "main", "main"), account(HELLO, "hello", "managed"), bedrock]);
+      await t.open("fresh", "create");
+      expect((await t.store.read()).sessions.fresh?.accountId).toBe(HELLO);
+    });
+
+    it("still moves to another Claude subscription with room before spending a reset", async () => {
+      const calls: Array<string | null> = [];
+      const { service, store, limitTurn } = await setUp(
+        { accounts: [account(MAIN, "main", "main"), account(HELLO, "hello", "managed"), bedrock] as never, defaults: { claude: MAIN, codex: null, pi: null }, sessions: {} },
+        window,
+        redeeming("reset", calls),
+      );
+      service.setPreferences(preferences.schema.parse({ paidApiFallback: true, autoRedeem: true }));
+      await limitTurn();
+      expect(calls).toEqual([]);
+      expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+    });
+  });
+
+  describe("and Claude's Auto mode, which Bedrock can't run", () => {
+    for (const [what, mode] of [["in Auto mode", "auto"], ["whose mode Paseo doesn't say (Auto is its default)", null]] as const) {
+      it(`never moves an agent ${what} onto it by itself, and says why`, async () => {
+        const { service, store, reopened, notes, limitTurn, agent } = await setUp(onlyMain, window);
+        agent.currentModeId = mode;
+        service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+        await limitTurn();
+        expect((await store.read()).sessions[AGENT]?.accountId).not.toBe(bedrock.id);
+        expect(reopened).toEqual([]);
+        expect(notes.at(-1)).toMatchObject({ outcome: "stayed" });
+        expect(notes.at(-1)?.detail).toMatch(/bedrock \(AWS Bedrock\) wasn't used: Bedrock can't run Claude's Auto mode/);
+      });
+    }
+
+    it("doesn't open or keep an Auto-mode agent on it by itself, but does once the agent is in another mode", async () => {
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const { service, store, agent, paseo } = await setUp(onlyMain, window);
+      service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+      await store.update((draft) => {
+        Object.assign(draft.accounts.find((entry) => entry.id === MAIN)!, { limitedUntil: inFuture(), limitKind: "window", limitedAt: new Date().toISOString() });
+      });
+      const open = (agentId: string, reason: "create" | "resume") =>
+        service.onSessionOpen({ agentId, provider: "claude", reason, purpose: "interactive", env: {}, workspaceId: "w", cwd: root } as never, { paseo } as never);
+      agent.currentModeId = "auto";
+      await open("fresh", "create");
+      await open(AGENT, "resume");
+      expect((await store.read()).sessions.fresh?.accountId).toBe(MAIN);
+      expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+      agent.currentModeId = "acceptEdits";
+      await open(AGENT, "resume");
+      expect((await store.read()).sessions[AGENT]?.accountId).toBe(bedrock.id);
+    });
+
+    it("opens a new agent on it by the mode it was created in, which Paseo can't say before the agent exists", async () => {
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const { service, store, paseo } = await setUp(onlyMain, window);
+      service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+      await store.update((draft) => {
+        Object.assign(draft.accounts.find((entry) => entry.id === MAIN)!, { limitedUntil: inFuture(), limitKind: "window", limitedAt: new Date().toISOString() });
+      });
+      const open = (agentId: string, metadata: Record<string, unknown> | undefined) =>
+        service.onSessionOpen(
+          { agentId, provider: "claude", reason: "create", purpose: "interactive", env: {}, workspaceId: "w", cwd: root, ...(metadata ? { metadata } : {}) } as never,
+          { paseo } as never,
+        );
+      const where = async (agentId: string) => (await store.read()).sessions[agentId]?.accountId;
+      await open("edits", (await createdIn(service, paseo, "acceptEdits")).metadata);
+      expect(await where("edits")).toBe(bedrock.id);
+      // Auto mode, no mode named (Paseo's default is Auto), or a Paseo before 0.16 with no metadata to carry it in.
+      await open("auto", (await createdIn(service, paseo, "auto")).metadata);
+      await open("unnamed", (await createdIn(service, paseo, undefined)).metadata);
+      await open("older", (await createdIn(service, paseo, "acceptEdits", null)).metadata);
+      expect({ auto: await where("auto"), unnamed: await where("unnamed"), older: await where("older") }).toEqual({ auto: MAIN, unnamed: MAIN, older: MAIN });
+    });
+
+    it("notes a new agent's mode in its create request only for Claude, with paid fallback on and a Bedrock account", async () => {
+      const { service, paseo } = await setUp(onlyMain, window);
+      const request = (provider: string) => ({ config: { provider, cwd: root, modeId: "acceptEdits" }, metadata: { "zerosub.account": "x" } });
+      expect(await service.onAgentCreate(request("claude") as never, { paseo } as never)).toBeUndefined();
+      service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+      expect(await service.onAgentCreate(request("codex") as never, { paseo } as never)).toBeUndefined();
+      expect(((await service.onAgentCreate(request("claude") as never, { paseo } as never)) as { metadata?: unknown } | undefined)?.metadata).toEqual({ "zerosub.account": "x", "zerosub.created-mode": "acceptEdits" });
+      const noBedrock = await setUp({ ...onlyMain, accounts: [account(MAIN, "main", "main")] as never }, window);
+      noBedrock.service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+      expect(await noBedrock.service.onAgentCreate(request("claude") as never, { paseo } as never)).toBeUndefined();
+    });
+
+    it("doesn't align an Auto-mode agent onto it, but does one in another mode", async () => {
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      for (const mode of ["auto", "acceptEdits"]) {
+        const { service, store, reopened, agent, paseo } = await setUp(onlyMain, window);
+        service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+        agent.currentModeId = mode;
+        await store.update((draft) => {
+          Object.assign(draft.accounts.find((entry) => entry.id === MAIN)!, { limitedUntil: inFuture(), limitKind: "window", limitedAt: new Date().toISOString() });
+          draft.sessions[AGENT] = { accountId: MAIN, family: "claude", openedAt: new Date().toISOString() };
+        });
+        vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + 2 * 60_000 });
+        try {
+          await service.alignSessions(paseo as never);
+        } finally {
+          vi.useRealTimers();
+        }
+        expect(reopened).toEqual(mode === "auto" ? [] : [AGENT]);
+        expect((await store.read()).sessions[AGENT]?.accountId).toBe(mode === "auto" ? MAIN : bedrock.id);
+      }
+    });
+
+    it("still runs one put there by hand or as the default, and Paseo's refusal isn't taken for a limit or a refusal", async () => {
+      const { service, store, notes, agent, paseo } = await setUp({ ...onlyMain, defaults: { claude: bedrock.id, codex: null, pi: null } } as never, window, {
+        detectLimit: () => null,
+      });
+      agent.currentModeId = "auto";
+      const open = () =>
+        service.onSessionOpen({ agentId: AGENT, provider: "claude", reason: "resume", purpose: "interactive", env: {}, workspaceId: "w", cwd: root } as never, { paseo } as never);
+      await open();
+      expect((await store.read()).sessions[AGENT]?.accountId).toBe(bedrock.id);
+      await service.onTurnEnded(
+        { agent: { id: AGENT, provider: "claude" }, turnId: null, outcome: { kind: "failed", error: { message: "Claude Auto mode requires the Anthropic API. Choose another mode to use Bedrock." } }, timeline: [] } as never,
+        { paseo } as never,
+      );
+      const account = (await store.read()).accounts.find((entry) => entry.id === bedrock.id)!;
+      expect(account).toMatchObject({ signedIn: true, limitedUntil: null });
+      expect((await store.read()).sessions[AGENT]?.accountId).toBe(bedrock.id);
+      expect(notes.at(-1)).toMatchObject({ outcome: "stayed", to: "bedrock" });
+      expect(notes.at(-1)?.detail).toMatch(/Auto mode can't run on bedrock.*Pick another mode/);
+    });
+  });
+
+  it("isn't used while a subscription account has room, even with it on", async () => {
+    const { service, store, notes, limitTurn } = await setUp(
+      { accounts: [account(MAIN, "main", "main"), account(HELLO, "hello", "managed"), bedrock] as never, defaults: { claude: MAIN, codex: null, pi: null }, sessions: {} },
+      window,
+    );
+    service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+    await limitTurn();
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(notes.at(-1)?.detail ?? null).toBeNull();
   });
 });
 

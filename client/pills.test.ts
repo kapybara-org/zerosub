@@ -38,6 +38,8 @@ function account(id: string, isDefault: boolean, overrides: Partial<AccountView>
     moving: null,
     pace: null,
     azure: null,
+    bedrock: null,
+    apiError: null,
     ...overrides,
   };
 }

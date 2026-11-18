@@ -52,9 +52,9 @@ export const preferences = defineSettings({
     /**
      * Off unless turned on. When every subscription account of a provider is out (at its limit,
      * signed out or disabled), routing may move agents onto a paid API account that stands in for
-     * one (an Azure OpenAI account under ChatGPT), billed per token; a banked reset goes first when
-     * `autoRedeem` is on. Off, such an account is only used when picked for an agent or made the
-     * default, like any API-key account.
+     * one (an Azure OpenAI account under ChatGPT, an AWS Bedrock account under Claude), billed per
+     * token; a banked reset goes first when `autoRedeem` is on. Off, such an account is only used
+     * when picked for an agent or made the default, like any API-key account.
      */
     paidApiFallback: z.boolean().default(false),
     /** Show the account pill in the composer of Claude and Codex agents. */

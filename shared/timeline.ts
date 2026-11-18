@@ -25,6 +25,8 @@ export const SwitchRowSchema = z.object({
     "enabled",
     /** Every account of this provider is at its limit; nothing to switch to. */
     "exhausted",
+    /** `from` is a paid API account (AWS Bedrock) it moved onto by itself, and a subscription account has room again. */
+    "room",
     /** `from` still works but is projected past the 5-hour pacing gate; a cold idle agent moved off it. */
     "pacing",
   ]),

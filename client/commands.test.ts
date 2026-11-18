@@ -34,6 +34,8 @@ function account(status: AccountView["status"], nextAgentUntil: string | null): 
     moving: null,
     pace: null,
     azure: null,
+    bedrock: null,
+    apiError: null,
   };
 }
 

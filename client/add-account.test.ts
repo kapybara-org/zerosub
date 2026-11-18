@@ -55,6 +55,7 @@ vi.mock("@getpaseo/plugin/client/react-native", () => ({
 vi.mock("./ui", () => ({ Button: "Button", useText: () => new Proxy({}, { get: () => ({}) }) }));
 vi.mock("./api-account", () => ({ ApiAccountForm: "ApiAccountForm" }));
 vi.mock("./azure-account", () => ({ AzureAccountForm: "AzureAccountForm" }));
+vi.mock("./bedrock-account", () => ({ BedrockAccountForm: "BedrockAccountForm" }));
 vi.mock("./pi-accounts", () => ({ useInputStyle: () => ({}) }));
 vi.mock("./store", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./store")>()),
@@ -112,13 +113,34 @@ describe("adding a Claude account", () => {
     return { store, draw, step };
   }
 
-  it("asks first whether it's a subscription or an API key", () => {
-    const { step } = setUp();
+  it("asks first, in one chooser, whether it's a subscription, an API key, a folder signed in already or AWS Bedrock", () => {
+    const { store, step } = setUp();
     const modes = step("ModeStep");
-    const choices = [...elements(mount(modes.type as (props: unknown) => ReactNode, modes.props)())].flatMap((element) =>
-      typeof element.props.title === "string" ? [element.props.title] : [],
-    );
-    expect(choices).toEqual(["Claude subscription", "API key or token", "A folder that's signed in already"]);
+    const shown = [...elements(mount(modes.type as (props: unknown) => ReactNode, modes.props)())];
+    const choices = shown.flatMap((element) => (typeof element.props.title === "string" ? [element.props.title] : []));
+    expect(choices).toEqual(["Claude subscription", "API key or token", "A folder that's signed in already", "AWS Bedrock"]);
+    // Off by default, Bedrock is only used when chosen, and the chooser says so.
+    const bedrock = shown.find((element) => element.props.title === "AWS Bedrock")!;
+    expect(bedrock.props.detail).toMatch(/used only when you choose it/);
+    expect(store.rpc).not.toHaveBeenCalled();
+  });
+
+  it("says Bedrock may take over by itself once every subscription is out, with paid API accounts turned on", () => {
+    const { store, step } = setUp();
+    (store.state as Record<string, unknown>).paidApiFallback = true;
+    const modes = step("ModeStep");
+    const bedrock = [...elements(mount(modes.type as (props: unknown) => ReactNode, modes.props)())].find((element) => element.props.title === "AWS Bedrock")!;
+    expect(bedrock.props.detail).toMatch(/only when every Claude subscription account is out/);
+  });
+
+  it("takes AWS Bedrock in its own form, without starting a sign-in or asking for a proxy", () => {
+    const { store, draw, step } = setUp();
+    (step("ModeStep").props.onBedrock as () => void)();
+    const tree = draw();
+    expect(find(tree, (element) => element.type === "BedrockAccountForm")).toBeTruthy();
+    expect([...elements(tree)].some((element) => element.type === "ApiAccountForm")).toBe(false);
+    expect([...elements(tree)].some((element) => typeof element.type === "function" && element.type.name === "ProxyStep")).toBe(false);
+    expect(store.rpc).not.toHaveBeenCalled();
   });
 
   it("takes an API key in its own form, without starting a sign-in", () => {
@@ -231,6 +253,7 @@ describe("adding a ChatGPT account", () => {
     const tree = draw();
     expect(find(tree, (element) => element.type === "AzureAccountForm")).toBeTruthy();
     expect([...elements(tree)].some((element) => element.type === "ApiAccountForm")).toBe(false);
+    expect([...elements(tree)].some((element) => element.type === "BedrockAccountForm")).toBe(false);
     expect(store.rpc).not.toHaveBeenCalled();
   });
 });

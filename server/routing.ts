@@ -1,5 +1,5 @@
 import { accountPeak } from "../shared/format";
-import { isAzureAccount, PACE_GATE_PERCENT, type Family, type PaceView, type Usage, type UsageWindow } from "../shared/model";
+import { isAzureAccount, isBedrockAccount, PACE_GATE_PERCENT, type Family, type PaceView, type Usage, type UsageWindow } from "../shared/model";
 import { FIVE_HOUR_MINUTES, WEEK_MINUTES } from "./codex";
 import {
   accountsOf,
@@ -86,13 +86,13 @@ export function canStandIn(account: StoredAccount, now: number, model?: string |
 }
 
 /**
- * A paid API account that stands in for a subscription (an Azure OpenAI account), marked so when it
- * was added. Like any API account it's billed per use, so routing never puts agents on it by itself
+ * A paid API account that stands in for a subscription (an Azure OpenAI account under ChatGPT, an AWS
+ * Bedrock account under Claude), marked so when it was added. Like any API account it's billed per use, so routing never puts agents on it by itself
  * unless `paidApiFallback` is on, and then only as a last resort: once no subscription account of the
  * family can stand in (see `mostAvailable`). It can always be picked by hand, or made the default.
  */
 export function isLastResort(account: StoredAccount): boolean {
-  return isAzureAccount(account);
+  return isAzureAccount(account) || isBedrockAccount(account);
 }
 
 /**
@@ -393,6 +393,16 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   const bound = findAccount(state, binding?.accountId);
   let account = bound && bound.family === input.family ? bound : undefined;
   let bind: Binding | null = null;
+  // A paid stand-in (Bedrock) that ZeroSub bound the agent to by itself (a ChatGPT chat continued on
+  // Claude while every subscription was out) only holds it until a subscription account can take it:
+  // one with room, or, with `autoRedeem`, a limited one with a banked reset to spend. Then the agent
+  // routes as an unbound one would, and alignment takes it off the bill. One the user put there stays.
+  if (
+    account && binding?.source === "auto" && input.portable && isLastResort(account) &&
+    (accounts.some((other) => canStandIn(other, input.now, input.model)) || (input.autoRedeem && withBankedReset(state, input.family, input.usageOf, input.now)))
+  ) {
+    account = undefined;
+  }
 
   // The account named for this very agent outranks the pick, which waits for an agent that names
   // none. One that can't take the agent is passed over, and the agent routes as usual.
@@ -422,7 +432,11 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
     if (account && isLastResort(account) && input.autoRedeem) {
       account = withBankedReset(state, input.family, input.usageOf, input.now) ?? account;
     }
-    if (account) bind = { accountId: account.id, source: "balance", at, selectionReason: nearReset ? "weekly_reset" : "headroom" };
+    // An agent that can move isn't bound to a paid stand-in (Bedrock): it's only there until a
+    // subscription account has room. A thread that can't move (Azure's) is, as it lives there.
+    if (account && !(input.portable && isLastResort(account))) {
+      bind = { accountId: account.id, source: "balance", at, selectionReason: nearReset ? "weekly_reset" : "headroom" };
+    }
   }
   if (!account) {
     // An existing Codex thread ZeroSub never routed (imported from the user's own CLI, or started
@@ -457,11 +471,12 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
       skipped = { account, why };
       account = alternative;
       // A thread that can't move lives where it starts. Otherwise a disabled account keeps its
-      // agents' bindings, so they return when it's enabled again; a limit re-pins them.
+      // agents' bindings, so they return when it's enabled again; a limit re-pins them, except onto
+      // a paid stand-in (Bedrock), which they leave again once a subscription account has room.
       bind =
         !input.portable
           ? { accountId: alternative.id, source: "thread", at }
-          : why === "disabled"
+          : why === "disabled" || isLastResort(alternative)
             ? null
             : { accountId: alternative.id, source: "auto", at };
     }

@@ -53,6 +53,8 @@ function account(id: string, fields: Partial<AccountView> = {}): AccountView {
     moving: null,
     pace: null,
     azure: null,
+    bedrock: null,
+    apiError: null,
     ...fields,
   };
 }

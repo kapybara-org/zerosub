@@ -1,6 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import { ApiKeyKindSchema, ApiPriceSchema, FamilySchema, LoginMethodSchema, LoginViewSchema, StateViewSchema, TrafficSwitchesSchema } from "./model";
+import { ApiKeyKindSchema, ApiPriceSchema, BedrockSourceSchema, FamilySchema, LoginMethodSchema, LoginViewSchema, StateViewSchema, TrafficSwitchesSchema } from "./model";
 
 export const getState = defineRpc({
   name: "zerosub.state",
@@ -96,6 +96,61 @@ export const updateAzureAccount = defineRpc({
     prices: z.record(z.string().trim().max(200), ApiPriceSchema).optional(),
   }),
   output: z.object({ ok: z.literal(true), warning: z.string().nullable() }),
+});
+
+const BedrockFields = {
+  /** An AWS region code, like `eu-central-1`. */
+  region: z.string().trim().min(1).max(40),
+  source: BedrockSourceSchema,
+  /** For `profile`: a profile in the host's ~/.aws config. Only its name is stored. */
+  profile: z.string().trim().max(128).optional(),
+  /** For `keys`. The secret and session token are written to the account's home and never sent back. */
+  accessKeyId: z.string().trim().max(128).optional(),
+  secretAccessKey: z.string().trim().max(1024).optional(),
+  sessionToken: z.string().trim().max(4096).optional(),
+  /** Model or inference-profile IDs for ANTHROPIC_MODEL and the Opus, Sonnet and Haiku defaults; empty keeps Claude Code's. */
+  models: z
+    .object({
+      model: z.string().trim().max(200).optional(),
+      opus: z.string().trim().max(200).optional(),
+      sonnet: z.string().trim().max(200).optional(),
+      haiku: z.string().trim().max(200).optional(),
+    })
+    .optional(),
+};
+
+/**
+ * Adds an AWS Bedrock account under Claude. Its credentials are checked with the host's `aws` CLI
+ * first, when it has one; refused ones aren't saved, and `warning` says when they couldn't be checked.
+ */
+export const addBedrockAccount = defineRpc({
+  name: "zerosub.accounts.bedrock.add",
+  input: z.object({ label: z.string().trim().min(1).max(40), ...BedrockFields }),
+  output: z.object({ accountId: z.string(), warning: z.string().nullable() }),
+});
+
+/** Changes an AWS Bedrock account's region, credentials (an empty secret keeps it), models or price table. */
+export const updateBedrockAccount = defineRpc({
+  name: "zerosub.accounts.bedrock.update",
+  input: z.object({
+    accountId: z.string(),
+    ...BedrockFields,
+    region: BedrockFields.region.optional(),
+    source: BedrockFields.source.optional(),
+    prices: z.record(z.string().trim().max(200), ApiPriceSchema).optional(),
+  }),
+  output: z.object({ ok: z.literal(true), warning: z.string().nullable() }),
+});
+
+/**
+ * The AWS region the host's own setup names (its environment, ~/.aws/config, or the EC2 instance it
+ * runs on), to fill in the Bedrock form. Asked for only when that form opens, and answered within a
+ * couple of seconds, with null when the host names none.
+ */
+export const detectBedrockRegion = defineRpc({
+  name: "zerosub.accounts.bedrock.region",
+  input: z.object({}),
+  output: z.object({ region: z.string().nullable(), source: z.enum(["environment", "config", "instance"]).nullable() }),
 });
 
 /** Sets a Claude or Pi account's proxy (their CLI logins' included); an empty value clears it. */
