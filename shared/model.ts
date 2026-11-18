@@ -382,6 +382,12 @@ export const AccountViewSchema = z.object({
   plan: z.string().nullable(),
   organization: z.string().nullable(),
   status: AccountStatusSchema,
+  /**
+   * Set aside by the user. `status` names only one state, and a signed-out account says
+   * `signed_out` even when it's also disabled, so this tells whether it needs enabling.
+   * False from older servers, which only said so through `status`.
+   */
+  disabled: z.boolean().default(false),
   isDefault: z.boolean(),
   /** Set while the next new agent of this family will start on this account (one-time pick). */
   nextAgentUntil: z.string().nullable().optional(),

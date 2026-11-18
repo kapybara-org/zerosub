@@ -3,7 +3,7 @@ import { Icon, Modal, TextInput, useToast } from "@getpaseo/plugin/client/react-
 import { SettingsCard, SettingsSwitch } from "@getpaseo/plugin/client/ui";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ScrollView, Text, View } from "react-native";
-import { accountSubtitle, describeReopen, egressText, formatAge, formatCredits, formatExtraUsage, formatPlan, staleNotice, usageSummary } from "../shared/format";
+import { accountSubtitle, describeReopen, egressText, formatAge, formatCredits, formatExtraUsage, formatPlan, isDisabled, staleNotice, usageSummary } from "../shared/format";
 import { FAMILY_LABEL, HAND_OFF, shownFamilies, type AccountView, type Family, type StateView } from "../shared/model";
 import { preferences } from "../shared/preferences";
 import {
@@ -347,7 +347,8 @@ function AccountCard({
   const summary = usageSummary(account);
   const subtitle = accountSubtitle(account);
   const signedOut = account.status === "signed_out";
-  const disabled = account.status === "disabled";
+  // A signed-out account reports only that as its status, but may be disabled too.
+  const disabled = isDisabled(account);
   const faded = disabled ? { opacity: 0.55 } : null;
   const windows = account.usage?.windows ?? [];
   const agents = account.agentCount === 0 ? "No agents" : `${account.agentCount} agent${account.agentCount === 1 ? "" : "s"}`;
@@ -355,7 +356,7 @@ function AccountCard({
 
   // Sets the account aside for a while, or brings it back; its agents move off it and back.
   const toggle = useCallback(async () => {
-    const enabling = account.status === "disabled";
+    const enabling = isDisabled(account);
     setBusy("toggle");
     try {
       const result = await store.rpc(setAccountEnabled, { accountId: account.id, enabled: enabling });
@@ -633,16 +634,30 @@ function AccountCard({
           {disabled ? "Disabled · agents won't use it" : freshness ? `${agents} · ${freshness}` : agents}
         </Text>
         {signedOut ? (
-          <Button
-            theme={theme}
-            size="small"
-            tone="primary"
-            icon={api ? "KeyRound" : "LogIn"}
-            label={bedrock ? "Fix settings" : api ? "Fix key" : "Sign in"}
-            tooltip={bedrock ? "Fix this account's AWS credentials, region or models" : api ? "Enter a working key for this account" : "Sign this account in again"}
-            tooltipAlign="end"
-            onPress={azure ? () => setEditingAzure(true) : bedrock ? () => setEditingBedrock(true) : api ? () => setEditingApi(true) : onSignIn}
-          />
+          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+            {disabled ? (
+              <Button
+                theme={theme}
+                size="small"
+                icon="CirclePlay"
+                label="Enable"
+                tooltip="Use this account again once it's signed in"
+                tooltipAlign="end"
+                busy={busy === "toggle"}
+                onPress={() => void toggle()}
+              />
+            ) : null}
+            <Button
+              theme={theme}
+              size="small"
+              tone="primary"
+              icon={api ? "KeyRound" : "LogIn"}
+              label={bedrock ? "Fix settings" : api ? "Fix key" : "Sign in"}
+              tooltip={bedrock ? "Fix this account's AWS credentials, region or models" : api ? "Enter a working key for this account" : "Sign this account in again"}
+              tooltipAlign="end"
+              onPress={azure ? () => setEditingAzure(true) : bedrock ? () => setEditingBedrock(true) : api ? () => setEditingApi(true) : onSignIn}
+            />
+          </View>
         ) : disabled ? (
           <Button
             theme={theme}

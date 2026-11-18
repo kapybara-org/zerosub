@@ -226,6 +226,11 @@ export function usageSummary(account: AccountView, now: number = Date.now()): st
   return reset ? `${base} · resets ${reset}` : base;
 }
 
+/** Set aside by the user, whatever else `status` says. Older servers only said so through `status`. */
+export function isDisabled(account: Pick<AccountView, "status" | "disabled">): boolean {
+  return account.disabled || account.status === "disabled";
+}
+
 /** The note over state the daemon stopped answering for: "Showing data from 3m ago · couldn't refresh: …". */
 export function staleNotice(updatedAt: number | null, error: string, now: number = Date.now()): string {
   if (updatedAt === null) return `Couldn't refresh: ${error}`;

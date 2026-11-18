@@ -33,6 +33,7 @@ function account(id: string, fields: Partial<AccountView> = {}): AccountView {
     plan: null,
     organization: null,
     status: "ready",
+    disabled: false,
     isDefault: false,
     limitedUntil: null,
     usage: null,
