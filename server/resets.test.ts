@@ -20,6 +20,20 @@ const grant = (patch: Record<string, unknown> = {}) => ({
 });
 
 describe("Claude banked resets", () => {
+  it("directs users to Claude when the CLI surface reports no grant balance", () => {
+    const status = parseClaudeResets({ eligible: false, ineligible_reason: "surface", grants: [] }, NOW);
+    expect(status).toMatchObject({ offer: null, checkInClaude: true });
+  });
+
+  it("shows a reported Fable grant without offering to redeem it as a full reset", () => {
+    const status = parseClaudeResets({
+      eligible: true, next_grant_id: "grant_1",
+      grants: [grant({ clears: ["five_hour", "seven_day_overage_included"], use_requires_limit: false })],
+    }, NOW);
+    expect(status.checkInClaude).toBe(true);
+    expect(status.offer).toMatchObject({ available: 2, usableNow: false, refills: ["5-hour", "Fable weekly"] });
+  });
+
   it("offers the next grant when the account is at a limit", () => {
     const { offer, nextGrantId } = parseClaudeResets(
       { eligible: true, at_limit: true, grants: [grant()], next_grant_id: "grant_1" },

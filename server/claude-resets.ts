@@ -91,6 +91,7 @@ export interface ClaudeResetStatus {
   nextGrantId: string | null;
   /** Claude sees the account at a usage limit right now. */
   atLimit: boolean;
+  checkInClaude?: boolean;
 }
 
 /** Reads the `cedar_ember` block. `offer` is null when nothing is banked. */
@@ -99,15 +100,20 @@ export function parseClaudeResets(block: unknown, now: number = Date.now()): Cla
   const atLimit = block.at_limit === true;
   const grants = (Array.isArray(block.grants) ? block.grants : []).map(parseGrant).filter((grant): grant is Grant => grant !== null);
   const available = grants.reduce((sum, grant) => sum + grant.resetsLeft, 0);
-  if (available === 0) return { offer: null, nextGrantId: null, atLimit };
+  const webOnly = block.eligible === false && block.ineligible_reason === "surface";
+  if (available === 0) return { offer: null, nextGrantId: null, atLimit, checkInClaude: webOnly };
 
   const nextId = typeof block.next_grant_id === "string" && grants.some((grant) => grant.id === block.next_grant_id) ? block.next_grant_id : null;
   const next = grants.find((grant) => grant.id === nextId) ?? grants.find((grant) => grant.resetsLeft > 0) ?? null;
   const eligible = block.eligible === true;
   const cooldown = isoTime(block.cooldown_until);
 
+  // A Fable reset restores only the Fable share of weekly usage. Leave it to Claude’s supported surface.
+  const fable = next?.clears.includes("seven_day_overage_included") ?? false;
   let blockedReason: string | null = null;
-  if (!eligible) {
+  if (fable) {
+    blockedReason = "Use this Fable reset in Claude under Settings → Usage.";
+  } else if (!eligible) {
     const reason = typeof block.ineligible_reason === "string" ? block.ineligible_reason : "unavailable";
     blockedReason = INELIGIBLE[reason] ?? INELIGIBLE.unavailable ?? null;
   } else if (cooldown && Date.parse(cooldown) > now) {
@@ -126,6 +132,7 @@ export function parseClaudeResets(block: unknown, now: number = Date.now()): Cla
 
   return {
     nextGrantId: nextId,
+    checkInClaude: webOnly || fable,
     atLimit,
     offer: {
       available,

@@ -108,6 +108,7 @@ export const UsageSchema = z.object({
   cached: z.boolean().default(false),
   /** Banked resets, when the provider reports any. */
   resets: ResetOfferSchema.nullable().default(null),
+  checkResetsInClaude: z.boolean().optional(),
   /** Credits the account can spend past full windows, when the provider reports any. */
   credits: CreditsSchema.nullable().default(null),
   /** Claude extra usage, when the usage response reports it. Shown on the account card. */

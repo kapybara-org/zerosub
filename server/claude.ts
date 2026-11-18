@@ -239,8 +239,10 @@ export class ClaudeAdapter implements FamilyAdapter {
           const body = (await response.json()) as { cedar_ember?: unknown; extra_usage?: unknown };
           const windows = parseUsage(body);
           this.noteResetStatus(home, body.cedar_ember);
+          const resetStatus = parseClaudeResets(body.cedar_ember);
           return {
-            fetchedAt, windows, error: null, cached: false, resets: parseClaudeResets(body.cedar_ember).offer, credits: null,
+            fetchedAt, windows, error: null, cached: false, resets: resetStatus.offer, credits: null,
+            checkResetsInClaude: resetStatus.checkInClaude ?? false,
             ...(withSpend ? { extraUsage: parseExtraUsage(body.extra_usage) } : {}),
           };
         }
@@ -317,6 +319,9 @@ export class ClaudeAdapter implements FamilyAdapter {
       status = parseClaudeResets(((await response.json()) as { cedar_ember?: unknown }).cedar_ember);
     } catch (error) {
       return { outcome: "error", message: `Couldn't check the account's resets: ${describe(error)}`, left: null };
+    }
+    if (status.checkInClaude) {
+      return { outcome: "unavailable", message: "Check for banked resets in Claude under Settings → Usage.", left: null };
     }
     if (!status.offer || !status.nextGrantId) return { outcome: "none", message: "No banked resets left on this account.", left: 0 };
     if (options.onlyAtLimit && !status.atLimit) {

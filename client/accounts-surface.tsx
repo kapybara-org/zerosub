@@ -741,6 +741,9 @@ function AccountCard({
         {!signedOut && credits ? <Text style={text.small}>{formatCredits(credits)}</Text> : null}
         {!signedOut && extraUsage ? <Text style={text.small}>{extraUsage}</Text> : null}
         {!signedOut && windows.length > 0 && account.usage?.error ? <Text style={text.small}>{account.usage.error}</Text> : null}
+        {!signedOut && account.usage?.checkResetsInClaude && !resets?.blockedReason ? (
+          <Text style={text.small}>Check for banked Fable resets in Claude under Settings → Usage.</Text>
+        ) : null}
         {!signedOut && resets?.blockedReason ? <Text style={text.small}>{resets.blockedReason}</Text> : null}
       </View>
 
