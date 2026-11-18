@@ -379,8 +379,9 @@ describe("disabled accounts", () => {
     expect(route([personal])?.account.id).toBe("claude-main");
     expect(route([personal], "claude-personal")?.account.id).toBe("claude-personal");
     expect(route([personal], "claude-personal")?.bind).toBeNull(); // so it still returns once work is enabled
-    // Only an account routing could have picked by itself stands in: not the disabled one or a full one.
+    // Only an account routing could have picked by itself stands in: not the disabled one, an API account or a full one.
     expect(route([personal], "claude-work")?.account.id).toBe("claude-main");
+    expect(route([account({ id: "claude-api", auth: "api" })], "claude-api")?.account.id).toBe("claude-main");
     expect(route([account({ id: "claude-personal", limitedUntil: "2026-09-23T14:00:00Z" })], "claude-personal")?.account.id).toBe(
       "claude-main",
     );
