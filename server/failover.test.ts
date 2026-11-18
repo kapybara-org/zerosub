@@ -3138,6 +3138,32 @@ describe("changing the default account", () => {
         expect(reopened).toEqual(["fix-build"]);
         expect((await store.read()).bindings["fix-build"]).toMatchObject({ accountId: HELLO, source: "auto" });
       });
+
+      it("moves a later Opus agent when an earlier Fable agent has nowhere to go", async () => {
+        const { store, reopened } = await setUpBusy("fable-agent", ago(120), {
+          others: ["opus-agent"],
+          accounts: withFableFull(false),
+          models: { "fable-agent": FABLE, "opus-agent": OPUS },
+        });
+        expect(reopened).toEqual(["opus-agent"]);
+        const state = await store.read();
+        expect(state.sessions["fable-agent"]?.accountId).toBe(MAIN);
+        expect(state.bindings["opus-agent"]).toMatchObject({ accountId: HELLO, source: "auto" });
+      });
+
+      it("moves a later Opus agent when an earlier Fable agent's only target would pass the gate", async () => {
+        // `spare` is the only account with room for Fable, and its 75% reading would pass the gate with the agent.
+        const { store, reopened } = await setUpBusy("fable-agent", ago(120), {
+          others: ["opus-agent"],
+          accounts: withFableFull(true),
+          usedBy: { [HELLO]: 20, [SPARE]: 75 },
+          models: { "fable-agent": FABLE, "opus-agent": OPUS },
+        });
+        expect(reopened).toEqual(["opus-agent"]);
+        const state = await store.read();
+        expect(state.sessions["fable-agent"]?.accountId).toBe(MAIN);
+        expect(state.bindings["opus-agent"]).toMatchObject({ accountId: HELLO, source: "auto" });
+      });
     });
 
     it("moves nothing with automatic switching off", async () => {
