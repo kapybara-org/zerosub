@@ -2245,8 +2245,6 @@ export class Service {
           if (!this.prefs.balanceNewAgents || !this.prefs.autoSwitch || !this.paced(findAccount(latest, accountId), now)) return;
           const next = mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([accountId]), false, this.pacing(now), this.agentModels.get(agentId));
           // Only to an account with room in both windows that stays under the gate with this agent.
-          // The target depends on the agent's model (a model's own limit can rule an account out), so
-          // an agent with nowhere to go doesn't stop the pass: a later one on another model may still move.
           if (!next || headroomScore(this.usage.get(next.id), now) >= 100) continue;
           if (paceScore(this.usage.get(next.id), this.pendingOn(next.id, now) + 1, now).gated) continue;
           move = { account: next, pin: true };
@@ -2254,7 +2252,9 @@ export class Service {
         } else {
           move = this.nextAccount(latest, agentId, family, accountId);
         }
-        if (!move) return;
+        // The target depends on the agent's model (a model's own limit can rule an account out), so
+        // an agent with nowhere to go doesn't stop the pass: a later one on another model may still move.
+        if (!move) continue;
         const next = move.account;
         this.notePlacement(next.id, now);
         if (move.pin && !isLastResort(next)) await this.pin(agentId, next.id, latest.bindings[agentId]);

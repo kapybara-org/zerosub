@@ -3494,6 +3494,32 @@ describe("changing the default account", () => {
     expect((await service.view(paseo)).agents.find((route) => route.agentId === "serving")?.waiting).toBe("background");
   });
 
+  it("moves a later Opus agent off an account at its limit when an earlier Fable agent has nowhere to go", async () => {
+    const { service, store, context, reopened } = await setUpAgents(
+      {
+        accounts: [
+          account(MAIN, "marketing", "main"),
+          // The only other account has no Fable room, so a Fable agent can't go anywhere.
+          { ...account(WORK, "work", "managed"), modelLimits: { fable: { until: inFuture(), at: inPast(), source: "turn" as const } } },
+        ] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+        sessions: { failing: session(MAIN), "fable-agent": session(MAIN), "opus-agent": session(MAIN) },
+      },
+      [
+        { id: "failing", status: "idle", model: "claude-opus-4-1" },
+        // Listed first, so the pass meets it before "opus-agent".
+        { id: "fable-agent", status: "idle", model: "claude-fable-5-2" },
+        { id: "opus-agent", status: "idle", model: "claude-opus-4-1" },
+      ],
+    );
+    service.setPreferences(preferences.schema.parse({ autoSwitch: true, autoContinue: false, moveAgentsOnDefaultChange: false }));
+    await service.onTurnEnded({ agent: { id: "failing", provider: "claude" }, turnId: null, outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never, context);
+    await vi.waitFor(() => expect(reopened).toContain("opus-agent"));
+    expect(reopened).not.toContain("fable-agent");
+    await vi.waitFor(async () => expect((await store.read()).sessions["opus-agent"]?.accountId).toBe(WORK));
+    expect((await store.read()).sessions["fable-agent"]?.accountId).toBe(MAIN);
+  });
+
   it("keeps a deferred move waiting for background work only when nobody asked for it", async () => {
     const { service, store, paseo, context, reopened, agents } = await setUpAgents(
       {
