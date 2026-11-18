@@ -3164,6 +3164,16 @@ describe("changing the default account", () => {
       expect(notes).toContainEqual({ agentId: "fix-build", data: expect.objectContaining({ reason: "pacing", from: "work", to: "personal" }) });
     });
 
+    it("moves at most three agents in one pass", async () => {
+      const { reopened } = await setUpBusy("a1", ago(120), { others: ["a2", "a3", "a4", "a5"] });
+      expect(reopened).toHaveLength(3);
+    });
+
+    it("leaves an agent idle for more than a day", async () => {
+      const { reopened } = await setUpBusy("old-spike", ago(26 * 60));
+      expect(reopened).toEqual([]);
+    });
+
     it("leaves an agent used in the last hour", async () => {
       const { reopened } = await setUpBusy("review-pr", ago(10));
       expect(reopened).toEqual([]);
@@ -3269,7 +3279,7 @@ describe("changing the default account", () => {
 
     it("stops moving agents once the account they go to would reach the gate", async () => {
       const others = ["agent-2", "agent-3", "agent-4", "agent-5", "agent-6"];
-      const { service, reopened } = await setUpBusy("fix-build", ago(120), { others });
+      const { service, reopened } = await setUpBusy("fix-build", ago(120), { others, personal: 45 });
       expect(reopened.length).toBeGreaterThan(0);
       expect(reopened.length).toBeLessThan(others.length + 1);
       const usage = (service as unknown as { usage: Map<string, Usage> }).usage.get(HELLO);

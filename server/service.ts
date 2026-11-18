@@ -170,6 +170,10 @@ const TURN_SETTLE_MS = 60_000;
  * or an hour), so moving it costs its next turn nothing extra. A pacing move only takes these.
  */
 const CACHE_COLD_MS = 60 * 60_000;
+/** The most agents one pacing pass moves; the next live reading starts another if the account is still paced. */
+const PACING_MOVES_PER_PASS = 3;
+/** A pacing pass leaves an agent idle longer than this where it is. */
+const PACING_MOVE_MAX_IDLE_MS = 24 * 60 * 60_000;
 /**
  * How long an RPC that moves agents or spends a reset waits for that before answering, since Paseo
  * gives up on an RPC after 30 s. The work carries on, and timeline notes and the state say how it went.
@@ -2188,7 +2192,8 @@ export class Service {
   /**
    * Idle agents still on an exhausted account would fail on their next turn; move them now.
    * With `pacing`, the account still works but is projected past the 5-hour gate. Only agents whose
-   * prompt cache is cold move, and only to an account that stays under the gate with them.
+   * prompt cache is cold move (not those idle over a day), at most `PACING_MOVES_PER_PASS` of them, and
+   * only to an account that stays under the gate and under `WEEK_NEARLY_USED_PERCENT` of its week with them.
    */
   private async moveIdleAgentsOff(
     paseo: PaseoApi,
@@ -2216,7 +2221,9 @@ export class Service {
           (!scope || scopeCoversModel(scope, this.agentModels.get(agent.id))),
       )
       .map((agent) => agent.id);
+    let moved = 0;
     for (const agentId of candidates) {
+      if (reason === "pacing" && moved >= PACING_MOVES_PER_PASS) return;
       if (!this.switchGuard.allows(agentId, Date.now())) continue;
       const info = await agentInfo(paseo, agentId);
       // One the user is using right now is left for alignment to move once it's quiet.
@@ -2226,7 +2233,7 @@ export class Service {
         !settled(info.status) ||
         busy(info) ||
         hasBackgroundWork(info) ||
-        (reason === "pacing" ? !this.cacheCold(info, Date.now()) : this.recentlyActive(info, Date.now()))
+        (reason === "pacing" ? !this.cacheCold(info, Date.now()) || this.idleFor(info, Date.now()) > PACING_MOVE_MAX_IDLE_MS : this.recentlyActive(info, Date.now()))
       ) continue;
       this.agentModes.set(agentId, info.modeId);
       // Left for its own failover, or alone when that can't be told.
@@ -2246,7 +2253,8 @@ export class Service {
           const next = mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([accountId]), false, this.pacing(now), this.agentModels.get(agentId));
           // Only to an account with room in both windows that stays under the gate with this agent.
           if (!next || headroomScore(this.usage.get(next.id), now) >= 100) continue;
-          if (paceScore(this.usage.get(next.id), this.pendingOn(next.id, now) + 1, now).gated) continue;
+          const pace = paceScore(this.usage.get(next.id), this.pendingOn(next.id, now) + 1, now);
+          if (pace.gated || pace.weekHeld) continue;
           move = { account: next, pin: true };
           this.logPlacement(latest, family, agentId, next, now, "pacing move");
         } else {
@@ -2257,6 +2265,7 @@ export class Service {
         if (!move) continue;
         const next = move.account;
         this.notePlacement(next.id, now);
+        moved += 1;
         if (move.pin && !isLastResort(next)) await this.pin(agentId, next.id, latest.bindings[agentId]);
         this.switchGuard.note(agentId, now);
         const row: SwitchRow = {
@@ -3304,7 +3313,11 @@ export class Service {
 
   /** Nothing touched the agent for `CACHE_COLD_MS`: no turn, message or other change. */
   private cacheCold(agent: AgentInfo, now: number): boolean {
-    return now - Math.max(this.turnAt.get(agent.id) ?? 0, agent.lastMessageAt, agent.updatedAt) >= CACHE_COLD_MS;
+    return this.idleFor(agent, now) >= CACHE_COLD_MS;
+  }
+
+  private idleFor(agent: AgentInfo, now: number): number {
+    return now - Math.max(this.turnAt.get(agent.id) ?? 0, agent.lastMessageAt, agent.updatedAt);
   }
 
   /** The account can still take agents but is projected past the 5-hour gate. */

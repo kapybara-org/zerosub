@@ -1,4 +1,4 @@
-import { estimateApiCost, totalTokens, type AccountView, type PaceView, type AgentRoute, type AzureSummary, type Credits, type Egress, type ExtraUsage, type UsageWindow } from "./model";
+import { estimateApiCost, totalTokens, type AccountView, type PaceView, WEEK_NEARLY_USED_PERCENT, type AgentRoute, type AzureSummary, type Credits, type Egress, type ExtraUsage, type UsageWindow } from "./model";
 import type { ReopenSummary } from "./rpc";
 
 /** "in 2h 14m", "in 3d 4h", "now". */
@@ -262,14 +262,11 @@ export function apiUsageLines(account: Pick<AzureSummary, "prices" | "usage">, n
   return { tokens, cost, note };
 }
 
-/** Weekly use at which an account counts as nearly used up. */
-const WEEK_NEARLY_USED = 90;
-
 /** What pacing makes of an account, in a few words for a menu row. `next`: pacing picks it for the next new agent. */
 export function paceVerdict(pace: PaceView, next: boolean): string {
   if (next) return "Picks next";
   if (pace.gated) return "Held back: busy hour";
-  if (pace.weeklyUsed !== null && pace.weeklyUsed >= WEEK_NEARLY_USED) return "Week nearly used";
+  if (pace.weeklyUsed !== null && pace.weeklyUsed >= WEEK_NEARLY_USED_PERCENT) return "Week nearly used";
   // The same standing as the account card's `describePace`.
   if (pace.weeklyUsed !== null && pace.weekElapsed !== null && Math.round(pace.weeklyUsed + pace.pendingWeekly) > Math.round(pace.weekElapsed)) {
     return "Using week fast";

@@ -856,6 +856,19 @@ describe("pacing", () => {
     expect(picks).toEqual(["claude-work", "claude-work", "claude-spare"]);
   });
 
+  it("holds back an account whose week is nearly used", () => {
+    const week = (percent: number, weekElapsed = 4) => paceScore(pace(20, 2, percent, weekElapsed), 0, PNOW).weekHeld;
+    expect(week(98, 7 - 2 / 24)).toBe(true);
+    expect(week(90)).toBe(true);
+    expect(week(89.9)).toBe(false);
+    expect(week(98, 8)).toBe(false);
+
+    const both: Record<string, Usage> = { "claude-main": pace(20, 2, 98, 7 - 2 / 24), "claude-work": pace(20, 2, 60, 4) };
+    const two = stateWith(Object.keys(both).map((id) => account({ id })), { defaults: { claude: "claude-main", codex: null, pi: null } });
+    const pacing = { pendingOf: () => 0 };
+    expect(mostAvailable(two, "claude", (id) => both[id], PNOW, new Set(), false, pacing)?.id).toBe("claude-work");
+  });
+
   it("gates a raw 5-hour reading at 80% even with a slow burn, and scores unknown usage in the middle", () => {
     const slow = pace(85, 4.9, 10, 6);
     expect(paceScore(slow, 0, PNOW).fiveHour).toBeLessThan(90);

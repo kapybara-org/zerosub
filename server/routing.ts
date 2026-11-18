@@ -1,5 +1,5 @@
 import { accountPeak } from "../shared/format";
-import { isAzureAccount, isBedrockAccount, PACE_GATE_PERCENT, type Family, type PaceView, type Usage, type UsageWindow } from "../shared/model";
+import { isAzureAccount, isBedrockAccount, PACE_GATE_PERCENT, WEEK_NEARLY_USED_PERCENT, type Family, type PaceView, type Usage, type UsageWindow } from "../shared/model";
 import { FIVE_HOUR_MINUTES, WEEK_MINUTES } from "./codex";
 import {
   accountsOf,
@@ -137,6 +137,8 @@ export interface PaceScore {
   weekly: number;
   score: number;
   gated: boolean;
+  /** The week has used WEEK_NEARLY_USED_PERCENT or more and hasn't reset. */
+  weekHeld: boolean;
 }
 
 export function weeklyWindow(usage: Usage): UsageWindow | undefined {
@@ -152,7 +154,7 @@ export function paceScore(usage: Usage | null | undefined, pending: number, now:
   const long = usage ? weeklyWindow(usage) : undefined;
   if (!usage || usage.windows.length === 0 || (!short && !long)) {
     const fiveHour = UNKNOWN_SCORE + fiveCharge;
-    return { fiveHour, weekly: 0, score: fiveHour, gated: fiveHour >= FIVE_HOUR_GATE_PERCENT };
+    return { fiveHour, weekly: 0, score: fiveHour, gated: fiveHour >= FIVE_HOUR_GATE_PERCENT, weekHeld: false };
   }
   const parsed = Date.parse(usage.fetchedAt);
   const fetched = Number.isFinite(parsed) ? Math.min(parsed, now) : now;
@@ -182,6 +184,7 @@ export function paceScore(usage: Usage | null | undefined, pending: number, now:
     weekly,
     score: Math.max(fiveHour, weekly),
     gated: fiveHourGated(usage, now) || fiveHour >= FIVE_HOUR_GATE_PERCENT,
+    weekHeld: !!long && Number.isFinite(long.usedPercent) && !expired(long) && long.usedPercent >= WEEK_NEARLY_USED_PERCENT,
   };
 }
 
@@ -217,7 +220,8 @@ export function paceView(usage: Usage | null | undefined, pending: number, now: 
  * an account at 81% of its 5 hours beats one at 88% of its week, and runs out minutes later), then
  * the lowest peak, preferring the default, then the CLI login, on ties. An account with a full window
  * that caps it ranks last, gate or not, though it's usable: its limit lifted at the 5-hour reset with
- * its week still full, say, or ChatGPT credits keep it going.
+ * its week still full, say, or ChatGPT credits keep it going. With `pacing`, an account that has used
+ * `WEEK_NEARLY_USED_PERCENT` of its week ranks behind the rest, like one past the 5-hour gate.
  *
  * With `paidFallback` (the `paidApiFallback` preference), a usable paid API account (`isLastResort`)
  * is chosen once no subscription account can stand in; without it, never.
@@ -242,7 +246,7 @@ export function mostAvailable(
     const score = headroomScore(usage, now);
     const pace = pacing ? paceScore(usage, pacing.pendingOf(account.id), now) : undefined;
     return [
-      score >= 100 ? 2 : (pace ? pace.gated : fiveHourGated(usage, now)) ? 1 : 0,
+      score >= 100 ? 2 : (pace ? pace.gated || pace.weekHeld : fiveHourGated(usage, now)) ? 1 : 0,
       pace ? pace.score : score,
       account.id === preferred ? 0 : 1,
       account.kind === "main" ? 0 : 1,
