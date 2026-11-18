@@ -4,7 +4,7 @@ import { useCallback, useState, type ComponentType } from "react";
 import { Text, View } from "react-native";
 import type { AccountView, ResetOffer } from "../shared/model";
 import { redeemReset, type RedeemResult } from "../shared/rpc";
-import { describe, stoppedWaiting, type ZeroSubStore } from "./store";
+import { describe, stoppedWaiting, useStore, type ZeroSubStore } from "./store";
 import { Button, useText } from "./ui";
 
 type Theme = PluginHostProps["theme"];
@@ -47,15 +47,18 @@ export function ResetConfirm({
   theme: Theme;
   store: ZeroSubStore;
   account: AccountView;
-  /** The agent stopped by this account's limit; it carries on after the reset. */
+  /** The agent stopped by this account's limit; it carries on after the reset when the follow-up is on. */
   agentId?: string;
   onFinished(result: RedeemResult): void;
   onCancel(): void;
 }) {
   const text = useText(theme);
+  const { state } = useStore(store);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const resets = account.usage?.resets ?? null;
+  // The agent only gets the follow-up with "Keep going after a switch" on.
+  const carriesOn = agentId !== undefined && (state?.autoContinue ?? true);
 
   const confirm = useCallback(async () => {
     setBusy(true);
@@ -89,7 +92,7 @@ export function ResetConfirm({
   return (
     <View style={{ gap: 12 }}>
       <Text style={text.body}>
-        Refills {refills} on {account.label} now{agentId ? ", then this agent carries on" : ""}. A reset can't be undone.
+        Refills {refills} on {account.label} now{carriesOn ? ", then this agent carries on" : ""}. A reset can't be undone.
       </Text>
       <Text style={text.muted}>{resetDetail(resets)}</Text>
       {resets.blockedReason ? <Text style={text.warning}>{resets.blockedReason}</Text> : null}

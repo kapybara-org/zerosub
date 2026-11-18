@@ -560,6 +560,8 @@ export const StateViewSchema = z.object({
   agentMetadata: z.boolean().optional(),
   /** Paid API accounts (Azure OpenAI, AWS Bedrock) may take work over by themselves once every subscription is out. */
   paidApiFallback: z.boolean().optional(),
+  /** "Keep going after a switch": the follow-up goes out after a switch or a banked reset. */
+  autoContinue: z.boolean().default(true),
   warnings: z.array(z.string()),
 });
 export type StateView = z.infer<typeof StateViewSchema>;

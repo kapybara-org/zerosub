@@ -61,6 +61,7 @@ async function menu(route: Partial<AgentRoute>, family: "claude" | "codex" = "co
     showComposerPill: true,
     openCodeAvailable,
     autoSwitch: true,
+    autoContinue: true,
     warnings: [],
   };
   const buttons: PluginButton[] = [];
@@ -107,6 +108,7 @@ async function buttons(options: { inComposer: boolean; agentMetadata?: boolean; 
     showComposerPill: true,
     openCodeAvailable: options.openCodeAvailable ?? false,
     autoSwitch: true,
+    autoContinue: true,
     agentMetadata: options.agentMetadata,
     warnings: [],
   };
@@ -236,6 +238,7 @@ describe("the OpenCode entry", () => {
       showComposerPill: true,
       openCodeAvailable: false,
       autoSwitch: true,
+      autoContinue: true,
       warnings: [],
     };
     const client = {
@@ -277,6 +280,7 @@ describe("the OpenCode entry", () => {
       showComposerPill: true,
       openCodeAvailable: true,
       autoSwitch: true,
+      autoContinue: true,
       warnings: [],
     };
     const client = {
@@ -320,6 +324,7 @@ describe("the OpenCode entry", () => {
       showComposerPill: true,
       openCodeAvailable: true,
       autoSwitch: true,
+      autoContinue: true,
       warnings: [],
     };
     const client = {

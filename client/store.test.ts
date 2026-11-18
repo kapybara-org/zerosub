@@ -19,6 +19,7 @@ function view(overrides: Partial<StateView> = {}): StateView {
     showComposerPill: false,
     openCodeAvailable: false,
     autoSwitch: false,
+    autoContinue: true,
     warnings: [],
     ...overrides,
   };
