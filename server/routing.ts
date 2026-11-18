@@ -1,5 +1,5 @@
 import { accountPeak } from "../shared/format";
-import { isAzureAccount, type Family, type Usage, type UsageWindow } from "../shared/model";
+import { isAzureAccount, PACE_GATE_PERCENT, type Family, type PaceView, type Usage, type UsageWindow } from "../shared/model";
 import { FIVE_HOUR_MINUTES, WEEK_MINUTES } from "./codex";
 import {
   accountsOf,
@@ -23,7 +23,23 @@ const NEAR_RESET_MAX_USED_PERCENT = 80;
  * new agents, any account under this ranks ahead of every account past it, unless a window that caps
  * it is full (see `mostAvailable`).
  */
-const FIVE_HOUR_GATE_PERCENT = 80;
+const FIVE_HOUR_GATE_PERCENT = PACE_GATE_PERCENT;
+
+const FIVE_HOUR_MS = FIVE_HOUR_MINUTES * 60_000;
+const WEEK_MS = WEEK_MINUTES * 60_000;
+/** Tunable: how far ahead the 5-hour use is projected. Rests on a low-confidence window size. */
+const PACE_HORIZON_MS = 3_600_000;
+/** Tunable: a young window's burn rate is measured over at least this long, so a first burst doesn't extrapolate wildly. */
+const MIN_FIVE_HOUR_ELAPSED_MS = 1_800_000;
+/** Tunable: the least share of the week that counts as elapsed, so a fresh week doesn't inflate the pace. */
+const MIN_WEEK_SHARE = 1 / 7;
+const UNKNOWN_SCORE = 50;
+/** Tunable: 5-hour percent charged for each agent placed on an account since its reading. */
+export const PENDING_FIVE_HOUR_PERCENT = 10;
+/** Tunable: weekly percent charged for each agent placed on an account since its reading. */
+export const PENDING_WEEKLY_PERCENT = 2;
+/** How long a placement counts as pending, until a usage reading can show it. */
+export const PENDING_MS = 600_000;
 
 export function isLimited(account: StoredAccount, now: number): boolean {
   if (!account.limitedUntil) return false;
@@ -68,7 +84,7 @@ export function headroomScore(usage: Usage | null | undefined, now = Date.now())
 }
 
 /** The 5-hour window: Codex says how long its windows are, Claude's is known by id. */
-function fiveHourWindow(usage: Usage): UsageWindow | undefined {
+export function fiveHourWindow(usage: Usage): UsageWindow | undefined {
   return usage.windows.find((window) => window.minutes === FIVE_HOUR_MINUTES) ??
     usage.windows.find((window) => window.minutes == null && (window.id === "five_hour" || window.id === "primary"));
 }
@@ -82,6 +98,93 @@ export function fiveHourGated(usage: Usage | null | undefined, now: number): boo
   if (!short || !Number.isFinite(short.usedPercent)) return false;
   if (short.resetsAt && Date.parse(short.resetsAt) <= now) return false;
   return short.usedPercent >= FIVE_HOUR_GATE_PERCENT;
+}
+
+/** Agents ZeroSub placed on an account that its latest usage reading may not show yet. */
+export interface Pacing {
+  pendingOf(accountId: string): number;
+}
+
+export interface PaceScore {
+  /** Projected 5-hour use an hour ahead, plus pending agents. */
+  fiveHour: number;
+  /** Weekly use against the share of the week that has passed, plus pending agents. */
+  weekly: number;
+  score: number;
+  gated: boolean;
+}
+
+export function weeklyWindow(usage: Usage): UsageWindow | undefined {
+  return usage.windows.find((window) => window.minutes === WEEK_MINUTES) ??
+    usage.windows.find((window) => window.minutes == null && (window.id === "seven_day" || window.id === "secondary"));
+}
+
+/** Lower is better. Combines the 5-hour projection and the weekly pace; see the README. */
+export function paceScore(usage: Usage | null | undefined, pending: number, now: number): PaceScore {
+  const fiveCharge = PENDING_FIVE_HOUR_PERCENT * pending;
+  const weekCharge = PENDING_WEEKLY_PERCENT * pending;
+  const short = usage ? fiveHourWindow(usage) : undefined;
+  const long = usage ? weeklyWindow(usage) : undefined;
+  if (!usage || usage.windows.length === 0 || (!short && !long)) {
+    const fiveHour = UNKNOWN_SCORE + fiveCharge;
+    return { fiveHour, weekly: 0, score: fiveHour, gated: fiveHour >= FIVE_HOUR_GATE_PERCENT };
+  }
+  const parsed = Date.parse(usage.fetchedAt);
+  const fetched = Number.isFinite(parsed) ? Math.min(parsed, now) : now;
+  const expired = (window: UsageWindow) => !!window.resetsAt && Date.parse(window.resetsAt) <= now;
+
+  let fiveHour = fiveCharge;
+  if (short && Number.isFinite(short.usedPercent) && !expired(short)) {
+    const reset = Date.parse(short.resetsAt ?? "");
+    if (!Number.isFinite(reset)) fiveHour = short.usedPercent + fiveCharge;
+    else {
+      const elapsed = Math.max(MIN_FIVE_HOUR_ELAPSED_MS, fetched - (reset - FIVE_HOUR_MS));
+      const ahead = Math.min(now + PACE_HORIZON_MS, reset) - fetched;
+      fiveHour = short.usedPercent + (short.usedPercent / elapsed) * ahead + fiveCharge;
+    }
+  }
+  let weekly = 0;
+  if (long && Number.isFinite(long.usedPercent) && !expired(long)) {
+    const reset = Date.parse(long.resetsAt ?? "");
+    if (!Number.isFinite(reset)) weekly = long.usedPercent + weekCharge;
+    else {
+      const share = 1 - (reset - fetched) / WEEK_MS;
+      weekly = (long.usedPercent + weekCharge) / Math.min(1, Math.max(MIN_WEEK_SHARE, share));
+    }
+  }
+  return {
+    fiveHour,
+    weekly,
+    score: Math.max(fiveHour, weekly),
+    gated: fiveHourGated(usage, now) || fiveHour >= FIVE_HOUR_GATE_PERCENT,
+  };
+}
+
+/** `paceScore` broken into the parts an account card draws. */
+export function paceView(usage: Usage | null | undefined, pending: number, now: number): PaceView {
+  const pace = paceScore(usage, pending, now);
+  const short = usage ? fiveHourWindow(usage) : undefined;
+  const long = usage ? weeklyWindow(usage) : undefined;
+  const expired = (window: UsageWindow) => !!window.resetsAt && Date.parse(window.resetsAt) <= now;
+  const used = (window: UsageWindow | undefined) =>
+    window && Number.isFinite(window.usedPercent) ? (expired(window) ? 0 : window.usedPercent) : null;
+  const parsed = usage ? Date.parse(usage.fetchedAt) : Number.NaN;
+  const fetched = Number.isFinite(parsed) ? Math.min(parsed, now) : now;
+  const weekReset = long?.resetsAt ? Date.parse(long.resetsAt) : Number.NaN;
+  const weekElapsed =
+    long && Number.isFinite(long.usedPercent) && !expired(long) && Number.isFinite(weekReset)
+      ? Math.min(100, Math.max(0, (1 - (weekReset - fetched) / WEEK_MS) * 100))
+      : null;
+  return {
+    fiveHourUsed: used(short),
+    fiveHourProjected: pace.fiveHour,
+    pendingFiveHour: PENDING_FIVE_HOUR_PERCENT * pending,
+    weeklyUsed: used(long),
+    pendingWeekly: PENDING_WEEKLY_PERCENT * pending,
+    weekElapsed,
+    pending,
+    gated: pace.gated,
+  };
 }
 
 /**
@@ -101,6 +204,7 @@ export function mostAvailable(
   now: number,
   exclude: ReadonlySet<string> = new Set(),
   paidFallback = false,
+  pacing?: Pacing,
 ): StoredAccount | undefined {
   const preferred = defaultAccount(state, family)?.id;
   const open = accountsOf(state, family).filter((account) => !exclude.has(account.id));
@@ -110,9 +214,10 @@ export function mostAvailable(
   const rank = (account: StoredAccount) => {
     const usage = usageOf(account.id);
     const score = headroomScore(usage, now);
+    const pace = pacing ? paceScore(usage, pacing.pendingOf(account.id), now) : undefined;
     return [
-      score >= 100 ? 2 : fiveHourGated(usage, now) ? 1 : 0,
-      score,
+      score >= 100 ? 2 : (pace ? pace.gated : fiveHourGated(usage, now)) ? 1 : 0,
+      pace ? pace.score : score,
       account.id === preferred ? 0 : 1,
       account.kind === "main" ? 0 : 1,
       Date.parse(account.createdAt) || 0,
@@ -217,6 +322,8 @@ export interface RouteInput {
    * open, not Paseo's helpers (see `takesNextPick` in service.ts). Only a new agent takes it.
    */
   allowNextPick?: boolean;
+  /** Agents recently placed on an account; only read while `balanceNewAgents` is on. */
+  pendingOf?(accountId: string): number;
 }
 
 export interface RouteDecision {
@@ -247,6 +354,9 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   if (accounts.length === 0) return null;
   const at = new Date(input.now).toISOString();
   const fresh = input.reason === "create";
+  const pacing: Pacing | undefined = input.balanceNewAgents
+    ? { pendingOf: (id) => input.pendingOf?.(id) ?? 0 }
+    : undefined;
 
   const binding = state.bindings[input.agentId];
   const bound = findAccount(state, binding?.accountId);
@@ -276,7 +386,7 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   }
   if (!account && fresh && input.balanceNewAgents && accounts.length > 1) {
     const nearReset = input.family === "codex" ? soonestWeeklyReset(state, input.family, input.usageOf, input.now) : undefined;
-    account = nearReset ?? mostAvailable(state, input.family, input.usageOf, input.now, new Set(), input.paidFallback);
+    account = nearReset ?? mostAvailable(state, input.family, input.usageOf, input.now, new Set(), input.paidFallback, pacing);
     // A banked reset is free, so it goes before a paid stand-in, as it does when a turn hits a limit.
     if (account && isLastResort(account) && input.autoRedeem) {
       account = withBankedReset(state, input.family, input.usageOf, input.now) ?? account;
@@ -305,7 +415,7 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
     let alternative =
       staying && staying.family === input.family && staying.id !== account.id && isUsable(staying, input.now) && keeps(staying)
         ? staying
-        : mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]), input.paidFallback);
+        : mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]), input.paidFallback, pacing);
     // Before a paid stand-in, a limited subscription with a usable banked reset: the account itself
     // (it stays, and its first turn spends the reset) or another one.
     if (alternative && isLastResort(alternative) && input.autoRedeem) {

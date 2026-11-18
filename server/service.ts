@@ -78,7 +78,7 @@ import { maskProxy, normalizeProxy } from "./proxy";
 import { Reopener, hostCanReload } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
-import { chooseAccount, isLastResort, isLimited, isUsable, mostAvailable, withBankedReset, type RouteDecision, type RouteInput } from "./routing";
+import { canStandIn, chooseAccount, fiveHourWindow, headroomScore, isLastResort, isLimited, isUsable, mostAvailable, paceScore, paceView, PENDING_MS, weeklyWindow, withBankedReset, type Pacing, type RouteDecision, type RouteInput } from "./routing";
 import {
   ALL_SOURCES,
   MAIN_ACCOUNT_ID,
@@ -142,6 +142,11 @@ const ALIGN_RETRY_MS = 30 * 60_000;
  */
 const TURN_SETTLE_MS = 60_000;
 /**
+ * An agent idle this long has no warm prompt cache on any account (Anthropic keeps one 5 minutes,
+ * or an hour), so moving it costs its next turn nothing extra. A pacing move only takes these.
+ */
+const CACHE_COLD_MS = 60 * 60_000;
+/**
  * How long an RPC that moves agents or spends a reset waits for that before answering, since Paseo
  * gives up on an RPC after 30 s. The work carries on, and timeline notes and the state say how it went.
  */
@@ -155,6 +160,7 @@ const USAGE_REPLY_MS = 15_000;
 const EGRESS_MS = 30 * 60_000;
 /** A home an agent was routed to this recently isn't moved yet: its session may only now be starting. */
 const ROUTED_SETTLE_MS = 30_000;
+const USAGE_HISTORY_SIZE = 12;
 
 const DEFAULT_PREFERENCES: Preferences = {
   autoSwitch: true,
@@ -212,6 +218,8 @@ interface AgentInfo {
   continuedFrom: string | null;
   /** When the user last sent it a message (ms), or 0. */
   lastMessageAt: number;
+  /** When Paseo last changed the agent (ms), or 0. */
+  updatedAt: number;
   /** Shells and monitors it left running after its turn (Paseo 0.16+; 0 before). A reload cancels them. */
   backgroundWork: number;
   /** Its metadata holds its own ID (see `AGENT_METADATA_KEY`). Null when Paseo sends no metadata (before 0.16). */
@@ -989,6 +997,44 @@ export class Service {
     });
   }
 
+  /** Agents placed on an account in the last `PENDING_MS`, which its latest usage reading may not show yet. */
+  private readonly placements: { accountId: string; at: number }[] = [];
+
+  private notePlacement(accountId: string, now: number): { accountId: string; at: number } {
+    const placement = { accountId, at: now };
+    this.placements.push(placement);
+    while (this.placements.length > 0 && this.placements[0]!.at <= now - PENDING_MS) this.placements.shift();
+    return placement;
+  }
+
+  private pendingOn(accountId: string, now: number): number {
+    return this.placements.filter((placement) => placement.accountId === accountId && placement.at > now - PENDING_MS).length;
+  }
+
+  private pacing(now: number): Pacing | undefined {
+    return this.prefs.balanceNewAgents ? { pendingOf: (id) => this.pendingOn(id, now) } : undefined;
+  }
+
+  /** The latest live readings per account, oldest first, for tuning the pacing constants from the log. */
+  private readonly usageHistory = new Map<string, { at: number; fiveHour: number | null; weekly: number | null }[]>();
+
+  private noteHistory(accountId: string, usage: Usage): void {
+    const list = this.usageHistory.get(accountId) ?? [];
+    list.push({ at: Date.parse(usage.fetchedAt) || Date.now(), fiveHour: fiveHourWindow(usage)?.usedPercent ?? null, weekly: weeklyWindow(usage)?.usedPercent ?? null });
+    while (list.length > USAGE_HISTORY_SIZE) list.shift();
+    this.usageHistory.set(accountId, list);
+  }
+
+  /** One log line per balanced placement: every candidate's pace scores and recent 5-hour readings. */
+  private logPlacement(state: StoredState, family: Family, agentId: string, chosen: StoredAccount, now: number, why: string): void {
+    const parts = accountsOf(state, family).filter((account) => canStandIn(account, now)).map((account) => {
+      const pace = paceScore(this.usage.get(account.id), this.pendingOn(account.id, now), now);
+      const seen = (this.usageHistory.get(account.id) ?? []).slice(-4).map((entry) => entry.fiveHour ?? "?").join("/") || "none";
+      return `${account.label} 5h ${pace.fiveHour.toFixed(1)} wk ${pace.weekly.toFixed(1)} score ${pace.score.toFixed(1)} gated ${pace.gated ? "yes" : "no"} pending ${this.pendingOn(account.id, now)} seen 5h ${seen}`;
+    });
+    console.log(`[ZeroSub] placed ${agentId} on ${chosen.label} (${why}): ${parts.join("; ")}`);
+  }
+
   /**
    * A session of a family that isn't available here runs on the CLI login, like any session ZeroSub
    * didn't route: so the account recorded for the session before goes, unless a session opened since
@@ -1047,9 +1093,15 @@ export class Service {
       current: request.reason === "create" ? undefined : this.standingIn(state, request.agentId, family, request.reason === "refresh"),
       requested: request.reason === "create" ? requestedAccount(request) : undefined,
       allowNextPick: takesNextPick(request),
+      pendingOf: (id) => this.pendingOn(id, now),
     };
     const first = chooseAccount(state, input);
     if (!first) return undefined;
+    if (first.bind?.source === "balance") this.logPlacement(state, family, request.agentId, first.account, now, "new agent");
+    // Recorded before any await, so concurrent creates see each other's placements, and moved below
+    // if the session opens elsewhere. Only the user's own agents count, not Paseo's helpers.
+    const placement =
+      takesNextPick(request) && (request.reason === "create" || first.skipped) ? this.notePlacement(first.account.id, now) : undefined;
     let decision = first;
     const prepare = async (account: StoredAccount) => {
       // Taken before anything else waits, so a move of this home that hasn't finished gives way (see
@@ -1089,6 +1141,7 @@ export class Service {
       });
     }
     const { account } = decision;
+    if (placement) placement.accountId = account.id;
     if (account.id !== first.account.id) await prepare(account);
     if (decision.nextPick && Date.parse(decision.nextPick.until) > now) {
       console.log(`[ZeroSub] next-agent pick ${decision.bind?.source === "user" ? "used" : "dropped, as its account can't take agents now"}: ${request.agentId}`);
@@ -1482,7 +1535,7 @@ export class Service {
     const move = adapter.portable ? this.nextAccount(latest, agentId, family, account.id) : null;
     // Another subscription account comes first, then a banked reset (free), and a paid Azure account
     // (with `paidApiFallback` on) only once neither is to be had.
-    let next = adapter.portable ? move?.account : mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]));
+    let next = adapter.portable ? move?.account : mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]), false, this.pacing(now));
     if (!next) {
       if (problem.kind === "limit" && problem.hit.kind === "window" && this.prefs.autoRedeem && !account.disabled && account.auth !== "api") {
         // Opt-in: every subscription account is out, so spend a banked reset rather than stop (or pay).
@@ -1559,6 +1612,8 @@ export class Service {
 
     if (adapter.portable) {
       if (move?.pin) await this.pin(agentId, next.id, latest.bindings[agentId]);
+      // Only a Claude agent moves here. A ChatGPT hand-off's new agent counts itself as it opens.
+      this.notePlacement(next.id, now);
       this.switchGuard.note(agentId, now);
       const result = await this.reopenAgent(paseo, agentId, { settle: true });
       const continued = result.outcome === "reopened" && this.prefs.autoContinue && (await this.untouchedSince(paseo, agentId, endedAt));
@@ -1874,7 +1929,8 @@ export class Service {
   private nextAccount(state: StoredState, agentId: string, family: Family, exhausted: string): { account: StoredAccount; pin: boolean } | undefined {
     const routed = this.routeFor(state, agentId, family, exhausted);
     if (routed && routed.account.id !== exhausted && !routed.skipped) return { account: routed.account, pin: false };
-    const roomiest = mostAvailable(state, family, (id) => this.usage.get(id), Date.now(), new Set([exhausted]), this.prefs.paidApiFallback);
+    const now = Date.now();
+    const roomiest = mostAvailable(state, family, (id) => this.usage.get(id), now, new Set([exhausted]), this.prefs.paidApiFallback, this.pacing(now));
     return roomiest && { account: roomiest, pin: true };
   }
 
@@ -1885,18 +1941,22 @@ export class Service {
     });
   }
 
-  /** Idle agents still on an exhausted account would fail on their next turn; move them now. */
+  /**
+   * Idle agents still on an exhausted account would fail on their next turn; move them now.
+   * With `pacing`, the account still works but is projected past the 5-hour gate. Only agents whose
+   * prompt cache is cold move, and only to an account that stays under the gate with them.
+   */
   private async moveIdleAgentsOff(
     paseo: PaseoApi,
     accountId: string,
     family: Family,
     except: string,
-    reason: "limit" | "signed_out",
+    reason: "limit" | "signed_out" | "pacing",
   ): Promise<void> {
     const state = await this.store.read();
     const from = findAccount(state, accountId);
     // One a reset refilled just before this turn's limit came in still has room (see `failover`).
-    if (!from || isUsable(from, Date.now())) return;
+    if (!from || (reason === "pacing" ? !this.paced(from, Date.now()) : isUsable(from, Date.now()))) return;
     const families = await this.families.resolve(paseo);
     const candidates = (await this.cachedAgents(paseo))
       .filter(
@@ -1904,14 +1964,22 @@ export class Service {
           agent.id !== except &&
           !agent.archived &&
           families[agent.provider] === family &&
-          this.runningOn(state, agent.id, family) === accountId,
+          this.runningOn(state, agent.id, family) === accountId &&
+          !(reason === "pacing" && state.bindings[agent.id]?.source === "user"),
       )
       .map((agent) => agent.id);
     for (const agentId of candidates) {
       if (!this.switchGuard.allows(agentId, Date.now())) continue;
       const info = await agentInfo(paseo, agentId);
       // One the user is using right now is left for alignment to move once it's quiet.
-      if (!info || info.archived || !settled(info.status) || busy(info) || hasBackgroundWork(info) || this.recentlyActive(info, Date.now())) continue;
+      if (
+        !info ||
+        info.archived ||
+        !settled(info.status) ||
+        busy(info) ||
+        hasBackgroundWork(info) ||
+        (reason === "pacing" ? !this.cacheCold(info, Date.now()) : this.recentlyActive(info, Date.now()))
+      ) continue;
       // Left for its own failover, or alone when that can't be told.
       if ((await this.lastTurnHitLimit(paseo, agentId, family)) !== false) continue;
       const release = this.tryClaim(agentId);
@@ -1920,9 +1988,24 @@ export class Service {
         const now = Date.now();
         const latest = await this.store.read();
         if (this.runningOn(latest, agentId, family) !== accountId) continue;
-        const move = this.nextAccount(latest, agentId, family, accountId);
+        // The user may have picked its account since the pass listed it.
+        if (reason === "pacing" && latest.bindings[agentId]?.source === "user") continue;
+        let move: { account: StoredAccount; pin: boolean } | undefined;
+        if (reason === "pacing") {
+          // Turning either preference off stops a pass that's already running.
+          if (!this.prefs.balanceNewAgents || !this.prefs.autoSwitch || !this.paced(findAccount(latest, accountId), now)) return;
+          const next = mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([accountId]), false, this.pacing(now));
+          // Only to an account with room in both windows that stays under the gate with this agent.
+          if (!next || headroomScore(this.usage.get(next.id), now) >= 100) return;
+          if (paceScore(this.usage.get(next.id), this.pendingOn(next.id, now) + 1, now).gated) return;
+          move = { account: next, pin: true };
+          this.logPlacement(latest, family, agentId, next, now, "pacing move");
+        } else {
+          move = this.nextAccount(latest, agentId, family, accountId);
+        }
         if (!move) return;
         const next = move.account;
+        this.notePlacement(next.id, now);
         if (move.pin) await this.pin(agentId, next.id, latest.bindings[agentId]);
         this.switchGuard.note(agentId, now);
         const row: SwitchRow = {
@@ -1930,7 +2013,7 @@ export class Service {
           from: from?.label ?? null,
           to: next.label,
           reason,
-          resetsAt: findAccount(latest, accountId)?.limitedUntil ?? null,
+          resetsAt: reason === "pacing" ? null : (findAccount(latest, accountId)?.limitedUntil ?? null),
           continued: false,
           continuedIn: null,
           toFamily: null,
@@ -1998,7 +2081,7 @@ export class Service {
       : false;
     if (!provider || !available) return { skipped: `${name} isn't available in Paseo on this host.` };
     const now = Date.now();
-    let account = mostAvailable(state, other, (id) => this.usage.get(id), now, new Set(), this.prefs.paidApiFallback);
+    let account = mostAvailable(state, other, (id) => this.usage.get(id), now, new Set(), this.prefs.paidApiFallback, this.pacing(now));
     // A fork is a new agent that can't change accounts later, so a free banked reset goes before a paid stand-in here too.
     if (account && isLastResort(account) && this.prefs.autoRedeem) {
       account = withBankedReset(state, other, (id) => this.usage.get(id), now) ?? account;
@@ -2897,19 +2980,45 @@ export class Service {
    * `current` is the account its session runs on, which it keeps while that can stand in.
    */
   private routeFor(state: StoredState, agentId: string, family: Family, current?: string): RouteDecision | null {
+    const now = Date.now();
     return chooseAccount(state, {
       agentId,
       family,
       reason: "refresh",
-      now: Date.now(),
+      now,
       autoSwitch: this.prefs.autoSwitch,
-      balanceNewAgents: false,
+      balanceNewAgents: this.prefs.balanceNewAgents,
       paidFallback: this.prefs.paidApiFallback,
       autoRedeem: this.prefs.autoRedeem,
       portable: this.adapters[family].portable,
       usageOf: (id) => this.usage.get(id),
       current,
+      pendingOf: (id) => this.pendingOn(id, now),
     });
+  }
+
+  /** While spreading is on: per family, the account a new agent naming none would start on. */
+  private pacedNextAccounts(state: StoredState, now: number): Record<string, string> | undefined {
+    if (!this.prefs.balanceNewAgents) return undefined;
+    const next: Record<string, string> = {};
+    for (const family of FAMILIES) {
+      if (accountsOf(state, family).length < 2) continue;
+      const decision = chooseAccount(state, {
+        agentId: "",
+        family,
+        reason: "create",
+        now,
+        autoSwitch: this.prefs.autoSwitch,
+        balanceNewAgents: true,
+        paidFallback: this.prefs.paidApiFallback,
+        autoRedeem: this.prefs.autoRedeem,
+        portable: this.adapters[family].portable,
+        usageOf: (id) => this.usage.get(id),
+        pendingOf: (id) => this.pendingOn(id, now),
+      });
+      if (decision?.bind?.source === "balance") next[family] = decision.account.id;
+    }
+    return next;
   }
 
   /**
@@ -2930,6 +3039,38 @@ export class Service {
   /** The user was using the agent a moment ago: a turn started or ended, or they sent a message. */
   private recentlyActive(agent: AgentInfo, now: number): boolean {
     return now - Math.max(this.turnAt.get(agent.id) ?? 0, agent.lastMessageAt) < TURN_SETTLE_MS;
+  }
+
+  /** Nothing touched the agent for `CACHE_COLD_MS`: no turn, message or other change. */
+  private cacheCold(agent: AgentInfo, now: number): boolean {
+    return now - Math.max(this.turnAt.get(agent.id) ?? 0, agent.lastMessageAt, agent.updatedAt) >= CACHE_COLD_MS;
+  }
+
+  /** The account can still take agents but is projected past the 5-hour gate. */
+  private paced(account: StoredAccount | undefined, now: number): account is StoredAccount {
+    return !!account && canStandIn(account, now) &&
+      paceScore(this.usage.get(account.id), this.pendingOn(account.id, now), now).gated;
+  }
+
+  /** Accounts a pacing pass is moving agents off now. */
+  private readonly relieving = new Set<string>();
+
+  /**
+   * After a live reading: with spreading and automatic switching on, moves cold idle agents off a
+   * portable account projected past the 5-hour gate (see `moveIdleAgentsOff`).
+   */
+  private relieveIfPaced(accountId: string): void {
+    const paseo = this.paseo;
+    if (!paseo || !this.prefs.balanceNewAgents || !this.prefs.autoSwitch || this.relieving.has(accountId)) return;
+    this.relieving.add(accountId);
+    void (async () => {
+      const state = await this.store.read();
+      const from = findAccount(state, accountId);
+      if (!this.paced(from, Date.now()) || !this.adapters[from.family].portable) return;
+      await this.moveIdleAgentsOff(paseo, accountId, from.family, "", "pacing");
+    })()
+      .catch((error: unknown) => log("moving idle agents off a busy account failed", error))
+      .finally(() => this.relieving.delete(accountId));
   }
 
   /**
@@ -3302,6 +3443,7 @@ export class Service {
         return;
       }
       this.usageLive.add(accountId);
+      this.noteHistory(accountId, usage);
       const now = Date.now();
       // With "Use ChatGPT credits when a limit is reached" on, credits keep an account going past a
       // full window, so a full window alone isn't a limit then.
@@ -3334,6 +3476,7 @@ export class Service {
           target.limitKind = null;
         });
       }
+      this.relieveIfPaced(accountId);
     })().finally(() => this.usageInFlight.delete(accountId));
     this.usageInFlight.set(accountId, task);
     return task;
@@ -3448,6 +3591,10 @@ export class Service {
       const note = this.moveNotes.get(account.id);
       return { to: shownPath(move?.to ?? homesNow(account.family === "pi" ? "pi" : "claude")), waiting: note?.waiting ?? null, error: note?.error ?? null };
     };
+    // Pacing only chooses between two or more accounts that can take agents by themselves.
+    const pacedFamilies = new Set(
+      FAMILIES.filter((family) => state.accounts.filter((other) => other.family === family && canStandIn(other, now)).length > 1),
+    );
     const accounts: AccountView[] = state.accounts.map((account) => {
       const limited = isLimited(account, now);
       const proxy = proxies.get(account.id);
@@ -3480,6 +3627,9 @@ export class Service {
         egress: this.egress.get(account.id) ?? null,
         externalHome: external.has(account.id),
         moving: moving(account),
+        pace: this.prefs.balanceNewAgents && pacedFamilies.has(account.family) && canStandIn(account, now)
+          ? paceView(this.usage.get(account.id), this.pendingOn(account.id, now), now)
+          : null,
         azure: azures.get(account.id) ?? null,
       };
     });
@@ -3495,6 +3645,7 @@ export class Service {
       openCodeAvailable: await this.openCodeAvailable(paseo),
       autoSwitch: this.prefs.autoSwitch,
       balanceNewAgents: this.prefs.balanceNewAgents,
+      pacedNext: this.pacedNextAccounts(state, now),
       agentMetadata: takesAgentMetadata(paseo),
       paidApiFallback: this.prefs.paidApiFallback,
       warnings: await this.warnings(),
@@ -5117,6 +5268,7 @@ function toAgentInfo(agent: AgentSnapshot): AgentInfo {
     title: agent.title ?? null,
     continuedFrom: agent.labels?.[CONTINUED_FROM_LABEL] ?? null,
     lastMessageAt: Date.parse(agent.lastUserMessageAt ?? "") || 0,
+    updatedAt: Date.parse(agent.updatedAt) || 0,
     backgroundWork: (agent as { backgroundWork?: { count?: number } }).backgroundWork?.count ?? 0,
     named: metadata ? metadata[AGENT_METADATA_KEY] === agent.id : null,
   };

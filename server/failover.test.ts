@@ -11,7 +11,9 @@ import type { SwitchGuard } from "./switch-guard";
 import { Service } from "./service";
 import { MAIN_ACCOUNT_ID, StateStore, type OpenCodeFork, type StoredAccount, type StoredState } from "./state";
 import { buildTranscript, continuationPrompt } from "./handoff";
+import { paceScore } from "./routing";
 import { saveReadings } from "./usage";
+import type { Usage } from "../shared/model";
 import { preferences } from "../shared/preferences";
 import { absentPi } from "./fakes.test-support";
 
@@ -192,6 +194,12 @@ async function redeemNow(service: Service, paseo: unknown, accountId: string, ag
 }
 
 const inFuture = () => new Date(Date.now() + 30 * 60_000).toISOString();
+/** Agents placed on an account in the last 10 minutes, as pacing counts them. */
+const pendingOn = (service: Service, accountId: string) =>
+  (service as unknown as { pendingOn(id: string, now: number): number }).pendingOn(accountId, Date.now());
+/** Records an agent just placed on an account. */
+const placed = (service: Service, accountId: string) =>
+  (service as unknown as { notePlacement(id: string, now: number): void }).notePlacement(accountId, Date.now());
 const inPast = () => new Date(Date.now() - 60_000).toISOString();
 
 const TWIN = "claude-twin";
@@ -988,7 +996,7 @@ describe("forking to the other provider", () => {
         { agent: { id: AGENT, provider: "claude" }, turnId: "t", outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never,
         context,
       );
-    return { service, store, created, notes, limitTurn, paseo: paseo as never, sends, timelines, addTurn, gap, byId, agents, hooks, setSourceEpoch: (epoch: string) => { sourceEpoch = epoch; }, timelineReads };
+    return { service, store, created, notes, limitTurn, paseo: paseo as never, context, sends, timelines, addTurn, gap, byId, agents, hooks, setSourceEpoch: (epoch: string) => { sourceEpoch = epoch; }, timelineReads };
   }
 
   it("carries the work on with the other provider, at the same permission level", async () => {
@@ -1046,6 +1054,17 @@ describe("forking to the other provider", () => {
     await limitTurn();
     expect(created).toHaveLength(1);
     expect(notes.at(-1)).toMatchObject({ outcome: "continued", continuedIn: { agentId: created[0]?.agentId } });
+  });
+
+  it("records one pending placement for a fork with balancing on, as the fork opens", async () => {
+    const { service, created, limitTurn, context } = await setUpFork("bypassPermissions", [], {}, [], { prefs: { balanceNewAgents: true } });
+    await limitTurn();
+    expect(pendingOn(service, CODEX_MAIN)).toBe(0);
+    await service.onSessionOpen(
+      { agentId: created[0]!.agentId, provider: "codex", reason: "create", purpose: "interactive", workspaceId: "ws-1", env: {} } as never,
+      context,
+    );
+    expect(pendingOn(service, CODEX_MAIN)).toBe(1);
   });
 
   it("won't fork into a mode more permissive than the original's", async () => {
@@ -2919,30 +2938,36 @@ describe("changing the default account", () => {
   /** Several agents, each answering for itself. `reopened` lists the ones Paseo was asked to reload. */
   async function setUpAgents(
     state: Partial<StoredState>,
-    listed: Array<{ id: string; status: string; provider?: string; archived?: boolean; backgroundWork?: number }>,
-    options: { claude?: Partial<FamilyAdapter>; onList?: (service: Service, context: never) => void } = {},
+    listed: Array<{ id: string; status: string; provider?: string; archived?: boolean; backgroundWork?: number; updatedAt?: string }>,
+    options: { claude?: Partial<FamilyAdapter>; codex?: Partial<FamilyAdapter>; onList?: (service: Service, context: never) => void | Promise<void> } = {},
   ) {
     const store = new StateStore(join(root, "state.json"));
     await store.update((draft) => Object.assign(draft, state));
-    const agents = listed.map(({ id, status, provider, archived, backgroundWork }) => ({
+    const agents = listed.map(({ id, status, provider, archived, backgroundWork, updatedAt }) => ({
       id,
       provider: provider ?? "claude",
       status,
       archivedAt: archived ? "2026-09-23T08:00:00.000Z" : null,
       lastUserMessageAt: openedAt,
+      updatedAt,
       backgroundWork: { count: backgroundWork ?? 0 },
     }));
+    /** The timeline notes ZeroSub added, by agent. */
+    const notes: Array<{ agentId: string; data: { reason: string } }> = [];
     const paseo = {
       config: { get: async () => ({ config: { providers: {} } }) },
       agents: {
         list: async () => {
-          options.onList?.(service, context);
+          await options.onList?.(service, context);
           return { entries: agents.map((agent) => ({ agent })), pageInfo: { hasMore: false, nextCursor: null } };
         },
         ref: (id: string) => ({
           refresh: async () => ({ agent: agents.find((agent) => agent.id === id) }),
           send: async () => undefined,
-          timeline: { append: async () => undefined, refetch: async () => ({ entries: [] }) },
+          timeline: {
+            append: async (item: { data: { reason: string } }) => void notes.push({ agentId: id, data: item.data }),
+            refetch: async () => ({ entries: [] }),
+          },
         }),
       },
     };
@@ -2950,7 +2975,7 @@ describe("changing the default account", () => {
     const reopened: string[] = [];
     const hit = (): LimitHit => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your session limit" });
     const service: Service = new Service(
-      { claude: { ...claudeAdapter(hit), ...options.claude }, codex: { ...claudeAdapter(hit), family: "codex", portable: false } as FamilyAdapter, pi: absentPi() },
+      { claude: { ...claudeAdapter(hit), ...options.claude }, codex: { ...claudeAdapter(hit), family: "codex", portable: false, ...options.codex } as FamilyAdapter, pi: absentPi() },
       store,
       { resolve: async () => ({ claude: "claude" as const, codex: "codex" as const }) } as unknown as FamilyResolver,
       {
@@ -2965,8 +2990,163 @@ describe("changing the default account", () => {
     );
     services.push(service);
     service.setPreferences(KEEP);
-    return { service, store, paseo: paseo as never, context, reopened, agents };
+    return { service, store, paseo: paseo as never, context, reopened, agents, notes };
   }
+
+  describe("moving idle agents off a busy account", () => {
+    const ago = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
+    const reading = (percent: number): UsageRead => ({
+      fetchedAt: new Date().toISOString(),
+      windows: [
+        { id: "five_hour", label: "5-hour", usedPercent: percent, resetsAt: new Date(Date.now() + 3 * 60 * 60_000).toISOString(), minutes: 300 },
+        { id: "seven_day", label: "Weekly", usedPercent: 10, resetsAt: new Date(Date.now() + 3 * 24 * 60 * 60_000).toISOString(), minutes: 10_080 },
+      ],
+      error: null,
+      cached: false,
+      resets: null,
+    });
+
+    /** `work` (the CLI login) reads 60% two hours into its window, so it's projected past the gate. */
+    async function setUpBusy(
+      agentId: string,
+      updatedAt: string,
+      options: {
+        personal?: number;
+        prefs?: Record<string, unknown>;
+        bindings?: StoredState["bindings"];
+        onList?: (service: Service) => void | Promise<void>;
+        /** More agents on `work`, idle as long as `agentId`. */
+        others?: string[];
+        /** Agents just placed on `personal`, which its reading doesn't show yet. */
+        pending?: number;
+      } = {},
+    ) {
+      const ids = [agentId, ...(options.others ?? [])];
+      const setup = await setUpAgents(
+        {
+          accounts: [account(MAIN, "work", "main"), account(HELLO, "personal", "managed")] as never,
+          defaults: { claude: MAIN, codex: null, pi: null },
+          sessions: Object.fromEntries(ids.map((id) => [id, session(MAIN)])),
+          bindings: options.bindings ?? {},
+        },
+        ids.map((id) => ({ id, status: "idle", updatedAt })),
+        {
+          claude: { usage: async (home: string | null) => (home ? reading(options.personal ?? 20) : reading(60)) } as Partial<FamilyAdapter>,
+          onList: options.onList,
+        },
+      );
+      setup.service.setPreferences(
+        preferences.schema.parse({ autoSwitch: true, balanceNewAgents: true, autoContinue: false, ...options.prefs }),
+      );
+      for (let n = 0; n < (options.pending ?? 0); n += 1) placed(setup.service, HELLO);
+      await setup.service.view(setup.paseo, true);
+      // The pass runs after the readings land; wait until it's done.
+      await vi.waitFor(() => expect((setup.service as unknown as { relieving: Set<string> }).relieving.size).toBe(0));
+      return setup;
+    }
+
+    it("moves an agent idle for an hour off it", async () => {
+      const { store, reopened, notes } = await setUpBusy("fix-build", ago(120));
+      expect(reopened).toEqual(["fix-build"]);
+      const state = await store.read();
+      expect(state.bindings["fix-build"]).toMatchObject({ accountId: HELLO, source: "auto" });
+      expect(state.sessions["fix-build"]?.accountId).toBe(HELLO);
+      expect(notes).toContainEqual({ agentId: "fix-build", data: expect.objectContaining({ reason: "pacing", from: "work", to: "personal" }) });
+    });
+
+    it("leaves an agent used in the last hour", async () => {
+      const { reopened } = await setUpBusy("review-pr", ago(10));
+      expect(reopened).toEqual([]);
+    });
+
+    it("leaves an agent the user put there", async () => {
+      const { store, reopened } = await setUpBusy("fix-build", ago(120), {
+        bindings: { "fix-build": { accountId: MAIN, source: "user", at: openedAt } },
+      });
+      expect(reopened).toEqual([]);
+      expect((await store.read()).bindings["fix-build"]).toMatchObject({ accountId: MAIN, source: "user" });
+    });
+
+    it("moves nothing with automatic switching off", async () => {
+      const { reopened } = await setUpBusy("fix-build", ago(120), { prefs: { autoSwitch: false } });
+      expect(reopened).toEqual([]);
+    });
+
+    it("moves nothing to an account that pending placements alone push past the gate", async () => {
+      // `personal` reads 20% two hours in: projected 30%, and 70% with four agents just placed there.
+      const { reopened } = await setUpBusy("fix-build", ago(120), { pending: 4 });
+      expect(reopened).toEqual([]);
+    });
+
+    it("stops moving agents once the account they go to would reach the gate", async () => {
+      const others = ["agent-2", "agent-3", "agent-4", "agent-5", "agent-6"];
+      const { service, reopened } = await setUpBusy("fix-build", ago(120), { others });
+      expect(reopened.length).toBeGreaterThan(0);
+      expect(reopened.length).toBeLessThan(others.length + 1);
+      const usage = (service as unknown as { usage: Map<string, Usage> }).usage.get(HELLO);
+      const pending = pendingOn(service, HELLO);
+      expect(pending).toBe(reopened.length);
+      expect(paceScore(usage, pending, Date.now()).gated).toBe(false);
+      expect(paceScore(usage, pending + 1, Date.now()).gated).toBe(true);
+    });
+
+    it("leaves an agent the user puts on the account during the pass", async () => {
+      const relieving = (service: Service) => (service as unknown as { relieving: Set<string> }).relieving;
+      const { store, reopened } = await setUpBusy("fix-build", ago(120), {
+        // The pass reads the bindings before it lists agents, so this pick lands after that read.
+        onList: async (service) => {
+          if (relieving(service).size === 0) return;
+          await (service as unknown as { store: StateStore }).store.update((draft) => {
+            draft.bindings["fix-build"] = { accountId: MAIN, source: "user", at: openedAt };
+          });
+        },
+      });
+      expect(reopened).toEqual([]);
+      expect((await store.read()).bindings["fix-build"]).toMatchObject({ accountId: MAIN, source: "user" });
+    });
+
+    it("moves nothing with spreading off", async () => {
+      const { reopened } = await setUpBusy("fix-build", ago(120), { prefs: { balanceNewAgents: false } });
+      expect(reopened).toEqual([]);
+    });
+
+    it("stops when spreading is turned off during the pass", async () => {
+      const relieving = (service: Service) => (service as unknown as { relieving: Set<string> }).relieving;
+      const { reopened } = await setUpBusy("fix-build", ago(120), {
+        // The pass lists agents after its own preference check, so this turns spreading off mid-pass.
+        onList: (service) => {
+          if (relieving(service).size > 0) service.setPreferences(preferences.schema.parse({ autoSwitch: true, balanceNewAgents: false }));
+        },
+      });
+      expect(reopened).toEqual([]);
+    });
+
+    it("leaves ChatGPT agents on a busy ChatGPT account", async () => {
+      const CODEX_OTHER = "codex-other";
+      const { service, store, paseo, reopened } = await setUpAgents(
+        {
+          accounts: [
+            { ...account(CODEX_MAIN, "work", "main"), family: "codex" },
+            { ...account(CODEX_OTHER, "personal", "managed"), family: "codex" },
+          ] as never,
+          defaults: { claude: null, codex: CODEX_MAIN, pi: null },
+          sessions: { "fix-build": { accountId: CODEX_MAIN, family: "codex" as const, openedAt } },
+        },
+        [{ id: "fix-build", status: "idle", provider: "codex", updatedAt: ago(120) }],
+        { codex: { usage: async (home: string | null) => (home ? reading(20) : reading(60)) } as Partial<FamilyAdapter> },
+      );
+      service.setPreferences(preferences.schema.parse({ autoSwitch: true, balanceNewAgents: true, autoContinue: false }));
+      await service.view(paseo, true);
+      await vi.waitFor(() => expect((service as unknown as { relieving: Set<string> }).relieving.size).toBe(0));
+      expect(reopened).toEqual([]);
+      expect((await store.read()).bindings["fix-build"]).toBeUndefined();
+    });
+
+    it("moves nothing when the other account would pass the gate too", async () => {
+      const { reopened } = await setUpBusy("fix-build", ago(120), { personal: 75 });
+      expect(reopened).toEqual([]);
+    });
+  });
 
   it("moves an agent whose last turn failed off an account it can't work on", async () => {
     const { service, store, paseo, reopened } = await setUpAgents(
@@ -4395,6 +4575,90 @@ describe("the account button's reason row", () => {
     });
     expect((await route())?.accountId).toBe(MAIN);
     expect((await route())?.selectionReason).toBeUndefined();
+  });
+});
+
+describe("pending placements", () => {
+  it("records none for Paseo's helper sessions, which open in no workspace", async () => {
+    const { service, paseo } = await setUp(
+      {
+        accounts: [account(MAIN, "work", "main"), account(HELLO, "personal", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+      },
+      () => {
+        throw new Error("unused");
+      },
+    );
+    service.setPreferences(preferences.schema.parse({ balanceNewAgents: true }));
+    const open = (agentId: string, extra: Record<string, unknown>) =>
+      service.onSessionOpen({ agentId, provider: "claude", reason: "create", purpose: "interactive", env: {}, ...extra } as never, { paseo } as never);
+    await open("commit-message", {});
+    await open("hidden-helper", { workspaceId: "ws-1", background: true });
+    expect(pendingOn(service, MAIN) + pendingOn(service, HELLO)).toBe(0);
+    await open("new-agent", { workspaceId: "ws-1" });
+    expect(pendingOn(service, MAIN) + pendingOn(service, HELLO)).toBe(1);
+  });
+
+  it("spreads concurrent new agents by pending placements", async () => {
+    const { service, store, paseo } = await setUp(
+      {
+        accounts: [account(MAIN, "work", "main"), account(HELLO, "personal", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+      },
+      () => {
+        throw new Error("unused");
+      },
+    );
+    service.setPreferences(preferences.schema.parse({ balanceNewAgents: true }));
+    const context = { paseo } as never;
+    const create = (agentId: string) =>
+      service.onSessionOpen({ agentId, provider: "claude", reason: "create", purpose: "interactive", workspaceId: "ws-1", env: {} } as never, context);
+    await Promise.all([create("new-a"), create("new-b")]);
+    const { sessions } = await store.read();
+    expect(new Set([sessions["new-a"]?.accountId, sessions["new-b"]?.accountId])).toEqual(new Set([MAIN, HELLO]));
+  });
+
+  it("view names the pacedNext account", async () => {
+    const { service, paseo } = await setUp(
+      {
+        accounts: [account(MAIN, "work", "main"), account(HELLO, "personal", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+      },
+      () => {
+        throw new Error("unused");
+      },
+    );
+    expect((await service.view(paseo as never)).pacedNext).toBeUndefined();
+    service.setPreferences(preferences.schema.parse({ balanceNewAgents: true }));
+    await service.onSessionOpen({ agentId: "new-a", provider: "claude", reason: "create", purpose: "interactive", workspaceId: "ws-1", env: {} } as never, { paseo } as never);
+    const placed = (await service.view(paseo as never)).accounts.find((a) => a.pace && a.pace.pending > 0)?.id;
+    expect(placed).toBeDefined();
+    expect((await service.view(paseo as never)).pacedNext?.claude).toBe(placed === MAIN ? HELLO : MAIN);
+  });
+
+  it("logs pace scores for a balanced new agent", async () => {
+    const { service, paseo } = await setUp(
+      {
+        accounts: [account(MAIN, "work", "main"), account(HELLO, "personal", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+      },
+      () => {
+        throw new Error("unused");
+      },
+    );
+    service.setPreferences(preferences.schema.parse({ balanceNewAgents: true }));
+    const logged = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      await service.onSessionOpen(
+        { agentId: "agent-new", provider: "claude", reason: "create", purpose: "interactive", workspaceId: "ws-1", env: {} } as never,
+        { paseo } as never,
+      );
+      expect(logged.mock.calls.map((call) => String(call[0]))).toContainEqual(
+        expect.stringMatching(/\[ZeroSub\] placed agent-new on .*5h .* wk .* score .* gated (yes|no) pending \d+ seen 5h/),
+      );
+    } finally {
+      logged.mockRestore();
+    }
   });
 });
 

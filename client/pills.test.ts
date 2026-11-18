@@ -36,6 +36,7 @@ function account(id: string, isDefault: boolean, overrides: Partial<AccountView>
     egress: null,
     externalHome: false,
     moving: null,
+    pace: null,
     azure: null,
     ...overrides,
   };
@@ -173,6 +174,14 @@ describe("the account button, where the composer has the Account control and the
 });
 
 describe("the account button", () => {
+  it("shows pacing in each account's title while spreading, and today's text without it", async () => {
+    const pace = { fiveHourUsed: 61, fiveHourProjected: 78, pendingFiveHour: 0, weeklyUsed: 30, pendingWeekly: 0, weekElapsed: 50, pending: 0, gated: true };
+    const items = await menu({ movable: true }, "codex", [account("work", true, { pace }), account("home", false)]);
+    const titles = items.flatMap((entry) => (entry.kind === "item" ? [entry.title] : []));
+    expect(titles[0]).toBe("work — held back: busy hour");
+    expect(titles[1]).toBe("home");
+  });
+
   it("says when an agent started on its account because the weekly reset was near", async () => {
     expect(await menu({ selectionReason: "weekly_reset" })).toContainEqual(
       expect.objectContaining({ id: "selection-reason", title: "Started here: weekly reset was near", disabled: true }),

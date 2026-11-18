@@ -159,6 +159,14 @@ function stored(id: string, label: string, kind: "main" | "managed", fields: Par
   return { id, family: "claude", label, kind, home: kind === "main" ? null : join(tmpdir(), id), createdAt: "2026-09-23T00:00:00.000Z", ...fields };
 }
 
+const reading = (usedPercent: number): UsageRead => ({
+  fetchedAt: new Date().toISOString(),
+  windows: [{ id: "five_hour", label: "5-hour", usedPercent, resetsAt: null }],
+  error: null,
+  cached: false,
+  resets: null,
+});
+
 const accounts = () => [stored(MAIN, "marketing", "main"), stored(HELLO, "hello", "managed")] as never;
 const inFuture = () => new Date(Date.now() + 30 * 60_000).toISOString();
 
@@ -256,13 +264,6 @@ describe("the next new agent pick, as sessions open", () => {
       ["removed", null],
     ];
     // The default is busy and another account has more room, so routing as usual and standing in differ.
-    const reading = (usedPercent: number): UsageRead => ({
-      fetchedAt: new Date().toISOString(),
-      windows: [{ id: "five_hour", label: "5-hour", usedPercent, resetsAt: null }],
-      error: null,
-      cached: false,
-      resets: null,
-    });
     for (const balanceNewAgents of [false, true]) {
       for (const [why, hello] of cases) {
         const label = `${why}${balanceNewAgents ? ", spreading" : ""}`;
@@ -445,5 +446,35 @@ describe("the next new agent pick, as sessions open", () => {
     await service.setNextAgent(HELLO, true);
     expect(await open("after")).toBe(HELLO);
     expect(JSON.parse(await readFile(path, "utf8")).nextAgent).toEqual({ claude: null, codex: null, pi: null });
+  });
+});
+
+describe("pacing on account cards", () => {
+  const spread = async (hello: Partial<StoredAccount> = {}, balanceNewAgents = true) => {
+    const { service, paseo, open } = setUp(
+      await storeWith({
+        accounts: [stored(MAIN, "work", "main"), stored(HELLO, "personal", "managed", hello)] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+      }),
+      { usage: (home) => reading(home === null ? 70 : 10) },
+    );
+    service.setPreferences({ ...preferences.schema.parse({}), balanceNewAgents });
+    await Promise.all([service.refreshUsage(MAIN, true), service.refreshUsage(HELLO, true)]);
+    await open("first");
+    return Object.fromEntries((await service.view(paseo)).accounts.map((account) => [account.id, account.pace]));
+  };
+
+  it("shows how pacing reads each account, counting the agent just placed", async () => {
+    const paces = await spread();
+    expect(paces[HELLO]).toMatchObject({ fiveHourUsed: 10, fiveHourProjected: 20, pending: 1, gated: false });
+    expect(paces[MAIN]).toMatchObject({ fiveHourUsed: 70, pending: 0 });
+  });
+
+  it("shows nothing with spreading off", async () => {
+    expect(await spread({}, false)).toEqual({ [MAIN]: null, [HELLO]: null });
+  });
+
+  it("shows nothing when only one account can stand in", async () => {
+    expect((await spread({ disabled: true }))[MAIN]).toBeNull();
   });
 });
