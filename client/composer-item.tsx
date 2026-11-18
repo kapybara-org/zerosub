@@ -2,7 +2,7 @@ import type { PluginClientContext } from "@getpaseo/plugin/client";
 import * as paseoClient from "@getpaseo/plugin/client";
 import * as paseoUi from "@getpaseo/plugin/client/ui";
 import type { ComponentType } from "react";
-import { accountPeak, formatCredits, formatPercent, paceVerdict, pillText } from "../shared/format";
+import { accountPeak, formatCredits, formatPercent, isDisabled, paceVerdict, pillText } from "../shared/format";
 import { ACCOUNT_METADATA_KEY, AGENT_METADATA_KEY, HAND_OFF, type AccountView, type StateView } from "../shared/model";
 import { moveAgent, useStore, type ZeroSubStore } from "./store";
 
@@ -129,7 +129,7 @@ export function agentChoices(state: StateView, agentId: string): AccountChoices 
 
 /** As routing takes them: an account at its limit only with automatic switching off. */
 function takesAgents(state: StateView, account: AccountView): boolean {
-  return account.status !== "signed_out" && account.status !== "disabled" && !(state.autoSwitch && account.status === "limited");
+  return account.status !== "signed_out" && !isDisabled(account) && !(state.autoSwitch && account.status === "limited");
 }
 
 function detail(account: AccountView, next: boolean, lead?: string): string | undefined {

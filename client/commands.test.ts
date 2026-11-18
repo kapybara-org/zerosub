@@ -13,6 +13,7 @@ function account(status: AccountView["status"], nextAgentUntil: string | null): 
     plan: null,
     organization: null,
     status,
+    disabled: status === "disabled",
     isDefault: false,
     nextAgentUntil,
     limitedUntil: null,

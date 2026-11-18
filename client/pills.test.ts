@@ -18,6 +18,7 @@ function account(id: string, isDefault: boolean, overrides: Partial<AccountView>
     plan: null,
     organization: null,
     status: "ready",
+    disabled: false,
     isDefault,
     limitedUntil: null,
     usage: null,

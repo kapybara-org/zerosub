@@ -10,6 +10,7 @@ import {
   formatExtraUsage,
   formatPlan,
   formatResetIn,
+  isDisabled,
   moveProblem,
   peakUsage,
   pillText,
@@ -68,6 +69,7 @@ describe("account presentation", () => {
     plan: "max",
     organization: null,
     status: "ready",
+    disabled: false,
     isDefault: false,
     limitedUntil: null,
     usage: {
@@ -183,6 +185,17 @@ describe("move outcomes", () => {
     expect(moveProblem({ ...nothing, failed: [{ agentId: "a", error: "Timed out closing previous session during refresh" }] }, "work")).toBe(
       "Couldn't reload this agent onto work (Timed out closing previous session during refresh), so it moves when its session next starts.",
     );
+  });
+});
+
+describe("account state for the app", () => {
+  const base = { status: "ready" as const, disabled: false, auth: "subscription" as const };
+
+  it("knows an account is disabled even when it's signed out too", () => {
+    expect(isDisabled(base)).toBe(false);
+    expect(isDisabled({ ...base, status: "signed_out", disabled: true })).toBe(true);
+    // Older servers only said so through the status.
+    expect(isDisabled({ ...base, status: "disabled", disabled: false })).toBe(true);
   });
 });
 

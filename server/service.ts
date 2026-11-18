@@ -3930,6 +3930,7 @@ export class Service {
         plan: account.plan,
         organization: account.organization,
         status: !account.signedIn ? "signed_out" : account.disabled ? "disabled" : limited ? "limited" : "ready",
+        disabled: account.disabled,
         isDefault: defaultAccount(state, account.family)?.id === account.id,
         nextAgentUntil: nextPickUntil(state, account.id, account.family, now),
         limitedUntil: limited ? account.limitedUntil : null,
