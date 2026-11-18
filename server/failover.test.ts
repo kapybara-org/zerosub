@@ -3426,9 +3426,8 @@ describe("changing the default account", () => {
     await service.onTurnEnded({ agent: { id: "failing", provider: "claude" }, turnId: null, outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never, context);
     await vi.waitFor(() => expect(reopened).toContain("opus-agent"));
     expect(reopened).not.toContain("fable-agent");
-    const state = await store.read();
-    expect(state.sessions["fable-agent"]?.accountId).toBe(MAIN);
-    expect(state.sessions["opus-agent"]?.accountId).toBe(WORK);
+    await vi.waitFor(async () => expect((await store.read()).sessions["opus-agent"]?.accountId).toBe(WORK));
+    expect((await store.read()).sessions["fable-agent"]?.accountId).toBe(MAIN);
   });
 
   it("keeps a deferred move waiting for background work only when nobody asked for it", async () => {
