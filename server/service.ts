@@ -3443,6 +3443,11 @@ export class Service {
   private movesUnattended(state: StoredState, agent: AgentInfo, family: Family, current: string, target: string, now: number): boolean {
     const reason = this.driftReason(state, agent.id, current, target, now);
     const stranded = !this.adapters[family].portable && agent.hasHistory;
+    // A throttled paid stand-in (Bedrock) is no reason to move: the target can only be an account
+    // that is out too, so the agent would just be reopened where it can't work.
+    const from = findAccount(state, current);
+    const to = findAccount(state, target);
+    if (from && isLastResort(from) && isLimited(from, now) && (!to || !isUsable(to, now))) return false;
     return stranded || (reason !== "manual" && reason !== "default");
   }
 

@@ -4682,6 +4682,51 @@ describe("AWS Bedrock as the last resort", () => {
     expect(notes[0]).toMatchObject({ reason: "exhausted", outcome: "stayed", to: "bedrock" });
   });
 
+  it("leaves an idle agent on a throttled Bedrock at the alignment check while its subscription is out too", async () => {
+    const at = new Date().toISOString();
+    const until = new Date(Date.now() + 10 * 60_000).toISOString();
+    const { service, store, reopened, notes, paseo } = await setUp(
+      {
+        ...onlyMain,
+        accounts: [
+          { ...account(MAIN, "main", "main"), limitedUntil: until, limitKind: "window", limitedAt: at },
+          { ...bedrock, limitedUntil: until, limitKind: "window", limitedAt: at },
+        ] as never,
+        sessions: { [AGENT]: { accountId: bedrock.id, family: "claude", openedAt: at } },
+      },
+      window,
+    );
+    service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+    // 30 s later, past the minute after its turn that alignment leaves an agent alone for.
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + 2 * 60_000 });
+    try {
+      await service.alignSessions(paseo as never);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(reopened).toEqual([]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(bedrock.id);
+    expect(notes).toEqual([]);
+  });
+
+  it("still moves an idle agent back off Bedrock while Bedrock is usable and the subscription has room", async () => {
+    const at = new Date().toISOString();
+    const { service, store, reopened, notes, paseo } = await setUp(
+      { ...onlyMain, sessions: { [AGENT]: { accountId: bedrock.id, family: "claude", openedAt: at } } },
+      window,
+    );
+    service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + 2 * 60_000 });
+    try {
+      await service.alignSessions(paseo as never);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+    expect(reopened).toEqual([AGENT]);
+    expect(notes.at(-1)).toMatchObject({ reason: "room", to: "main" });
+  });
+
   describe("with banked resets used automatically too", () => {
     const redeeming = (outcome: "reset" | "none", calls: Array<string | null>) => ({
       claude: { redeemReset: async (home: string | null) => (calls.push(home), outcome === "reset" ? { outcome, message: "Limits reset.", left: 0 } : { outcome, message: "No banked resets.", left: 0 }) },
