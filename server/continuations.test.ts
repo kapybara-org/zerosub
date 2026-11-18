@@ -290,6 +290,28 @@ describe("Codex account continuations", () => {
     expect(t.sent.at(-1)?.text).toContain("Current user correction before the limit");
   });
 
+  it("counts a limit hand-off to a new tab once, as that tab opens, and a stay not at all", async () => {
+    const pending = (service: Service) =>
+      ["a", "b", "c"].reduce((sum, id) => sum + (service as unknown as { pendingOn(id: string, now: number): number }).pendingOn(id, Date.now()), 0);
+    const t = await setup();
+    const service = t.service();
+    const limit = { agent: t.agents.get("root"), turnId: "limit-turn", outcome: { kind: "failed" }, timeline: [] };
+    service.setPreferences(preferences.schema.parse({ balanceNewAgents: true, autoContinue: false }));
+    await service.onTurnEnded(limit as never, { paseo: t.paseo } as never);
+    expect(t.created).toHaveLength(0);
+    expect(pending(service)).toBe(0);
+    service.setPreferences(preferences.schema.parse({ balanceNewAgents: true }));
+    await service.onTurnEnded({ ...limit, turnId: "limit-turn-2" } as never, { paseo: t.paseo } as never);
+    expect(t.created).toHaveLength(1);
+    expect(pending(service)).toBe(0);
+    const tab = t.created[0]!.agentId!;
+    await service.onSessionOpen(
+      { agentId: tab, provider: "codex", reason: "create", purpose: "interactive", workspaceId: "workspace-1", env: {} } as never,
+      { paseo: t.paseo } as never,
+    );
+    expect(pending(service)).toBe(1);
+  });
+
   it("continues an account-limit turn in error status into an available account's existing error-status tab", async () => {
     const t = await setup();
     const service = t.service();

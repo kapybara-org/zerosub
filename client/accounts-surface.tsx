@@ -20,6 +20,7 @@ import { AzureAccountModal, AzureUsage, azureCardDetails } from "./azure-account
 import { BedrockAccountModal, BedrockUsage, bedrockCardDetails } from "./bedrock-account";
 import { ForkDestinationRows, OpenCodeForkRows } from "./fork-settings";
 import { AddPiAccountModal, ApiKeyModal, HomesHint, PiSectionNotes, ProxyModal, ShellHint, piCardDetails } from "./pi-accounts";
+import { PaceSection } from "./pace";
 import { ResetConfirm, redeemToast, resetBadge } from "./reset-confirm";
 import { describe, stoppedWaiting, useStore, VISIBLE_POLL_MS, type ZeroSubStore } from "./store";
 import { Badge, Button, Card, IconButton, UsageBar, useText } from "./ui";
@@ -562,6 +563,7 @@ function AccountCard({
         {account.kind === "main" ? <Badge theme={theme} label="CLI login" /> : null}
         {account.status === "limited" ? <Badge theme={theme} label="Limit reached" tone="danger" /> : null}
         {account.status === "signed_out" ? <Badge theme={theme} label="Signed out" tone="warning" /> : null}
+        {account.pace?.gated ? <Badge theme={theme} label="Held back" tone="warning" /> : null}
         {resets && !signedOut ? <Badge theme={theme} label={resetBadge(resets)} tone="accent" /> : null}
       </View>
 
@@ -600,6 +602,11 @@ function AccountCard({
         ) : (
           <Text style={text.small}>{account.usage?.error ?? summary ?? "Checking usage…"}</Text>
         )}
+        {account.pace ? (
+          <View style={{ borderTopWidth: 1, borderTopColor: theme.colors.border, paddingTop: 10 }}>
+            <PaceSection theme={theme} pace={account.pace} />
+          </View>
+        ) : null}
         {!signedOut && credits ? <Text style={text.small}>{formatCredits(credits)}</Text> : null}
         {!signedOut && extraUsage ? <Text style={text.small}>{extraUsage}</Text> : null}
         {!signedOut && windows.length > 0 && account.usage?.error ? <Text style={text.small}>{account.usage.error}</Text> : null}

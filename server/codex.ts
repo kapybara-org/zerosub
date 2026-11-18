@@ -71,7 +71,7 @@ class AppServer {
     try {
       await server.request(
         "initialize",
-        { clientInfo: { name: CLIENT_NAME, title: "Paseo ZeroSub", version: "1.16.0" }, capabilities: { experimentalApi: false } },
+        { clientInfo: { name: CLIENT_NAME, title: "Paseo ZeroSub", version: "1.18.2" }, capabilities: { experimentalApi: false } },
         60_000,
       );
       server.send({ method: "initialized" });
@@ -234,8 +234,8 @@ export class CodexAdapter implements FamilyAdapter {
     return { ok: false, detail: (result.stderr || result.stdout).trim().split("\n")[0] || `${command} not found` };
   }
 
-  prepareHome(home: string): Promise<void> {
-    return prepareCodexHome(home);
+  prepareHome(home: string, wanted?: () => Promise<boolean>): Promise<void> {
+    return prepareCodexHome(home, false, wanted);
   }
 
   async identity(home: string | null): Promise<Identity> {

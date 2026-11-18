@@ -59,6 +59,7 @@ function account(family: Family, id: string, kind: "main" | "managed"): StoredAc
     limitedUntil: null,
     limitKind: null,
     limitedAt: null,
+    modelLimits: {},
     createdAt: EARLIER,
   };
 }

@@ -324,11 +324,18 @@ export class ClaudeAdapter implements FamilyAdapter {
     if (isBedrockHome(home)) return;
     const { command, prefix } = await providerCommand("claude");
     const result = await run(command, [...prefix, "auth", "logout"], { env: spawnEnv(await this.env(home), "claude"), timeoutMs: 30_000 });
-    if (result.code === 0 || process.platform !== "darwin") return; // Elsewhere the login lives in the home itself.
-    // Don't leave a live refresh token behind in the keychain for a home that is about to be deleted.
-    await run("/usr/bin/security", ["delete-generic-password", "-a", keychainAccount(), "-s", keychainService(home)], {
+    if (process.platform !== "darwin") return; // Elsewhere the login lives in the home itself.
+    // Don't leave a live refresh token behind in the keychain for a home that is about to be deleted. The
+    // CLI's logout exits 0 even when its own delete of the entry failed, so the entry is checked either way.
+    const service = keychainService(home);
+    const removed = await run("/usr/bin/security", ["delete-generic-password", "-a", keychainAccount(), "-s", service], {
       timeoutMs: 10_000,
     });
+    if (removed.code === 0 || removed.code === KEYCHAIN_ITEM_NOT_FOUND) return;
+    // Thrown so the cleanup tries again later, rather than deleting the home over a live entry.
+    const why = removed.timedOut ? "timed out" : removed.stderr.trim() || `exit ${removed.code}`;
+    const signedOut = result.code === 0 ? "Signed" : "Couldn't sign";
+    throw new Error(`${signedOut} ${home} out, but couldn't remove its keychain entry "${service}" (${why})`);
   }
 
   /**

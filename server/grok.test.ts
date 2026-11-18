@@ -279,6 +279,7 @@ function grokAccount(id: string, kind: "main" | "managed"): StoredAccount {
     limitedUntil: null,
     limitKind: null,
     limitedAt: null,
+    modelLimits: {},
     createdAt: new Date().toISOString(),
   };
 }

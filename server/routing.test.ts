@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Usage } from "../shared/model";
 import { applyEnv } from "./adapter";
 import { parseRateLimits } from "./codex";
-import { canStandIn, chooseAccount, fiveHourGated, isLastResort, mostAvailable } from "./routing";
+import { canStandIn, chooseAccount, fiveHourGated, isLastResort, isLimitedFor, mostAvailable, paceScore, paceView, scopeCoversModel } from "./routing";
 import { emptyState, type StoredAccount, type StoredState } from "./state";
 
 const NOW = Date.parse("2026-09-23T12:00:00Z");
@@ -24,6 +24,7 @@ function account(partial: Partial<StoredAccount> & Pick<StoredAccount, "id">): S
     limitedUntil: null,
     limitKind: null,
     limitedAt: null,
+    modelLimits: {},
     createdAt: "2026-09-01T00:00:00Z",
     ...partial,
   };
@@ -189,7 +190,8 @@ describe("chooseAccount", () => {
         usageOf: (id) => reading(id === soon.id),
       });
       // Past its reset, the near window starts again empty: by headroom it is then the roomier one.
-      expect(decision?.account.id).toBe(condition === "past-reset" ? soon.id : later.id);
+      // Pacing still reads a cached or failed reading's windows, and the near reset is behind its week's pace.
+      expect(decision?.account.id).toBe(["past-reset", "cached", "error"].includes(condition) ? soon.id : later.id);
       expect(decision?.bind?.selectionReason).toBe("headroom");
     },
   );
@@ -779,5 +781,170 @@ describe("AWS Bedrock accounts", () => {
       }
       expect(chooseAccount(stateWith([out(cli), sub, bedrock], { bindings }), { ...redeem, reason: "resume", usageOf })?.account.id).toBe(sub.id);
     });
+  });
+});
+
+describe("pacing", () => {
+  const PNOW = Date.parse("2026-09-23T17:00:00Z");
+  const hours = (h: number) => new Date(PNOW + h * 3_600_000).toISOString();
+  /** `fiveStarted` and `weekElapsed` are how long ago each window started, in hours and days. */
+  function pace(five: number, fiveStarted: number, week: number, weekElapsed: number): Usage {
+    return {
+      fetchedAt: new Date(PNOW).toISOString(),
+      windows: [
+        { id: "five_hour", label: "5-hour", usedPercent: five, resetsAt: hours(5 - fiveStarted) },
+        { id: "seven_day", label: "Weekly", usedPercent: week, resetsAt: hours((7 - weekElapsed) * 24) },
+      ],
+      error: null, cached: false, resets: null, credits: null,
+    };
+  }
+  const readings: Record<string, Usage> = {
+    "claude-main": pace(30, 0.5, 25, 3.5),
+    "claude-work": pace(45, 4, 50, 6),
+    "claude-personal": pace(20, 2, 70, 2),
+    "claude-spare": pace(35, 3.5, 40, 4),
+  };
+  const state = stateWith(Object.keys(readings).map((id) => account({ id, createdAt: id === "claude-main" ? "2026-08-01T00:00:00Z" : "2026-09-01T00:00:00Z" })), {
+    defaults: { claude: "claude-main", codex: null, pi: null },
+  });
+  const usageOf = (id: string) => readings[id];
+
+  it("scores the example accounts", () => {
+    const score = (id: string, pending = 0) => paceScore(readings[id], pending, PNOW);
+    expect(score("claude-main")).toMatchObject({ fiveHour: 90, gated: true });
+    expect(score("claude-work").score).toBeCloseTo(58.33, 2);
+    expect(score("claude-spare").score).toBe(70);
+    expect(score("claude-personal").score).toBeCloseTo(245, 5);
+    expect(score("claude-work", 1).score).toBeCloseTo(66.25, 5);
+    expect(score("claude-work", 2).score).toBeCloseTo(76.25, 5);
+  });
+
+  it("breaks the score into card parts", () => {
+    expect(paceView(readings["claude-main"], 0, PNOW)).toMatchObject({
+      fiveHourUsed: 30, fiveHourProjected: 90, pendingFiveHour: 0, weeklyUsed: 25, weekElapsed: 50, pending: 0, gated: true,
+    });
+    const work = paceView(readings["claude-work"], 2, PNOW);
+    expect(work).toMatchObject({ fiveHourUsed: 45, pendingFiveHour: 20, pendingWeekly: 4, gated: false });
+    expect(work.fiveHourProjected).toBeCloseTo(76.25, 5);
+    expect(work.weekElapsed).toBeCloseTo(85.71, 2);
+    expect(paceView(undefined, 0, PNOW)).toMatchObject({
+      fiveHourUsed: null, fiveHourProjected: 50, weeklyUsed: null, weekElapsed: null, gated: false,
+    });
+  });
+
+  it("agrees with paceScore for every example account", () => {
+    for (const id of Object.keys(readings)) {
+      for (const pending of [0, 1, 2]) {
+        const view = paceView(readings[id], pending, PNOW);
+        const score = paceScore(readings[id], pending, PNOW);
+        expect(view.fiveHourProjected).toBe(score.fiveHour);
+        expect(view.gated).toBe(score.gated);
+      }
+    }
+  });
+
+  it("places three paced creates on work, work, spare, where the unpaced pick is main", () => {
+    expect(mostAvailable(state, "claude", usageOf, PNOW)?.id).toBe("claude-main");
+    const picks: string[] = [];
+    const pending = new Map<string, number>();
+    for (let n = 0; n < 3; n += 1) {
+      const pick = mostAvailable(state, "claude", usageOf, PNOW, new Set(), false, { pendingOf: (id) => pending.get(id) ?? 0 })!;
+      picks.push(pick.id);
+      pending.set(pick.id, (pending.get(pick.id) ?? 0) + 1);
+    }
+    expect(picks).toEqual(["claude-work", "claude-work", "claude-spare"]);
+  });
+
+  it("gates a raw 5-hour reading at 80% even with a slow burn, and scores unknown usage in the middle", () => {
+    const slow = pace(85, 4.9, 10, 6);
+    expect(paceScore(slow, 0, PNOW).fiveHour).toBeLessThan(90);
+    expect(paceScore(slow, 0, PNOW).gated).toBe(true);
+    expect(paceScore(undefined, 2, PNOW).score).toBe(70);
+  });
+
+  it("scores an account with no 5-hour or weekly window as unknown", () => {
+    const odd: Usage = { ...pace(0, 1, 0, 1), windows: [{ id: "weekly_opus", label: "Weekly - Opus", usedPercent: 10, resetsAt: null }] };
+    expect(paceScore(odd, 1, PNOW)).toMatchObject({ fiveHour: 60, weekly: 0, score: 60 });
+  });
+
+  it("treats an unparseable resetsAt like a missing one", () => {
+    const bad: Usage = {
+      ...pace(0, 1, 0, 1),
+      windows: [
+        { id: "five_hour", label: "5-hour", usedPercent: 85, resetsAt: "soon" },
+        { id: "seven_day", label: "Weekly", usedPercent: 40, resetsAt: "soon" },
+      ],
+    };
+    expect(paceScore(bad, 1, PNOW)).toMatchObject({ fiveHour: 95, weekly: 42, score: 95, gated: true });
+  });
+
+  it("ignores pending placements and ranks the legacy way when balancing is off", () => {
+    const decision = (balanceNewAgents: boolean) => chooseAccount(state, {
+      ...base, now: PNOW, balanceNewAgents, reason: "create", usageOf, pendingOf: () => 5,
+    });
+    expect(decision(false)?.account.id).toBe("claude-main");
+    expect(decision(true)?.account.id).toBe("claude-spare");
+  });
+});
+
+describe("limits of one model's own window", () => {
+  const fableLimit = { fable: { until: "2026-09-25T12:00:00Z", at: "2026-09-23T11:00:00Z", source: "turn" as const } };
+  const main = account({ id: "claude-main", kind: "main", home: null });
+  const work = account({ id: "claude-work", modelLimits: fableLimit });
+  const open = stateWith([main, work], { defaults: { claude: "claude-work", codex: null, pi: null } });
+  const input = { ...base, reason: "resume" as const, usageOf: () => null };
+
+  it("matches a scope to the models whose name holds all its words", () => {
+    expect(scopeCoversModel("fable", "claude-fable-5-2")).toBe(true);
+    expect(scopeCoversModel("fable", "fable")).toBe(true);
+    expect(scopeCoversModel("Fable", "Claude-Fable-5.2")).toBe(true);
+    expect(scopeCoversModel("opus", "claude-fable-5-2")).toBe(false);
+    expect(scopeCoversModel("fable", "claude-fables")).toBe(false);
+    expect(scopeCoversModel("fable", null)).toBe(false);
+    expect(scopeCoversModel("fable", undefined)).toBe(false);
+    expect(scopeCoversModel("fable", "default")).toBe(false);
+    expect(scopeCoversModel("", "claude-fable-5-2")).toBe(false);
+  });
+
+  it("limits an account only for the model it covers, and only until it expires", () => {
+    expect(isLimitedFor(work, NOW, "claude-fable-5-2")).toBe(true);
+    expect(isLimitedFor(work, NOW, "claude-opus-4-1")).toBe(false);
+    expect(isLimitedFor(work, NOW, null)).toBe(false);
+    expect(isLimitedFor(work, NOW)).toBe(false);
+    expect(isLimitedFor(work, Date.parse("2026-09-26T00:00:00Z"), "claude-fable-5-2")).toBe(false);
+    expect(canStandIn(work, NOW, "claude-fable-5-2")).toBe(false);
+    expect(canStandIn(work, NOW, "claude-opus-4-1")).toBe(true);
+  });
+
+  it("routes an agent on that model away, and leaves other models and unknown ones where they are", () => {
+    const fable = chooseAccount(open, { ...input, model: "claude-fable-5-2" });
+    expect(fable?.account.id).toBe("claude-main");
+    expect(fable?.skipped).toMatchObject({ why: "limited" });
+    for (const model of ["claude-opus-4-1", null, undefined]) {
+      const decision = chooseAccount(open, { ...input, model });
+      expect(decision?.account.id).toBe("claude-work");
+      expect(decision?.skipped).toBeNull();
+    }
+  });
+
+  it("ignores a limit that has expired", () => {
+    const expired = account({ id: "claude-work", modelLimits: { fable: { until: "2026-09-23T11:00:00Z", at: "x", source: "turn" } } });
+    const state = stateWith([main, expired], { defaults: { claude: "claude-work", codex: null, pi: null } });
+    expect(chooseAccount(state, { ...input, model: "claude-fable-5-2" })?.account.id).toBe("claude-work");
+  });
+
+  it("keeps an agent where it stands in only while that account takes its model", () => {
+    const stateAB = stateWith([main, work, account({ id: "claude-third" })], { defaults: { claude: "claude-main", codex: null, pi: null } });
+    const fable = chooseAccount({ ...stateAB, bindings: { "agent-1": { accountId: "claude-work", source: "user", at: "x" } } }, { ...input, current: "claude-work", model: "claude-fable-5-2" });
+    expect(fable?.account.id).not.toBe("claude-work");
+  });
+
+  it("spreads a new agent of that model off the account", () => {
+    const state = stateWith([main, work]);
+    const pick = (model: string | null) => mostAvailable(state, "claude", () => null, NOW, new Set(), false, undefined, model)?.id;
+    expect(pick("claude-fable-5-2")).toBe("claude-main");
+    // Same headroom: the default (main) wins for an unaffected model too, so exclude it to see work is still usable.
+    expect(mostAvailable(state, "claude", () => null, NOW, new Set(["claude-main"]), false, undefined, "claude-opus-4-1")?.id).toBe("claude-work");
+    expect(mostAvailable(state, "claude", () => null, NOW, new Set(["claude-main"]), false, undefined, "claude-fable-5-2")).toBeUndefined();
   });
 });

@@ -11,9 +11,10 @@ import type { SwitchGuard } from "./switch-guard";
 import { Service } from "./service";
 import { MAIN_ACCOUNT_ID, StateStore, type OpenCodeFork, type StoredAccount, type StoredState } from "./state";
 import { buildTranscript, continuationPrompt } from "./handoff";
+import { paceScore } from "./routing";
 import { saveReadings } from "./usage";
-import { preferences } from "../shared/preferences";
 import type { Usage } from "../shared/model";
+import { preferences } from "../shared/preferences";
 import { absentPi } from "./fakes.test-support";
 
 const MAIN = MAIN_ACCOUNT_ID.claude;
@@ -196,6 +197,12 @@ async function redeemNow(service: Service, paseo: unknown, accountId: string, ag
 }
 
 const inFuture = () => new Date(Date.now() + 30 * 60_000).toISOString();
+/** Agents placed on an account in the last 10 minutes, as pacing counts them. */
+const pendingOn = (service: Service, accountId: string) =>
+  (service as unknown as { pendingOn(id: string, now: number): number }).pendingOn(accountId, Date.now());
+/** Records an agent just placed on an account. */
+const placed = (service: Service, accountId: string) =>
+  (service as unknown as { notePlacement(id: string, now: number): void }).notePlacement(accountId, Date.now());
 const inPast = () => new Date(Date.now() - 60_000).toISOString();
 
 const TWIN = "claude-twin";
@@ -992,7 +999,7 @@ describe("forking to the other provider", () => {
         { agent: { id: AGENT, provider: "claude" }, turnId: "t", outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never,
         context,
       );
-    return { service, store, created, notes, limitTurn, paseo: paseo as never, sends, timelines, addTurn, gap, byId, agents, hooks, setSourceEpoch: (epoch: string) => { sourceEpoch = epoch; }, timelineReads };
+    return { service, store, created, notes, limitTurn, paseo: paseo as never, context, sends, timelines, addTurn, gap, byId, agents, hooks, setSourceEpoch: (epoch: string) => { sourceEpoch = epoch; }, timelineReads };
   }
 
   it("carries the work on with the other provider, at the same permission level", async () => {
@@ -1121,6 +1128,17 @@ describe("forking to the other provider", () => {
     await limitTurn();
     expect(created).toHaveLength(1);
     expect(notes.at(-1)).toMatchObject({ outcome: "continued", continuedIn: { agentId: created[0]?.agentId } });
+  });
+
+  it("records one pending placement for a fork with balancing on, as the fork opens", async () => {
+    const { service, created, limitTurn, context } = await setUpFork("bypassPermissions", [], {}, [], { prefs: { balanceNewAgents: true } });
+    await limitTurn();
+    expect(pendingOn(service, CODEX_MAIN)).toBe(0);
+    await service.onSessionOpen(
+      { agentId: created[0]!.agentId, provider: "codex", reason: "create", purpose: "interactive", workspaceId: "ws-1", env: {} } as never,
+      context,
+    );
+    expect(pendingOn(service, CODEX_MAIN)).toBe(1);
   });
 
   it("won't fork into a mode more permissive than the original's", async () => {
@@ -2830,17 +2848,36 @@ describe("usage readings", () => {
     expect(await newAgentOpensOn(service, store, paseo)).toBe(MAIN);
   });
 
-  it("leaves a limit a turn ran into while one model's window is full", async () => {
-    // The turn may have hit that model's limit: the account's room says nothing about it.
+  it("clears a limit a turn ran into once the account's own windows have room, one model's window full or not", async () => {
+    // A model's own hit lands on that model (see "one model's limit"), so what a turn left on the
+    // account is the account's, and only its own windows say whether it has room.
     const { service, store, limitTurn } = await setUp(
       state(),
-      () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your Fable limit" }),
+      () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your session limit" }),
       { usage: fableFull },
     );
     await limitTurn();
+    await service.refreshUsage(MAIN, true);
+    expect(await limitedUntil(store)).not.toBeNull(); // a fresh turn limit is trusted for a while
     await settle(store);
     await service.refreshUsage(MAIN, true);
-    expect(await limitedUntil(store)).not.toBeNull();
+    expect(await limitedUntil(store)).toBeNull();
+    expect((await store.read()).accounts.find((a) => a.id === MAIN)?.modelLimits.fable?.source).toBe("reading");
+  });
+
+  it("limits a model by its own full window, and lifts it once the window has room", async () => {
+    let reading = fableFull;
+    const { service, store, paseo } = await setUp(state(), unused, { usage: () => reading() });
+    const main = async () => (await store.read()).accounts.find((a) => a.id === MAIN)!;
+    await service.refreshUsage(MAIN, true);
+    expect((await main()).modelLimits.fable).toMatchObject({ source: "reading" });
+    expect((await main()).limitedUntil).toBeNull();
+    expect(await newAgentOpensOn(service, store, paseo)).toBe(MAIN); // other models still start there
+
+    reading = () => ({ ...fableFull(), windows: fableFull().windows.map((w) => (w.id === "weekly_fable" ? { ...w, usedPercent: 40 } : w)) });
+    await service.refreshUsage(MAIN, true);
+    expect((await main()).modelLimits).toEqual({});
+    expect((await main()).limitedUntil).toBeNull();
   });
 
   it("takes a full window without credits for a limit, whatever the setting", async () => {
@@ -2994,30 +3031,37 @@ describe("changing the default account", () => {
   /** Several agents, each answering for itself. `reopened` lists the ones Paseo was asked to reload. */
   async function setUpAgents(
     state: Partial<StoredState>,
-    listed: Array<{ id: string; status: string; provider?: string; archived?: boolean; backgroundWork?: number }>,
-    options: { claude?: Partial<FamilyAdapter>; onList?: (service: Service, context: never) => void } = {},
+    listed: Array<{ id: string; status: string; provider?: string; archived?: boolean; backgroundWork?: number; updatedAt?: string; model?: string }>,
+    options: { claude?: Partial<FamilyAdapter>; codex?: Partial<FamilyAdapter>; onList?: (service: Service, context: never) => void | Promise<void> } = {},
   ) {
     const store = new StateStore(join(root, "state.json"));
     await store.update((draft) => Object.assign(draft, state));
-    const agents = listed.map(({ id, status, provider, archived, backgroundWork }) => ({
+    const agents = listed.map(({ id, status, provider, archived, backgroundWork, updatedAt, model }) => ({
       id,
       provider: provider ?? "claude",
+      model,
       status,
       archivedAt: archived ? "2026-09-23T08:00:00.000Z" : null,
       lastUserMessageAt: openedAt,
+      updatedAt,
       backgroundWork: { count: backgroundWork ?? 0 },
     }));
+    /** The timeline notes ZeroSub added, by agent. */
+    const notes: Array<{ agentId: string; data: { reason: string } }> = [];
     const paseo = {
       config: { get: async () => ({ config: { providers: {} } }) },
       agents: {
         list: async () => {
-          options.onList?.(service, context);
+          await options.onList?.(service, context);
           return { entries: agents.map((agent) => ({ agent })), pageInfo: { hasMore: false, nextCursor: null } };
         },
         ref: (id: string) => ({
           refresh: async () => ({ agent: agents.find((agent) => agent.id === id) }),
           send: async () => undefined,
-          timeline: { append: async () => undefined, refetch: async () => ({ entries: [] }) },
+          timeline: {
+            append: async (item: { data: { reason: string } }) => void notes.push({ agentId: id, data: item.data }),
+            refetch: async () => ({ entries: [] }),
+          },
         }),
       },
     };
@@ -3025,7 +3069,7 @@ describe("changing the default account", () => {
     const reopened: string[] = [];
     const hit = (): LimitHit => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your session limit" });
     const service: Service = new Service(
-      { claude: { ...claudeAdapter(hit), ...options.claude }, codex: { ...claudeAdapter(hit), family: "codex", portable: false } as FamilyAdapter, pi: absentPi() },
+      { claude: { ...claudeAdapter(hit), ...options.claude }, codex: { ...claudeAdapter(hit), family: "codex", portable: false, ...options.codex } as FamilyAdapter, pi: absentPi() },
       store,
       { resolve: async () => ({ claude: "claude" as const, codex: "codex" as const }) } as unknown as FamilyResolver,
       {
@@ -3040,8 +3084,242 @@ describe("changing the default account", () => {
     );
     services.push(service);
     service.setPreferences(KEEP);
-    return { service, store, paseo: paseo as never, context, reopened, agents };
+    return { service, store, paseo: paseo as never, context, reopened, agents, notes };
   }
+
+  describe("moving idle agents off a busy account", () => {
+    const ago = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
+    const reading = (percent: number): UsageRead => ({
+      fetchedAt: new Date().toISOString(),
+      windows: [
+        { id: "five_hour", label: "5-hour", usedPercent: percent, resetsAt: new Date(Date.now() + 3 * 60 * 60_000).toISOString(), minutes: 300 },
+        { id: "seven_day", label: "Weekly", usedPercent: 10, resetsAt: new Date(Date.now() + 3 * 24 * 60 * 60_000).toISOString(), minutes: 10_080 },
+      ],
+      error: null,
+      cached: false,
+      resets: null,
+    });
+
+    /** `work` (the CLI login) reads 60% two hours into its window, so it's projected past the gate. */
+    async function setUpBusy(
+      agentId: string,
+      updatedAt: string,
+      options: {
+        personal?: number;
+        prefs?: Record<string, unknown>;
+        bindings?: StoredState["bindings"];
+        onList?: (service: Service) => void | Promise<void>;
+        /** More agents on `work`, idle as long as `agentId`. */
+        others?: string[];
+        /** Agents just placed on `personal`, which its reading doesn't show yet. */
+        pending?: number;
+        /** The models agents run, by agent. */
+        models?: Record<string, string>;
+        /** Replaces the two accounts; `usedBy` gives each one's 5-hour percent by account ID (`work` stays at 60). */
+        accounts?: StoredAccount[];
+        usedBy?: Record<string, number>;
+      } = {},
+    ) {
+      const ids = [agentId, ...(options.others ?? [])];
+      const setup = await setUpAgents(
+        {
+          accounts: (options.accounts ?? [account(MAIN, "work", "main"), account(HELLO, "personal", "managed")]) as never,
+          defaults: { claude: MAIN, codex: null, pi: null },
+          sessions: Object.fromEntries(ids.map((id) => [id, session(MAIN)])),
+          bindings: options.bindings ?? {},
+        },
+        ids.map((id) => ({ id, status: "idle", updatedAt, model: options.models?.[id] })),
+        {
+          claude: {
+            usage: async (home: string | null) => {
+              const byHome = (options.accounts ?? []).find((entry) => entry.home === home);
+              return home ? reading(options.usedBy?.[byHome?.id ?? ""] ?? options.personal ?? 20) : reading(60);
+            },
+          } as Partial<FamilyAdapter>,
+          onList: options.onList,
+        },
+      );
+      setup.service.setPreferences(
+        preferences.schema.parse({ autoSwitch: true, balanceNewAgents: true, autoContinue: false, ...options.prefs }),
+      );
+      for (let n = 0; n < (options.pending ?? 0); n += 1) placed(setup.service, HELLO);
+      await setup.service.view(setup.paseo, true);
+      // The pass runs after the readings land; wait until it's done.
+      await vi.waitFor(() => expect((setup.service as unknown as { relieving: Set<string> }).relieving.size).toBe(0));
+      return setup;
+    }
+
+    it("moves an agent idle for an hour off it", async () => {
+      const { store, reopened, notes } = await setUpBusy("fix-build", ago(120));
+      expect(reopened).toEqual(["fix-build"]);
+      const state = await store.read();
+      expect(state.bindings["fix-build"]).toMatchObject({ accountId: HELLO, source: "auto" });
+      expect(state.sessions["fix-build"]?.accountId).toBe(HELLO);
+      expect(notes).toContainEqual({ agentId: "fix-build", data: expect.objectContaining({ reason: "pacing", from: "work", to: "personal" }) });
+    });
+
+    it("leaves an agent used in the last hour", async () => {
+      const { reopened } = await setUpBusy("review-pr", ago(10));
+      expect(reopened).toEqual([]);
+    });
+
+    it("leaves an agent the user put there", async () => {
+      const { store, reopened } = await setUpBusy("fix-build", ago(120), {
+        bindings: { "fix-build": { accountId: MAIN, source: "user", at: openedAt } },
+      });
+      expect(reopened).toEqual([]);
+      expect((await store.read()).bindings["fix-build"]).toMatchObject({ accountId: MAIN, source: "user" });
+    });
+
+    describe("with a model's own limit on an account", () => {
+      const FABLE = "claude-fable-5-2";
+      const OPUS = "claude-opus-4-1";
+      const SPARE = "claude-spare";
+      const fableFull = { fable: { until: inFuture(), at: inPast(), source: "turn" as const } };
+      // `personal` has the most room (20%) but its Fable window is full; `spare` reads 40%.
+      const withFableFull = (spare: boolean) =>
+        [
+          account(MAIN, "work", "main"),
+          { ...account(HELLO, "personal", "managed"), modelLimits: fableFull },
+          ...(spare ? [account(SPARE, "spare", "managed")] : []),
+        ] as unknown as StoredAccount[];
+
+      it("keeps a Fable agent off an account whose Fable window is full, even with the most room", async () => {
+        const { store, reopened } = await setUpBusy("fix-build", ago(120), {
+          accounts: withFableFull(false),
+          models: { "fix-build": FABLE },
+        });
+        expect(reopened).toEqual([]);
+        expect((await store.read()).sessions["fix-build"]?.accountId).toBe(MAIN);
+      });
+
+      it("moves a Fable agent to the account without that limit", async () => {
+        const { store, reopened } = await setUpBusy("fix-build", ago(120), {
+          accounts: withFableFull(true),
+          usedBy: { [HELLO]: 20, [SPARE]: 40 },
+          models: { "fix-build": FABLE },
+        });
+        expect(reopened).toEqual(["fix-build"]);
+        expect((await store.read()).bindings["fix-build"]).toMatchObject({ accountId: SPARE, source: "auto" });
+      });
+
+      it("moves an Opus agent onto the account whose Fable window is full", async () => {
+        const { store, reopened } = await setUpBusy("fix-build", ago(120), {
+          accounts: withFableFull(true),
+          usedBy: { [HELLO]: 20, [SPARE]: 40 },
+          models: { "fix-build": OPUS },
+        });
+        expect(reopened).toEqual(["fix-build"]);
+        expect((await store.read()).bindings["fix-build"]).toMatchObject({ accountId: HELLO, source: "auto" });
+      });
+
+      it("moves a later Opus agent when an earlier Fable agent has nowhere to go", async () => {
+        const { store, reopened } = await setUpBusy("fable-agent", ago(120), {
+          others: ["opus-agent"],
+          accounts: withFableFull(false),
+          models: { "fable-agent": FABLE, "opus-agent": OPUS },
+        });
+        expect(reopened).toEqual(["opus-agent"]);
+        const state = await store.read();
+        expect(state.sessions["fable-agent"]?.accountId).toBe(MAIN);
+        expect(state.bindings["opus-agent"]).toMatchObject({ accountId: HELLO, source: "auto" });
+      });
+
+      it("moves a later Opus agent when an earlier Fable agent's only target would pass the gate", async () => {
+        // `spare` is the only account with room for Fable, and its 75% reading would pass the gate with the agent.
+        const { store, reopened } = await setUpBusy("fable-agent", ago(120), {
+          others: ["opus-agent"],
+          accounts: withFableFull(true),
+          usedBy: { [HELLO]: 20, [SPARE]: 75 },
+          models: { "fable-agent": FABLE, "opus-agent": OPUS },
+        });
+        expect(reopened).toEqual(["opus-agent"]);
+        const state = await store.read();
+        expect(state.sessions["fable-agent"]?.accountId).toBe(MAIN);
+        expect(state.bindings["opus-agent"]).toMatchObject({ accountId: HELLO, source: "auto" });
+      });
+    });
+
+    it("moves nothing with automatic switching off", async () => {
+      const { reopened } = await setUpBusy("fix-build", ago(120), { prefs: { autoSwitch: false } });
+      expect(reopened).toEqual([]);
+    });
+
+    it("moves nothing to an account that pending placements alone push past the gate", async () => {
+      // `personal` reads 20% two hours in: projected 30%, and 70% with four agents just placed there.
+      const { reopened } = await setUpBusy("fix-build", ago(120), { pending: 4 });
+      expect(reopened).toEqual([]);
+    });
+
+    it("stops moving agents once the account they go to would reach the gate", async () => {
+      const others = ["agent-2", "agent-3", "agent-4", "agent-5", "agent-6"];
+      const { service, reopened } = await setUpBusy("fix-build", ago(120), { others });
+      expect(reopened.length).toBeGreaterThan(0);
+      expect(reopened.length).toBeLessThan(others.length + 1);
+      const usage = (service as unknown as { usage: Map<string, Usage> }).usage.get(HELLO);
+      const pending = pendingOn(service, HELLO);
+      expect(pending).toBe(reopened.length);
+      expect(paceScore(usage, pending, Date.now()).gated).toBe(false);
+      expect(paceScore(usage, pending + 1, Date.now()).gated).toBe(true);
+    });
+
+    it("leaves an agent the user puts on the account during the pass", async () => {
+      const relieving = (service: Service) => (service as unknown as { relieving: Set<string> }).relieving;
+      const { store, reopened } = await setUpBusy("fix-build", ago(120), {
+        // The pass reads the bindings before it lists agents, so this pick lands after that read.
+        onList: async (service) => {
+          if (relieving(service).size === 0) return;
+          await (service as unknown as { store: StateStore }).store.update((draft) => {
+            draft.bindings["fix-build"] = { accountId: MAIN, source: "user", at: openedAt };
+          });
+        },
+      });
+      expect(reopened).toEqual([]);
+      expect((await store.read()).bindings["fix-build"]).toMatchObject({ accountId: MAIN, source: "user" });
+    });
+
+    it("moves nothing with spreading off", async () => {
+      const { reopened } = await setUpBusy("fix-build", ago(120), { prefs: { balanceNewAgents: false } });
+      expect(reopened).toEqual([]);
+    });
+
+    it("stops when spreading is turned off during the pass", async () => {
+      const relieving = (service: Service) => (service as unknown as { relieving: Set<string> }).relieving;
+      const { reopened } = await setUpBusy("fix-build", ago(120), {
+        // The pass lists agents after its own preference check, so this turns spreading off mid-pass.
+        onList: (service) => {
+          if (relieving(service).size > 0) service.setPreferences(preferences.schema.parse({ autoSwitch: true, balanceNewAgents: false }));
+        },
+      });
+      expect(reopened).toEqual([]);
+    });
+
+    it("leaves ChatGPT agents on a busy ChatGPT account", async () => {
+      const CODEX_OTHER = "codex-other";
+      const { service, store, paseo, reopened } = await setUpAgents(
+        {
+          accounts: [
+            { ...account(CODEX_MAIN, "work", "main"), family: "codex" },
+            { ...account(CODEX_OTHER, "personal", "managed"), family: "codex" },
+          ] as never,
+          defaults: { claude: null, codex: CODEX_MAIN, pi: null },
+          sessions: { "fix-build": { accountId: CODEX_MAIN, family: "codex" as const, openedAt } },
+        },
+        [{ id: "fix-build", status: "idle", provider: "codex", updatedAt: ago(120) }],
+        { codex: { usage: async (home: string | null) => (home ? reading(20) : reading(60)) } as Partial<FamilyAdapter> },
+      );
+      service.setPreferences(preferences.schema.parse({ autoSwitch: true, balanceNewAgents: true, autoContinue: false }));
+      await service.view(paseo, true);
+      await vi.waitFor(() => expect((service as unknown as { relieving: Set<string> }).relieving.size).toBe(0));
+      expect(reopened).toEqual([]);
+      expect((await store.read()).bindings["fix-build"]).toBeUndefined();
+    });
+
+    it("moves nothing when the other account would pass the gate too", async () => {
+      const { reopened } = await setUpBusy("fix-build", ago(120), { personal: 75 });
+      expect(reopened).toEqual([]);
+    });
+  });
 
   it("moves an agent whose last turn failed off an account it can't work on", async () => {
     const { service, store, paseo, reopened } = await setUpAgents(
@@ -3368,6 +3646,34 @@ describe("changing the default account", () => {
       expect(state.bindings.stuck, why).toBeUndefined();
       expect(state.bindings.fine, why).toMatchObject({ accountId: MAIN, source: "auto" });
     }
+  });
+
+  it("moves a Fable agent off an account whose Fable window is full, and keeps an Opus agent there", async () => {
+    const { service, store, paseo, reopened } = await setUpAgents(
+      {
+        accounts: [
+          account(MAIN, "marketing", "main"),
+          { ...account(WORK, "work", "managed"), modelLimits: { fable: { until: inFuture(), at: inPast(), source: "turn" as const } } },
+          account(HELLO, "hello", "managed"),
+        ] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+        bindings: {},
+        sessions: { "fable-agent": session(WORK), "opus-agent": session(WORK) },
+      },
+      [
+        { id: "fable-agent", status: "idle", model: "claude-fable-5-2" },
+        { id: "opus-agent", status: "idle", model: "claude-opus-4-1" },
+      ],
+    );
+    service.setPreferences(KEEP);
+    expect(await service.setDefault(paseo, HELLO)).toEqual({ ...NOTHING_MOVED, reopened: ["fable-agent"] });
+    expect(reopened).toEqual(["fable-agent"]);
+    const state = await store.read();
+    expect(state.sessions["fable-agent"]?.accountId).toBe(HELLO);
+    expect(state.bindings["fable-agent"]).toBeUndefined();
+    // The Opus agent can stay on `work`, so it is kept there, as it would be without the limit.
+    expect(state.bindings["opus-agent"]).toMatchObject({ accountId: WORK, source: "auto" });
+    expect(state.sessions["opus-agent"]?.accountId).toBe(WORK);
   });
 
   it("changes nothing when the account is already the default", async () => {
@@ -4473,6 +4779,90 @@ describe("the account button's reason row", () => {
   });
 });
 
+describe("pending placements", () => {
+  it("records none for Paseo's helper sessions, which open in no workspace", async () => {
+    const { service, paseo } = await setUp(
+      {
+        accounts: [account(MAIN, "work", "main"), account(HELLO, "personal", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+      },
+      () => {
+        throw new Error("unused");
+      },
+    );
+    service.setPreferences(preferences.schema.parse({ balanceNewAgents: true }));
+    const open = (agentId: string, extra: Record<string, unknown>) =>
+      service.onSessionOpen({ agentId, provider: "claude", reason: "create", purpose: "interactive", env: {}, ...extra } as never, { paseo } as never);
+    await open("commit-message", {});
+    await open("hidden-helper", { workspaceId: "ws-1", background: true });
+    expect(pendingOn(service, MAIN) + pendingOn(service, HELLO)).toBe(0);
+    await open("new-agent", { workspaceId: "ws-1" });
+    expect(pendingOn(service, MAIN) + pendingOn(service, HELLO)).toBe(1);
+  });
+
+  it("spreads concurrent new agents by pending placements", async () => {
+    const { service, store, paseo } = await setUp(
+      {
+        accounts: [account(MAIN, "work", "main"), account(HELLO, "personal", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+      },
+      () => {
+        throw new Error("unused");
+      },
+    );
+    service.setPreferences(preferences.schema.parse({ balanceNewAgents: true }));
+    const context = { paseo } as never;
+    const create = (agentId: string) =>
+      service.onSessionOpen({ agentId, provider: "claude", reason: "create", purpose: "interactive", workspaceId: "ws-1", env: {} } as never, context);
+    await Promise.all([create("new-a"), create("new-b")]);
+    const { sessions } = await store.read();
+    expect(new Set([sessions["new-a"]?.accountId, sessions["new-b"]?.accountId])).toEqual(new Set([MAIN, HELLO]));
+  });
+
+  it("view names the pacedNext account", async () => {
+    const { service, paseo } = await setUp(
+      {
+        accounts: [account(MAIN, "work", "main"), account(HELLO, "personal", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+      },
+      () => {
+        throw new Error("unused");
+      },
+    );
+    expect((await service.view(paseo as never)).pacedNext).toBeUndefined();
+    service.setPreferences(preferences.schema.parse({ balanceNewAgents: true }));
+    await service.onSessionOpen({ agentId: "new-a", provider: "claude", reason: "create", purpose: "interactive", workspaceId: "ws-1", env: {} } as never, { paseo } as never);
+    const placed = (await service.view(paseo as never)).accounts.find((a) => a.pace && a.pace.pending > 0)?.id;
+    expect(placed).toBeDefined();
+    expect((await service.view(paseo as never)).pacedNext?.claude).toBe(placed === MAIN ? HELLO : MAIN);
+  });
+
+  it("logs pace scores for a balanced new agent", async () => {
+    const { service, paseo } = await setUp(
+      {
+        accounts: [account(MAIN, "work", "main"), account(HELLO, "personal", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+      },
+      () => {
+        throw new Error("unused");
+      },
+    );
+    service.setPreferences(preferences.schema.parse({ balanceNewAgents: true }));
+    const logged = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      await service.onSessionOpen(
+        { agentId: "agent-new", provider: "claude", reason: "create", purpose: "interactive", workspaceId: "ws-1", env: {} } as never,
+        { paseo } as never,
+      );
+      expect(logged.mock.calls.map((call) => String(call[0]))).toContainEqual(
+        expect.stringMatching(/\[ZeroSub\] placed agent-new on .*5h .* wk .* score .* gated (yes|no) pending \d+ seen 5h/),
+      );
+    } finally {
+      logged.mockRestore();
+    }
+  });
+});
+
 describe("an API account's refused key", () => {
   const API = "claude-api";
 
@@ -4962,5 +5352,93 @@ describe("AWS Bedrock as the last resort", () => {
     await limitTurn();
     expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
     expect(notes.at(-1)?.detail ?? null).toBeNull();
+  });
+});
+
+describe("one model's limit", () => {
+  const OPUS_AGENT = "agent-opus";
+  const FABLE_AGENT = "agent-fable";
+  const MODEL = { fable: "claude-fable-5-2", opus: "claude-opus-4-1" };
+  const fableHit = (): LimitHit => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your Fable limit", scope: "fable" });
+  const state = (sessions: StoredState["sessions"] = {}) => ({
+    accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+    defaults: { claude: MAIN, codex: null, pi: null },
+    sessions: { [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt: "2026-09-23T07:00:00.000Z" }, ...sessions },
+  });
+  const accountOf = async (store: StateStore, id: string) => (await store.read()).accounts.find((entry) => entry.id === id)!;
+
+  it("records the limit on the model, leaves the account free, and moves only that agent", async () => {
+    const { store, agent, reopened, notes, limitTurn } = await setUp(state(), fableHit);
+    (agent as { model?: string }).model = MODEL.fable;
+    await limitTurn();
+    const main = await accountOf(store, MAIN);
+    expect(main.limitedUntil).toBeNull();
+    expect(main.modelLimits.fable).toMatchObject({ source: "turn" });
+    expect(Date.parse(main.modelLimits.fable!.until)).toBeGreaterThan(Date.now());
+    expect(reopened).toEqual([AGENT]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(notes.at(-1)).toMatchObject({ from: "marketing", to: "hello", outcome: "switched" });
+  });
+
+  it("takes an agent whose model Paseo doesn't say to run the model that hit the limit", async () => {
+    const { store, reopened, limitTurn } = await setUp(state(), fableHit);
+    await limitTurn();
+    expect((await accountOf(store, MAIN)).limitedUntil).toBeNull();
+    expect(reopened).toEqual([AGENT]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+  });
+
+  it("shares the limit with the other slots signed into the subscription", async () => {
+    const { store, limitTurn } = await setUp(
+      { ...state(), accounts: [signedInAs(MAIN), { ...signedInAs(TWIN), identity: signedInAs(MAIN).identity }] as never },
+      fableHit,
+    );
+    await limitTurn();
+    expect((await accountOf(store, TWIN)).modelLimits.fable).toBeDefined();
+    expect((await accountOf(store, TWIN)).limitedUntil).toBeNull();
+  });
+
+  it("moves an idle agent of that model off the account, but not one on another model", async () => {
+    const idle = (id: string, model: string) => ({
+      id, provider: "claude", status: "idle", archivedAt: null, lastUserMessageAt: "2026-09-23T07:00:00.000Z", model,
+    });
+    const extra = [idle(OPUS_AGENT, MODEL.opus), idle(FABLE_AGENT, MODEL.fable)];
+    const { store, paseo, agent, reopened, limitTurn } = await setUp(state(), fableHit);
+    (agent as { model?: string }).model = MODEL.fable;
+    const api = paseo.agents as unknown as {
+      list: () => Promise<unknown>;
+      ref: (id: string) => Record<string, unknown>;
+    };
+    const ref = api.ref;
+    api.list = async () => ({ entries: [agent, ...extra].map((entry) => ({ agent: entry })), pageInfo: { hasMore: false, nextCursor: null } });
+    api.ref = (id: string) => ({ ...ref(id), refresh: async () => ({ agent: extra.find((entry) => entry.id === id) ?? agent }) });
+    await limitTurn();
+    await vi.waitFor(() => expect(reopened).toContain(FABLE_AGENT));
+    expect(reopened).not.toContain(OPUS_AGENT);
+    const state2 = await store.read();
+    expect(state2.sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(state2.bindings[OPUS_AGENT]).toBeUndefined();
+  });
+
+  describe("picking an account by hand", () => {
+    const limited = () => ({
+      ...state(),
+      accounts: [account(MAIN, "marketing", "main"), { ...account(HELLO, "hello", "managed"), modelLimits: { fable: { until: inFuture(), at: inPast(), source: "turn" } } }] as never,
+    });
+
+    it("lets an agent on another model pick it, and refuses one on the limited model", async () => {
+      const { service, store, agent, paseo } = await setUp(limited(), fableHit);
+      (agent as { model?: string }).model = MODEL.opus;
+      expect((await service.setAgentAccount(paseo as never, AGENT, HELLO)).reopened).toEqual([AGENT]);
+      expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+    });
+
+    it("tells the user it is the model's limit", async () => {
+      const { service, store, agent, paseo, reopened } = await setUp(limited(), fableHit);
+      (agent as { model?: string }).model = MODEL.fable;
+      await expect(service.setAgentAccount(paseo as never, AGENT, HELLO)).rejects.toThrow(/hello has reached its Fable limit.*another model/);
+      expect(reopened).toEqual([]);
+      expect((await store.read()).bindings[AGENT]).toBeUndefined();
+    });
   });
 });

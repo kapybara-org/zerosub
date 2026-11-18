@@ -349,6 +349,30 @@ export type Egress = z.infer<typeof EgressSchema>;
 export const AccountStatusSchema = z.enum(["ready", "signed_out", "limited", "checking", "disabled"]);
 export type AccountStatus = z.infer<typeof AccountStatusSchema>;
 
+/** An account projected to this share of its 5-hour window, or already there, is held back when spreading. */
+export const PACE_GATE_PERCENT = 80;
+
+/** How pacing reads an account (see `paceScore` in server/routing.ts). Sent only while spreading is on. */
+export const PaceViewSchema = z.object({
+  /** 5-hour use in the latest reading; 0 once that window has reset; null with no 5-hour reading. */
+  fiveHourUsed: z.number().nullable(),
+  /** `paceScore(...).fiveHour`: projected an hour ahead, pending agents included. */
+  fiveHourProjected: z.number(),
+  /** The part of `fiveHourProjected` charged for pending agents. */
+  pendingFiveHour: z.number(),
+  /** Weekly use in the latest reading; 0 once it has reset; null with no weekly reading. */
+  weeklyUsed: z.number().nullable(),
+  /** Weekly percent charged for pending agents. */
+  pendingWeekly: z.number(),
+  /** Percent of the week gone at the reading, 0 to 100; null when the reset time is unknown or passed. */
+  weekElapsed: z.number().nullable(),
+  /** Agents placed here in the last `PENDING_MS` that the reading may not show. */
+  pending: z.number(),
+  /** `paceScore(...).gated`: new agents go to accounts under the gate first. */
+  gated: z.boolean(),
+});
+export type PaceView = z.infer<typeof PaceViewSchema>;
+
 export const AccountViewSchema = z.object({
   id: z.string(),
   family: FamilySchema,
@@ -402,6 +426,8 @@ export const AccountViewSchema = z.object({
   apiError: z.string().nullable().default(null),
   /** The account's home is due to move to `to`, and hasn't yet: what it waits for, or what went wrong. */
   moving: z.object({ to: z.string(), waiting: z.string().nullable(), error: z.string().nullable() }).nullable().default(null),
+  /** How pacing reads this account; null unless spreading is on and it's one of two or more accounts that can stand in. */
+  pace: PaceViewSchema.nullable().default(null),
 });
 export type AccountView = z.infer<typeof AccountViewSchema>;
 
@@ -517,6 +543,8 @@ export const StateViewSchema = z.object({
   autoSwitch: z.boolean().default(true),
   /** New agents without an account of their own start on the one with the most room, not on the default. */
   balanceNewAgents: z.boolean().optional(),
+  /** While spreading is on: per family, the account a new agent naming none would start on. */
+  pacedNext: z.record(z.string(), z.string()).optional(),
   /**
    * This host's Paseo keeps agent metadata (0.16 and later), which carries the Account control's
    * choice for a new agent and tells it which running agent it belongs to. Without it the control

@@ -38,13 +38,33 @@ describe("detectClaudeLimit", () => {
       const notice = `You${apostrophe}ve hit your 5-hour limit · resets 7pm (America/Sao_Paulo)`;
       const hit = detectClaudeLimit({ outcome: completed, timeline: turn("Working on it.", notice) }, NOW);
       // 7pm in São Paulo (UTC-3), whatever the daemon's own zone.
-      expect(hit).toEqual({ message: notice, kind: "window", resetsAt: "2026-09-23T22:00:00.000Z" });
+      expect(hit).toEqual({ message: notice, kind: "window", resetsAt: "2026-09-23T22:00:00.000Z", scope: null });
     }
     const saved = detectClaudeLimit(
       { outcome: completed, timeline: turn("You've hit your 5-hour limit · resets 3pm (Asia/Kolkata) · progress saved") },
       NOW,
     );
     expect(saved).toMatchObject({ kind: "window", resetsAt: "2026-09-23T09:30:00.000Z" });
+  });
+
+  it("names the model of a model limit, and no scope for a limit of the account", () => {
+    const scopeOf = (notice: string) => detectClaudeLimit({ outcome: completed, timeline: turn(notice) }, NOW)?.scope;
+    expect(scopeOf("You've hit your Fable limit · resets 4:30am (UTC)")).toBe("fable");
+    expect(scopeOf("You've hit your Opus limit · resets 4:30am (UTC)")).toBe("opus");
+    expect(scopeOf("You’ve hit your Sonnet limit")).toBe("sonnet");
+    expect(scopeOf("You've reached your Fable limit.")).toBe("fable");
+    expect(scopeOf("You've reached your Fable 5.2 limit · resets 3pm (UTC)")).toBe("fable");
+    expect(scopeOf("You've reached your Haiku limit")).toBe("haiku");
+    for (const notice of [
+      "You've hit your 5-hour limit · resets 3pm (UTC)",
+      "You've hit your session limit · resets 3pm (UTC)",
+      "You've hit your weekly limit · resets Sep 25, 3pm (UTC)",
+      "You've hit your limit · resets 3pm (UTC)",
+      "You've hit your usage limit",
+      "Claude AI usage limit reached|1790150000",
+    ]) {
+      expect(scopeOf(notice)).toBeNull();
+    }
   });
 
   it("recognises weekly and model limits with a date", () => {

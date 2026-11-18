@@ -108,11 +108,17 @@ function firstLine(text: string): string {
   return (text.split("\n")[0] ?? text).trim();
 }
 
+/** The model a Claude limit notice names ("hit your Fable limit", "reached your Fable 5.2 limit"), lowercase. */
+const CLAUDE_SCOPE = new RegExp(`^You${APOSTROPHE}ve (?:hit|reached) your (Opus|Sonnet|Fable|Haiku)\\b`, "i");
+
 export function detectClaudeLimit(event: TurnEvent, now: Date = new Date()): LimitHit | null {
   for (const text of notices(event, true)) {
     const line = firstLine(text);
     const match = CLAUDE_LIMITS.find(({ pattern }) => pattern.test(line));
-    if (match) return { message: line, kind: match.kind, resetsAt: parseClaudeReset(line, now) };
+    if (match) {
+      const scope = match.kind === "window" ? (line.match(CLAUDE_SCOPE)?.[1]?.toLowerCase() ?? null) : null;
+      return { message: line, kind: match.kind, resetsAt: parseClaudeReset(line, now), scope };
+    }
   }
   return null;
 }
