@@ -60,6 +60,13 @@ export const preferences = defineSettings({
     paidApiFallback: z.boolean().default(false),
     /** Show the account pill in the composer of Claude and Codex agents. */
     showComposerPill: z.boolean().default(true),
+    /**
+     * On unless turned off. Where the composer has the Account control (Paseo 0.16 and
+     * later), show the account pill on a running agent while the control isn't on screen: Paseo hides
+     * it in a composer too narrow for it. Off, the pill steps back for the control as it did before,
+     * on screen or not.
+     */
+    keepComposerPill: z.boolean().default(true),
   }),
 });
 

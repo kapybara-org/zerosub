@@ -3,11 +3,11 @@ import type { ReactElement } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ACCOUNT_METADATA_KEY, AGENT_METADATA_KEY, type AccountView, type AgentRoute, type PaceView, type StateView } from "../shared/model";
 import { setAgentAccount } from "../shared/rpc";
-import { FOLLOW, MANAGE, accountChoices, agentChoices, contributeComposerItem } from "./composer-item";
+import { FOLLOW, MANAGE, accountChoices, agentChoices, agentFace, contributeComposerItem, matching } from "./composer-item";
 import type { ZeroSubStore } from "./store";
 
 // What the app hands a plugin: Paseo 0.16 has `useComposer` and `Select`, an older app has neither.
-const app = vi.hoisted(() => ({ useComposer: undefined as unknown, Select: undefined as unknown }));
+const app = vi.hoisted(() => ({ useComposer: undefined as unknown, Select: undefined as unknown, Combobox: undefined as unknown, compact: true, platform: "web" }));
 vi.mock("@getpaseo/plugin/client", () => ({
   get useComposer() {
     return app.useComposer;
@@ -17,6 +17,21 @@ vi.mock("@getpaseo/plugin/client/ui", () => ({
   get Select() {
     return app.Select;
   },
+  get Combobox() {
+    return app.Combobox;
+  },
+}));
+// Drawn with React Native's own views; here it's the element the control comes down to.
+vi.mock("./account-pill-button", () => ({ AccountPillButton: "AccountPillButton" }));
+// A running agent's control sits in a view that checks whether it's on screen; called here as a plain
+// function, its hooks do nothing, and `render` below unwraps it to the Select.
+vi.mock("react-native", () => ({ View: "View" }));
+vi.mock("react", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("react")>()),
+  useRef: () => ({ current: null }),
+  useEffect: () => undefined,
+  useState: <T,>(initial: T) => [initial, () => undefined],
+  useMemo: <T,>(make: () => T) => make(),
 }));
 vi.mock("./store", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./store")>()),
@@ -83,6 +98,7 @@ function view(accounts: AccountView[], fields: Partial<StateView> = {}): StateVi
     piHomes: null,
     claudeHomes: null,
     showComposerPill: true,
+    keepComposerPill: true,
     openCodeAvailable: false,
     autoSwitch: true,
     autoContinue: true,
@@ -222,7 +238,7 @@ describe("pacing in the menu", () => {
 
 interface Item {
   id: string;
-  Component: () => ReactElement<Record<string, unknown>> | null;
+  Component: (props: unknown) => ReactElement<Record<string, unknown>> | null;
 }
 
 /** The app as `contributeComposerItem` sees it, and the composer its item sits in. */
@@ -243,7 +259,20 @@ function setUp(state: StateView | null, composer: { context: string; provider?: 
     },
   } as unknown as PluginClientContext;
   const control = contributeComposerItem(client, { state, rpc } as unknown as ZeroSubStore);
-  return { items, removed, setMetadata, rpc, openSurface, control, render: () => items[0]!.Component() };
+  return { items, removed, setMetadata, rpc, openSurface, control, render: () => unwrap(items[0]!.Component(host())) };
+}
+
+/** What Paseo hands a composer item: a phone's composer is compact. */
+function host() {
+  return { theme: {}, host: { id: "local", label: "local" }, layout: { compact: app.compact, platform: app.platform } };
+}
+
+/** The Select a rendered control comes down to, past the components and the view around it. */
+function unwrap(element: ReactElement<Record<string, unknown>> | null): ReactElement<Record<string, unknown>> | null {
+  let current = element;
+  while (current && typeof current.type === "function") current = (current.type as (props: unknown) => typeof current)(current.props);
+  if (current?.type === "View") current = [current.props.children].flat().find(Boolean) as typeof current;
+  return current;
 }
 
 describe("the account control for an agent that doesn't exist yet", () => {
@@ -417,6 +446,7 @@ describe("the accounts a running agent's composer offers", () => {
     expect(agentChoices(running([main]), "agent-1")).toBeNull();
     expect(agentChoices(running([main, work], {}, { showComposerPill: false }), "agent-1")).toBeNull();
   });
+
 });
 
 describe("the account control of a running agent", () => {
@@ -462,5 +492,104 @@ describe("the account control of a running agent", () => {
     rpc.mockResolvedValueOnce({ reopened: [], deferred: [], failed: [{ agentId: "agent-1", error: "no session" }], pending: [], continuedIn: null });
     const change = render()!.props.onValueChange as (event: { value: string }) => Promise<void>;
     await expect(change({ value: "work" })).rejects.toThrow(/work/);
+  });
+});
+
+// With keepComposerPill on, a running agent's control reads as its account button does.
+describe("a running agent's control, as the account button shows it", () => {
+  beforeEach(() => {
+    app.useComposer = undefined;
+    app.Select = undefined;
+    app.Combobox = undefined;
+    // A phone's composer, unless a test says otherwise: there the control is Paseo's own.
+    app.compact = true;
+    app.platform = "web";
+  });
+  const named = { [AGENT_METADATA_KEY]: "agent-1" };
+
+  it("is the account button itself off a phone: the usage on a pill that opens the button's own menu", () => {
+    app.Combobox = "Combobox";
+    app.compact = false;
+    const element = setUp(running([main, work]), { context: "agent", metadata: named }).render()!;
+    expect(element.type).toBe("AccountPillButton");
+    expect(element.props).toMatchObject({ agentId: "agent-1", label: "5h 42", icon: "CircleUserRound" });
+    // Its tooltip is the account button's: the account, then a line for each window
+    expect((element.props.title as string).split("\n").slice(0, 2)).toEqual(["Account: main", "5h 42%"]);
+    expect(typeof element.props.Menu).toBe("function");
+    // On a phone the control is only ever in the composer's sheet: a list there, not a menu over it.
+    app.compact = true;
+    expect(setUp(running([main, work]), { context: "agent", metadata: named }).render()?.type).toBe("Combobox");
+    // With the preference off, as before.
+    app.compact = false;
+    expect(setUp(running([main, work], {}, { keepComposerPill: false }), { context: "agent", metadata: named }).render()?.type).toBe("Select");
+  });
+
+  it("is Paseo's own control in the native apps, also where the composer isn't compact (a tablet, a phone on its side)", () => {
+    // The pill's menu is placed with `position: fixed`, which only React Native for the web has.
+    app.Combobox = "Combobox";
+    app.compact = false;
+    app.platform = "ios";
+    expect(setUp(running([main, work]), { context: "agent", metadata: named }).render()?.type).toBe("Combobox");
+    app.platform = "android";
+    expect(setUp(running([main, work]), { context: "agent", metadata: named }).render()?.type).toBe("Combobox");
+  });
+
+  it("says the account's usage on the control, and each account's name and usage in the list", () => {
+    const face = agentFace(running([main, work, home]), "agent-1")!;
+    expect(face.value).toEqual({ id: "main", label: "5h 42" });
+    expect(face.entries).toEqual([
+      { id: "main", label: "main", description: "5h 42%" },
+      { id: "work", label: "work", description: "5h 7%" },
+      { id: "home", label: "home", description: "5h – · 7d –" },
+      { id: MANAGE, label: "Manage accounts…" },
+    ]);
+    // Nothing where the plain control has nothing.
+    expect(agentFace(running([main, work]), "another-agent")).toBeNull();
+  });
+
+  it("names both accounts while a move is under way, and says why an account can't be used", () => {
+    const moving = agentFace(running([main, work], { accountId: "work", pinned: true, pendingAccountId: "main", waiting: "turn" }), "agent-1")!;
+    expect(moving.value.label).toBe("main → work");
+    expect(moving.entries[0]).toEqual({ id: "work", label: "main → work" });
+    const full = account("main", { isDefault: true, status: "limited", usage: used(100) });
+    const out = agentFace(running([full, work], {}, { autoSwitch: false }), "agent-1")!;
+    expect(out.value.label).toBe("5h 100");
+    expect(out.entries[0]).toEqual({ id: "main", label: "main", description: "5h 100%" });
+  });
+
+  it("offers a ChatGPT thread its continuation by name", () => {
+    const chatgpt = [account("a", { family: "codex", isDefault: true }), account("b", { family: "codex" })];
+    const thread = agentFace(running(chatgpt, { family: "codex", accountId: "a", movable: false, pinned: true }), "agent-1")!;
+    expect(thread.entries.map((entry) => entry.label)).toEqual(["a", "Continue on b", "Manage accounts…"]);
+  });
+
+  it("shows as a list that can say the usage on the control, and moves the agent from it", async () => {
+    app.Combobox = "Combobox";
+    const { render, rpc, openSurface } = setUp(running([main, work]), { context: "agent", metadata: named });
+    const element = render()!;
+    expect(element.type).toBe("Combobox");
+    expect(element.props).toMatchObject({ title: "Account", icon: "CircleUserRound", value: { id: "main", label: "5h 42" } });
+    const search = element.props.search as (input: { query: string }) => Promise<{ id: string }[]>;
+    expect((await search({ query: "" })).map((entry) => entry.id)).toEqual(["main", "work", MANAGE]);
+    expect((await search({ query: "WOR" })).map((entry) => entry.id)).toEqual(["work"]);
+    const select = element.props.onSelect as (input: { item: { id: string } }) => Promise<void> | void;
+    await select({ item: { id: "work" } });
+    expect(rpc).toHaveBeenLastCalledWith(setAgentAccount, { agentId: "agent-1", accountId: "work" });
+    await select({ item: { id: MANAGE } });
+    expect(openSurface).toHaveBeenCalledWith("accounts");
+  });
+
+  it("stays a plain Select with the preference off, or in an app without the list", () => {
+    app.Combobox = "Combobox";
+    expect(setUp(running([main, work], {}, { keepComposerPill: false }), { context: "agent", metadata: named }).render()?.type).toBe("Select");
+    app.Combobox = undefined;
+    expect(setUp(running([main, work]), { context: "agent", metadata: named }).render()?.type).toBe("Select");
+  });
+
+  it("matches a search against the name and the usage", () => {
+    const entries = [{ id: "a", label: "work", description: "5h 7%" }, { id: "b", label: "home" }];
+    expect(matching(entries, "  ")).toEqual(entries);
+    expect(matching(entries, "HOME").map((entry) => entry.id)).toEqual(["b"]);
+    expect(matching(entries, "7%").map((entry) => entry.id)).toEqual(["a"]);
   });
 });

@@ -9,6 +9,7 @@ import {
 import { useState } from "react";
 import { Text } from "react-native";
 import { DEFAULT_CONTINUE_PROMPT, preferences, type Preferences } from "../shared/preferences";
+import { ComposerPillRows } from "./composer-settings";
 import { ForkDestinationRows, OpenCodeForkRows } from "./fork-settings";
 
 /** Settings → Plugins → zerosub. Accounts themselves live in the sidebar surface. */
@@ -154,13 +155,7 @@ export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurface
             disabled={settings.saving || !settings.values.autoSwitch}
             onValueChange={(codexSameConversation) => save({ codexSameConversation })}
           />
-          <SettingsSwitch
-            label="Show the account pill in the composer"
-            hint="Appears on Claude and Codex agents once a provider has two or more accounts."
-            value={settings.values.showComposerPill}
-            disabled={settings.saving}
-            onValueChange={(showComposerPill) => save({ showComposerPill })}
-          />
+          <ComposerPillRows values={settings.values} saving={settings.saving} onSave={save} />
         </SettingsCard>
       </SettingsSection>
       <SettingsSection title="Continue on OpenCode">

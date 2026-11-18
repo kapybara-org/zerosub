@@ -278,6 +278,7 @@ describe("the accounts screen", () => {
       piLaunchers: null,
       piHomes: null,
       showComposerPill: true,
+      keepComposerPill: true,
       openCodeAvailable: false,
       autoSwitch: true,
       autoContinue: true,

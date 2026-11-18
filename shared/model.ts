@@ -563,6 +563,8 @@ export const StateViewSchema = z.object({
   /** The folder added Claude accounts' homes are kept in (`~/.claude-config`, say), and whether it's the default. */
   claudeHomes: z.object({ dir: z.string(), isDefault: z.boolean() }).nullable().default(null),
   showComposerPill: z.boolean(),
+  /** The account pill shows on a running agent while its Account control isn't on screen. */
+  keepComposerPill: z.boolean().default(true),
   /** This host's Paseo lists OpenCode as available, so "Continue on OpenCode" can work. */
   openCodeAvailable: z.boolean().default(false),
   /** Accounts at their limit are skipped, so agents can't be moved onto one by hand either. */
