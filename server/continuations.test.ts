@@ -19,9 +19,17 @@ type Entry = { item: AgentTimelineItem; timestamp: string; seqStart: number; seq
 let dir: string;
 /** The services the current test made, stopped once it ends. */
 const services: Service[] = [];
-beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "zerosub-continuations-")); });
+let previousLaunchers: string | undefined;
+beforeEach(async () => {
+  dir = await mkdtemp(join(tmpdir(), "zerosub-continuations-"));
+  previousLaunchers = process.env.ZEROSUB_LAUNCHER_DIR;
+  process.env.ZEROSUB_LAUNCHER_DIR = join(dir, "launchers");
+});
 afterEach(async () => {
   await Promise.all(services.splice(0).map((service) => service.stop()));
+  if (previousLaunchers === undefined) delete process.env.ZEROSUB_LAUNCHER_DIR;
+  else process.env.ZEROSUB_LAUNCHER_DIR = previousLaunchers;
+  // Retried: a write the test set off in the background can still be landing in it.
   await rm(dir, { recursive: true, force: true, maxRetries: 5 });
 });
 
