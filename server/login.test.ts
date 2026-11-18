@@ -25,7 +25,7 @@ async function login(email: string | null, existingId?: string, storedEmail = "f
       id: "codex-existing", family: "codex", label: "first", autoLabel: false,
       kind: "managed", auth: "subscription", home: root, email: storedEmail, plan: "team", organization: null,
       identity: "chatgpt|team-workspace", signedIn: true, disabled: false,
-      limitedUntil: null, limitKind: null, limitedAt: null, createdAt: new Date().toISOString(),
+      limitedUntil: null, limitKind: null, limitedAt: null, modelLimits: {}, createdAt: new Date().toISOString(),
     });
   });
   const identity: Identity = {

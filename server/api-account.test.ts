@@ -241,6 +241,7 @@ describe("an API account", () => {
         limitedUntil: null,
         limitKind: null,
         limitedAt: null,
+        modelLimits: {},
         createdAt: new Date().toISOString(),
       });
     });

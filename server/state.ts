@@ -39,6 +39,11 @@ export const StoredAccountSchema = z.object({
    * saved by earlier versions, which count as a turn's.
    */
   limitSource: z.enum(["turn", "reading"]).optional(),
+  /**
+   * Limits of one model's own window ("Weekly · Fable"), keyed by the lowercase scope name. They keep
+   * agents on that model off the account; the account itself stays usable for every other model.
+   */
+  modelLimits: z.record(z.string(), z.object({ until: z.string(), at: z.string(), source: z.enum(["turn", "reading"]) })).default({}),
   createdAt: z.string(),
 });
 export type StoredAccount = z.infer<typeof StoredAccountSchema>;

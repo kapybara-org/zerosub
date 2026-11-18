@@ -2774,17 +2774,36 @@ describe("usage readings", () => {
     expect(await newAgentOpensOn(service, store, paseo)).toBe(MAIN);
   });
 
-  it("leaves a limit a turn ran into while one model's window is full", async () => {
-    // The turn may have hit that model's limit: the account's room says nothing about it.
+  it("clears a limit a turn ran into once the account's own windows have room, one model's window full or not", async () => {
+    // A model's own hit lands on that model (see "one model's limit"), so what a turn left on the
+    // account is the account's, and only its own windows say whether it has room.
     const { service, store, limitTurn } = await setUp(
       state(),
-      () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your Fable limit" }),
+      () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your session limit" }),
       { usage: fableFull },
     );
     await limitTurn();
+    await service.refreshUsage(MAIN, true);
+    expect(await limitedUntil(store)).not.toBeNull(); // a fresh turn limit is trusted for a while
     await settle(store);
     await service.refreshUsage(MAIN, true);
-    expect(await limitedUntil(store)).not.toBeNull();
+    expect(await limitedUntil(store)).toBeNull();
+    expect((await store.read()).accounts.find((a) => a.id === MAIN)?.modelLimits.fable?.source).toBe("reading");
+  });
+
+  it("limits a model by its own full window, and lifts it once the window has room", async () => {
+    let reading = fableFull;
+    const { service, store, paseo } = await setUp(state(), unused, { usage: () => reading() });
+    const main = async () => (await store.read()).accounts.find((a) => a.id === MAIN)!;
+    await service.refreshUsage(MAIN, true);
+    expect((await main()).modelLimits.fable).toMatchObject({ source: "reading" });
+    expect((await main()).limitedUntil).toBeNull();
+    expect(await newAgentOpensOn(service, store, paseo)).toBe(MAIN); // other models still start there
+
+    reading = () => ({ ...fableFull(), windows: fableFull().windows.map((w) => (w.id === "weekly_fable" ? { ...w, usedPercent: 40 } : w)) });
+    await service.refreshUsage(MAIN, true);
+    expect((await main()).modelLimits).toEqual({});
+    expect((await main()).limitedUntil).toBeNull();
   });
 
   it("takes a full window without credits for a limit, whatever the setting", async () => {
@@ -2938,14 +2957,15 @@ describe("changing the default account", () => {
   /** Several agents, each answering for itself. `reopened` lists the ones Paseo was asked to reload. */
   async function setUpAgents(
     state: Partial<StoredState>,
-    listed: Array<{ id: string; status: string; provider?: string; archived?: boolean; backgroundWork?: number; updatedAt?: string }>,
+    listed: Array<{ id: string; status: string; provider?: string; archived?: boolean; backgroundWork?: number; updatedAt?: string; model?: string }>,
     options: { claude?: Partial<FamilyAdapter>; codex?: Partial<FamilyAdapter>; onList?: (service: Service, context: never) => void | Promise<void> } = {},
   ) {
     const store = new StateStore(join(root, "state.json"));
     await store.update((draft) => Object.assign(draft, state));
-    const agents = listed.map(({ id, status, provider, archived, backgroundWork, updatedAt }) => ({
+    const agents = listed.map(({ id, status, provider, archived, backgroundWork, updatedAt, model }) => ({
       id,
       provider: provider ?? "claude",
+      model,
       status,
       archivedAt: archived ? "2026-09-23T08:00:00.000Z" : null,
       lastUserMessageAt: openedAt,
@@ -3019,19 +3039,29 @@ describe("changing the default account", () => {
         others?: string[];
         /** Agents just placed on `personal`, which its reading doesn't show yet. */
         pending?: number;
+        /** The models agents run, by agent. */
+        models?: Record<string, string>;
+        /** Replaces the two accounts; `usedBy` gives each one's 5-hour percent by account ID (`work` stays at 60). */
+        accounts?: StoredAccount[];
+        usedBy?: Record<string, number>;
       } = {},
     ) {
       const ids = [agentId, ...(options.others ?? [])];
       const setup = await setUpAgents(
         {
-          accounts: [account(MAIN, "work", "main"), account(HELLO, "personal", "managed")] as never,
+          accounts: (options.accounts ?? [account(MAIN, "work", "main"), account(HELLO, "personal", "managed")]) as never,
           defaults: { claude: MAIN, codex: null, pi: null },
           sessions: Object.fromEntries(ids.map((id) => [id, session(MAIN)])),
           bindings: options.bindings ?? {},
         },
-        ids.map((id) => ({ id, status: "idle", updatedAt })),
+        ids.map((id) => ({ id, status: "idle", updatedAt, model: options.models?.[id] })),
         {
-          claude: { usage: async (home: string | null) => (home ? reading(options.personal ?? 20) : reading(60)) } as Partial<FamilyAdapter>,
+          claude: {
+            usage: async (home: string | null) => {
+              const byHome = (options.accounts ?? []).find((entry) => entry.home === home);
+              return home ? reading(options.usedBy?.[byHome?.id ?? ""] ?? options.personal ?? 20) : reading(60);
+            },
+          } as Partial<FamilyAdapter>,
           onList: options.onList,
         },
       );
@@ -3065,6 +3095,49 @@ describe("changing the default account", () => {
       });
       expect(reopened).toEqual([]);
       expect((await store.read()).bindings["fix-build"]).toMatchObject({ accountId: MAIN, source: "user" });
+    });
+
+    describe("with a model's own limit on an account", () => {
+      const FABLE = "claude-fable-5-2";
+      const OPUS = "claude-opus-4-1";
+      const SPARE = "claude-spare";
+      const fableFull = { fable: { until: inFuture(), at: inPast(), source: "turn" as const } };
+      // `personal` has the most room (20%) but its Fable window is full; `spare` reads 40%.
+      const withFableFull = (spare: boolean) =>
+        [
+          account(MAIN, "work", "main"),
+          { ...account(HELLO, "personal", "managed"), modelLimits: fableFull },
+          ...(spare ? [account(SPARE, "spare", "managed")] : []),
+        ] as unknown as StoredAccount[];
+
+      it("keeps a Fable agent off an account whose Fable window is full, even with the most room", async () => {
+        const { store, reopened } = await setUpBusy("fix-build", ago(120), {
+          accounts: withFableFull(false),
+          models: { "fix-build": FABLE },
+        });
+        expect(reopened).toEqual([]);
+        expect((await store.read()).sessions["fix-build"]?.accountId).toBe(MAIN);
+      });
+
+      it("moves a Fable agent to the account without that limit", async () => {
+        const { store, reopened } = await setUpBusy("fix-build", ago(120), {
+          accounts: withFableFull(true),
+          usedBy: { [HELLO]: 20, [SPARE]: 40 },
+          models: { "fix-build": FABLE },
+        });
+        expect(reopened).toEqual(["fix-build"]);
+        expect((await store.read()).bindings["fix-build"]).toMatchObject({ accountId: SPARE, source: "auto" });
+      });
+
+      it("moves an Opus agent onto the account whose Fable window is full", async () => {
+        const { store, reopened } = await setUpBusy("fix-build", ago(120), {
+          accounts: withFableFull(true),
+          usedBy: { [HELLO]: 20, [SPARE]: 40 },
+          models: { "fix-build": OPUS },
+        });
+        expect(reopened).toEqual(["fix-build"]);
+        expect((await store.read()).bindings["fix-build"]).toMatchObject({ accountId: HELLO, source: "auto" });
+      });
     });
 
     it("moves nothing with automatic switching off", async () => {
@@ -3473,6 +3546,34 @@ describe("changing the default account", () => {
       expect(state.bindings.stuck, why).toBeUndefined();
       expect(state.bindings.fine, why).toMatchObject({ accountId: MAIN, source: "auto" });
     }
+  });
+
+  it("moves a Fable agent off an account whose Fable window is full, and keeps an Opus agent there", async () => {
+    const { service, store, paseo, reopened } = await setUpAgents(
+      {
+        accounts: [
+          account(MAIN, "marketing", "main"),
+          { ...account(WORK, "work", "managed"), modelLimits: { fable: { until: inFuture(), at: inPast(), source: "turn" as const } } },
+          account(HELLO, "hello", "managed"),
+        ] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+        bindings: {},
+        sessions: { "fable-agent": session(WORK), "opus-agent": session(WORK) },
+      },
+      [
+        { id: "fable-agent", status: "idle", model: "claude-fable-5-2" },
+        { id: "opus-agent", status: "idle", model: "claude-opus-4-1" },
+      ],
+    );
+    service.setPreferences(KEEP);
+    expect(await service.setDefault(paseo, HELLO)).toEqual({ ...NOTHING_MOVED, reopened: ["fable-agent"] });
+    expect(reopened).toEqual(["fable-agent"]);
+    const state = await store.read();
+    expect(state.sessions["fable-agent"]?.accountId).toBe(HELLO);
+    expect(state.bindings["fable-agent"]).toBeUndefined();
+    // The Opus agent can stay on `work`, so it is kept there, as it would be without the limit.
+    expect(state.bindings["opus-agent"]).toMatchObject({ accountId: WORK, source: "auto" });
+    expect(state.sessions["opus-agent"]?.accountId).toBe(WORK);
   });
 
   it("changes nothing when the account is already the default", async () => {
@@ -4762,5 +4863,93 @@ describe("an API account at a limit with every other account out", () => {
     service.setPreferences(preferences.schema.parse({ autoRedeem: true }));
     await limitTurn();
     expect(redeemed).toEqual([]);
+  });
+});
+
+describe("one model's limit", () => {
+  const OPUS_AGENT = "agent-opus";
+  const FABLE_AGENT = "agent-fable";
+  const MODEL = { fable: "claude-fable-5-2", opus: "claude-opus-4-1" };
+  const fableHit = (): LimitHit => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your Fable limit", scope: "fable" });
+  const state = (sessions: StoredState["sessions"] = {}) => ({
+    accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+    defaults: { claude: MAIN, codex: null, pi: null },
+    sessions: { [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt: "2026-09-23T07:00:00.000Z" }, ...sessions },
+  });
+  const accountOf = async (store: StateStore, id: string) => (await store.read()).accounts.find((entry) => entry.id === id)!;
+
+  it("records the limit on the model, leaves the account free, and moves only that agent", async () => {
+    const { store, agent, reopened, notes, limitTurn } = await setUp(state(), fableHit);
+    (agent as { model?: string }).model = MODEL.fable;
+    await limitTurn();
+    const main = await accountOf(store, MAIN);
+    expect(main.limitedUntil).toBeNull();
+    expect(main.modelLimits.fable).toMatchObject({ source: "turn" });
+    expect(Date.parse(main.modelLimits.fable!.until)).toBeGreaterThan(Date.now());
+    expect(reopened).toEqual([AGENT]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(notes.at(-1)).toMatchObject({ from: "marketing", to: "hello", outcome: "switched" });
+  });
+
+  it("takes an agent whose model Paseo doesn't say to run the model that hit the limit", async () => {
+    const { store, reopened, limitTurn } = await setUp(state(), fableHit);
+    await limitTurn();
+    expect((await accountOf(store, MAIN)).limitedUntil).toBeNull();
+    expect(reopened).toEqual([AGENT]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+  });
+
+  it("shares the limit with the other slots signed into the subscription", async () => {
+    const { store, limitTurn } = await setUp(
+      { ...state(), accounts: [signedInAs(MAIN), { ...signedInAs(TWIN), identity: signedInAs(MAIN).identity }] as never },
+      fableHit,
+    );
+    await limitTurn();
+    expect((await accountOf(store, TWIN)).modelLimits.fable).toBeDefined();
+    expect((await accountOf(store, TWIN)).limitedUntil).toBeNull();
+  });
+
+  it("moves an idle agent of that model off the account, but not one on another model", async () => {
+    const idle = (id: string, model: string) => ({
+      id, provider: "claude", status: "idle", archivedAt: null, lastUserMessageAt: "2026-09-23T07:00:00.000Z", model,
+    });
+    const extra = [idle(OPUS_AGENT, MODEL.opus), idle(FABLE_AGENT, MODEL.fable)];
+    const { store, paseo, agent, reopened, limitTurn } = await setUp(state(), fableHit);
+    (agent as { model?: string }).model = MODEL.fable;
+    const api = paseo.agents as unknown as {
+      list: () => Promise<unknown>;
+      ref: (id: string) => Record<string, unknown>;
+    };
+    const ref = api.ref;
+    api.list = async () => ({ entries: [agent, ...extra].map((entry) => ({ agent: entry })), pageInfo: { hasMore: false, nextCursor: null } });
+    api.ref = (id: string) => ({ ...ref(id), refresh: async () => ({ agent: extra.find((entry) => entry.id === id) ?? agent }) });
+    await limitTurn();
+    await vi.waitFor(() => expect(reopened).toContain(FABLE_AGENT));
+    expect(reopened).not.toContain(OPUS_AGENT);
+    const state2 = await store.read();
+    expect(state2.sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(state2.bindings[OPUS_AGENT]).toBeUndefined();
+  });
+
+  describe("picking an account by hand", () => {
+    const limited = () => ({
+      ...state(),
+      accounts: [account(MAIN, "marketing", "main"), { ...account(HELLO, "hello", "managed"), modelLimits: { fable: { until: inFuture(), at: inPast(), source: "turn" } } }] as never,
+    });
+
+    it("lets an agent on another model pick it, and refuses one on the limited model", async () => {
+      const { service, store, agent, paseo } = await setUp(limited(), fableHit);
+      (agent as { model?: string }).model = MODEL.opus;
+      expect((await service.setAgentAccount(paseo as never, AGENT, HELLO)).reopened).toEqual([AGENT]);
+      expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+    });
+
+    it("tells the user it is the model's limit", async () => {
+      const { service, store, agent, paseo, reopened } = await setUp(limited(), fableHit);
+      (agent as { model?: string }).model = MODEL.fable;
+      await expect(service.setAgentAccount(paseo as never, AGENT, HELLO)).rejects.toThrow(/hello has reached its Fable limit.*another model/);
+      expect(reopened).toEqual([]);
+      expect((await store.read()).bindings[AGENT]).toBeUndefined();
+    });
   });
 });

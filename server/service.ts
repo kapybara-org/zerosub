@@ -31,8 +31,9 @@ import {
   type StateView,
   type TrafficSwitches,
   type Usage,
+  type UsageWindow,
 } from "../shared/model";
-import { capsAccount, limitedPick } from "../shared/format";
+import { capsAccount, limitedModelPick, limitedPick, windowScope } from "../shared/format";
 import { DEFAULT_CONTINUE_PROMPT, type Preferences } from "../shared/preferences";
 import type { RedeemResult, ReopenSummary } from "../shared/rpc";
 import { SWITCH_ROW_KIND, SWITCH_ROW_VERSION, type SwitchRow } from "../shared/timeline";
@@ -78,7 +79,7 @@ import { maskProxy, normalizeProxy } from "./proxy";
 import { Reopener, hostCanReload } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
-import { canStandIn, chooseAccount, fiveHourWindow, headroomScore, isLastResort, isLimited, isUsable, mostAvailable, paceScore, paceView, PENDING_MS, weeklyWindow, withBankedReset, type Pacing, type RouteDecision, type RouteInput } from "./routing";
+import { canStandIn, chooseAccount, fiveHourWindow, headroomScore, isLastResort, isLimited, isLimitedFor, isUsable, mostAvailable, paceScore, paceView, PENDING_MS, scopeCoversModel, weeklyWindow, withBankedReset, type Pacing, type RouteDecision, type RouteInput } from "./routing";
 import {
   ALL_SOURCES,
   MAIN_ACCOUNT_ID,
@@ -224,6 +225,8 @@ interface AgentInfo {
   backgroundWork: number;
   /** Its metadata holds its own ID (see `AGENT_METADATA_KEY`). Null when Paseo sends no metadata (before 0.16). */
   named: boolean | null;
+  /** The model the agent runs, when Paseo says (a limit of one model's own window depends on it). */
+  model: string | null;
 }
 
 /**
@@ -519,6 +522,11 @@ export class Service {
   private readonly redeeming = new Set<string>();
   private readonly browserSignIn = canSignInWithBrowser();
   private agentCache: { at: number; agents: Promise<AgentInfo[]> } | null = null;
+  /**
+   * The model each agent runs, as last seen. Routing, alignment and the account button all decide
+   * with this one value, so a session that opens somewhere is never moved again by another reading.
+   */
+  private readonly agentModels = new Map<string, string | null>();
   private openCodeCache: { at: number; available: boolean } | null = null;
   private lastPrune = 0;
   private cleaning: Promise<void> | null = null;
@@ -1078,6 +1086,8 @@ export class Service {
     if (reload) reload.opens += 1;
     const ownReload = reload?.opens === 1;
     const state = await this.store.read();
+    // Paseo's session_open says nothing of the model, so ask once; `routeFor` reads the same value.
+    await withTimeout(this.modelOf(context.paseo, request.agentId), 3_000);
     const input: RouteInput = {
       agentId: request.agentId,
       family,
@@ -1094,6 +1104,7 @@ export class Service {
       requested: request.reason === "create" ? requestedAccount(request) : undefined,
       allowNextPick: takesNextPick(request),
       pendingOf: (id) => this.pendingOn(id, now),
+      model: this.agentModels.get(request.agentId) ?? null,
     };
     const first = chooseAccount(state, input);
     if (!first) return undefined;
@@ -1405,13 +1416,15 @@ export class Service {
     ranOn: string | null,
   ): Promise<void> {
     if (!ranOn) return;
+    // A limit of one model's window matters to this agent by its model: learn it before deciding.
+    if (problem.kind === "limit" && problem.hit.scope) await withTimeout(this.modelOf(paseo, agentId), 3_000);
     let release = this.tryClaim(agentId);
     if (!release) {
       // Another move has the agent (alignment, a switch asked for as the turn ended, a manual Codex
       // handoff). The limit is recorded now, so nothing is routed to the account meanwhile, then this
       // waits for that move: giving up would leave the agent waiting on the limit with nobody to carry
       // it on. Failover then finds the agent moved, or its task continued, and leaves it there.
-      await this.noteLimit(ranOn, problem);
+      await this.noteLimit(ranOn, problem, agentId);
       release = await this.claim(agentId);
     }
     let exhausted: string | null = null;
@@ -1421,7 +1434,7 @@ export class Service {
       if (!account) return;
       if (this.runningOn(state, agentId, family) !== account.id) {
         // Moved while the turn was being read (the user picked another account, say).
-        await this.noteLimit(account.id, problem);
+        await this.noteLimit(account.id, problem, agentId);
         return;
       }
       exhausted = account.id;
@@ -1430,16 +1443,21 @@ export class Service {
       release();
     }
     if (exhausted && this.prefs.autoSwitch && this.adapters[family].portable) {
-      void this.moveIdleAgentsOff(paseo, exhausted, family, agentId, problem.kind).catch((error: unknown) =>
+      void this.moveIdleAgentsOff(paseo, exhausted, family, agentId, problem.kind, problem.kind === "limit" ? problem.hit.scope : null).catch((error: unknown) =>
         log("moving idle agents failed", error),
       );
     }
   }
 
   /** Records the limit a turn hit on `accountId`, unless a reset refilled the account just now. */
-  private async noteLimit(accountId: string, problem: Problem): Promise<void> {
+  private async noteLimit(accountId: string, problem: Problem, agentId: string): Promise<void> {
     if (problem.kind !== "limit") return;
     const { hit } = problem;
+    if (hit.kind === "window" && hit.scope) {
+      this.rememberScope(agentId, hit.scope);
+      await this.markModelLimited(accountId, hit.scope, hit.resetsAt ?? new Date(Date.now() + WINDOW_LIMIT_MS).toISOString(), "turn");
+      return;
+    }
     if (hit.kind === "window" && this.recentlyRedeemed(accountId)) return;
     await this.markLimited(accountId, hit.resetsAt ?? new Date(Date.now() + (hit.kind === "budget" ? BUDGET_LIMIT_MS : WINDOW_LIMIT_MS)).toISOString(), hit.kind, "turn");
   }
@@ -1463,7 +1481,7 @@ export class Service {
           log(`could not find where ${agentId}'s task continues`, error);
           return null;
         });
-    if (problem.kind === "limit" && problem.hit.kind === "window" && this.recentlyRedeemed(account.id)) {
+    if (problem.kind === "limit" && problem.hit.kind === "window" && !problem.hit.scope && this.recentlyRedeemed(account.id)) {
       // This turn hit the limit just before a reset refilled it (another agent's failover or the
       // user spent one moments ago). The account has room again: carry on instead of switching.
       if (elsewhere) {
@@ -1481,20 +1499,34 @@ export class Service {
     if (problem.kind === "limit") {
       const { hit } = problem;
       resetsAt = hit.resetsAt ?? new Date(now + (hit.kind === "budget" ? BUDGET_LIMIT_MS : WINDOW_LIMIT_MS)).toISOString();
-      await this.markLimited(account.id, resetsAt, hit.kind, "turn");
-      if (hit.kind === "window") {
-        // The notice is the freshest word on usage: show that window full until a new reading lands.
-        const shown = this.usage.get(account.id);
-        if (shown) this.setUsage(account.id, showLimit(shown, hit.resetsAt));
-        // The account was just used, so its token is fresh: ask for the exact reset time.
+      if (hit.kind === "window" && hit.scope) {
+        // One model's own window: only agents on that model are kept off the account, and the
+        // account keeps its place for every other model.
+        this.rememberScope(agentId, hit.scope);
+        await this.markModelLimited(account.id, hit.scope, resetsAt, "turn");
         await withTimeout(this.refreshUsage(account.id, true), 12_000);
-        const exact = this.resetFromUsage(account.id);
+        const exact = this.resetFromUsage(account.id, hit.scope);
         if (exact && Date.parse(exact) > now) {
           resetsAt = exact;
-          await this.markLimited(account.id, exact, "window", "turn");
+          await this.markModelLimited(account.id, hit.scope, exact, "turn");
         }
+        console.log(`[ZeroSub] ${account.label} hit its ${hit.scope} limit (agent ${agentId}): ${hit.message}`);
+      } else {
+        await this.markLimited(account.id, resetsAt, hit.kind, "turn");
+        if (hit.kind === "window") {
+          // The notice is the freshest word on usage: show that window full until a new reading lands.
+          const shown = this.usage.get(account.id);
+          if (shown) this.setUsage(account.id, showLimit(shown, hit.resetsAt));
+          // The account was just used, so its token is fresh: ask for the exact reset time.
+          await withTimeout(this.refreshUsage(account.id, true), 12_000);
+          const exact = this.resetFromUsage(account.id);
+          if (exact && Date.parse(exact) > now) {
+            resetsAt = exact;
+            await this.markLimited(account.id, exact, "window", "turn");
+          }
+        }
+        console.log(`[ZeroSub] ${account.label} hit a ${hit.kind} limit (agent ${agentId}): ${hit.message}`);
       }
-      console.log(`[ZeroSub] ${account.label} hit a ${hit.kind} limit (agent ${agentId}): ${hit.message}`);
     } else {
       console.log(`[ZeroSub] ${account.label} is signed out (agent ${agentId})`);
     }
@@ -1535,9 +1567,9 @@ export class Service {
     const move = adapter.portable ? this.nextAccount(latest, agentId, family, account.id) : null;
     // Another subscription account comes first, then a banked reset (free), and a paid Azure account
     // (with `paidApiFallback` on) only once neither is to be had.
-    let next = adapter.portable ? move?.account : mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]), false, this.pacing(now));
+    let next = adapter.portable ? move?.account : mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]), false, this.pacing(now), this.agentModels.get(agentId));
     if (!next) {
-      if (problem.kind === "limit" && problem.hit.kind === "window" && this.prefs.autoRedeem && !account.disabled && account.auth !== "api") {
+      if (problem.kind === "limit" && problem.hit.kind === "window" && !problem.hit.scope && this.prefs.autoRedeem && !account.disabled && account.auth !== "api") {
         // Opt-in: every subscription account is out, so spend a banked reset rather than stop (or pay).
         const reply = await this.redeemOn(account, true);
         if (reply.outcome === "reset") {
@@ -1566,7 +1598,7 @@ export class Service {
         console.log(`[ZeroSub] no automatic reset for ${account.label}: ${reply.message}`);
       }
       if (!adapter.portable && this.prefs.paidApiFallback) {
-        next = mostAvailable(await this.store.read(), family, (id) => this.usage.get(id), Date.now(), new Set([account.id]), true);
+        next = mostAvailable(await this.store.read(), family, (id) => this.usage.get(id), Date.now(), new Set([account.id]), true, undefined, this.agentModels.get(agentId));
       }
     }
     if (!next) {
@@ -1717,6 +1749,16 @@ export class Service {
       const limit: Limit = { limitedUntil: until, limitKind: kind, limitedAt: new Date().toISOString(), limitSource: source };
       // A quota belongs to the subscription, so every slot signed into it is out of room.
       for (const slot of [account, ...sameSubscription(draft, account)]) Object.assign(slot, limit);
+    });
+  }
+
+  /** Records the limit of one model's own window; every slot signed into the subscription shares it. */
+  private async markModelLimited(accountId: string, scope: string, until: string, source: "turn" | "reading"): Promise<void> {
+    await this.store.update((draft) => {
+      const account = findAccount(draft, accountId);
+      if (!account) return;
+      const limit = { until, at: new Date().toISOString(), source };
+      for (const slot of [account, ...sameSubscription(draft, account)]) slot.modelLimits[scope] = limit;
     });
   }
 
@@ -1873,10 +1915,15 @@ export class Service {
   }
 
   /** The reset time of the window that is full, from the freshest live usage reading. */
-  private resetFromUsage(accountId: string): string | null {
+  private resetFromUsage(accountId: string, scope?: string): string | null {
     const usage = this.usage.get(accountId);
     if (!usage || usage.cached) return null;
     const full = usage.windows.filter((window) => window.usedPercent >= 99 && window.resetsAt);
+    // A limit of one model's own window is lifted by that window alone.
+    if (scope) {
+      const own = full.filter((window) => !capsAccount(window) && scopeCoversModel(scope, windowScope(window)));
+      return own.sort((a, b) => Date.parse(b.resetsAt ?? "") - Date.parse(a.resetsAt ?? ""))[0]?.resetsAt ?? null;
+    }
     // A full window of one model's only is what the turn hit when none of the account's own is full,
     // so a later-resetting model window doesn't stretch a 5-hour limit to days.
     const hit = full.some(capsAccount) ? full.filter(capsAccount) : full;
@@ -1930,7 +1977,7 @@ export class Service {
     const routed = this.routeFor(state, agentId, family, exhausted);
     if (routed && routed.account.id !== exhausted && !routed.skipped) return { account: routed.account, pin: false };
     const now = Date.now();
-    const roomiest = mostAvailable(state, family, (id) => this.usage.get(id), now, new Set([exhausted]), this.prefs.paidApiFallback, this.pacing(now));
+    const roomiest = mostAvailable(state, family, (id) => this.usage.get(id), now, new Set([exhausted]), this.prefs.paidApiFallback, this.pacing(now), this.agentModels.get(agentId));
     return roomiest && { account: roomiest, pin: true };
   }
 
@@ -1952,11 +1999,14 @@ export class Service {
     family: Family,
     except: string,
     reason: "limit" | "signed_out" | "pacing",
+    scope?: string | null,
   ): Promise<void> {
     const state = await this.store.read();
     const from = findAccount(state, accountId);
+    if (!from) return;
     // One a reset refilled just before this turn's limit came in still has room (see `failover`).
-    if (!from || (reason === "pacing" ? !this.paced(from, Date.now()) : isUsable(from, Date.now()))) return;
+    // A limit of one model's window leaves the account usable: only agents on that model move.
+    if (reason === "pacing" ? !this.paced(from, Date.now()) : scope ? !isLimitedFor(from, Date.now(), scope) : isUsable(from, Date.now())) return;
     const families = await this.families.resolve(paseo);
     const candidates = (await this.cachedAgents(paseo))
       .filter(
@@ -1965,7 +2015,8 @@ export class Service {
           !agent.archived &&
           families[agent.provider] === family &&
           this.runningOn(state, agent.id, family) === accountId &&
-          !(reason === "pacing" && state.bindings[agent.id]?.source === "user"),
+          !(reason === "pacing" && state.bindings[agent.id]?.source === "user") &&
+          (!scope || scopeCoversModel(scope, this.agentModels.get(agent.id))),
       )
       .map((agent) => agent.id);
     for (const agentId of candidates) {
@@ -1994,7 +2045,7 @@ export class Service {
         if (reason === "pacing") {
           // Turning either preference off stops a pass that's already running.
           if (!this.prefs.balanceNewAgents || !this.prefs.autoSwitch || !this.paced(findAccount(latest, accountId), now)) return;
-          const next = mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([accountId]), false, this.pacing(now));
+          const next = mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([accountId]), false, this.pacing(now), this.agentModels.get(agentId));
           // Only to an account with room in both windows that stays under the gate with this agent.
           if (!next || headroomScore(this.usage.get(next.id), now) >= 100) return;
           if (paceScore(this.usage.get(next.id), this.pendingOn(next.id, now) + 1, now).gated) return;
@@ -2013,7 +2064,7 @@ export class Service {
           from: from?.label ?? null,
           to: next.label,
           reason,
-          resetsAt: reason === "pacing" ? null : (findAccount(latest, accountId)?.limitedUntil ?? null),
+          resetsAt: reason === "pacing" ? null : limitEnd(findAccount(latest, accountId), this.agentModels.get(agentId), now),
           continued: false,
           continuedIn: null,
           toFamily: null,
@@ -2994,6 +3045,7 @@ export class Service {
       usageOf: (id) => this.usage.get(id),
       current,
       pendingOf: (id) => this.pendingOn(id, now),
+      model: this.agentModels.get(agentId) ?? null,
     });
   }
 
@@ -3232,7 +3284,7 @@ export class Service {
           from: findAccount(state, current)?.label ?? fromLabels.get(current) ?? null,
           to: findAccount(state, target)?.label ?? target,
           reason: why,
-          resetsAt: why === "limit" ? (findAccount(state, current)?.limitedUntil ?? null) : null,
+          resetsAt: why === "limit" ? limitEnd(findAccount(state, current), this.agentModels.get(agentId), Date.now()) : null,
           continued: false,
           continuedIn: null,
           toFamily: null,
@@ -3388,7 +3440,7 @@ export class Service {
     if (!from) return "removed";
     if (!from.signedIn) return "signed_out";
     if (from.disabled) return "disabled";
-    if (isLimited(from, now)) return "limit";
+    if (isLimitedFor(from, now, this.agentModels.get(agentId))) return "limit";
     return state.bindings[agentId]?.accountId === target ? "manual" : "default";
   }
 
@@ -3449,10 +3501,10 @@ export class Service {
       // full window, so a full window alone isn't a limit then.
       const creditsCover = this.prefs.useCredits && usage.credits != null;
       const full = creditsCover ? undefined : usage.windows.find((window) => window.usedPercent >= 100 && window.resetsAt);
-      // One model's own full window (Claude's "Weekly · Opus") leaves the account usable for the rest.
-      // A turn that hits it still marks the account (see `failover`), and while it's full that limit
-      // doesn't clear here.
+      // One model's own full window (Claude's "Weekly · Opus") leaves the account usable for the rest:
+      // it limits only that model (see `noteModelWindows`), never the account.
       const cutOff = full && usage.windows.find((window) => window.usedPercent >= 100 && window.resetsAt && capsAccount(window));
+      await this.noteModelWindows(accountId, usage.windows, now);
       if (cutOff && !isLimited(account, now)) {
         await this.markLimited(accountId, cutOff.resetsAt ?? new Date(now + WINDOW_LIMIT_MS).toISOString(), "window", "reading");
         return;
@@ -3460,15 +3512,14 @@ export class Service {
       // A window limit clears once usage shows room again, or once credits cover it if a reading set
       // it: a limit a turn ran into stands, credits or not. Budget limits never appear in usage
       // windows, and a fresh limit is trusted for a while (it may be on a window we can't see).
-      // A reading only takes a limit from the account's own windows, so its limit clears on those:
-      // one model's full window (Claude's "Weekly · Fable") doesn't hold it, nor one set by a
-      // version that still took any full window for the account's.
+      // Only the account's own windows set or hold its limit, whoever reported it: a model's full
+      // window (Claude's "Weekly · Fable") is its own limit, and doesn't hold one a turn set, nor one
+      // saved by a version that took any full window for the account's.
       const settled = account.limitedAt ? now - Date.parse(account.limitedAt) > LIMIT_TRUST_MS : true;
       const fromReading = account.limitSource === "reading";
-      const watched = fromReading ? usage.windows.filter(capsAccount) : usage.windows;
-      const stillFull = fromReading ? cutOff : full;
+      const watched = usage.windows.filter(capsAccount);
       const roomy = (creditsCover && fromReading) || Math.max(...watched.map((window) => window.usedPercent)) < 90;
-      if (!stillFull && account.limitedUntil && account.limitKind === "window" && settled && roomy) {
+      if (!cutOff && account.limitedUntil && account.limitKind === "window" && settled && roomy) {
         await this.store.update((draft) => {
           const target = findAccount(draft, accountId);
           if (!target) return;
@@ -3480,6 +3531,43 @@ export class Service {
     })().finally(() => this.usageInFlight.delete(accountId));
     this.usageInFlight.set(accountId, task);
     return task;
+  }
+
+  /**
+   * Keeps an account's model limits (see `modelLimits`) in step with a live reading: a model's own
+   * window at 100% limits that model until its reset, unless a limit still stands; one with room
+   * again (under 90%) lifts a limit a reading set, or a turn's once it has settled. Past ones are dropped.
+   */
+  private async noteModelWindows(accountId: string, windows: readonly UsageWindow[], now: number): Promise<void> {
+    const own = windows.filter((window) => !capsAccount(window));
+    const apply = (limits: StoredAccount["modelLimits"]): boolean => {
+      let changed = false;
+      for (const [scope, limit] of Object.entries(limits)) {
+        if (Date.parse(limit.until) > now) continue;
+        delete limits[scope];
+        changed = true;
+      }
+      for (const window of own) {
+        const scope = windowScope(window);
+        const held = limits[scope];
+        if (window.usedPercent >= 100 && window.resetsAt && Date.parse(window.resetsAt) > now) {
+          if (held) continue;
+          limits[scope] = { until: window.resetsAt, at: new Date(now).toISOString(), source: "reading" };
+          changed = true;
+        } else if (held && window.usedPercent < 90 && (held.source === "reading" || now - Date.parse(held.at) > LIMIT_TRUST_MS)) {
+          delete limits[scope];
+          changed = true;
+        }
+      }
+      return changed;
+    };
+    // Most readings change nothing, so the registry is only written when one does.
+    const seen = findAccount(await this.store.read(), accountId);
+    if (!seen || !apply(structuredClone(seen.modelLimits))) return;
+    await this.store.update((draft) => {
+      const account = findAccount(draft, accountId);
+      if (account) apply(account.modelLimits);
+    });
   }
 
   /**
@@ -3703,9 +3791,33 @@ export class Service {
     void agent.setMetadata({ [AGENT_METADATA_KEY]: agentId }).catch(failed);
   }
 
+  /** Remembers the model Paseo reports; one it doesn't report leaves what's known (see `rememberScope`). */
+  private noteModel(agent: AgentInfo): void {
+    if (agent.model) this.agentModels.set(agent.id, agent.model);
+    else if (!this.agentModels.has(agent.id)) this.agentModels.set(agent.id, null);
+  }
+
+  /** The agent's model: known, else looked up once. A lookup that fails says null and isn't remembered. */
+  private async modelOf(paseo: PaseoApi, agentId: string): Promise<string | null> {
+    if (this.agentModels.has(agentId)) return this.agentModels.get(agentId) ?? null;
+    const info = await agentInfo(paseo, agentId);
+    if (!info) return null;
+    this.noteModel(info);
+    return this.agentModels.get(agentId) ?? null;
+  }
+
+  /** An agent whose model Paseo doesn't report is taken to run the model whose limit it just hit. */
+  private rememberScope(agentId: string, scope: string): void {
+    const known = this.agentModels.get(agentId);
+    if (!known || known.toLowerCase() === "default") this.agentModels.set(agentId, scope);
+  }
+
   private cachedAgents(paseo: PaseoApi): Promise<AgentInfo[]> {
     if (this.agentCache && Date.now() - this.agentCache.at < AGENT_LIST_MS) return this.agentCache.agents;
-    const agents = listAgents(paseo, false).then((result) => result.agents);
+    const agents = listAgents(paseo, false).then((result) => {
+      for (const agent of result.agents) this.noteModel(agent);
+      return result.agents;
+    });
     this.agentCache = { at: Date.now(), agents };
     agents.catch(() => {
       this.agentCache = null;
@@ -3914,6 +4026,8 @@ export class Service {
     let kept = 0;
     const moving: string[] = [];
     if (open.length === 0) return { kept, moving };
+    // This listing is fresh, so it is also where the agents' models are read from.
+    for (const agent of open) this.noteModel(agent);
     const now = Date.now();
     const at = new Date(now).toISOString();
     await this.store.update((draft) => {
@@ -3926,7 +4040,7 @@ export class Service {
         // Still starting, and not routed yet: it will be, by the new default.
         if (agent.status === "initializing" && !draft.sessions[agent.id]) continue;
         const current = findAccount(draft, this.runningOn(draft, agent.id, family));
-        if (!current || current.family !== family || !isUsable(current, now)) moving.push(agent.id);
+        if (!current || current.family !== family || !isUsable(current, now, this.agentModels.get(agent.id))) moving.push(agent.id);
         else if (current.id !== newDefault) {
           // "auto", like a limit switch, so the account button still offers "Follow default".
           draft.bindings[agent.id] = { accountId: current.id, source: "auto", at };
@@ -3944,6 +4058,7 @@ export class Service {
       for (const slot of [account, ...sameSubscription(draft, account)]) {
         slot.limitedUntil = null;
         slot.limitKind = null;
+        slot.modelLimits = {};
       }
     });
     if (!findAccount(state, accountId)) throw new Error("That account no longer exists.");
@@ -3968,7 +4083,14 @@ export class Service {
     if (!target || target.family !== family) throw new Error("That account can't be used with this agent.");
     if (!target.signedIn) throw new Error(`${target.label} is signed out. Sign it in first.`);
     if (accountId && target.disabled) throw new Error(`${target.label} is disabled. Enable it in Accounts first.`);
-    if (accountId && this.prefs.autoSwitch && isLimited(target, Date.now())) throw new Error(limitedPick(target.label));
+    if (accountId && this.prefs.autoSwitch) {
+      const now = Date.now();
+      if (isLimited(target, now)) throw new Error(limitedPick(target.label));
+      // Only a limit of this agent's own model refuses it; another model's leaves the account open.
+      const model = await this.modelOf(paseo, agentId);
+      const scope = Object.entries(target.modelLimits).find(([name, limit]) => Date.parse(limit.until) > now && scopeCoversModel(name, model))?.[0];
+      if (scope) throw new Error(limitedModelPick(target.label, scope));
+    }
 
     if (!adapter.portable) {
       if (info.status === "running" || info.status === "initializing") {
@@ -5104,6 +5226,7 @@ export class Service {
         // Cleared first, so a limit the account brings from another slot (see applyIdentity) stands.
         account.limitedUntil = null;
         account.limitKind = null;
+        account.modelLimits = {};
         handedOver = applyIdentity(account, identity, draft);
       });
     } catch (error) {
@@ -5191,8 +5314,17 @@ function newAccount(fields: Pick<StoredAccount, "id" | "family" | "kind" | "home
     limitedUntil: null,
     limitKind: null,
     limitedAt: null,
+    modelLimits: {},
     createdAt: new Date().toISOString(),
   };
+}
+
+/** When the account's limit that keeps an agent on `model` off it lifts: its own, else that of the model's window. */
+function limitEnd(account: StoredAccount | undefined, model: string | null | undefined, now: number): string | null {
+  if (!account) return null;
+  if (account.limitedUntil && isLimited(account, now)) return account.limitedUntil;
+  const scoped = Object.entries(account.modelLimits).filter(([scope, limit]) => Date.parse(limit.until) > now && scopeCoversModel(scope, model));
+  return scoped.sort((a, b) => Date.parse(b[1].until) - Date.parse(a[1].until))[0]?.[1].until ?? account.limitedUntil;
 }
 
 type Limit = Pick<StoredAccount, "limitedUntil" | "limitKind" | "limitedAt" | "limitSource">;
@@ -5211,11 +5343,19 @@ function applyIdentity(account: StoredAccount, identity: Identity, state: Stored
   account.limitKind = null;
   account.limitedAt = null;
   account.limitSource = undefined;
+  account.modelLimits = {};
   const now = Date.now();
-  const limited = sameSubscription(state, account).find((other) => isLimited(other, now));
+  const twins = sameSubscription(state, account);
+  const limited = twins.find((other) => isLimited(other, now));
   if (limited) {
     const { limitedUntil, limitKind, limitedAt, limitSource } = limited;
     Object.assign(account, { limitedUntil, limitKind, limitedAt, limitSource });
+  }
+  // The new subscription's model limits are the ones its other slots know of.
+  for (const twin of twins) {
+    for (const [scope, limit] of Object.entries(twin.modelLimits)) {
+      if (Date.parse(limit.until) > now) account.modelLimits[scope] = limit;
+    }
   }
   return true;
 }
@@ -5271,6 +5411,7 @@ function toAgentInfo(agent: AgentSnapshot): AgentInfo {
     updatedAt: Date.parse(agent.updatedAt) || 0,
     backgroundWork: (agent as { backgroundWork?: { count?: number } }).backgroundWork?.count ?? 0,
     named: metadata ? metadata[AGENT_METADATA_KEY] === agent.id : null,
+    model: agent.model ?? agent.runtimeInfo?.model ?? null,
   };
 }
 
