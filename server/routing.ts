@@ -457,8 +457,9 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
     // A paid stand-in is only kept while no subscription account could take over from it.
     const keeps = (stand: StoredAccount) =>
       !isLastResort(stand) || !accountsOf(state, input.family).some((other) => other.id !== account!.id && canStandIn(other, input.now, input.model));
+    const stays = (stand: StoredAccount) => canStandIn(stand, input.now, input.model) || (isLastResort(stand) && isUsable(stand, input.now, input.model));
     let alternative =
-      staying && staying.family === input.family && staying.id !== account.id && isUsable(staying, input.now, input.model) && keeps(staying)
+      staying && staying.family === input.family && staying.id !== account.id && stays(staying) && keeps(staying)
         ? staying
         : mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]), input.paidFallback, pacing, input.model);
     // Before a paid stand-in, a limited subscription with a usable banked reset: the account itself
