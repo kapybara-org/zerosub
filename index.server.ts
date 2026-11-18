@@ -108,7 +108,7 @@ export default function contribute(server: PluginServerContext) {
     console.error("[ZeroSub] this Paseo doesn't report closed agents", describe(error));
   }
 
-  server.handle(getState, ({ refreshUsage }, { paseo }) => service.view(paseo, refreshUsage));
+  server.handle(getState, ({ refreshUsage, accountId }, { paseo }) => service.view(paseo, refreshUsage, accountId));
   server.handle(startLogin, ({ family, method, accountId, proxy }) => service.startLogin(family, method, accountId, proxy));
   server.handle(submitLoginCode, ({ loginId, code }) => service.submitCode(loginId, code));
   server.handle(cancelLogin, ({ loginId }) => service.cancelLogin(loginId));
