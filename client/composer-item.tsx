@@ -42,6 +42,9 @@ export interface AccountChoices {
   icon: string;
 }
 
+/** Beside an agent's account in its list, when the agent started there because the account's weekly reset was near. */
+export const WEEKLY_RESET_NOTE = "Weekly reset was near";
+
 /** The option that names no account: the agent starts, or goes back to, where the default sends it. */
 export const FOLLOW = "follow";
 /** The option that opens the Accounts screen. */
@@ -86,7 +89,8 @@ export function accountChoices(state: StateView, provider: string | null, chosen
 /**
  * What the account control offers for a running agent: the account it's on first (named with the
  * one it's moving from while a move is under way, as on the account button), then the accounts it
- * can move to, going back to the default, and the Accounts screen. Null when the agent isn't routed
+ * can move to, going back to the default, and the Accounts screen. The agent's account also says
+ * when the agent started on it because its weekly reset was near. Null when the agent isn't routed
  * or its provider has one account. What needs a confirmation, a banked reset or a fork to the other
  * provider, stays with the account button, which shows for it (see pills.ts).
  */
@@ -101,7 +105,13 @@ export function agentChoices(state: StateView, agentId: string): AccountChoices 
   const { label } = pillText(current, running ?? null, route.waiting ?? (state.canReopen ? "idle" : "restart"));
   // As on the account button: pacing's verdict names the account it picks for the next new agent.
   const next = (account: AccountView) => state.pacedNext?.[account.family] === account.id;
-  const options: AccountOption[] = [{ value: current.id, label, description: detail(current, next(current)) }];
+  // Why the agent is on this account, which the account button's menu says as "Started here: weekly
+  // reset was near": with the control there, that button doesn't show for an agent that isn't at a
+  // limit. Short, as a list cuts a description to one line. On this account it stands in place of
+  // pacing's verdict, which the others keep; without pacing the usage comes after it.
+  const options: AccountOption[] = [
+    { value: current.id, label, description: detail(current, next(current), route.selectionReason === "weekly_reset" ? WEEKLY_RESET_NOTE : undefined) },
+  ];
   // Codex threads can't change accounts in place and continue in the task's tab for the account;
   // Grok conversations stay on theirs, so the others aren't offered.
   const stays = !route.movable && !HAND_OFF[route.family];
@@ -123,7 +133,7 @@ function takesAgents(state: StateView, account: AccountView): boolean {
 }
 
 function detail(account: AccountView, next: boolean, lead?: string): string | undefined {
-  // A pace and a lead mean a one-time pick: the pick wins over pacing's verdict.
+  // A pace and a lead: the lead (a one-time pick, or why the agent started here) wins over pacing's verdict.
   if (account.pace) return lead ?? paceVerdict(account.pace, next);
   const parts = lead ? [lead] : [];
   if (account.status === "limited") parts.push("Limit reached");

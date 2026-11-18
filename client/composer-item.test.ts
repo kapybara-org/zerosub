@@ -347,6 +347,27 @@ describe("the accounts a running agent's composer offers", () => {
     });
   });
 
+  it("says by the agent's account when the agent started there because its weekly reset was near", () => {
+    const near = agentChoices(running([main, work], { selectionReason: "weekly_reset" }), "agent-1")!;
+    expect(near.options[0]).toEqual({ value: "main", label: "main", description: "Weekly reset was near · 42% used" });
+    // Only by its own account, and with no usage reading the note stands alone.
+    expect(near.options[1]!.description).toBe("7% used");
+    const unread = agentChoices(running([home, work], { accountId: "home", selectionReason: "weekly_reset" }), "agent-1")!;
+    expect(unread.options[0]!.description).toBe("Weekly reset was near");
+    expect(agentChoices(running([main, work]), "agent-1")!.options[0]!.description).toBe("42% used");
+  });
+
+  it("says the weekly-reset note on the agent's own account while spreading, and pacing's verdict on the others", () => {
+    const pacedMain = account("main", { isDefault: true, usage: used(72), pace: paced({ fiveHourUsed: 72, fiveHourProjected: 91, gated: true }) });
+    const pacedWork = account("work", { usage: used(7), pace: paced({ fiveHourUsed: 7, fiveHourProjected: 12, weeklyUsed: 20 }) });
+    const spreading = { balanceNewAgents: true, pacedNext: { claude: "work" } };
+    const options = agentChoices(running([pacedMain, pacedWork], { selectionReason: "weekly_reset" }, spreading), "agent-1")!.options;
+    expect(options.map((option) => option.description)).toEqual(["Weekly reset was near", "Picks next", undefined]);
+    // On another account than the one it started on, the agent's account has pacing's verdict like the rest.
+    const moved = agentChoices(running([pacedMain, pacedWork], { accountId: "work" }, spreading), "agent-1")!.options;
+    expect(moved.map((option) => option.description)).toEqual(["Picks next", "Held back: busy hour", undefined]);
+  });
+
   it("shows pacing's verdict on each account while spreading, as the account button does", () => {
     const pacedMain = account("main", { isDefault: true, usage: used(72), pace: paced({ fiveHourUsed: 72, fiveHourProjected: 91, gated: true }) });
     const pacedWork = account("work", { usage: used(7), pace: paced({ fiveHourUsed: 7, fiveHourProjected: 12, weeklyUsed: 20 }) });
