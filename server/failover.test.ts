@@ -3171,6 +3171,16 @@ describe("changing the default account", () => {
       expect((await store.read()).bindings["fix-build"]).toMatchObject({ accountId: MAIN, source: "user" });
     });
 
+    it("never moves an agent onto AWS Bedrock, even with paid API fallback on", async () => {
+      const bedrock = { ...account("claude-bedrock", "bedrock", "managed"), auth: "api" as const, provider: "bedrock" as const, identity: "bedrock|eu-central-1|host" };
+      const { store, reopened } = await setUpBusy("fix-build", ago(120), {
+        accounts: [account(MAIN, "work", "main"), bedrock] as never,
+        prefs: { paidApiFallback: true },
+      });
+      expect(reopened).toEqual([]);
+      expect((await store.read()).sessions["fix-build"]?.accountId).toBe(MAIN);
+    });
+
     describe("with a model's own limit on an account", () => {
       const FABLE = "claude-fable-5-2";
       const OPUS = "claude-opus-4-1";
