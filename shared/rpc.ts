@@ -4,7 +4,11 @@ import { ApiKeyKindSchema, ApiPriceSchema, BedrockSourceSchema, FamilySchema, Lo
 
 export const getState = defineRpc({
   name: "zerosub.state",
-  input: z.object({ refreshUsage: z.boolean().optional() }),
+  input: z.object({
+    refreshUsage: z.boolean().optional(),
+    /** With `refreshUsage`, only this account's usage is read. */
+    accountId: z.string().optional(),
+  }),
   output: StateViewSchema,
 });
 

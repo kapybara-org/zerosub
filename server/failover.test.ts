@@ -4590,6 +4590,21 @@ describe("answering before Paseo gives up", () => {
     expect((await viewing).accounts).toHaveLength(2);
     release();
   });
+
+  it("reads only the account asked for, when one is", async () => {
+    const read: Array<string | null> = [];
+    const { service, paseo } = await setUp(onMarketing(), hit, {
+      claude: {
+        usage: async (home: string | null) => {
+          read.push(home);
+          return { fetchedAt: new Date().toISOString(), windows: [], error: null, cached: false, resets: null };
+        },
+      },
+    });
+    read.length = 0;
+    await service.view(paseo as never, true, HELLO);
+    expect(read).toEqual([join(tmpdir(), HELLO)]);
+  });
 });
 
 describe("a reading past its reset", () => {

@@ -3823,12 +3823,14 @@ export class Service {
 
   // ------------------------------------------------------------------ RPC: state
 
-  async view(paseo: PaseoApi, refreshUsage = false): Promise<StateView> {
+  /** With `refreshUsage`, reads usage now first: `accountId`'s only, or every account's. */
+  async view(paseo: PaseoApi, refreshUsage = false, accountId?: string): Promise<StateView> {
     this.attach(paseo);
     if (refreshUsage) {
       const state = await this.store.read();
+      const accounts = accountId ? state.accounts.filter((account) => account.id === accountId) : state.accounts;
       // Renewing a sign-in can take longer than Paseo waits for an answer; later readings show at the next poll.
-      await settles(Promise.allSettled(state.accounts.map((account) => this.refreshUsage(account.id, true, true))), USAGE_REPLY_MS);
+      await settles(Promise.allSettled(accounts.map((account) => this.refreshUsage(account.id, true, true))), USAGE_REPLY_MS);
     }
     void this.prune(paseo).catch(() => undefined);
     const state = await this.store.read();
