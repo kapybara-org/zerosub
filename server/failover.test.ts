@@ -3095,11 +3095,11 @@ describe("changing the default account", () => {
 
   describe("moving idle agents off a busy account", () => {
     const ago = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
-    const reading = (percent: number): UsageRead => ({
+    const reading = (percent: number, week = 10): UsageRead => ({
       fetchedAt: new Date().toISOString(),
       windows: [
         { id: "five_hour", label: "5-hour", usedPercent: percent, resetsAt: new Date(Date.now() + 3 * 60 * 60_000).toISOString(), minutes: 300 },
-        { id: "seven_day", label: "Weekly", usedPercent: 10, resetsAt: new Date(Date.now() + 3 * 24 * 60 * 60_000).toISOString(), minutes: 10_080 },
+        { id: "seven_day", label: "Weekly", usedPercent: week, resetsAt: new Date(Date.now() + 3 * 24 * 60 * 60_000).toISOString(), minutes: 10_080 },
       ],
       error: null,
       cached: false,
@@ -3112,6 +3112,8 @@ describe("changing the default account", () => {
       updatedAt: string,
       options: {
         personal?: number;
+        /** `personal`'s weekly percent. */
+        personalWeek?: number;
         prefs?: Record<string, unknown>;
         bindings?: StoredState["bindings"];
         onList?: (service: Service) => void | Promise<void>;
@@ -3139,7 +3141,7 @@ describe("changing the default account", () => {
           claude: {
             usage: async (home: string | null) => {
               const byHome = (options.accounts ?? []).find((entry) => entry.home === home);
-              return home ? reading(options.usedBy?.[byHome?.id ?? ""] ?? options.personal ?? 20) : reading(60);
+              return home ? reading(options.usedBy?.[byHome?.id ?? ""] ?? options.personal ?? 20, options.personalWeek) : reading(60);
             },
           } as Partial<FamilyAdapter>,
           onList: options.onList,
@@ -3167,6 +3169,11 @@ describe("changing the default account", () => {
     it("moves at most three agents in one pass", async () => {
       const { reopened } = await setUpBusy("a1", ago(120), { others: ["a2", "a3", "a4", "a5"] });
       expect(reopened).toHaveLength(3);
+    });
+
+    it("leaves an agent where it is when the other account has used 90% of its week", async () => {
+      const { reopened } = await setUpBusy("fix-build", ago(120), { personalWeek: 90 });
+      expect(reopened).toEqual([]);
     });
 
     it("leaves an agent idle for more than a day", async () => {
