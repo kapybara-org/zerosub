@@ -6,17 +6,22 @@ import {
   canStandIn,
   paidStandIn,
   describeReopen,
+  egressText,
   formatAge,
   formatCredits,
   formatTokens,
+  formatCountdown,
   formatExtraUsage,
   formatPlan,
+  formatResetAt,
   formatResetIn,
   isDisabled,
   moveProblem,
   peakUsage,
   pillText,
+  reportsUsage,
   shortLabel,
+  shortWindowLabel,
   staleNotice,
   usageSummary,
 } from "./format";
@@ -33,6 +38,80 @@ describe("formatResetIn", () => {
     expect(formatResetIn("2026-09-23T11:00:00Z", NOW)).toBe("now");
     expect(formatResetIn(null, NOW)).toBeNull();
     expect(formatResetIn("not a date", NOW)).toBeNull();
+  });
+});
+
+describe("formatResetAt", () => {
+  // Local times, so it reads the same in every time zone. 28 October 2026 is a Wednesday.
+  const now = new Date(2026, 9, 28, 15, 20).getTime();
+  const at = (...parts: [number, number, number, number, number, number?, number?]) => new Date(...parts).toISOString();
+
+  it("gives the time today, the weekday within the week, and the date a week on", () => {
+    expect(formatResetAt(at(2026, 9, 28, 18, 0), now)).toBe("18:00");
+    expect(formatResetAt(at(2026, 9, 29, 2, 5), now)).toBe("Thu 02:05");
+    expect(formatResetAt(at(2026, 10, 3, 9, 0), now)).toBe("Tue 09:00");
+    // Today's weekday again: the date says it isn't today.
+    expect(formatResetAt(at(2026, 10, 4, 9, 0), now)).toBe("Nov 4 09:00");
+  });
+
+  it("rounds to the minute, so readings a moment apart read the same", () => {
+    expect(formatResetAt(at(2026, 9, 28, 17, 59, 59, 600), now)).toBe("18:00");
+  });
+
+  it("has nothing to say once the time has passed, or when there's none", () => {
+    expect(formatResetAt(at(2026, 9, 28, 15, 0), now)).toBeNull();
+    expect(formatResetAt(null, now)).toBeNull();
+    expect(formatResetAt("not a date", now)).toBeNull();
+  });
+});
+
+describe("formatCountdown", () => {
+  const now = Date.parse("2026-10-28T12:00:00Z");
+  it("counts hours and minutes, days and hours from a day on, as the status line does", () => {
+    expect(formatCountdown("2026-10-28T15:26:40Z", now)).toBe("3h26m");
+    expect(formatCountdown("2026-10-29T05:26:00Z", now)).toBe("17h26m");
+    expect(formatCountdown("2026-10-30T05:40:00Z", now)).toBe("1d17h");
+    expect(formatCountdown("2026-10-28T12:26:00Z", now)).toBe("26m");
+    // Each unit is written even when it's nothing, so every entry reads alike.
+    expect(formatCountdown("2026-10-28T15:00:00Z", now)).toBe("3h0m");
+    expect(formatCountdown("2026-10-30T12:20:00Z", now)).toBe("2d0h");
+    expect(formatCountdown("2026-10-28T12:00:30Z", now)).toBe("0m");
+  });
+
+  it("has nothing to say once the time has passed, or when there's none", () => {
+    expect(formatCountdown("2026-10-28T11:59:00Z", now)).toBeNull();
+    expect(formatCountdown(null, now)).toBeNull();
+    expect(formatCountdown("not a date", now)).toBeNull();
+  });
+});
+
+describe("egressText", () => {
+  const now = Date.parse("2026-10-28T12:00:00Z");
+  const egress = (checkedAt: string | null, ip: string | null = "203.0.113.7", error: string | null = null) => ({ ip, country: "US", checkedAt, error });
+
+  it("gives the address Anthropic sees and its country", () => {
+    expect(egressText(egress("2026-10-28T11:55:00Z"), now)).toBe("IP: 203.0.113.7 (US)");
+    expect(egressText({ ...egress("2026-10-28T11:55:00Z"), country: null }, now)).toBe("IP: 203.0.113.7");
+  });
+
+  it("says how old the address is once it's been an hour, as when checks fail since", () => {
+    expect(egressText(egress("2026-10-28T11:20:00Z", "203.0.113.7", "timed out"), now)).toBe("IP: 203.0.113.7 (US)");
+    expect(egressText(egress("2026-10-28T10:50:00Z", "203.0.113.7", "timed out"), now)).toBe("IP: 203.0.113.7 (US, 1h ago)");
+  });
+
+  it("says it couldn't check when it never could, and nothing before the first check", () => {
+    expect(egressText(egress(null, null, "Client network socket disconnected"), now)).toBe("IP: couldn't check");
+    expect(egressText(null, now)).toBeNull();
+  });
+});
+
+describe("shortWindowLabel", () => {
+  it("shortens the window names Claude and Codex readings use", () => {
+    expect(shortWindowLabel("5-hour")).toBe("5h");
+    expect(shortWindowLabel("Weekly")).toBe("7d");
+    expect(shortWindowLabel("3-day")).toBe("3d");
+    expect(shortWindowLabel("90-minute")).toBe("90m");
+    expect(shortWindowLabel("Usage")).toBe("Usage");
   });
 });
 
@@ -274,5 +353,16 @@ describe("paceVerdict", () => {
     expect(paceVerdict(busy, true)).toBe("Picks next");
     expect(paceVerdict(busy, false)).toBe("Held back: busy hour");
     expect(paceVerdict({ ...busy, gated: false }, false)).toBe("Week nearly used");
+  });
+});
+
+describe("reportsUsage", () => {
+  it("is a Claude or ChatGPT subscription account's, whose provider sends 5-hour and weekly windows", () => {
+    for (const family of ["claude", "codex"] as const) {
+      expect(reportsUsage({ family, auth: "subscription" })).toBe(true);
+      expect(reportsUsage({ family, auth: "api" })).toBe(false);
+    }
+    // Grok and Cursor never send windows, and Pi's CLI reports none.
+    for (const family of ["grok", "cursor", "pi"] as const) expect(reportsUsage({ family, auth: "subscription" })).toBe(false);
   });
 });

@@ -130,6 +130,7 @@ it("finds closures that use a loop's let or const, and nothing else", () => {
   expect(loopCaptures(code)).toEqual([3]);
 });
 
+// What a pill's menu reads its agent with went wrong this way on the phone (see `pillMenu`).
 it("keeps closures from using a loop's let or const in the client bundle", async () => {
   const code = await clientBundle();
   // esbuild's helper copies the bundle's exports, only `default`, so its loop runs once.

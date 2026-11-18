@@ -115,27 +115,44 @@ export function ResetConfirm({
   );
 }
 
-/** The confirmation as popover content for an agent's account button. */
-export function resetPopover(store: ZeroSubStore, account: AccountView, agentId: string): ComponentType<PluginButtonContentProps> {
+/**
+ * The confirmation as popover content for an agent's account button. It reads the account from the
+ * store as it renders, so what it says and whether it lets the reset go ahead stay current while it's
+ * open.
+ */
+export function resetPopover(
+  store: ZeroSubStore,
+  accountId: string,
+  agentId: string,
+): ComponentType<PluginButtonContentProps> {
   return function ResetPopover({ theme, close }: PluginButtonContentProps) {
     const toast = useToast();
     const text = useText(theme);
+    const { state } = useStore(store);
+    const account = state?.accounts.find((entry) => entry.id === accountId) ?? null;
     return (
       <View style={{ gap: 12, maxWidth: 360 }}>
         <Text style={text.heading}>Use a banked reset?</Text>
-        <ResetConfirm
-          theme={theme}
-          store={store}
-          account={account}
-          agentId={agentId}
-          onCancel={close}
-          onFinished={(result) => {
-            close();
-            const { message, variant } = redeemToast(account.label, result);
-            if (variant === "error") toast.error(message);
-            else toast.show(message, { variant, durationMs: 5_000 });
-          }}
-        />
+        {account ? (
+          <ResetConfirm
+            theme={theme}
+            store={store}
+            account={account}
+            agentId={agentId}
+            onCancel={close}
+            onFinished={(result) => {
+              close();
+              const { message, variant } = redeemToast(account.label, result);
+              if (variant === "error") toast.error(message);
+              else toast.show(message, { variant, durationMs: 5_000 });
+            }}
+          />
+        ) : (
+          <>
+            <Text style={text.body}>That account is no longer in ZeroSub.</Text>
+            <Button theme={theme} label="Close" tooltip="Close this window" tooltipAlign="end" onPress={close} />
+          </>
+        )}
       </View>
     );
   };

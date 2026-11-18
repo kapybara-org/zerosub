@@ -230,7 +230,7 @@ export function ApiAccountModal({
           account={account}
           onCancel={onClose}
           onDone={() => {
-            toast.show(`${account.label} updated. Agents started from now on use it.`, { variant: "success" });
+            toast.show(`${account.label} updated. Agents and terminal sessions started from now on use it.`, { variant: "success" });
             onClose();
           }}
         />

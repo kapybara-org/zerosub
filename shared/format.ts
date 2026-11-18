@@ -19,6 +19,51 @@ export function formatResetIn(resetsAt: string | null, now: number = Date.now())
   return restHours === 0 ? `in ${days}d` : `in ${days}d ${restHours}h`;
 }
 
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/**
+ * When a window resets, in local time: "18:00" today, "Fri 09:00" within the week, "Nov 4 09:00"
+ * a week on. Null once it has passed.
+ */
+export function formatResetAt(resetsAt: string | null, now: number = Date.now()): string | null {
+  if (!resetsAt) return null;
+  const at = Date.parse(resetsAt);
+  if (!Number.isFinite(at) || at <= now) return null;
+  const when = new Date(Math.round(at / 60_000) * 60_000);
+  const time = `${String(when.getHours()).padStart(2, "0")}:${String(when.getMinutes()).padStart(2, "0")}`;
+  const today = new Date(now);
+  const days = Math.round(
+    (new Date(when.getFullYear(), when.getMonth(), when.getDate()).getTime() -
+      new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime()) /
+      86_400_000,
+  );
+  if (days <= 0) return time;
+  if (days < 7) return `${WEEKDAYS[when.getDay()]} ${time}`;
+  return `${MONTHS[when.getMonth()]} ${when.getDate()} ${time}`;
+}
+
+/**
+ * How long until a window resets, as Claude Code's status line counts it: "3h26m", "17h26m", then
+ * days and hours from a day on, "1d17h", and minutes in the last hour, "26m". Null once it has passed.
+ */
+export function formatCountdown(resetsAt: string | null, now: number = Date.now()): string | null {
+  if (!resetsAt) return null;
+  const at = Date.parse(resetsAt);
+  if (!Number.isFinite(at) || at <= now) return null;
+  const minutes = Math.floor((at - now) / 60_000);
+  const hours = Math.floor(minutes / 60);
+  if (hours >= 24) return `${Math.floor(hours / 24)}d${hours % 24}h`;
+  return hours > 0 ? `${hours}h${minutes % 60}m` : `${minutes}m`;
+}
+
+/** "5h", "7d": a window's name the way a status line writes it (see `windowLabel` in server/codex.ts). */
+export function shortWindowLabel(label: string): string {
+  if (label === "Weekly") return "7d";
+  const span = /^(\d+)-(hour|day|minute)$/.exec(label);
+  return span ? `${span[1]}${span[2]![0]}` : label;
+}
+
 export function formatPercent(value: number): string {
   return `${Math.round(Math.min(100, Math.max(0, value)))}%`;
 }
@@ -229,6 +274,15 @@ export function usageSummary(account: AccountView, now: number = Date.now()): st
 /** Set aside by the user, whatever else `status` says. Older servers only said so through `status`. */
 export function isDisabled(account: Pick<AccountView, "status" | "disabled">): boolean {
   return account.disabled || account.status === "disabled";
+}
+
+/**
+ * The provider reports usage windows (5-hour, weekly) for this account: a Claude or ChatGPT
+ * subscription account's. Not an API account, billed per use, nor a Grok or Cursor account, whose
+ * providers never send windows, nor any Pi account, whose CLI reports none.
+ */
+export function reportsUsage(account: Pick<AccountView, "auth" | "family">): boolean {
+  return account.auth !== "api" && (account.family === "claude" || account.family === "codex");
 }
 
 /**
