@@ -117,18 +117,17 @@ export function isAccountHome(home: string, family?: Family): boolean {
 
 /**
  * Deletes a managed home. Its top level holds symlinks into the user's real CLI home, so those are
- * unlinked first; nothing outside ZeroSub's own directory is ever followed or removed. It holds the
- * home's lock, so a sync never puts entries back while the home is being deleted.
+ * unlinked first; nothing outside ZeroSub's own directory is ever followed or removed: only a folder
+ * it made for an account (see `isAccountHome`) goes, and a link put in its place is left as it is.
+ * It holds the home's lock, so a sync never puts entries back while the home is being deleted.
  */
 export function removeHome(home: string): Promise<void> {
   return withHome(home, async () => {
-    if (!isAccountHome(home)) return;
-    for (const name of await readdir(home).catch(() => [] as string[])) {
-      const path = join(home, name);
-      const entry = await lstat(path).catch(() => null);
-      if (entry?.isSymbolicLink()) await unlink(path).catch(() => undefined);
-    }
-    await rm(home, { recursive: true, force: true });
+    if (!isAccountHome(home) || !(await isOwnHome(home))) return;
+    // Checked again right here: a link put in its place is never followed into the folder it points at.
+    const entry = await lstat(home).catch(() => null);
+    if (!entry?.isDirectory()) return;
+    await removeTree(home);
   });
 }
 
@@ -967,23 +966,27 @@ function codexPrivate(name: string): boolean {
 }
 
 /**
- * An Azure OpenAI account's home (see azure.ts) also keeps `config.toml` to itself: it's the shared
- * one with ZeroSub's Azure provider set, remade here and at each session open.
+ * Brings a Codex home's shared entries in step with main; `wanted` as for `prepareClaudeHome`. An
+ * Azure OpenAI account's home (see azure.ts) also keeps `config.toml` to itself: it's the shared one
+ * with ZeroSub's Azure provider set, remade here and at each session open.
  */
-export async function prepareCodexHome(home: string, force = false): Promise<void> {
-  const azure = isAzureHome(home);
-  const last = lastSync.get(home);
-  if (!force && last && Date.now() - last < SYNC_TTL_MS) {
+export function prepareCodexHome(home: string, force = false, wanted?: () => Promise<boolean>): Promise<void> {
+  return withHome(home, async () => {
+    if (wanted && !(await wanted())) return;
+    const azure = isAzureHome(home);
+    const last = lastSync.get(home);
+    if (!force && last && Date.now() - last < SYNC_TTL_MS) {
+      if (azure) await syncAzureConfig(home);
+      return;
+    }
+    await syncOverlay(home, {
+      main: mainCodexHome(),
+      shareDirs: ["sessions", "archived_sessions"],
+      isPrivate: azure ? (name) => codexPrivate(name) || name === "config.toml" : codexPrivate,
+    });
     if (azure) await syncAzureConfig(home);
-    return;
-  }
-  await syncOverlay(home, {
-    main: mainCodexHome(),
-    shareDirs: ["sessions", "archived_sessions"],
-    isPrivate: azure ? (name) => codexPrivate(name) || name === "config.toml" : codexPrivate,
+    lastSync.set(home, Date.now());
   });
-  if (azure) await syncAzureConfig(home);
-  lastSync.set(home, Date.now());
 }
 
 /**

@@ -123,6 +123,7 @@ const BUDGET_LIMIT_MS = 3 * 60 * 60_000;
 const LIMIT_TRUST_MS = 15 * 60_000;
 const LOGIN_TTL_MS = 15 * 60_000;
 const LOGIN_GRACE_MS = 3_000;
+const REMOVED_WHILE_SIGNING_IN = "That account was removed while you were signing in, so it wasn't added back.";
 const PRUNE_MS = 10 * 60_000;
 /** Cleanup passes a home's sign-out (or sign-in check) may fail in before it's given up on. */
 const CLEANUP_TRIES = 3;
@@ -4215,6 +4216,10 @@ export class Service {
       if (draft.defaults[account.family] === accountId) draft.defaults[account.family] = null;
       dropNextPick(draft, account);
     });
+    // A sign-in into it that's still going would otherwise add it back when it finishes.
+    for (const login of this.logins.values()) {
+      if (login.accountId === accountId && !login.finishedAt) await this.cancelLogin(login.id);
+    }
     this.setUsage(accountId, null);
     this.egress.delete(accountId);
     if (isAzureAccount(account)) await this.apiUsage.forget(accountId).catch((error: unknown) => log(`could not forget ${account.label}'s token counts`, error));
@@ -5181,6 +5186,7 @@ export class Service {
 
     const state = await this.store.read();
     const existing = findAccount(state, session.accountId);
+    if (session.accountId && !existing) return this.failLogin(session, REMOVED_WHILE_SIGNING_IN);
     if (existing?.kind === "managed" && existing.identity && identity.identity && !sameAccountIdentity(session.family, existing, identity)) {
       // Signing an account back in must not quietly turn it into a different login.
       if (session.home) await adapter.logout(session.home).catch(() => undefined);
@@ -5211,11 +5217,17 @@ export class Service {
     session.finishedAt = Date.now(); // Claim completion before writing, so a late cancel can't race it.
 
     let accountId = session.accountId;
+    let removed = false;
     let handedOver = false;
     session.saving = true;
     try {
       await this.store.update((draft) => {
         let account = findAccount(draft, accountId);
+        if (!account && accountId) {
+          // Removed while signing back in: it stays removed (see `remove`).
+          removed = true;
+          return;
+        }
         if (!account) {
           // A managed account's ID matches its home's folder name, as its cleanup entry does.
           accountId = `${session.family}-${session.id}`;
@@ -5237,6 +5249,11 @@ export class Service {
       return;
     } finally {
       session.saving = false;
+    }
+    if (removed) {
+      session.view = { ...session.view, step: "failed", message: REMOVED_WHILE_SIGNING_IN };
+      this.scheduleCleanup();
+      return;
     }
     if (accountId) this.identityCheckedAt.set(accountId, Date.now());
     if (accountId && handedOver) this.forgetReading(accountId);
