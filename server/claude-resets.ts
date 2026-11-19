@@ -109,7 +109,7 @@ export function parseClaudeResets(block: unknown, now: number = Date.now()): Cla
   const cooldown = isoTime(block.cooldown_until);
 
   // A Fable reset restores only the Fable share of weekly usage. Leave it to Claude’s supported surface.
-  const fable = next?.clears.includes("seven_day_overage_included") ?? false;
+  const fable = !!next && next.clears.includes("seven_day_overage_included") && !next.clears.includes("seven_day");
   let blockedReason: string | null = null;
   if (fable) {
     blockedReason = "Use this Fable reset in Claude under Settings → Usage.";

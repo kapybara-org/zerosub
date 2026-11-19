@@ -129,6 +129,15 @@ describe("Claude's calls with an account's token", () => {
     proxy = null;
   });
 
+  it("keeps a banked Fable reset when an automatic check finds the account has room", async () => {
+    answer([() => Response.json({ cedar_ember: {
+      eligible: true, at_limit: false, next_grant_id: "grant_1",
+      grants: [{ id: "grant_1", resets_left: 1, clears: ["seven_day_overage_included"], usable_now: true }],
+    } })]);
+    expect(await new ClaudeAdapter().redeemReset(home, { onlyAtLimit: true })).toMatchObject({ outcome: "not_limited", left: 1 });
+    expect(calls).toEqual(["https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1"]);
+  });
+
   it("go through the account's own proxy: the usage read, and the read before redeeming a reset", async () => {
     // A proxy that records where each tunnel was asked to go, then refuses it: nothing leaves the machine.
     const seen: string[] = [];

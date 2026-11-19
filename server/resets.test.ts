@@ -34,6 +34,14 @@ describe("Claude banked resets", () => {
     expect(status.offer).toMatchObject({ available: 2, usableNow: false, refills: ["5-hour", "Fable weekly"] });
   });
 
+  it("keeps a full weekly reset usable when it also refills Fable", () => {
+    const status = parseClaudeResets({
+      eligible: true, at_limit: true, next_grant_id: "grant_1",
+      grants: [grant({ clears: ["seven_day", "seven_day_overage_included"] })],
+    }, NOW);
+    expect(status).toMatchObject({ checkInClaude: false, offer: { usableNow: true } });
+  });
+
   it("offers the next grant when the account is at a limit", () => {
     const { offer, nextGrantId } = parseClaudeResets(
       { eligible: true, at_limit: true, grants: [grant()], next_grant_id: "grant_1" },
