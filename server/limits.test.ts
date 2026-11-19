@@ -316,6 +316,11 @@ describe("sign-in failures", () => {
     expect(
       detectClaudeSignOut({ outcome: completed, timeline: turn("Failed to authenticate. API Error: 401 OAuth access token is invalid.") }),
     ).not.toBeNull();
+    // Its token couldn't be renewed: maybe signed out, maybe another process renewed it first. The
+    // account is only signed out once its sign-in is read again (see `confirmSignedOut`).
+    expect(
+      detectClaudeSignOut({ outcome: completed, timeline: turn("Failed to authenticate: OAuth session expired and could not be refreshed") }),
+    ).not.toBeNull();
     expect(detectClaudeSignOut({ outcome: completed, timeline: turn("The login form now validates emails.") })).toBeNull();
   });
 

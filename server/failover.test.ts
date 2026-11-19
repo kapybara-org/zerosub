@@ -5756,3 +5756,45 @@ describe("a Claude API key as the last resort", () => {
     expect((await store.read()).sessions[AGENT]?.accountId).toBe(keyed.id);
   });
 });
+
+// Every process on an account's home shares its token. One `claude auth status` taken while another
+// process renews that token can read as signed out, and the account then stayed signed out until the
+// next identity check, 30 minutes later: no agent was routed to it, and its agents moved off.
+describe("a sign-out read while the token is being renewed", () => {
+  const refused = () => "Failed to authenticate: OAuth session expired and could not be refreshed";
+  const signedIn: Identity = { signedIn: true, email: "hello@example.com", plan: "max", organization: null, identity: "personal|hello@example.com" };
+  const signedOut: Identity = { signedIn: false, email: null, plan: null, organization: null, identity: null };
+  const onHello = () => ({
+    accounts: [account(MAIN, "main", "main"), account(HELLO, "hello", "managed")] as never,
+    defaults: { claude: HELLO, codex: null, pi: null },
+    sessions: { [AGENT]: { accountId: HELLO, family: "claude" as const, openedAt: new Date().toISOString() } },
+  });
+
+  it("keeps the account signed in when the second reading says so", async () => {
+    const readings = [signedOut, signedIn];
+    const { service, store, reopened, limitTurn } = await setUp(onHello(), () => null as never, {
+      identity: () => readings.shift() ?? signedIn,
+      detectSignOut: refused,
+    });
+    service.signOutRecheckMs = 0;
+    await limitTurn();
+    const state = await store.read();
+    expect(readings).toEqual([]);
+    expect(state.accounts.find((a) => a.id === HELLO)?.signedIn).toBe(true);
+    expect(state.sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(reopened).toEqual([]);
+  });
+
+  it("signs it out and moves the agent when both readings say so", async () => {
+    const { service, store, reopened, limitTurn } = await setUp(onHello(), () => null as never, {
+      identity: () => signedOut,
+      detectSignOut: refused,
+    });
+    service.signOutRecheckMs = 0;
+    await limitTurn();
+    const state = await store.read();
+    expect(state.accounts.find((a) => a.id === HELLO)?.signedIn).toBe(false);
+    expect(state.sessions[AGENT]?.accountId).toBe(MAIN);
+    expect(reopened).toEqual([AGENT]);
+  });
+});

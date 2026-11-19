@@ -225,6 +225,7 @@ function setUp(store: StateStore, options: Options = {}) {
     { locate: async () => null } as unknown as Reopener,
   );
   services.push(service);
+  service.signOutRecheckMs = 0;
   service.setPreferences(preferences.schema.parse({}));
   service.attach(paseo as never);
   const context = { paseo } as never;

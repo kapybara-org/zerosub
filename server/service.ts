@@ -135,6 +135,12 @@ const RENEW_LOGIN_MS = 30 * 60_000;
 const ACTIVE_WINDOW_MS = 15 * 60_000;
 const UPKEEP_MS = 30_000;
 const IDENTITY_MS = 30 * 60_000;
+/**
+ * How long to wait before reading a sign-in again when a signed-in account reads as signed out. Every
+ * process on the account's home shares its token, and one reading taken while another process renews
+ * it can say signed out for a moment; a sign-out stands only when a second reading says so too.
+ */
+const SIGN_OUT_RECHECK_MS = 10_000;
 const AVAILABILITY_MS = 10 * 60_000;
 /** Assumed length of a window limit whose reset time couldn't be read. */
 const WINDOW_LIMIT_MS = 60 * 60_000;
@@ -608,6 +614,9 @@ export class Service {
     this.continuations = new CodexContinuations(store);
   }
 
+  /** Tests shorten it; see `SIGN_OUT_RECHECK_MS`. */
+  signOutRecheckMs = SIGN_OUT_RECHECK_MS;
+
   setPreferences(prefs: Preferences): void {
     const routingChanged = prefs.autoSwitch !== this.prefs.autoSwitch || prefs.paidApiFallback !== this.prefs.paidApiFallback;
     this.prefs = prefs;
@@ -738,10 +747,17 @@ export class Service {
     // A Pi API account's key is only known to work from a turn: a refused one is learned from a failed turn.
     if (!account || account.auth === "api") return;
     // A check that can't tell (Claude's keychain unreadable just now, say) changes nothing; the next one may.
-    const identity = await this.adapters[account.family].identity(account.home, { livePlan: livePlan && account.family === "claude" }).catch((error: unknown) => {
-      log(`could not check whether ${account.label} is signed in`, error);
-      return null;
-    });
+    const read = () =>
+      this.adapters[account.family].identity(account.home, { livePlan: livePlan && account.family === "claude" }).catch((error: unknown) => {
+        log(`could not check whether ${account.label} is signed in`, error);
+        return null;
+      });
+    let identity = await read();
+    if (identity && !identity.signedIn && account.signedIn) {
+      // One reading taken while another process renews the token can say signed out (see `SIGN_OUT_RECHECK_MS`).
+      await delay(this.signOutRecheckMs);
+      identity = await read();
+    }
     if (!identity) return;
     let handedOver = false;
     await this.store.update((draft) => {

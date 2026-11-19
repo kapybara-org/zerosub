@@ -42,7 +42,7 @@ const CODEX_LIMITS: ReadonlyArray<{ pattern: RegExp; kind: LimitKind }> = [
 ];
 
 const CLAUDE_SIGNED_OUT =
-  /^(?:Not logged in\s*·|Invalid API key\s*·|OAuth token (?:has expired|has been revoked)|Failed to authenticate\. API Error: 401)/i;
+  /^(?:Not logged in\s*·|Invalid API key\s*·|OAuth token (?:has expired|has been revoked)|Failed to authenticate(?:\. API Error: 401|: OAuth session expired))/i;
 const CODEX_SIGNED_OUT =
   /refresh token was already used|please log out and sign in again|access token could not be refreshed|refresh_token_reused|refresh_token_expired/i;
 
