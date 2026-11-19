@@ -40,6 +40,7 @@ afterEach(async () => {
 const homes = () => join(root, "zerosub", "homes");
 
 interface Fake {
+  mainSignedIn?: boolean;
   calls: string[];
   /** Which homes `identity` reports as signed in. */
   signedIn: Set<string>;
@@ -65,7 +66,7 @@ function fakeAdapter(fake: Fake): FamilyAdapter {
     env: async () => ({}),
     identity: async (home: string | null): Promise<Identity> => {
       fake.calls.push(`identity ${home}`);
-      const signedIn = home !== null && fake.signedIn.has(home);
+      const signedIn = home === null ? fake.mainSignedIn === true : fake.signedIn.has(home);
       return { signedIn, email: signedIn ? "new@example.com" : null, plan: null, organization: null, identity: signedIn ? "personal|new@example.com" : null };
     },
     api: async (home: string | null) => (home !== null && fake.keyed.has(home) ? { keyHint: "abcd", baseUrl: null } : null),
@@ -143,6 +144,24 @@ async function seed(state: Partial<StoredState>): Promise<void> {
   await new StateStore().update((draft) => Object.assign(draft, state));
 }
 const external = () => join(root, "claude-config", "claude-mine");
+
+it("adds a new Claude sign-in in its own home even if the CLI already uses that subscription", async () => {
+  await seed({ accounts: [{ ...main, email: "new@example.com", identity: "personal|new@example.com" }] as never });
+  const { service, store, fake } = start({ ...newFake(), mainSignedIn: true });
+  const login = await service.startLogin("claude", "code");
+  const home = join(homes(), `claude-${login.id}`);
+  fake.signedIn.add(home);
+  fake.finish({ ok: true, message: null });
+
+  await vi.waitFor(async () => {
+    const view = await service.view(fakePaseo());
+    expect(view.logins.find((entry) => entry.id === login.id)?.step).toBe("done");
+  });
+  const state = await store.read();
+  expect(state.accounts.find((account) => account.id === main.id)).toMatchObject({ disabled: true, signedIn: true });
+  expect(state.accounts.find((account) => account.id === state.defaults.claude)).toMatchObject({ kind: "managed", home, disabled: false });
+  expect(fake.calls.filter((call) => call.startsWith("logout"))).toEqual([]);
+});
 
 describe("signing an account in again as someone else", () => {
   it.each([
