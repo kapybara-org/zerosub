@@ -3,7 +3,7 @@ import { copyText, Modal, TextInput, useToast } from "@getpaseo/plugin/client/re
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ActivityIndicator, Pressable, Text, View } from "react-native";
 import { formatPlan } from "../shared/format";
-import { FAMILY_LABEL, type AccountView, type Family, type LoginMethod, type LoginView } from "../shared/model";
+import { FAMILY_LABEL, onAnthropicApi, type AccountView, type Family, type LoginMethod, type LoginView } from "../shared/model";
 import { cancelLogin, importAccount, startLogin, submitLoginCode } from "../shared/rpc";
 import { ApiAccountForm } from "./api-account";
 import { AzureAccountForm } from "./azure-account";
@@ -171,7 +171,7 @@ export function AddAccountModal({
         <Text style={text.body}>
           {added?.label ?? "The account"} is ready. Make it the default, or pick it for an agent from the account button in
           the message box;{" "}
-          {(azure || mode === "bedrock") && state?.paidApiFallback
+          {(azure || mode === "bedrock" || (added?.family === "claude" && onAnthropicApi(added.api?.baseUrl))) && state?.paidApiFallback
             ? `ZeroSub moves agents onto it by itself only when every ${azure ? "ChatGPT" : "Claude"} subscription account is out.`
             : "ZeroSub never moves agents onto it by itself."}
         </Text>
@@ -550,7 +550,11 @@ function ModeStep({
           <Choice
             theme={theme}
             title="API key or token"
-            detail="An Anthropic API key, or a key for another endpoint via its base URL. Billed per use; used only when you choose it."
+            detail={`An Anthropic API key, or a key for another endpoint via its base URL. Billed per use; ${
+              paidFallback
+                ? "one on Anthropic's own API is used by itself only when every Claude subscription account is out, or when you choose it; one for another endpoint only when you choose it."
+                : "used only when you choose it."
+            }`}
             onPress={onApi}
           />
           <Choice

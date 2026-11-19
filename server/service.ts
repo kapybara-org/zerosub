@@ -25,6 +25,7 @@ import {
   type BedrockModels,
   type BedrockSource,
   type BedrockSummary,
+  ANTHROPIC_API,
   isAzureAccount,
   isBedrockAccount,
   type AgentRoute,
@@ -99,7 +100,7 @@ import { maskProxy, normalizeProxy } from "./proxy";
 import { Reopener, hostCanReload } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
-import { canStandIn, chooseAccount, fiveHourWindow, headroomScore, isLastResort, isLimited, isLimitedFor, isUsable, mostAvailable, paceScore, paceView, PENDING_MS, scopeCoversModel, weeklyWindow, withBankedReset, type Pacing, type RouteDecision, type RouteInput } from "./routing";
+import { canStandIn, chooseAccount, fiveHourWindow, headroomScore, isLastResort, isLimited, isPaidStandIn, isLimitedFor, isUsable, mostAvailable, paceScore, paceView, PENDING_MS, scopeCoversModel, weeklyWindow, withBankedReset, type Pacing, type RouteDecision, type RouteInput } from "./routing";
 import {
   ALL_SOURCES,
   MAIN_ACCOUNT_ID,
@@ -608,9 +609,10 @@ export class Service {
   }
 
   setPreferences(prefs: Preferences): void {
-    const routingChanged = prefs.autoSwitch !== this.prefs.autoSwitch;
+    const routingChanged = prefs.autoSwitch !== this.prefs.autoSwitch || prefs.paidApiFallback !== this.prefs.paidApiFallback;
     this.prefs = prefs;
-    // Whether limited accounts are skipped decides where agents belong: move them now, not at the next upkeep.
+    // Whether limited accounts are skipped, and paid API accounts may stand in, decides where agents
+    // belong: move them now, not at the next upkeep.
     if (routingChanged && this.paseo) void this.alignSessions(this.paseo).catch((error: unknown) => log("aligning agents failed", error));
   }
 
@@ -1164,6 +1166,7 @@ export class Service {
       autoSwitch: this.prefs.autoSwitch,
       balanceNewAgents: this.prefs.balanceNewAgents,
       paidFallback: this.prefs.paidApiFallback,
+      paidApi: this.prefs.paidApiFallback,
       autoRedeem: this.prefs.autoRedeem,
       portable: adapter.portable,
       usageOf: (id) => this.usage.get(id),
@@ -1223,7 +1226,8 @@ export class Service {
         }
         // Paseo has opened the session without waiting: `onSessionOpen` sorts out its record.
         if (!interactive || abandoned?.aborted) return;
-        const session = { accountId: decision.account.id, family, openedAt: new Date(now).toISOString() };
+        const session: LiveSession = { accountId: decision.account.id, family, openedAt: new Date(now).toISOString() };
+        if (this.fellBackTo(draft, request.agentId, family, decision.account)) session.standIn = true;
         if (reload && ownReload) reload.opened = { replaced: draft.sessions[request.agentId], wrote: session };
         draft.sessions[request.agentId] = session;
         if (opening) opening.session = session;
@@ -1803,7 +1807,7 @@ export class Service {
     if (adapter.portable) {
       // Never pinned to a paid stand-in (Bedrock): it's only there until a subscription account has
       // room, and routing and alignment take the agent back then.
-      if (move?.pin && !isLastResort(next)) await this.pin(agentId, next.id, latest.bindings[agentId]);
+      if (move?.pin && !isPaidStandIn(next, this.prefs.paidApiFallback)) await this.pin(agentId, next.id, latest.bindings[agentId]);
       // Only a Claude agent moves here. A ChatGPT hand-off's new agent counts itself as it opens.
       this.notePlacement(next.id, now);
       this.switchGuard.note(agentId, now);
@@ -1816,7 +1820,7 @@ export class Service {
           reason,
           continued,
           outcome: result.outcome === "reopened" ? "switched" : "pending",
-          detail: result.outcome === "failed" ? failureDetail(result) : isLastResort(next) ? paidFallbackNote(next) : null,
+          detail: result.outcome === "failed" ? failureDetail(result) : this.paidNote(latest, agentId, family, next),
         },
         agentId,
       );
@@ -1836,7 +1840,7 @@ export class Service {
       });
       return;
     }
-    const paid = isLastResort(next);
+    const paid = isPaidStandIn(next, this.prefs.paidApiFallback);
     const why =
       (reason === "limit"
         ? `its ChatGPT account (${account.label}) reached its usage limit`
@@ -2129,6 +2133,15 @@ export class Service {
   }
 
   /**
+   * The timeline's word on an agent that moved onto a paid stand-in (`paidFallbackNote`), unless that's
+   * where it routes anyway: the account it's bound to, or the default it follows. Then it isn't there
+   * because every subscription account is out.
+   */
+  private paidNote(state: StoredState, agentId: string, family: Family, next: StoredAccount): string | null {
+    return this.fellBackTo(state, agentId, family, next) ? paidFallbackNote(next) : null;
+  }
+
+  /**
    * Whether a paid stand-in may take this agent by itself (`paidApiFallback`). Bedrock can't run
    * Claude's Auto mode (Paseo refuses to start the turn: "Claude Auto mode requires the Anthropic
    * API"), so a Claude agent in Auto mode never goes there by itself, nor one whose mode isn't known
@@ -2266,7 +2279,7 @@ export class Service {
         const next = move.account;
         this.notePlacement(next.id, now);
         moved += 1;
-        if (move.pin && !isLastResort(next)) await this.pin(agentId, next.id, latest.bindings[agentId]);
+        if (move.pin && !isPaidStandIn(next, this.prefs.paidApiFallback)) await this.pin(agentId, next.id, latest.bindings[agentId]);
         this.switchGuard.note(agentId, now);
         const row: SwitchRow = {
           family,
@@ -2279,7 +2292,7 @@ export class Service {
           toFamily: null,
           toProvider: null,
           outcome: "switched",
-          detail: isLastResort(next) ? paidFallbackNote(next) : null,
+          detail: this.paidNote(latest, agentId, family, next),
           at: new Date(now).toISOString(),
         };
         await this.noteOutcome(paseo, agentId, row, await this.reopenAgent(paseo, agentId, { row, background: true }));
@@ -2319,7 +2332,7 @@ export class Service {
         toFamily: other,
         toProvider: null,
         delivery: "sent",
-        ...(isLastResort(earlierAccount) ? { detail: paidFallbackNote(earlierAccount) } : {}),
+        ...(isPaidStandIn(earlierAccount, this.prefs.paidApiFallback) ? { detail: paidFallbackNote(earlierAccount) } : {}),
       };
     }
 
@@ -2343,15 +2356,19 @@ export class Service {
     const now = Date.now();
     let account = mostAvailable(state, other, (id) => this.usage.get(id), now, new Set(), this.prefs.paidApiFallback, this.pacing(now));
     // A fork is a new agent that can't change accounts later, so a free banked reset goes before a paid stand-in here too.
-    if (account && isLastResort(account) && this.prefs.autoRedeem) {
+    if (account && isPaidStandIn(account, this.prefs.paidApiFallback) && this.prefs.autoRedeem) {
       account = withBankedReset(state, other, (id) => this.usage.get(id), now) ?? account;
     }
     if (!account) {
-      // API accounts are billed per use, so they never take work over by themselves; say so rather than "at its limit".
-      const apiOnly = accountsOf(state, other).some((entry) => entry.auth === "api" && isUsable(entry, now));
+      // API accounts are billed per use, so they take work over by themselves only with
+      // `paidApiFallback`; say so rather than "at its limit".
+      // The setting is suggested only where it would help: off, and an account it would let stand in
+      // has room. A key on another endpoint, or a ChatGPT key that isn't Azure's, never stands in.
+      const api = accountsOf(state, other).filter((entry) => entry.auth === "api" && isUsable(entry, now));
+      const setting = !this.prefs.paidApiFallback && api.some((entry) => isPaidStandIn(entry, true));
       return {
-        skipped: apiOnly
-          ? `The only ${name} accounts with room use an API key, which ZeroSub never moves work onto by itself. To use one, start a ${name} agent and pick it from the agent's account button.`
+        skipped: api.length > 0
+          ? `The only ${name} accounts with room use an API key, which ZeroSub doesn't move work onto by itself. To use one, start a ${name} agent and pick it from the agent's account button${setting ? ', or turn on "Use paid API accounts when every subscription is out"' : ""}.`
           : `Every ${name} account is at its limit too.`,
       };
     }
@@ -2395,10 +2412,12 @@ export class Service {
           // A fork that lands on a paid stand-in (Bedrock) isn't the user's pick, even when they asked
           // for the fork: it's held there only until a subscription account can take it (see `chooseAccount`).
           const portable = this.adapters[other].portable;
+          const standIn = portable && isPaidStandIn(account, this.prefs.paidApiFallback);
           draft.bindings[newAgentId] = {
             accountId: account.id,
-            source: portable && isLastResort(account) ? "auto" : source === "user" ? "user" : portable ? "auto" : "thread",
+            source: standIn ? "auto" : source === "user" ? "user" : portable ? "auto" : "thread",
             at: new Date().toISOString(),
+            ...(standIn ? { standIn: true as const } : {}),
           };
         });
       },
@@ -2410,7 +2429,7 @@ export class Service {
       toFamily: other,
       toProvider: null,
       delivery: "sent",
-      ...(isLastResort(account) ? { detail: paidFallbackNote(account) } : {}),
+      ...(isPaidStandIn(account, this.prefs.paidApiFallback) ? { detail: paidFallbackNote(account) } : {}),
     };
   }
 
@@ -3258,6 +3277,7 @@ export class Service {
       autoSwitch: this.prefs.autoSwitch,
       balanceNewAgents: this.prefs.balanceNewAgents,
       paidFallback: paid,
+      paidApi: this.prefs.paidApiFallback,
       autoRedeem: this.prefs.autoRedeem,
       portable: this.adapters[family].portable,
       usageOf: (id) => this.usage.get(id),
@@ -3281,6 +3301,7 @@ export class Service {
         autoSwitch: this.prefs.autoSwitch,
         balanceNewAgents: true,
         paidFallback: this.prefs.paidApiFallback,
+        paidApi: this.prefs.paidApiFallback,
         autoRedeem: this.prefs.autoRedeem,
         portable: this.adapters[family].portable,
         usageOf: (id) => this.usage.get(id),
@@ -3657,7 +3678,7 @@ export class Service {
     // that is out too, so the agent would just be reopened where it can't work.
     const from = findAccount(state, current);
     const to = findAccount(state, target);
-    if (from && isLastResort(from) && isLimited(from, now) && (!to || !isUsable(to, now, this.agentModels.get(agent.id)))) return false;
+    if (from && isPaidStandIn(from, this.prefs.paidApiFallback) && isLimited(from, now) && (!to || !isUsable(to, now, this.agentModels.get(agent.id)))) return false;
     return stranded || (reason !== "manual" && reason !== "default");
   }
 
@@ -3668,7 +3689,7 @@ export class Service {
     if (!from.signedIn) return "signed_out";
     if (from.disabled) return "disabled";
     if (isLimitedFor(from, now, this.agentModels.get(agentId))) return "limit";
-    if (this.leavesPaid(state, current, target)) return "room";
+    if (this.leavesPaid(state, agentId, current, target, now)) return "room";
     return state.bindings[agentId]?.accountId === target ? "manual" : "default";
   }
 
@@ -3677,11 +3698,44 @@ export class Service {
    * sends it back once its own account, or the default it follows, has room again, and alignment makes
    * that move by itself, so the agent doesn't stay on the bill. One the user put on the stand-in
    * (picked for it, or made the default) is routed there anyway, so it never comes to this.
+   *
+   * A Claude key is a stand-in only while `paidApiFallback` is on. A session paid fallback opened on
+   * one (`LiveSession.standIn`), or a binding ZeroSub made to one (`Binding.standIn`), still counts
+   * after the setting is turned off, so the agent is moved back all the same, once the account it goes
+   * to can take it: not onto one that's out too. A stand-in that is the agent's own route is where it
+   * belongs, so a move onto it (Bedrock to the key the user picked) goes ahead as on any other account.
    */
-  private leavesPaid(state: StoredState, current: string, target: string): boolean {
+  private leavesPaid(state: StoredState, agentId: string, current: string, target: string, now: number): boolean {
     const from = findAccount(state, current);
     const to = findAccount(state, target);
-    return Boolean(from && to && isLastResort(from) && !isLastResort(to));
+    if (!from || !to) return false;
+    if (isPaidStandIn(to, this.prefs.paidApiFallback) && this.routeOf(state, agentId, to.family)?.id !== to.id) return false;
+    if (isPaidStandIn(from, this.prefs.paidApiFallback)) return true;
+    if (!isUsable(to, now, this.agentModels.get(agentId))) return false;
+    const session = state.sessions[agentId];
+    const binding = state.bindings[agentId];
+    return (session?.standIn === true && session.accountId === current) || (binding?.standIn === true && binding.accountId === current);
+  }
+
+  /**
+   * Whether a session opening on `account` is there only by paid fallback: a paid stand-in, or an
+   * account ZeroSub bound the agent to as one (`Binding.standIn`), that isn't where the agent routes
+   * (see `routeOf`).
+   */
+  private fellBackTo(state: StoredState, agentId: string, family: Family, account: StoredAccount): boolean {
+    const binding = state.bindings[agentId];
+    const bound = binding?.standIn === true && binding.accountId === account.id;
+    return (bound || isPaidStandIn(account, this.prefs.paidApiFallback)) && this.routeOf(state, agentId, family)?.id !== account.id;
+  }
+
+  /**
+   * Where an agent routes by its own choice: the account it's bound to, or else the default it
+   * follows. A binding ZeroSub made to a paid stand-in (`Binding.standIn`) isn't its choice.
+   */
+  private routeOf(state: StoredState, agentId: string, family: Family): StoredAccount | undefined {
+    const binding = state.bindings[agentId];
+    const bound = binding?.standIn ? undefined : findAccount(state, binding?.accountId);
+    return bound?.family === family ? bound : defaultAccount(state, family);
   }
 
   private async appendRow(paseo: PaseoApi, agentId: string, row: SwitchRow): Promise<void> {
@@ -4304,8 +4358,15 @@ export class Service {
         const current = findAccount(draft, this.runningOn(draft, agent.id, family));
         if (!current || current.family !== family || !isUsable(current, now, this.agentModels.get(agent.id))) moving.push(agent.id);
         else if (current.id !== newDefault) {
-          // "auto", like a limit switch, so the account button still offers "Follow default".
-          draft.bindings[agent.id] = { accountId: current.id, source: isLastResort(current) && current.id === previous ? "user" : "auto", at };
+          // "auto", like a limit switch, so the account button still offers "Follow default". On a paid
+          // stand-in it wasn't on by the old default, it's there only because every subscription was out:
+          // also when paid fallback opened its session there and the setting has been turned off since.
+          const session = draft.sessions[agent.id];
+          const standIn = isPaidStandIn(current, this.prefs.paidApiFallback) || (session?.standIn === true && session.accountId === current.id);
+          draft.bindings[agent.id] =
+            standIn && current.id === previous
+              ? { accountId: current.id, source: "user", at }
+              : { accountId: current.id, source: "auto", at, ...(standIn ? { standIn: true as const } : {}) };
           kept += 1;
         }
       }
@@ -5801,17 +5862,19 @@ function bedrockModelNote(label: string, model: string): string {
   return `Bedrock in ${label}'s region doesn't offer ${model}, which Claude Code picked for this agent's model. Claude Code's built-in Bedrock defaults for the opus, sonnet and haiku aliases can be older than a region offers: set the Opus, Sonnet and Haiku models in ${label}'s Bedrock settings (an inference profile your AWS account has, such as global.anthropic.claude-sonnet-5-5), or pick another model for this agent. ${label} stays usable for other models.`;
 }
 
-/** The timeline's word on work that moved onto a paid Azure or Bedrock account by itself (with `paidApiFallback` on). */
+/** The timeline's word on work that moved onto a paid API account by itself (with `paidApiFallback` on; see `isPaidStandIn`). */
 function paidFallbackNote(account: StoredAccount): string {
   if (isBedrockAccount(account)) {
     return `Every Claude subscription account is out, so this runs on ${account.label}: AWS Bedrock, a paid API billed per token. It moves back to a Claude account once one has room.`;
   }
-  return `Every ChatGPT subscription account is out, so this runs on ${account.label}: Azure OpenAI, a paid API billed per token. New agents go back to a ChatGPT account once one has room.`;
+  if (isAzureAccount(account)) {
+    return `Every ChatGPT subscription account is out, so this runs on ${account.label}: Azure OpenAI, a paid API billed per token. New agents go back to a ChatGPT account once one has room.`;
+  }
+  return `Every Claude subscription account is out, so this runs on ${account.label}: an API key, billed per use. It moves back to a Claude account once one has room.`;
 }
 
 /** What tells an API key's account from another: where the key goes, and a short hash of the key. */
 /** Anthropic's API, which a blank base URL means too. */
-const ANTHROPIC_API = "https://api.anthropic.com";
 
 function apiIdentity(baseUrl: string | null, digest: string): string {
   return `api|${baseUrl === null || baseUrl === ANTHROPIC_API ? "anthropic" : baseUrl}|${digest}`;

@@ -25,7 +25,7 @@ import {
   staleNotice,
   usageSummary,
 } from "./format";
-import type { AccountView } from "./model";
+import { onAnthropicApi, type AccountView } from "./model";
 
 const NOW = Date.parse("2026-09-23T12:00:00Z");
 
@@ -280,18 +280,25 @@ describe("account state for the app", () => {
   });
 
   it("only lets ready subscription accounts take work over, as the server does", () => {
-    const ready = { ...base, family: "claude" as const, azure: null, bedrock: null };
+    const ready = { ...base, family: "claude" as const, azure: null, bedrock: null, api: null };
     expect(canStandIn(ready)).toBe(true);
     expect(canStandIn({ ...ready, auth: "api" })).toBe(false);
-    // With paid API fallback, only a marked paid stand-in (Azure, Bedrock), as the server's isLastResort:
-    // another API key is used only when picked.
+    // With paid API fallback, a marked paid stand-in (Azure, Bedrock) or a Claude key on Anthropic's own
+    // API, as the server's isPaidStandIn: another API key is used only when picked.
     const bedrock = { ...ready, auth: "api" as const, bedrock: {} as NonNullable<AccountView["bedrock"]> };
     const azure = { ...ready, family: "codex" as const, auth: "api" as const, azure: {} as NonNullable<AccountView["azure"]> };
     expect(canStandIn(bedrock)).toBe(false);
     expect(canStandIn(bedrock, true)).toBe(true);
     expect(canStandIn(azure, true)).toBe(true);
     expect(canStandIn({ ...ready, auth: "api" }, true)).toBe(false);
-    expect(paidStandIn({ azure: null, bedrock: null })).toBe(false);
+    const key = (baseUrl: string | null) => ({ ...ready, auth: "api" as const, api: { keyKind: "api_key" as const, keyHint: "abcd", baseUrl, disableTelemetry: false, disableErrorReporting: false, disableNonessentialTraffic: false } });
+    expect(canStandIn(key(null))).toBe(false);
+    expect(canStandIn(key(null), true)).toBe(true);
+    expect(canStandIn(key("https://api.anthropic.com"), true)).toBe(true);
+    expect(canStandIn(key("https://gw.example.com"), true)).toBe(false);
+    // A ChatGPT key that isn't Azure's never stands in.
+    expect(paidStandIn({ ...key(null), family: "codex" })).toBe(false);
+    expect(paidStandIn({ family: "claude", auth: "subscription", azure: null, bedrock: null, api: null })).toBe(false);
     expect(canStandIn({ ...ready, status: "limited" })).toBe(false);
     expect(canStandIn({ ...ready, status: "disabled" })).toBe(false);
     expect(canStandIn({ ...ready, status: "signed_out" })).toBe(false);
@@ -364,5 +371,16 @@ describe("reportsUsage", () => {
     }
     // Grok and Cursor never send windows, and Pi's CLI reports none.
     for (const family of ["grok", "cursor", "pi"] as const) expect(reportsUsage({ family, auth: "subscription" })).toBe(false);
+  });
+});
+
+describe("onAnthropicApi", () => {
+  it("is a Claude key's base URL left empty or set to Anthropic's own API, and nothing else", () => {
+    for (const url of [null, undefined, "", "  ", "https://api.anthropic.com", "https://api.anthropic.com/", "HTTPS://API.ANTHROPIC.COM"]) {
+      expect(onAnthropicApi(url), String(url)).toBe(true);
+    }
+    for (const url of ["https://gw.example.com", "http://api.anthropic.com", "https://api.anthropic.com.example.com", "https://api.anthropic.com/v2"]) {
+      expect(onAnthropicApi(url), url).toBe(false);
+    }
   });
 });

@@ -25,7 +25,7 @@ import { ClaudeAdapter } from "./claude";
 import { accountSettings, prepareClaudeHome, writeAccountProxy } from "./homes";
 import { BEDROCK_QUOTA_MS, BEDROCK_THROTTLE_MS, detectBedrockAutoModeRefusal, detectBedrockLimit, detectBedrockModelUnavailable, detectBedrockRefusal } from "./limits";
 import type { RunResult } from "./process";
-import { canStandIn, isLastResort, mostAvailable } from "./routing";
+import { canStandIn, isLastResort, isPaidStandIn, mostAvailable } from "./routing";
 import { emptyState, StoredAccountSchema, type StoredAccount } from "./state";
 
 // AWS's own documentation examples, not real credentials.
@@ -428,12 +428,15 @@ describe("Bedrock accounts among Claude accounts", () => {
     expect(isBedrockAccount({ ...bedrock, family: "codex" })).toBe(false);
     expect(isLastResort(bedrock)).toBe(true);
     expect(isLastResort(keyed)).toBe(false);
-    // Neither stands in by itself like a subscription does.
+    // Neither stands in by itself like a subscription does; both may with paid API fallback on.
     expect(canStandIn(bedrock, NOW)).toBe(false);
     expect(canStandIn(keyed, NOW)).toBe(false);
-    for (const paidFallback of [false, true]) {
-      expect(mostAvailable({ ...emptyState(), accounts: [out, keyed] }, "claude", usageOf, NOW, new Set(), paidFallback)).toBeUndefined();
-    }
+    // Bedrock is one whatever the setting says, as on main; a Claude key on Anthropic's API only with it on.
+    expect(isPaidStandIn(bedrock, false)).toBe(true);
+    expect(isPaidStandIn(keyed, false)).toBe(false);
+    expect(isPaidStandIn(keyed, true)).toBe(true);
+    expect(mostAvailable({ ...emptyState(), accounts: [out, keyed] }, "claude", usageOf, NOW, new Set(), false)).toBeUndefined();
+    expect(mostAvailable({ ...emptyState(), accounts: [out, keyed] }, "claude", usageOf, NOW, new Set(), true)?.id).toBe(keyed.id);
   });
 
   it("are passed over while a subscription account can stand in, however full", () => {

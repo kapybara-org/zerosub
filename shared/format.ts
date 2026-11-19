@@ -1,4 +1,4 @@
-import { estimateApiCost, totalTokens, type AccountView, type PaceView, WEEK_NEARLY_USED_PERCENT, type AgentRoute, type AzureSummary, type Credits, type Egress, type ExtraUsage, type UsageWindow } from "./model";
+import { estimateApiCost, onAnthropicApi, totalTokens, type AccountView, type PaceView, WEEK_NEARLY_USED_PERCENT, type AgentRoute, type AzureSummary, type Credits, type Egress, type ExtraUsage, type UsageWindow } from "./model";
 import type { ReopenSummary } from "./rpc";
 
 /** "in 2h 14m", "in 3d 4h", "now". */
@@ -287,18 +287,23 @@ export function reportsUsage(account: Pick<AccountView, "auth" | "family">): boo
 
 /**
  * ZeroSub may carry work on with this account by itself: it's ready, and not billed per use, or with
- * paid API fallback on a paid stand-in (an Azure OpenAI or AWS Bedrock account); not a Pi account
- * (Pi's own login may be an API key too). The app's side of `canStandIn` and `isLastResort` in
- * server/routing.ts, which pick where forks and switches go: an API key without one of those markers
- * is used only when picked.
+ * paid API fallback on a paid stand-in (`paidStandIn`); not a Pi account (Pi's own login may be an
+ * API key too). The app's side of `canStandIn` and `isPaidStandIn` in server/routing.ts, which pick
+ * where forks and switches go: any other API key is used only when picked.
  */
-export function canStandIn(account: Pick<AccountView, "status" | "auth" | "family" | "azure" | "bedrock">, paidFallback = false): boolean {
+export function canStandIn(account: Pick<AccountView, "status" | "auth" | "family" | "azure" | "bedrock" | "api">, paidFallback = false): boolean {
   return account.status === "ready" && account.family !== "pi" && (account.auth !== "api" || (paidFallback && paidStandIn(account)));
 }
 
-/** An Azure OpenAI or AWS Bedrock account: one "Use paid API accounts when every subscription is out" lets stand in. */
-export function paidStandIn(account: Pick<AccountView, "azure" | "bedrock">): boolean {
-  return Boolean(account.azure || account.bedrock);
+/**
+ * One "Use paid API accounts when every subscription is out" lets stand in, as the server's
+ * `isPaidStandIn` with it on: an Azure OpenAI or AWS Bedrock account, or a Claude account on an API
+ * key or token that goes to Anthropic's own API. A Claude key whose settings couldn't be read counts
+ * as going elsewhere.
+ */
+export function paidStandIn(account: Pick<AccountView, "family" | "auth" | "azure" | "bedrock" | "api">): boolean {
+  if (account.azure || account.bedrock) return true;
+  return account.family === "claude" && account.auth === "api" && account.api !== null && onAnthropicApi(account.api.baseUrl);
 }
 
 /** The note over state the daemon stopped answering for: "Showing data from 3m ago · couldn't refresh: …". */
