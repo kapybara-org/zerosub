@@ -3,6 +3,8 @@ import {
   paceVerdict,
   accountSubtitle,
   apiUsageLines,
+  canStandIn,
+  paidStandIn,
   describeReopen,
   formatAge,
   formatCredits,
@@ -196,6 +198,26 @@ describe("account state for the app", () => {
     expect(isDisabled({ ...base, status: "signed_out", disabled: true })).toBe(true);
     // Older servers only said so through the status.
     expect(isDisabled({ ...base, status: "disabled", disabled: false })).toBe(true);
+  });
+
+  it("only lets ready subscription accounts take work over, as the server does", () => {
+    const ready = { ...base, family: "claude" as const, azure: null, bedrock: null };
+    expect(canStandIn(ready)).toBe(true);
+    expect(canStandIn({ ...ready, auth: "api" })).toBe(false);
+    // With paid API fallback, only a marked paid stand-in (Azure, Bedrock), as the server's isLastResort:
+    // another API key is used only when picked.
+    const bedrock = { ...ready, auth: "api" as const, bedrock: {} as NonNullable<AccountView["bedrock"]> };
+    const azure = { ...ready, family: "codex" as const, auth: "api" as const, azure: {} as NonNullable<AccountView["azure"]> };
+    expect(canStandIn(bedrock)).toBe(false);
+    expect(canStandIn(bedrock, true)).toBe(true);
+    expect(canStandIn(azure, true)).toBe(true);
+    expect(canStandIn({ ...ready, auth: "api" }, true)).toBe(false);
+    expect(paidStandIn({ azure: null, bedrock: null })).toBe(false);
+    expect(canStandIn({ ...ready, status: "limited" })).toBe(false);
+    expect(canStandIn({ ...ready, status: "disabled" })).toBe(false);
+    expect(canStandIn({ ...ready, status: "signed_out" })).toBe(false);
+    // Pi's own login may be an API key too.
+    expect(canStandIn({ ...ready, family: "pi" })).toBe(false);
   });
 });
 
