@@ -714,6 +714,37 @@ describe("adding a folder that's already signed in", () => {
     expect(await homeOf(store, again)).toBe(folder);
   });
 
+  it("imports the CLI subscription into an isolated home and keeps one entry enabled", async () => {
+    const { service, store, fake } = start();
+    const folder = join(root, "elsewhere", "claude-isolated");
+    const duplicate = join(root, "elsewhere", "claude-duplicate");
+    for (const home of [folder, duplicate]) {
+      await makeHome(home);
+      await writeFile(join(home, ".claude.json"), "{}");
+      fake.signedIn.add(home);
+    }
+    const limitedUntil = new Date(Date.now() + 60_000).toISOString();
+    await seed({
+      accounts: [{ ...main, email: "ada@example.com", identity: "personal|ada@example.com", limitedUntil }],
+      bindings: { agent: { accountId: main.id, source: "user", at: main.createdAt } },
+    });
+
+    const id = await service.importAccount(folder);
+    const state = await store.read();
+    expect(state.defaults.claude).toBe(id);
+    expect(state.bindings.agent?.accountId).toBe(id);
+    expect(state.accounts.find((account) => account.id === id)).toMatchObject({ home: folder, disabled: false, limitedUntil });
+    expect(state.accounts.find((account) => account.id === main.id)).toMatchObject({ signedIn: true, disabled: true });
+    await expect(service.importAccount(duplicate)).rejects.toThrow("already added");
+    expect(fake.calls.filter((call) => call.startsWith("logout"))).toEqual([]);
+
+    await service.setAccountEnabled(paseo, main.id, true);
+    const switchedBack = await store.read();
+    expect(switchedBack.defaults.claude).toBe(main.id);
+    expect(switchedBack.bindings.agent?.accountId).toBe(main.id);
+    expect(switchedBack.accounts.filter((account) => !account.disabled).map((account) => account.id)).toEqual([main.id]);
+  });
+
   it("refuses a folder it can't add, saying why", async () => {
     const { service, store, fake } = start();
     const work = join(kept(), "claude-work");

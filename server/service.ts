@@ -4312,8 +4312,14 @@ export class Service {
     }
     await this.store.update((draft) => {
       const target = findAccount(draft, accountId);
-      if (target) target.disabled = !enabled;
-      if (target && !enabled) dropNextPick(draft, target);
+      if (!target) return;
+      const peer = claudeLoginPeer(draft, target);
+      if (enabled && peer && !peer.disabled && !target.signedIn) {
+        throw new Error(`Sign in to ${target.label} before switching away from ${peer.label}.`);
+      }
+      target.disabled = !enabled;
+      if (enabled && target.signedIn && peer) preferClaudeLogin(draft, target, peer);
+      if (!enabled) dropNextPick(draft, target);
     });
     console.log(`[ZeroSub] ${account.label} is ${enabled ? "enabled" : "disabled"}`);
     let stayed = 0;
@@ -5262,8 +5268,7 @@ export class Service {
     let account: StoredAccount | undefined;
     await this.store.update((draft) => {
       if (draft.accounts.some((entry) => entry.home && resolve(entry.home) === home)) throw new Error(`${shown} is already added.`);
-      // The CLI's own login counts too: an added account must be one of its own.
-      const duplicate = accountsOf(draft, "claude").find((entry) => entry.identity === identity.identity);
+      const duplicate = managedLoginDuplicate(draft, "claude", identity);
       if (duplicate) throw new Error(`${identity.email ?? shown} is already added as "${duplicate.label}".`);
       // A folder of ZeroSub's own gets its ID back: a managed account's ID matches its folder's name there.
       const name = basename(home);
@@ -5797,13 +5802,7 @@ export class Service {
           : `Couldn't tell which workspace member signed in, because Codex didn't return an email. Sign in again as ${expected}.`,
       );
     }
-    // The CLI's own login is whatever the user signs it into; only added accounts must be distinct.
-    const duplicate =
-      identity.identity && existing?.kind !== "main"
-        ? accountsOf(state, session.family).find(
-            (account) => account.id !== session.accountId && sameAccountIdentity(session.family, account, identity, true),
-          )
-        : undefined;
+    const duplicate = existing?.kind === "main" ? undefined : managedLoginDuplicate(state, session.family, identity, session.accountId);
     if (duplicate) {
       if (!existing && session.home) await adapter.logout(session.home).catch(() => undefined);
       return this.failLogin(
@@ -5825,6 +5824,9 @@ export class Service {
           // Removed while signing back in: it stays removed (see `remove`).
           removed = true;
           return;
+        }
+        if (account?.kind !== "main" && managedLoginDuplicate(draft, session.family, identity, accountId)) {
+          throw new Error(`${identity.email ?? "That account"} was already added while you were signing in.`);
         }
         if (!account) {
           // A managed account's ID matches its home's folder name, as its cleanup entry does.
@@ -6038,11 +6040,47 @@ function sameSubscription(state: StoredState, account: StoredAccount): StoredAcc
   return accountsOf(state, account.family).filter((other) => other.id !== account.id && sameAccountIdentity(account.family, other, account));
 }
 
+/** Claude allows one managed login beside its native CLI login. Other duplicates are still refused. */
+function managedLoginDuplicate(state: StoredState, family: Family, identity: Identity, except?: string | null): StoredAccount | undefined {
+  return accountsOf(state, family).find((other) =>
+    other.id !== except && (family !== "claude" || other.kind !== "main" || other.auth !== "subscription") &&
+    sameAccountIdentity(family, other, identity, true),
+  );
+}
+
+function claudeLoginPeer(state: StoredState, account: StoredAccount): StoredAccount | undefined {
+  if (account.family !== "claude" || account.auth !== "subscription") return undefined;
+  return sameSubscription(state, account).find((other) => other.kind !== account.kind && other.auth === "subscription");
+}
+
+/** The two logins share a subscription. Transfer routing and known limits without changing either sign-in. */
+function preferClaudeLogin(state: StoredState, account: StoredAccount, peer: StoredAccount): void {
+  peer.disabled = true;
+  if (defaultAccount(state, "claude")?.id === peer.id) state.defaults.claude = account.id;
+  if (state.nextAgent.claude?.accountId === peer.id) state.nextAgent.claude.accountId = account.id;
+  for (const binding of Object.values(state.bindings)) {
+    if (binding.accountId === peer.id) binding.accountId = account.id;
+  }
+  const now = Date.now();
+  if (isLimited(peer, now) && !isLimited(account, now)) {
+    const { limitedUntil, limitKind, limitedAt, limitSource } = peer;
+    Object.assign(account, { limitedUntil, limitKind, limitedAt, limitSource });
+  }
+  for (const [scope, limit] of Object.entries(peer.modelLimits)) {
+    if (Date.parse(limit.until) > now && !(Date.parse(account.modelLimits[scope]?.until ?? "") >= Date.parse(limit.until))) {
+      account.modelLimits[scope] = limit;
+    }
+  }
+}
+
 /** Returns true when the CLI login's account was replaced by a different one, which drops what the slot knew of the old one's limit. */
 function applyIdentity(account: StoredAccount, identity: Identity, state: StoredState): boolean {
   const handedOver = account.kind === "main" && identity.signedIn && !!account.identity && !!identity.identity && !sameAccountIdentity(account.family, account, identity);
   applyIdentityFields(account, identity, state);
-  if (!handedOver) return false;
+  if (!handedOver) {
+    enforceClaudeLoginPair(state, account, identity);
+    return false;
+  }
   account.limitedUntil = null;
   account.limitKind = null;
   account.limitedAt = null;
@@ -6061,7 +6099,15 @@ function applyIdentity(account: StoredAccount, identity: Identity, state: Stored
       if (Date.parse(limit.until) > now) account.modelLimits[scope] = limit;
     }
   }
+  enforceClaudeLoginPair(state, account, identity);
   return true;
+}
+
+function enforceClaudeLoginPair(state: StoredState, account: StoredAccount, identity: Identity): void {
+  if (!identity.signedIn || !identity.identity || account.disabled) return;
+  const peer = claudeLoginPeer(state, account);
+  if (peer && account.kind === "managed") preferClaudeLogin(state, account, peer);
+  else if (peer?.signedIn && !peer.disabled) preferClaudeLogin(state, peer, account);
 }
 
 function applyIdentityFields(account: StoredAccount, identity: Identity, state: StoredState): void {
