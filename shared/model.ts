@@ -180,6 +180,19 @@ export const TrafficSwitchesSchema = z.object({
 });
 export type TrafficSwitches = z.infer<typeof TrafficSwitchesSchema>;
 
+/** Anthropic's own API, where a Claude API key goes when its base URL is left empty. */
+export const ANTHROPIC_API = "https://api.anthropic.com";
+
+/**
+ * Whether a Claude API key with this base URL goes to Anthropic's own API: no base URL, or
+ * Anthropic's typed out. Only such a key stands in with "Use paid API accounts when every
+ * subscription is out" (see `isPaidStandIn`); one on another endpoint is used only when chosen.
+ */
+export function onAnthropicApi(baseUrl: string | null | undefined): boolean {
+  const url = baseUrl?.trim().replace(/\/+$/, "").toLowerCase();
+  return !url || url === ANTHROPIC_API;
+}
+
 /** An API key's settings as shown in the app; the key itself never leaves the host. */
 export const ApiSummarySchema = TrafficSwitchesSchema.extend({
   /** Left out by providers whose accounts only take an API key (Pi's). */

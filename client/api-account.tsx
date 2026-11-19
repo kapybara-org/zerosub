@@ -3,9 +3,9 @@ import { Modal, TextInput, useToast } from "@getpaseo/plugin/client/react-native
 import { SettingsCard, SettingsSelect, SettingsSwitch } from "@getpaseo/plugin/client/ui";
 import { useCallback, useMemo, useState, type ReactNode } from "react";
 import { Text, View } from "react-native";
-import type { AccountView, ApiKeyKind, TrafficSwitches } from "../shared/model";
+import { onAnthropicApi, type AccountView, type ApiKeyKind, type TrafficSwitches } from "../shared/model";
 import { addApiAccount, updateApiAccount } from "../shared/rpc";
-import { describe, type ZeroSubStore } from "./store";
+import { describe, useStore, type ZeroSubStore } from "./store";
 import { Button, useText } from "./ui";
 
 type Theme = PluginSurfaceProps["theme"];
@@ -35,6 +35,7 @@ export function ApiAccountForm({
   onCancel(): void;
 }) {
   const text = useText(theme);
+  const paidFallback = useStore(store).state?.paidApiFallback ?? false;
   const editing = Boolean(account);
   const current = account?.api ?? null;
   const [label, setLabel] = useState("");
@@ -187,8 +188,12 @@ export function ApiAccountForm({
         </SettingsCard>
       </View>
       <Text style={text.small}>
-        Billed per use, so ZeroSub never moves agents onto it by itself: it's used only as the default or when you pick it
-        for an agent. The key stays on this host.
+        {paidFallback && onAnthropicApi(baseUrl)
+          ? "Billed per use. With paid API accounts turned on, ZeroSub moves Claude agents onto it by itself only when every Claude subscription account is out, and back once one has room; you can always pick it for an agent, or make it the default."
+          : `Billed per use, so ZeroSub never moves agents onto it by itself${
+              paidFallback ? " (with paid API accounts turned on, only a key on Anthropic's own API stands in)" : ""
+            }: it's used only as the default or when you pick it for an agent.`}{" "}
+        The key stays on this host.
       </Text>
       {error ? <Text style={text.danger}>{error}</Text> : null}
       <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, justifyContent: "flex-end" }}>

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Usage } from "../shared/model";
 import { applyEnv } from "./adapter";
 import { parseRateLimits } from "./codex";
-import { canStandIn, chooseAccount, fiveHourGated, isLastResort, isLimitedFor, mostAvailable, paceScore, paceView, scopeCoversModel } from "./routing";
+import { canStandIn, chooseAccount, fiveHourGated, isLastResort, isLimitedFor, isPaidStandIn, mostAvailable, paceScore, paceView, scopeCoversModel } from "./routing";
 import { emptyState, type StoredAccount, type StoredState } from "./state";
 
 const NOW = Date.parse("2026-09-23T12:00:00Z");
@@ -542,14 +542,21 @@ describe("Azure OpenAI accounts", () => {
     expect(isLastResort(sub)).toBe(false);
     // An API-key account without the marker (a Claude one, or a ChatGPT one some other version wrote) isn't Azure.
     const keyed = account({ id: "codex-key", family: "codex", auth: "api" });
-    const claudeKey = account({ id: "claude-key", family: "claude", auth: "api" });
+    const claudeKey = account({ id: "claude-key", family: "claude", auth: "api", identity: "api|anthropic|0123456789abcdef" });
     expect(isLastResort(keyed)).toBe(false);
     expect(isLastResort(claudeKey)).toBe(false);
     expect(isLastResort({ ...claudeKey, provider: "azure" })).toBe(false);
+    // A ChatGPT API key without the marker never stands in. A Claude one does with paid API fallback
+    // on (see "Claude API-key accounts with paid API fallback"), though it isn't a marked one.
+    expect(isPaidStandIn(keyed, true)).toBe(false);
+    expect(isPaidStandIn(claudeKey, true)).toBe(true);
+    expect(isPaidStandIn(azure, false)).toBe(true);
     for (const paidFallback of [false, true]) {
       expect(mostAvailable(stateWith([out(cli), keyed]), "codex", () => null, NOW, new Set(), paidFallback)).toBeUndefined();
-      expect(mostAvailable(stateWith([account({ id: "claude-a", limitedUntil: "2026-09-23T15:00:00Z" }), claudeKey]), "claude", () => null, NOW, new Set(), paidFallback)).toBeUndefined();
     }
+    const claudeOut = stateWith([account({ id: "claude-a", limitedUntil: "2026-09-23T15:00:00Z" }), claudeKey]);
+    expect(mostAvailable(claudeOut, "claude", () => null, NOW, new Set(), false)).toBeUndefined();
+    expect(mostAvailable(claudeOut, "claude", () => null, NOW, new Set(), true)?.id).toBe(claudeKey.id);
   });
 
   describe("with paid API fallback off (the default)", () => {
@@ -960,5 +967,60 @@ describe("limits of one model's own window", () => {
     // Same headroom: the default (main) wins for an unaffected model too, so exclude it to see work is still usable.
     expect(mostAvailable(state, "claude", () => null, NOW, new Set(["claude-main"]), false, undefined, "claude-opus-4-1")?.id).toBe("claude-work");
     expect(mostAvailable(state, "claude", () => null, NOW, new Set(["claude-main"]), false, undefined, "claude-fable-5-2")).toBeUndefined();
+  });
+});
+
+describe("Claude API-key accounts with paid API fallback", () => {
+  const main = account({ id: "claude-main", kind: "main", home: null });
+  const key = account({ id: "claude-key", auth: "api", identity: "api|anthropic|0123456789abcdef", createdAt: "2026-08-01T00:00:00Z" });
+  // A key for another endpoint (a gateway, a third-party service speaking Anthropic's API).
+  const gateway = account({ id: "claude-gateway", auth: "api", identity: "api|https://gw.example.com|0123456789abcdef", createdAt: "2026-08-01T00:00:00Z" });
+  const out = (entry: StoredAccount) => ({ ...entry, limitedUntil: "2026-09-23T15:00:00Z", limitKind: "window" as const });
+  const bound = (state: ReturnType<typeof stateWith>) => ({ ...state, bindings: { "agent-1": { accountId: main.id, source: "user" as const, at: "2026-09-23T00:00:00Z" } } });
+
+  it("take a limited agent over only with the setting on, and only once no subscription can", () => {
+    const state = bound(stateWith([out(main), key]));
+    const off = chooseAccount(state, { ...base, usageOf: () => null, reason: "resume", current: main.id });
+    expect(off?.account.id).toBe(main.id);
+    const on = chooseAccount(state, { ...base, usageOf: () => null, reason: "resume", current: main.id, paidFallback: true });
+    expect(on?.account.id).toBe(key.id);
+    expect(on?.skipped?.account.id).toBe(main.id);
+    // Not re-pinned there: the agent keeps its own binding and returns once its account has room.
+    expect(on?.bind).toBeNull();
+    // A subscription with room goes first.
+    const other = account({ id: "claude-work" });
+    expect(chooseAccount(bound(stateWith([out(main), key, other])), { ...base, usageOf: () => null, reason: "resume", current: main.id, paidFallback: true })?.account.id).toBe(other.id);
+  });
+
+  it("keep an agent already on one only while no subscription could take over", () => {
+    const other = account({ id: "claude-work" });
+    expect(chooseAccount(bound(stateWith([out(main), key])), { ...base, usageOf: () => null, reason: "resume", current: key.id, paidFallback: true })?.account.id).toBe(key.id);
+    expect(chooseAccount(bound(stateWith([out(main), key, other])), { ...base, usageOf: () => null, reason: "resume", current: key.id, paidFallback: true })?.account.id).toBe(other.id);
+  });
+
+  it("with the setting off, aren't stand-ins at all: following the default leaves one, though the default is at its limit", () => {
+    // The user put the agent on the key, then set it back to follow the default, which is out.
+    const state = stateWith([out(main), key]);
+    expect(isPaidStandIn(key, false)).toBe(false);
+    expect(chooseAccount(state, { ...base, usageOf: () => null, reason: "resume", current: key.id })?.account.id).toBe(main.id);
+    // With it on, the key is where the agent waits for a subscription, as with Azure or Bedrock.
+    expect(chooseAccount(state, { ...base, usageOf: () => null, reason: "resume", current: key.id, paidFallback: true })?.account.id).toBe(key.id);
+  });
+
+  it("only count on Anthropic's own API: a key for another endpoint is used only when chosen, even with the setting on", () => {
+    expect(isPaidStandIn(gateway, true)).toBe(false);
+    // Anthropic's API typed out, as earlier versions saved it, counts as Anthropic's.
+    expect(isPaidStandIn({ ...key, identity: "api|https://api.anthropic.com|0123456789abcdef" }, true)).toBe(true);
+    expect(isPaidStandIn({ ...key, identity: null }, true)).toBe(false);
+    const state = bound(stateWith([out(main), gateway]));
+    expect(chooseAccount(state, { ...base, usageOf: () => null, reason: "resume", current: main.id, paidFallback: true })?.account.id).toBe(main.id);
+    expect(mostAvailable(state, "claude", () => null, NOW, new Set(), true)).toBeUndefined();
+    // Nor is an agent the user put there held on it once it follows the default again.
+    expect(chooseAccount(stateWith([out(main), gateway]), { ...base, usageOf: () => null, reason: "resume", current: gateway.id, paidFallback: true })?.account.id).toBe(main.id);
+  });
+
+  it("stay stand-ins by the setting when one choice turns paid fallback off (Claude's Auto mode, for Bedrock)", () => {
+    const state = stateWith([out(main), key]);
+    expect(chooseAccount(state, { ...base, usageOf: () => null, reason: "resume", current: key.id, paidFallback: false, paidApi: true })?.account.id).toBe(key.id);
   });
 });
