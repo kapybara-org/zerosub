@@ -152,10 +152,21 @@ export class ClaudeAdapter implements FamilyAdapter {
     const email = str(status.email);
     const orgId = str(status.orgId);
     let plan = str(status.subscriptionType);
-    // Claude Code still reports the former Max 20x plan as "max".
-    if (signedIn && plan === "max") {
-      const credentials = await readCredentials(home).catch(() => null);
-      if (credentials?.rateLimitTier === "default_claude_max_20x") plan = "ultra";
+    if (signedIn && (email || plan === "max")) {
+      const config = email ? await readFile(home ? join(home, ".claude.json") : mainClaudeGlobalConfig(), "utf8").catch(() => "") : "";
+      const profile = parseJsonObject(config)?.oauthAccount as Record<string, unknown> | undefined;
+      const matches = email && str(profile?.emailAddress)?.toLowerCase() === email.toLowerCase() &&
+        (!orgId || str(profile?.organizationUuid) === orgId);
+      const name = matches ? str(profile?.planDisplayName) : null;
+      const tier = matches ? str(profile?.organizationRateLimitTier) : null;
+      // The profile can reflect a plan change while the credential still has its sign-in tier.
+      if (name) plan = name;
+      else if (tier === "default_claude_max_5x") plan = "max";
+      else if (tier === "default_claude_max_20x") plan = "ultra";
+      else if (!tier && plan === "max") {
+        const credentials = await readCredentials(home).catch(() => null);
+        if (credentials?.rateLimitTier === "default_claude_max_20x") plan = "ultra";
+      }
     }
     return {
       signedIn,
