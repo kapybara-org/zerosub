@@ -215,6 +215,46 @@ const inPast = () => new Date(Date.now() - 60_000).toISOString();
 const TWIN = "claude-twin";
 const signedInAs = (key: string) => ({ ...account(key, key, "managed"), identity: key, email: `${key}@example.com` });
 
+describe("a pin that allows a limited account", () => {
+  const budget = () => ({ kind: "budget" as const, resetsAt: null, message: "You're out of extra usage" });
+
+  it("refuses a limited account without allowLimited and takes it with it", async () => {
+    const { service, store, paseo } = await setUp(
+      {
+        accounts: [{ ...account(MAIN, "main", "main"), limitedUntil: inFuture(), limitKind: "window" }, account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: HELLO, codex: null, pi: null },
+        sessions: { [AGENT]: { accountId: HELLO, family: "claude", openedAt: new Date().toISOString() } },
+      },
+      budget,
+    );
+    await expect(service.setAgentAccount(paseo as never, AGENT, MAIN)).rejects.toThrow();
+    await expect(service.setAgentAccount(paseo as never, AGENT, null, { allowLimited: true })).rejects.toThrow(/Name the account/);
+    await service.setAgentAccount(paseo as never, AGENT, MAIN, { allowLimited: true });
+    expect((await store.read()).bindings[AGENT]).toMatchObject({ accountId: MAIN, source: "user", allowLimited: true });
+  });
+
+  it("leaves the agent where it is when its account hits the limit", async () => {
+    // Extra usage on the account ran out mid-turn: carrying the work on elsewhere would put it on an
+    // account the caller chose not to use.
+    const { store, reopened, sent, limitTurn } = await setUp(
+      {
+        accounts: [account(MAIN, "main", "main"), account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: HELLO, codex: null, pi: null },
+        bindings: { [AGENT]: { accountId: MAIN, source: "user", at: new Date().toISOString(), allowLimited: true } },
+        sessions: { [AGENT]: { accountId: MAIN, family: "claude", openedAt: new Date().toISOString() } },
+      },
+      budget,
+    );
+    await limitTurn();
+    const state = await store.read();
+    expect(state.accounts.find((a) => a.id === MAIN)?.limitKind).toBe("budget");
+    expect(state.sessions[AGENT]?.accountId).toBe(MAIN);
+    expect(state.bindings[AGENT]).toMatchObject({ accountId: MAIN, allowLimited: true });
+    expect(reopened).toEqual([]);
+    expect(sent).toEqual([]);
+  });
+});
+
 describe("one subscription, one limit", () => {
   const window = () => ({ kind: "window" as const, resetsAt: inFuture(), message: "You've hit your session limit" });
   const twinOfMain = (): StoredAccount => ({ ...account(MAIN, "main", "main"), identity: "org|x", email: "x@example.com" }) as never;

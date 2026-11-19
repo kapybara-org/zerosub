@@ -71,6 +71,12 @@ export const BindingSchema = z.object({
    * key no longer counts as a stand-in (see `chooseAccount` and `Service.leavesPaid`).
    */
   standIn: z.literal(true).optional(),
+  /**
+   * Keep the agent on this account even while it's at its limit (it runs on the account's extra
+   * usage, say): routing doesn't swap it, and a limit doesn't move it or carry it on elsewhere. Only
+   * set by `zerosub.agents.account` with `allowLimited`; signed-out and disabled accounts still swap.
+   */
+  allowLimited: z.literal(true).optional(),
 });
 export type Binding = z.infer<typeof BindingSchema>;
 

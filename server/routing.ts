@@ -505,7 +505,9 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   let skipped: RouteDecision["skipped"] = null;
   const why = !account.signedIn ? "signed_out" : account.disabled ? "disabled" : isLimitedFor(account, input.now, input.model, input.usageOf(account.id)) ? "limited" : null;
   const mayMove = fresh || input.portable;
-  if (why && mayMove && (input.autoSwitch || why !== "limited")) {
+  // Pinned with `allowLimited`: the agent runs on this account past its limit on purpose.
+  const keepLimited = why === "limited" && binding?.allowLimited === true && account === bound;
+  if (why && mayMove && !keepLimited && (input.autoSwitch || why !== "limited")) {
     const staying = findAccount(state, input.current);
     // A paid stand-in is only kept while no subscription account could take over from it.
     const keeps = (stand: StoredAccount) =>
