@@ -4668,6 +4668,10 @@ describe("answering before Paseo gives up", () => {
     const read: Array<string | null> = [];
     const { service, paseo } = await setUp(onMarketing(), hit, {
       claude: {
+        identity: async (home) => ({
+          signedIn: true, email: null, organization: null, identity: null,
+          plan: home ? "max" : "ultra",
+        }),
         usage: async (home: string | null) => {
           read.push(home);
           return { fetchedAt: new Date().toISOString(), windows: [], error: null, cached: false, resets: null };
@@ -4675,7 +4679,9 @@ describe("answering before Paseo gives up", () => {
       },
     });
     read.length = 0;
-    await service.view(paseo as never, true, HELLO);
+    const view = await service.view(paseo as never, true, HELLO);
+    expect(view.accounts.find((entry) => entry.id === HELLO)?.plan).toBe("max");
+    expect(view.accounts.find((entry) => entry.id === MAIN)?.plan).not.toBe("ultra");
     expect(read).toEqual([join(tmpdir(), HELLO)]);
   });
 });

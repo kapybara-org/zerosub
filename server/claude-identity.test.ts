@@ -1,10 +1,13 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // `claude auth status` reports "not logged in" whenever Claude Code couldn't read the Keychain entry
 // (locked keychain, `security` slower than its own 2 s limit). These run against stand-ins for both
 // commands, on every platform as if it were macOS; the real Keychain is never touched.
 
-let status: { loggedIn: boolean; subscriptionType?: string } = { loggedIn: false };
+let status: { loggedIn: boolean; subscriptionType?: string; email?: string; orgId?: string } = { loggedIn: false };
 let keychain: { code: number; stdout: string } = { code: 44, stdout: "" };
 
 vi.mock("./process", async (original) => ({
@@ -61,6 +64,56 @@ describe("whether a Claude account is signed out", () => {
     status = { loggedIn: true, subscriptionType: "max" };
     keychain = { code: 0, stdout: JSON.stringify({ claudeAiOauth: { rateLimitTier } }) };
     expect((await new ClaudeAdapter().identity(HOME)).plan).toBe(plan);
+  });
+
+  it("reports a changed plan from the matching profile even when sign-in credentials keep the old tier", async () => {
+    const home = await mkdtemp(join(tmpdir(), "zerosub-claude-plan-"));
+    const file = join(home, ".claude.json");
+    status = { loggedIn: true, subscriptionType: "max", email: "ada@example.com", orgId: "org-1" };
+    keychain = { code: 0, stdout: '{"claudeAiOauth":{"rateLimitTier":"default_claude_max_20x"}}' };
+    const adapter = new ClaudeAdapter();
+    const profile = { emailAddress: "ada@example.com", organizationUuid: "org-1", organizationRateLimitTier: "default_claude_max_5x" };
+    try {
+      await writeFile(file, JSON.stringify({ oauthAccount: { ...profile, organizationUuid: "other-org" } }));
+      expect((await adapter.identity(home)).plan).toBe("ultra");
+      await writeFile(file, JSON.stringify({ oauthAccount: profile }));
+      expect((await adapter.identity(home)).plan).toBe("max");
+      await writeFile(file, JSON.stringify({ oauthAccount: { ...profile, planDisplayName: "Ultra" } }));
+      expect((await adapter.identity(home)).plan).toBe("Ultra");
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the live plan after an upgrade while Claude's local profile still shows Max", async () => {
+    const home = await mkdtemp(join(tmpdir(), "zerosub-live-plan-"));
+    status = { loggedIn: true, subscriptionType: "max", email: "ada@example.com", orgId: "org-1" };
+    keychain = { code: 0, stdout: '{"claudeAiOauth":{"accessToken":"test-only-token","rateLimitTier":"default_claude_max_5x"}}' };
+    const fetchProfile = vi.fn(async () => Response.json({
+      account: { email: "ada@example.com" },
+      organization: { uuid: "org-1", plan_display_name: "Ultra" },
+    }));
+    vi.stubGlobal("fetch", fetchProfile);
+    vi.stubEnv("NO_PROXY", "api.anthropic.com");
+    vi.stubEnv("no_proxy", "api.anthropic.com");
+    try {
+      await writeFile(join(home, ".claude.json"), JSON.stringify({ oauthAccount: {
+        emailAddress: "ada@example.com", organizationUuid: "org-1", organizationRateLimitTier: "default_claude_max_5x",
+      } }));
+      const adapter = new ClaudeAdapter();
+      expect((await adapter.identity(home)).plan).toBe("max");
+      expect((await adapter.identity(home, { livePlan: true })).plan).toBe("Ultra");
+      expect(fetchProfile).toHaveBeenCalledExactlyOnceWith("https://api.anthropic.com/api/oauth/profile", expect.any(Object));
+      fetchProfile.mockResolvedValueOnce(Response.json({
+        account: { email: "ada@example.com" },
+        organization: { uuid: "other-org", plan_display_name: "Ultra" },
+      }));
+      expect((await adapter.identity(home, { livePlan: true })).plan).toBe("max");
+    } finally {
+      vi.unstubAllGlobals();
+      vi.unstubAllEnvs();
+      await rm(home, { recursive: true, force: true });
+    }
   });
 
   it("takes Claude Code's answer off macOS, where the sign-in is a file in the home", async () => {

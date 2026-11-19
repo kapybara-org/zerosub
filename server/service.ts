@@ -661,7 +661,7 @@ export class Service {
     const availability = await adapter.available().catch((error: unknown) => ({ ok: false, detail: describe(error) }));
     this.availability.set(family, { ...availability, at: Date.now() });
     if (!availability.ok) return;
-    const identity = await adapter.identity(null).catch(() => null);
+    const identity = await adapter.identity(null, { livePlan: family === "claude" }).catch(() => null);
     this.identityCheckedAt.set(MAIN_ACCOUNT_ID[family], Date.now());
     let handedOver = false;
     await this.store.update((draft) => {
@@ -704,7 +704,7 @@ export class Service {
         void this.refreshUsage(account.id).catch((error: unknown) => log(`usage refresh for ${account.label} failed`, error));
       }
       if (now - (this.identityCheckedAt.get(account.id) ?? 0) > IDENTITY_MS) {
-        void this.refreshIdentity(account.id).catch(() => undefined);
+        void this.refreshIdentity(account.id, true).catch(() => undefined);
       }
       if (account.signedIn && now - (this.egressCheckedAt.get(account.id) ?? 0) >= EGRESS_MS) void this.checkEgress(account);
     }
@@ -730,13 +730,13 @@ export class Service {
     }
   }
 
-  private async refreshIdentity(accountId: string): Promise<void> {
+  private async refreshIdentity(accountId: string, livePlan = false): Promise<void> {
     this.identityCheckedAt.set(accountId, Date.now());
     const account = findAccount(await this.store.read(), accountId);
     // A Pi API account's key is only known to work from a turn: a refused one is learned from a failed turn.
     if (!account || account.auth === "api") return;
     // A check that can't tell (Claude's keychain unreadable just now, say) changes nothing; the next one may.
-    const identity = await this.adapters[account.family].identity(account.home).catch((error: unknown) => {
+    const identity = await this.adapters[account.family].identity(account.home, { livePlan: livePlan && account.family === "claude" }).catch((error: unknown) => {
       log(`could not check whether ${account.label} is signed in`, error);
       return null;
     });
@@ -3843,7 +3843,10 @@ export class Service {
       const state = await this.store.read();
       const accounts = accountId ? state.accounts.filter((account) => account.id === accountId) : state.accounts;
       // Renewing a sign-in can take longer than Paseo waits for an answer; later readings show at the next poll.
-      await settles(Promise.allSettled(accounts.map((account) => this.refreshUsage(account.id, true, true))), USAGE_REPLY_MS);
+      await settles(Promise.allSettled(accounts.map(async (account) => {
+        await this.refreshUsage(account.id, true, true);
+        if (account.family === "claude") await this.refreshIdentity(account.id, true);
+      })), USAGE_REPLY_MS);
     }
     void this.prune(paseo).catch(() => undefined);
     const state = await this.store.read();

@@ -113,7 +113,7 @@ export interface FamilyAdapter {
    * the folder it runs in.
    */
   env(home: string | null, session?: { cwd: string }): Promise<EnvPatch>;
-  identity(home: string | null): Promise<Identity>;
+  identity(home: string | null, options?: { livePlan?: boolean }): Promise<Identity>;
   /**
    * Usage windows and banked resets. `renewLogin` lets the adapter have the CLI refresh an expired
    * sign-in first (slow, so only for explicit requests, and at most every 30 minutes in the background).
