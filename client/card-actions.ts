@@ -29,6 +29,24 @@ export function cardActions(
   return keys;
 }
 
+/** How many buttons a wide card keeps beside the account's name; the rest open from "…" under it. */
+export const INLINE_CARD_ACTIONS = 3;
+
+/** Kept beside the name first, when the card has them: the ones used most. */
+const INLINE_FIRST: readonly CardActionKey[] = ["clear", "usage", "default", "next"];
+
+/**
+ * A wide card's buttons sit beside the account's name, and eight of them leave the name little
+ * room. So up to `INLINE_CARD_ACTIONS` stay there and the rest open from "…" into a row under it.
+ * One button more than that fits as well as "…" does, so then they all stay. Both keep the card's order.
+ */
+export function splitCardActions(keys: readonly CardActionKey[]): { inline: CardActionKey[]; more: CardActionKey[] } {
+  if (keys.length <= INLINE_CARD_ACTIONS + 1) return { inline: [...keys], more: [] };
+  const kept = new Set(INLINE_FIRST.filter((key) => keys.includes(key)).slice(0, INLINE_CARD_ACTIONS));
+  for (const key of keys) if (kept.size < INLINE_CARD_ACTIONS) kept.add(key);
+  return { inline: keys.filter((key) => kept.has(key)), more: keys.filter((key) => !kept.has(key)) };
+}
+
 /** Whether removing an account moves its agents' conversations to the default account (see the server's `remove`). */
 function conversationsMove(family: AccountView["family"]): boolean {
   return family === "claude" || family === "pi";

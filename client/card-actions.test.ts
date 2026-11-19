@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AccountView } from "../shared/model";
-import { cardActions, claudeCardDetails, removeText } from "./card-actions";
+import { cardActions, claudeCardDetails, removeText, splitCardActions } from "./card-actions";
 
 type CardAccount = Parameters<typeof cardActions>[0];
 
@@ -123,5 +123,22 @@ describe("a card's details and Remove dialog with Grok and Cursor", () => {
     expect(details).toBe("Key …abcd · Anthropic API · Via http://127.0.0.1:7890 · IP: 203.0.113.9 (US) · Terminal: claude-work.sh");
     expect(claudeCardDetails({ family: "claude", api: null, proxy: null, egress: null, launcher: null } as unknown as AccountView)).toBeNull();
     expect(claudeCardDetails({ family: "cursor", api: null, proxy: null, egress, launcher: null } as unknown as AccountView)).toBeNull();
+  });
+});
+
+describe("a wide card's buttons beside the name", () => {
+  it("are the most used three, in the card's order, with the rest under \"…\"", () => {
+    const all = ["clear", "next", "default", "toggle", "usage", "proxy", "rename", "remove"] as const;
+    expect(splitCardActions(all)).toEqual({
+      inline: ["clear", "default", "usage"],
+      more: ["next", "toggle", "proxy", "rename", "remove"],
+    });
+    // Without the most used ones, the first others take their place.
+    expect(splitCardActions(["toggle", "api", "proxy", "rename", "remove"])).toEqual({ inline: ["toggle", "api", "proxy"], more: ["rename", "remove"] });
+  });
+
+  it("are all of them when one more than three would take the place of \"…\"", () => {
+    expect(splitCardActions(["next", "default", "rename", "remove"])).toEqual({ inline: ["next", "default", "rename", "remove"], more: [] });
+    expect(splitCardActions(["rename"])).toEqual({ inline: ["rename"], more: [] });
   });
 });
