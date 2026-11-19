@@ -99,6 +99,17 @@ function find(tree: ReactNode, match: (element: Element) => boolean): Element {
   return found;
 }
 
+/** A card's button; one a wide card keeps under "…" is found once "…" is opened. */
+function cardButton(render: () => ReactNode, label: string): Element | undefined {
+  const look = () => [...elements(render())].find((element) => element.type === "IconButton" && element.props.label === label);
+  const shown = look();
+  if (shown) return shown;
+  const more = [...elements(render())].find((element) => element.type === "IconButton" && element.props.label === "More actions");
+  if (!more) return undefined;
+  (more.props.onPress as () => void)();
+  return look();
+}
+
 function textOf(node: ReactNode): string {
   if (typeof node === "string" || typeof node === "number") return String(node);
   if (Array.isArray(node)) return node.map(textOf).join("");
@@ -341,7 +352,7 @@ describe("the accounts screen", () => {
     function open(proxy: string | null, overrides: Partial<AccountView> = {}) {
       const { card } = setUp({ accounts: [account("work", { isDefault: true }), account("home", { proxy, proxyEditable: true, ...overrides })] });
       const render = card("home");
-      (find(render(), (element) => element.type === "IconButton" && element.props.label === "Proxy").props.onPress as () => void)();
+      (cardButton(render, "Proxy")!.props.onPress as () => void)();
       const modal = find(render(), (element) => typeof element.type === "function" && element.type.name === "ProxyModal");
       const draw = mount(modal.type as (props: unknown) => ReactNode, modal.props);
       const input = (tree: Element) => find(tree, named("TextInput"));
@@ -478,6 +489,24 @@ describe("the accounts screen", () => {
     expect(store.refresh).toHaveBeenCalledWith({ refreshUsage: true, accountId: "home" });
     // An API account has no usage to read.
     expect(button(card("metered"))).toBeUndefined();
+  });
+
+  it("keeps a few of a wide card's buttons beside the name, and opens the rest from \"…\" under it", () => {
+    const { card } = setUp({
+      accounts: [account("work", { isDefault: true }), account("home", { status: "limited", proxyEditable: true })],
+    });
+    const render = card("home");
+    const labels = (tree: Element) => [...elements(tree)].filter((element) => element.type === "IconButton").map((element) => element.props.label);
+    const closed = labels(render());
+    expect(closed).toContain("More actions");
+    expect(closed).not.toContain("Remove");
+    expect(closed).toHaveLength(4);
+    (find(render(), named("IconButton", "More actions")).props.onPress as () => void)();
+    const opened = labels(render());
+    expect(opened).toContain("Fewer actions");
+    expect(opened).toEqual(expect.arrayContaining(["Proxy", "Rename", "Remove"]));
+    (find(render(), named("IconButton", "Fewer actions")).props.onPress as () => void)();
+    expect(labels(render())).toEqual(closed);
   });
 
   it("says a removal Paseo stopped waiting for goes on, rather than that it failed", async () => {

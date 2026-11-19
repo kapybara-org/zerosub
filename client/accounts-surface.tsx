@@ -24,7 +24,7 @@ import { PaceSection } from "./pace";
 import { ResetConfirm, redeemToast, resetBadge } from "./reset-confirm";
 import { describe, stoppedWaiting, useStore, VISIBLE_POLL_MS, type ZeroSubStore } from "./store";
 import { Badge, Button, Card, IconButton, UsageBar, useText, type TooltipAlign } from "./ui";
-import { cardActions, claudeCardDetails, removeText, type CardActionKey } from "./card-actions";
+import { cardActions, splitCardActions, claudeCardDetails, removeText, type CardActionKey } from "./card-actions";
 
 type Theme = PluginSurfaceProps["theme"];
 
@@ -359,6 +359,8 @@ function AccountCard({
     ? [bedrockCardDetails(account), claudeCardDetails(account)].filter(Boolean).join(" · ")
     : (piCardDetails(account) ?? claudeCardDetails(account) ?? azureCardDetails(account));
   const [confirmRemove, setConfirmRemove] = useState(false);
+  // A wide card's buttons past the first few, shown under the name (see `splitCardActions`).
+  const [moreActions, setMoreActions] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const resets = account.usage?.resets ?? null;
   const credits = account.usage?.credits ?? null;
@@ -553,36 +555,55 @@ function AccountCard({
       onPress: () => setConfirmRemove(true),
     },
   };
-  const actions = cardActions(account).map((key) => offered[key]);
-  // Beside the name, up to eight 30 pt buttons leave a 375 pt phone's card no room for it. There they go
-  // on a row under the name instead (261 pt wide there; eight take 254). That row starts 75 pt from the
-  // screen's left, so a 240 pt tip opens rightwards from the first two, centred over the next three and
-  // leftwards from the rest, and stays on screen.
-  const actionRow = (
-    <View
-      style={[
-        { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 2 },
-        compact ? { marginLeft: -6 } : { marginTop: -4, marginRight: -6 },
-      ]}
-    >
-      {actions.map((action, index) => {
-        const align: TooltipAlign = !compact ? "end" : index < 2 ? "start" : index < 5 ? "center" : "end";
-        return (
-          <IconButton
-            key={action.key}
-            theme={theme}
-            icon={action.icon}
-            label={action.label}
-            tooltip={action.tooltip}
-            tooltipAlign={align}
-            tone={action.tone}
-            busy={action.busy}
-            onPress={action.onPress}
-          />
-        );
-      })}
+  const keys = cardActions(account);
+  const split = splitCardActions(keys);
+  const iconButton = (action: CardAction, align: TooltipAlign) => (
+    <IconButton
+      key={action.key}
+      theme={theme}
+      icon={action.icon}
+      label={action.label}
+      tooltip={action.tooltip}
+      tooltipAlign={align}
+      tone={action.tone}
+      busy={action.busy}
+      onPress={action.onPress}
+    />
+  );
+  // On a phone the buttons go on a row under the name, which leaves the name its room: up to eight 30 pt
+  // buttons beside it would leave a 375 pt phone's card none. That row is 261 pt wide there (eight take
+  // 254) and starts 75 pt from the screen's left, so a 240 pt tip opens rightwards from the first two,
+  // centred over the next three and leftwards from the rest, and stays on screen.
+  const rowAlign = (index: number): TooltipAlign => (index % 8 < 2 ? "start" : index % 8 < 5 ? "center" : "end");
+  const actionRow = compact ? (
+    <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 2, marginLeft: -6 }}>
+      {keys.map((key, index) => iconButton(offered[key], rowAlign(index)))}
+    </View>
+  ) : (
+    // Beside the name on a wider screen only a few, and "…" for the rest (see `splitCardActions`).
+    <View style={{ flexDirection: "row", alignItems: "center", gap: 2, marginTop: -4, marginRight: -6 }}>
+      {split.inline.map((key) => iconButton(offered[key], "end"))}
+      {split.more.length > 0
+        ? iconButton(
+            {
+              key: "more",
+              icon: "Ellipsis",
+              label: moreActions ? "Fewer actions" : "More actions",
+              tooltip: moreActions ? "Hide the other actions" : "More actions for this account",
+              onPress: () => setMoreActions((open) => !open),
+            },
+            "end",
+          )
+        : null}
     </View>
   );
+  // Under the name and the card's full width, so the name stays readable; it starts at the card's left.
+  const moreRow =
+    !compact && moreActions && split.more.length > 0 ? (
+      <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 2, marginLeft: -6, marginTop: -6 }}>
+        {split.more.map((key, index) => iconButton(offered[key], rowAlign(index)))}
+      </View>
+    ) : null;
 
   return (
     <Card theme={theme} fill>
@@ -605,6 +626,7 @@ function AccountCard({
         </View>
         {compact ? null : actionRow}
       </View>
+      {moreRow}
 
       <View style={[{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 }, faded]}>
         {account.isDefault ? <Badge theme={theme} label="Default" tone="accent" /> : null}
