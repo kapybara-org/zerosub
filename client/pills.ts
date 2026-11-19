@@ -1,24 +1,64 @@
-import type {
-  PluginButton,
-  PluginButtonMenuEntry,
-  PluginButtonRegistration,
-  PluginClientContext,
-} from "@getpaseo/plugin/client";
-import { accountPeak, formatCredits, formatPercent, paceVerdict, pillText } from "../shared/format";
-import { FAMILY_LABEL, HAND_OFF, OTHER_FAMILY, type AccountView, type StateView } from "../shared/model";
+import type { PluginButton, PluginButtonRegistration, PluginClientContext } from "@getpaseo/plugin/client";
+import {
+  canStandIn,
+  capsAccount,
+  egressText,
+  formatCountdown,
+  formatCredits,
+  formatPercent,
+  formatResetAt,
+  isDisabled,
+  moveProblem,
+  paceVerdict,
+  pillText,
+  reportsUsage,
+  shortLabel,
+  shortWindowLabel,
+} from "../shared/format";
+import { FAMILY_LABEL, HAND_OFF, OTHER_FAMILY, type AccountView, type Family, type StateView } from "../shared/model";
+import { setAgentAccount } from "../shared/rpc";
+import { accountMenu, type MenuEntry } from "./account-menu";
 import { forkPopover, openCodeForkPopover } from "./fork-confirm";
 import { resetPopover } from "./reset-confirm";
-import { moveAgent, type ZeroSubStore } from "./store";
+import { stoppedWaiting, type ZeroSubStore } from "./store";
 
 /** The most agents Paseo returns per page. */
 const PAGE_SIZE = 200;
 const MAX_PAGES = 10;
+
+/** A little longer than the daemon keeps its list of agents (`AGENT_LIST_MS` in server/service.ts). */
+const AGENT_LIST_SETTLE_MS = 3_500;
 
 interface TrackedAgent {
   id: string;
   workspaceId: string;
   provider: string;
 }
+
+/** Where an agent stands, as its pill and its menu both read it. */
+interface Standing {
+  family: Family;
+  accounts: AccountView[];
+  route: StateView["agents"][number] | undefined;
+  current: AccountView;
+  offerReset: boolean;
+  /** The provider a stopped chat can carry on with; null for Pi. */
+  other: Family | null;
+  offerFork: boolean;
+  /** "Continue on OpenCode" by hand: a Claude agent on a host that has OpenCode. */
+  offerOpenCode: boolean;
+  /** Accounts at their limit can't be picked. */
+  autoSwitch: boolean;
+}
+
+/** A move asked for from the menu: to an account, or (`null`) back to following the default. */
+interface Move {
+  accountId: string | null;
+  label: string;
+}
+
+/** Says `move` is under way until `answer` settles. */
+type MoveStarted = (move: Move, answer: Promise<unknown>) => void;
 
 /**
  * One composer pill per Claude/Codex agent showing the account it runs on. Tapping it opens a menu
@@ -28,9 +68,31 @@ interface TrackedAgent {
  */
 export function contributePills(client: PluginClientContext, store: ZeroSubStore, inComposer = false): () => void {
   const agents = new Map<string, TrackedAgent>();
-  const pills = new Map<string, { registration: PluginButtonRegistration; key: string }>();
+  /**
+   * `face` is the pill's label, tooltip and icon, which Paseo updates in place. The menu reads the
+   * store itself (see `accountMenu`), so Paseo gets it once: a new one would close it.
+   */
+  const pills = new Map<string, { registration: PluginButtonRegistration; face: string }>();
+  /** Moves asked for from a menu and not answered yet, by agent. */
+  const moves = new Map<string, Move>();
   const lifetime = new AbortController();
   let stopped = false;
+  let lookAgain: ReturnType<typeof setTimeout> | null = null;
+
+  const moveStarted =
+    (agentId: string): MoveStarted =>
+    (move, answer) => {
+      moves.set(agentId, move);
+      sync();
+      // Until the state after it is in, so the pill doesn't show the old account again for a moment.
+      void answer
+        .catch(() => undefined)
+        .then(() => store.refresh())
+        .finally(() => {
+          if (moves.get(agentId) === move) moves.delete(agentId);
+          sync();
+        });
+    };
 
   function sync(): void {
     if (stopped) return;
@@ -42,18 +104,20 @@ export function contributePills(client: PluginClientContext, store: ZeroSubStore
       }
     }
     for (const agent of agents.values()) {
-      const button = state ? buttonFor(client, store, state, agent, inComposer) : null;
+      const standing = state ? standingOf(state, agent, inComposer) : null;
       const existing = pills.get(agent.id);
-      if (!button) {
+      if (!state || !standing) {
         existing?.registration.remove();
         pills.delete(agent.id);
         continue;
       }
-      const key = JSON.stringify([button.label, button.title, button.icon, menuKey(button)]);
+      const face = faceFor(state, standing, moves.get(agent.id) ?? null);
+      const key = JSON.stringify([face.label, face.title, face.icon]);
       if (existing) {
-        if (existing.key !== key) {
-          existing.registration.update(button);
-          existing.key = key;
+        if (existing.face !== key) {
+          // No behavior, so Paseo leaves an open menu open.
+          existing.registration.update(face);
+          existing.face = key;
         }
         continue;
       }
@@ -62,9 +126,9 @@ export function contributePills(client: PluginClientContext, store: ZeroSubStore
           id: "account",
           workspaceId: agent.workspaceId,
           agentId: agent.id,
-          button,
+          button: { ...face, behavior: { kind: "popover", Content: pillMenu(client, store, agent, moveStarted(agent.id), inComposer) } },
         });
-        pills.set(agent.id, { registration, key });
+        pills.set(agent.id, { registration, face: key });
       } catch (error) {
         console.warn("[ZeroSub] could not add account pill", error);
       }
@@ -117,8 +181,15 @@ export function contributePills(client: PluginClientContext, store: ZeroSubStore
           else {
             const known = agents.has(update.agent.id);
             track(update.agent);
-            // A new agent may have been routed by the daemon a moment ago; fetch its account.
-            if (!known) void store.refresh();
+            if (!known) {
+              // A new agent may have been routed by the daemon a moment ago; fetch its account. The
+              // daemon's list of agents can be a few seconds old, so look again once it's renewed.
+              void store.refresh({ fresh: true });
+              lookAgain ??= setTimeout(() => {
+                lookAgain = null;
+                if (!stopped) void store.refresh({ fresh: true });
+              }, AGENT_LIST_SETTLE_MS);
+            }
           }
           sync();
         },
@@ -131,6 +202,7 @@ export function contributePills(client: PluginClientContext, store: ZeroSubStore
 
   return () => {
     stopped = true;
+    if (lookAgain) clearTimeout(lookAgain);
     lifetime.abort();
     unsubscribeStore();
     for (const pill of pills.values()) pill.registration.remove();
@@ -138,13 +210,19 @@ export function contributePills(client: PluginClientContext, store: ZeroSubStore
   };
 }
 
-function buttonFor(
-  client: PluginClientContext,
-  store: ZeroSubStore,
-  state: StateView,
-  agent: TrackedAgent,
-  inComposer: boolean,
-): PluginButton | null {
+/**
+ * `agent`'s menu. Made here rather than in `sync`'s loop: Hermes on the phone scopes `let` and
+ * `const` to the function, not the block, so a closure made in a loop sees the loop's last agent.
+ */
+function pillMenu(client: PluginClientContext, store: ZeroSubStore, agent: TrackedAgent, moveStarted: MoveStarted, inComposer: boolean) {
+  return accountMenu(store, (state) => {
+    const standing = standingOf(state, agent, inComposer);
+    return standing ? menuEntries(client, store, state, standing, agent, moveStarted) : [];
+  });
+}
+
+/** Where `agent` stands, or null when it gets no pill; `inComposer` as for `contributePills`. */
+function standingOf(state: StateView, agent: TrackedAgent, inComposer: boolean): Standing | null {
   if (!state.showComposerPill) return null;
   const family = state.providers[agent.provider];
   if (!family) return null;
@@ -155,16 +233,20 @@ function buttonFor(
     accounts.find((account) => account.isDefault) ??
     accounts[0];
   if (!current) return null;
-  // A banked reset is worth offering right where the agent stopped, even with a single account.
+  // A banked reset is worth offering right where the agent stopped, even with a single account. A
+  // signed-out account can't spend one (the server refuses), though its usage still lists them.
   const resets = current.usage?.resets ?? null;
-  const offerReset = resets !== null && (current.status === "limited" || resets.usableNow);
-  // With every account of this provider out, the work can carry on with the other provider (Pi has none).
+  const offerReset = resets !== null && current.status !== "signed_out" && (current.status === "limited" || resets.usableNow);
+  // With no account of this provider left to move the work to, it can carry on with the other
+  // provider, on an account the server would pick for it. Either way an API account counts only when
+  // API accounts may stand in: otherwise the server never moves work onto one.
   const other = OTHER_FAMILY[family];
+  const standsIn = (account: AccountView) => canStandIn(account, state.paidApiFallback ?? false);
   const offerFork =
     other !== null &&
     current.status === "limited" &&
-    accounts.every((account) => account.status === "limited" || account.status === "signed_out" || account.status === "disabled") &&
-    state.accounts.some((account) => account.family === other && account.status === "ready");
+    !accounts.some(standsIn) &&
+    state.accounts.some((account) => account.family === other && standsIn(account));
   // OpenCode is a harness, not an account: any Claude agent can continue there by hand, however its
   // accounts are doing and whether or not automatic forking is on, once this host has OpenCode. Even a
   // single ready account gets the pill for that entry; Codex still only shows a pill with two accounts or a way out of a limit.
@@ -176,36 +258,92 @@ function buttonFor(
   // the control can't show for.
   if (inComposer && state.agentMetadata && route?.inComposer !== false && !(offerOpenCode || (current.status === "limited" && (offerReset || offerFork)))) return null;
 
-  // Paseo shows what an action throws: here, that the agent couldn't be reloaded.
-  const choose = (accountId: string | null, to: string) => () => moveAgent(store, agent.id, accountId, to);
+  return { family, accounts, route, current, offerReset, other, offerFork, offerOpenCode, autoSwitch: state.autoSwitch };
+}
+
+/**
+ * The pill's label, tooltip and icon. The pill is 160 points wide at most: room for the usage, not
+ * the account too, and the usage only without its percent signs (`5h 17 · 7d 37`; with them the
+ * second window is cut off). So the tooltip has both: the account first (on a phone Paseo heads the menu
+ * with the tooltip's first line, and only that), then a line a window counting down as the menu
+ * does, and the address Anthropic sees the agent's requests come from now, as Claude Code's status
+ * line shows it. Paseo updates them in place as the store polls. While a move is under way, from
+ * here (`moving`) or on the daemon, the pill names both accounts instead.
+ */
+function faceFor(state: StateView, { accounts, route, current }: Standing, moving: Move | null): Omit<PluginButton, "behavior"> {
+  const now = Date.now();
+  const icon = current.status === "limited" ? "CircleAlert" : "CircleUserRound";
+  const target = moving && (moving.accountId ?? accounts.find((account) => account.isDefault)?.id);
+  if (moving && target !== current.id && !route?.pendingAccountId) {
+    return { label: `${shortLabel(current, 12)} → ${shortLabel(moving, 12)}`, title: `Moving to ${moving.label}…`, icon };
+  }
+  const running = route?.pendingAccountId ? state.accounts.find((account) => account.id === route.pendingAccountId) : undefined;
+  const text = pillText(current, running ?? null, route?.waiting ?? (state.canReopen ? "idle" : "restart"));
+  const windows = running ? [] : shownWindows(current, now);
+  const details = windows.map(({ name, percent, resetsAt }) => {
+    const at = formatResetAt(resetsAt, now);
+    return `${name} ${formatPercent(percent)}${at ? ` · resets in ${formatCountdown(resetsAt, now)} (${at})` : ""}`;
+  });
+  const ip = egressText((running ?? current).egress, now);
+  return {
+    label: windows.length > 0 ? windows.map(({ name, percent }) => `${name} ${formatPercent(percent).slice(0, -1)}`).join(" · ") : text.label,
+    title: [text.title, ...details, ...(ip ? [ip] : [])].join("\n"),
+    icon,
+  };
+}
+
+/** The agent's menu: the provider's accounts, a way out when it's stuck on a limit, and the rest. */
+function menuEntries(
+  client: PluginClientContext,
+  store: ZeroSubStore,
+  state: StateView,
+  { family, accounts, route, current, offerReset, other, offerFork, offerOpenCode, autoSwitch }: Standing,
+  agent: TrackedAgent,
+  moveStarted: MoveStarted,
+): MenuEntry[] {
+  const choose = (accountId: string | null, to: string) => async () => {
+    const answer = store.rpc(setAgentAccount, { agentId: agent.id, accountId });
+    moveStarted({ accountId, label: to }, answer);
+    const summary = await answer.catch((error: unknown) => {
+      // The move goes on without Paseo waiting for it, and the pill shows it under way.
+      if (stoppedWaiting(error)) return null;
+      throw error;
+    });
+    // The menu shows what an action throws: here, that the agent couldn't be reloaded.
+    const problem = summary && moveProblem(summary, to);
+    if (problem) throw new Error(problem);
+  };
 
   // Codex threads can't change accounts in place; continue in this task's tab for that account.
   const movable = route?.movable ?? true;
   // Grok conversations stay on their account: the others are listed, not offered.
   const stays = !movable && !HAND_OFF[family];
-  const items: PluginButtonMenuEntry[] = accounts.map((account, index) => ({
+  const now = Date.now();
+  const items: MenuEntry[] = accounts.map((account, index) => ({
     kind: "item",
     id: `account-${index}`,
-    title: account.id === current.id || movable || stays ? menuTitle(state, account) : `Continue on ${account.label}`,
+    title: account.id === current.id || movable || stays ? accountName(state, account, now) : `Continue on ${account.label}`,
+    detail: usageLine(account, now),
     icon: account.id === current.id ? "CircleCheck" : movable || stays ? "Circle" : "ArrowRightLeft",
     // With automatic switching on, an account at its limit would only pass the agent on (the server refuses it too).
     disabled:
       stays ||
       account.status === "signed_out" ||
-      account.status === "disabled" ||
-      (state.autoSwitch && account.status === "limited") ||
+      isDisabled(account) ||
+      (autoSwitch && account.status === "limited") ||
       account.id === current.id,
     behavior: { kind: "action", onPress: choose(account.id, account.label) },
   }));
   // When the agent is stuck on a limit, a way out is the most useful thing in the menu.
-  const wayOut: PluginButtonMenuEntry[] = [];
+  const wayOut: MenuEntry[] = [];
+  const resets = current.usage?.resets ?? null;
   if (offerReset && resets) {
-    const entry: PluginButtonMenuEntry = {
+    const entry: MenuEntry = {
       kind: "item",
       id: "use-reset",
       title: `Use a banked reset on ${current.label} (${resets.available} left)…`,
       icon: "TimerReset",
-      behavior: { kind: "popover", Content: resetPopover(store, current, agent.id) },
+      behavior: { kind: "popover", Content: resetPopover(store, current.id, agent.id) },
     };
     if (current.status === "limited") wayOut.push(entry);
     else items.push(entry);
@@ -266,34 +404,61 @@ function buttonFor(
       },
     },
   });
-
-  const running = route?.pendingAccountId ? state.accounts.find((account) => account.id === route.pendingAccountId) : undefined;
-  return {
-    ...pillText(current, running ?? null, route?.waiting ?? (state.canReopen ? "idle" : "restart")),
-    icon: current.status === "limited" ? "CircleAlert" : "CircleUserRound",
-    behavior: { kind: "menu", items },
-  };
+  return items;
 }
 
-function menuTitle(state: StateView, account: AccountView): string {
-  if (account.status === "signed_out") return `${account.label} — signed out`;
-  if (account.status === "disabled") return `${account.label} — disabled`;
-  if (account.status === "limited") return `${account.label} — limit reached`;
+/**
+ * An account's usage, under its name in the menu: "5h 4% ↻2h40m · 7d 24% ↻1d17h", for each window
+ * that stops the whole account and how long until it resets, then any ChatGPT credits. With no
+ * reading (it failed, or there's none yet) the windows are there, empty, so every entry reads alike;
+ * an account the provider reports no usage for (an API account, a Grok or Cursor account, any Pi
+ * account; see `reportsUsage`) has none.
+ */
+function usageLine(account: AccountView, now: number): string | null {
+  const windows = shownWindows(account, now);
+  const credits = account.status === "signed_out" ? null : (account.usage?.credits ?? null);
+  const creditsText = credits ? ` · ${formatCredits(credits)}` : "";
+  if (windows.length === 0) return reportsUsage(account) ? `5h – · 7d –${creditsText}` : null;
+  return (
+    windows
+      .map(({ name, percent, resetsAt }) => {
+        const left = formatCountdown(resetsAt, now);
+        return `${name} ${formatPercent(percent)}${left ? ` ↻${left}` : ""}`;
+      })
+      .join(" · ") + creditsText
+  );
+}
+
+/** The account, and why it can't be used, if it can't. */
+function accountName(state: StateView, account: AccountView, now: number): string {
+  if (account.status === "signed_out") return `${account.label} (signed out${account.disabled ? ", disabled" : ""})`;
+  if (isDisabled(account)) return `${account.label} (disabled)`;
+  if (account.status === "limited") {
+    const windows = shownWindows(account, now);
+    // A full window says it already.
+    if (windows.some((usageWindow) => usageWindow.percent >= 100)) return account.label;
+    // With no reading to say when, the limit's own end does.
+    const until = windows.length > 0 ? null : formatCountdown(account.limitedUntil, now);
+    return `${account.label} (limit reached${until ? ` ↻${until}` : ""})`;
+  }
+  // While new agents are spread by pace: how this account stands for the next one.
   if (account.pace) {
     const verdict = paceVerdict(account.pace, state.pacedNext?.[account.family] === account.id);
-    return `${account.label} — ${verdict.charAt(0).toLowerCase()}${verdict.slice(1)}`;
+    return `${account.label} (${verdict.charAt(0).toLowerCase()}${verdict.slice(1)})`;
   }
-  // A full window of one model only (Claude's "Weekly · Opus") isn't the account's room.
-  const peak = account.usage ? accountPeak(account.usage.windows) : null;
-  if (!peak) return account.label;
-  const credits = account.usage?.credits;
-  return `${account.label} — ${formatPercent(peak.usedPercent)} used${credits ? ` · ${formatCredits(credits)}` : ""}`;
+  return account.label;
 }
 
-function menuKey(button: PluginButton): string {
-  return button.behavior.kind === "menu"
-    ? button.behavior.items
-        .map((item) => (item.kind === "item" ? `${item.id}:${item.title}:${String(item.icon)}:${item.disabled}` : item.id))
-        .join("|")
-    : "";
+/**
+ * The windows that stop the whole account, as a full "Weekly · Opus" doesn't, as they stand at
+ * `now`. None for a signed-out account, whose last reading may be long gone.
+ */
+function shownWindows(account: AccountView, now: number): { name: string; percent: number; resetsAt: string | null }[] {
+  if (account.status === "signed_out" || !account.usage) return [];
+  return account.usage.windows.filter(capsAccount).map((usageWindow) => ({
+    name: shortWindowLabel(usageWindow.label),
+    // Past its reset, a window starts again from nothing; the next reading says how much since.
+    percent: usageWindow.resetsAt && Date.parse(usageWindow.resetsAt) <= now ? 0 : usageWindow.usedPercent,
+    resetsAt: usageWindow.resetsAt,
+  }));
 }

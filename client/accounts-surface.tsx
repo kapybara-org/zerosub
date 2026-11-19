@@ -3,7 +3,7 @@ import { Icon, Modal, TextInput, useToast } from "@getpaseo/plugin/client/react-
 import { SettingsCard, SettingsSwitch } from "@getpaseo/plugin/client/ui";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ScrollView, Text, View } from "react-native";
-import { accountSubtitle, describeReopen, egressText, formatAge, formatCredits, formatExtraUsage, formatPlan, isDisabled, staleNotice, usageSummary } from "../shared/format";
+import { accountSubtitle, describeReopen, formatAge, formatCredits, formatExtraUsage, formatPlan, isDisabled, staleNotice, usageSummary } from "../shared/format";
 import { FAMILY_LABEL, HAND_OFF, shownFamilies, type AccountView, type Family, type StateView } from "../shared/model";
 import { preferences } from "../shared/preferences";
 import {
@@ -23,7 +23,8 @@ import { AddPiAccountModal, ApiKeyModal, HomesHint, PiSectionNotes, ProxyModal, 
 import { PaceSection } from "./pace";
 import { ResetConfirm, redeemToast, resetBadge } from "./reset-confirm";
 import { describe, stoppedWaiting, useStore, VISIBLE_POLL_MS, type ZeroSubStore } from "./store";
-import { Badge, Button, Card, IconButton, UsageBar, useText } from "./ui";
+import { Badge, Button, Card, IconButton, UsageBar, useText, type TooltipAlign } from "./ui";
+import { cardActions, claudeCardDetails, removeText, type CardActionKey } from "./card-actions";
 
 type Theme = PluginSurfaceProps["theme"];
 
@@ -302,6 +303,7 @@ function FamilySection({
               theme={theme}
               store={store}
               paidFallback={state.paidApiFallback ?? false}
+              compact={compact}
               onSignIn={() => onSignIn(account)}
             />
           ))}
@@ -312,11 +314,23 @@ function FamilySection({
   );
 }
 
+/** One of the icon buttons in a card's header. */
+interface CardAction {
+  key: string;
+  icon: string;
+  label: string;
+  tooltip: string;
+  tone?: "danger";
+  busy?: boolean;
+  onPress(): void;
+}
+
 function AccountCard({
   account,
   theme,
   store,
   paidFallback,
+  compact,
   onSignIn,
 }: {
   account: AccountView;
@@ -324,11 +338,13 @@ function AccountCard({
   store: ZeroSubStore;
   /** Paid API accounts (Azure, Bedrock) may take work over by themselves once every subscription is out. */
   paidFallback: boolean;
+  /** A phone-sized screen: the header's buttons get a row of their own, so the name keeps its room. */
+  compact: boolean;
   onSignIn(): void;
 }) {
   const text = useText(theme);
   const toast = useToast();
-  const [busy, setBusy] = useState<"default" | "remove" | "clear" | "toggle" | "next" | null>(null);
+  const [busy, setBusy] = useState<"default" | "remove" | "clear" | "toggle" | "usage" | "next" | null>(null);
   const [renaming, setRenaming] = useState(false);
   const [editingApi, setEditingApi] = useState(false);
   const [editingProxy, setEditingProxy] = useState(false);
@@ -406,6 +422,17 @@ function AccountCard({
     }
   }, [account, store, toast]);
 
+  // Read the way this account's Claude Code reaches Anthropic: through its own proxy, if it has one.
+  // What comes back, a reading or why there's none, shows on the card.
+  const refreshUsage = useCallback(async () => {
+    setBusy("usage");
+    try {
+      await store.refresh({ refreshUsage: true, accountId: account.id });
+    } finally {
+      setBusy(null);
+    }
+  }, [account.id, store]);
+
   // For when the user knows better, e.g. after upgrading the plan or buying credits.
   const markAvailable = useCallback(async () => {
     setBusy("clear");
@@ -423,7 +450,7 @@ function AccountCard({
     setBusy("remove");
     try {
       const result = await store.rpc(removeAccount, { accountId: account.id });
-      const removed = `Removed ${account.label}`;
+      const removed = account.externalHome ? `Removed ${account.label} from ZeroSub; its sign-in and files are kept` : `Removed ${account.label}`;
       // An older server only says how many agents ran on it, not how moving them went.
       const message = result.moves
         ? describeReopen(removed, result.moves)
@@ -448,110 +475,135 @@ function AccountCard({
     }
   }, [account, store, toast]);
 
+  const offered: Record<CardActionKey, CardAction> = {
+    clear: {
+      key: "clear",
+      icon: "CircleCheck",
+      label: "Mark as available again (it has room)",
+      tooltip: "Mark as available: use it again before its limit resets, e.g. after upgrading",
+      busy: busy === "clear",
+      onPress: () => void markAvailable(),
+    },
+    next: {
+      key: "next",
+      icon: account.nextAgentUntil ? "CircleX" : "SquarePlus",
+      label: account.nextAgentUntil ? "Cancel: next new agent goes back to the default" : "Use for the next new agent",
+      tooltip: account.nextAgentUntil
+        ? "Your next new agent starts here. Click to cancel"
+        : "Next new agent: the next agent you start (new workspace or tab) uses this account, once",
+      busy: busy === "next",
+      onPress: () => void nextAgent(),
+    },
+    default: {
+      key: "default",
+      icon: "Star",
+      label: "Make default",
+      tooltip: "Make default: new agents start on this account",
+      busy: busy === "default",
+      onPress: () => void makeDefault(),
+    },
+    toggle: {
+      key: "toggle",
+      icon: disabled ? "CirclePlay" : "CirclePause",
+      label: disabled ? "Enable account" : "Disable for now (agents won't use it)",
+      tooltip: disabled ? "Enable: agents can use this account again" : "Disable for now: agents stop using it and move to your other accounts",
+      busy: busy === "toggle",
+      onPress: () => void toggle(),
+    },
+    usage: {
+      key: "usage",
+      icon: "RefreshCw",
+      label: "Refresh usage",
+      tooltip: account.proxy ? `Refresh usage: read this account's now, through ${account.proxy}` : "Refresh usage: read this account's now",
+      busy: busy === "usage",
+      onPress: () => void refreshUsage(),
+    },
+    api: {
+      key: "api",
+      icon: "KeyRound",
+      label: "API settings",
+      tooltip: account.family === "pi" ? "API settings: key and base URL" : "API settings: key, base URL and traffic switches",
+      onPress: () => setEditingApi(true),
+    },
+    azure: {
+      key: "azure",
+      icon: "KeyRound",
+      label: "Azure settings",
+      tooltip: "Azure settings: endpoint, key and prices",
+      onPress: () => setEditingAzure(true),
+    },
+    bedrock: {
+      key: "bedrock",
+      icon: "KeyRound",
+      label: "Bedrock settings",
+      tooltip: "Bedrock settings: region, credentials, models and prices",
+      onPress: () => setEditingBedrock(true),
+    },
+    proxy: { key: "proxy", icon: "Globe", label: "Proxy", tooltip: "Proxy: the network this account uses", onPress: () => setEditingProxy(true) },
+    rename: { key: "rename", icon: "Pencil", label: "Rename", tooltip: "Rename this account", onPress: () => setRenaming(true) },
+    remove: {
+      key: "remove",
+      icon: "Trash2",
+      label: "Remove",
+      tooltip: account.externalHome ? "Remove from ZeroSub only: its sign-in, files and launcher stay" : api
+          ? "Remove: delete its saved key"
+          : "Remove: sign it out and delete its saved login",
+      tone: "danger",
+      busy: busy === "remove",
+      onPress: () => setConfirmRemove(true),
+    },
+  };
+  const actions = cardActions(account).map((key) => offered[key]);
+  // Beside the name, up to eight 30 pt buttons leave a 375 pt phone's card no room for it. There they go
+  // on a row under the name instead (261 pt wide there; eight take 254). That row starts 75 pt from the
+  // screen's left, so a 240 pt tip opens rightwards from the first two, centred over the next three and
+  // leftwards from the rest, and stays on screen.
+  const actionRow = (
+    <View
+      style={[
+        { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 2 },
+        compact ? { marginLeft: -6 } : { marginTop: -4, marginRight: -6 },
+      ]}
+    >
+      {actions.map((action, index) => {
+        const align: TooltipAlign = !compact ? "end" : index < 2 ? "start" : index < 5 ? "center" : "end";
+        return (
+          <IconButton
+            key={action.key}
+            theme={theme}
+            icon={action.icon}
+            label={action.label}
+            tooltip={action.tooltip}
+            tooltipAlign={align}
+            tone={action.tone}
+            busy={action.busy}
+            onPress={action.onPress}
+          />
+        );
+      })}
+    </View>
+  );
+
   return (
     <Card theme={theme} fill>
       <View style={{ flexDirection: "row", alignItems: "flex-start", gap: 12 }}>
         <View style={faded}>
           <Avatar theme={theme} label={account.label} />
         </View>
-        <View style={[{ flex: 1, minWidth: 0, gap: 3 }, faded]}>
-          <Text style={text.strong} numberOfLines={1}>
-            {account.label}
-          </Text>
-          {subtitle ? (
-            <Text style={text.small} numberOfLines={1}>
-              {subtitle}
+        <View style={{ flex: 1, minWidth: 0, gap: 6 }}>
+          <View style={[{ gap: 3 }, faded]}>
+            <Text style={text.strong} numberOfLines={1}>
+              {account.label}
             </Text>
-          ) : null}
+            {subtitle ? (
+              <Text style={text.small} numberOfLines={1}>
+                {subtitle}
+              </Text>
+            ) : null}
+          </View>
+          {compact ? actionRow : null}
         </View>
-        <View style={{ flexDirection: "row", alignItems: "center", gap: 2, marginTop: -4, marginRight: -6 }}>
-          {account.status === "limited" ? (
-            <IconButton
-              theme={theme}
-              icon="CircleCheck"
-              label="Mark as available again (it has room)"
-              tooltip="Mark as available: use it again before its limit resets, e.g. after upgrading"
-              busy={busy === "clear"}
-              onPress={() => void markAvailable()}
-            />
-          ) : null}
-          {/* A pick waiting here can always be canceled, whatever has become of the account since. */}
-          {account.nextAgentUntil || (!signedOut && !disabled) ? (
-            <IconButton
-              theme={theme}
-              icon={account.nextAgentUntil ? "CircleX" : "SquarePlus"}
-              label={account.nextAgentUntil ? "Cancel: next new agent goes back to the default" : "Use for the next new agent"}
-              tooltip={
-                account.nextAgentUntil
-                  ? "Your next new agent starts here. Click to cancel"
-                  : "Next new agent: the next agent you start (new workspace or tab) uses this account, once"
-              }
-              busy={busy === "next"}
-              onPress={() => void nextAgent()}
-            />
-          ) : null}
-          {!account.isDefault && !signedOut && !disabled ? (
-            <IconButton
-              theme={theme}
-              icon="Star"
-              label="Make default"
-              tooltip="Make default: new agents start on this account"
-              busy={busy === "default"}
-              onPress={() => void makeDefault()}
-            />
-          ) : null}
-          {/* No Pi account stands in for another, so one can't be disabled (see setAccountEnabled). */}
-          {account.family === "pi" && !disabled ? null : (
-            <IconButton
-              theme={theme}
-              icon={disabled ? "CirclePlay" : "CirclePause"}
-              label={disabled ? "Enable account" : "Disable for now (agents won't use it)"}
-              tooltip={
-                disabled
-                  ? "Enable: agents can use this account again"
-                  : "Disable for now: agents stop using it and move to your other accounts"
-              }
-              busy={busy === "toggle"}
-              onPress={() => void toggle()}
-            />
-          )}
-          {account.apiEditable ? (
-            <IconButton theme={theme} icon="KeyRound" label="API settings" tooltip="API settings: key and base URL" onPress={() => setEditingApi(true)} />
-          ) : null}
-          {azure ? (
-            <IconButton theme={theme} icon="KeyRound" label="Azure settings" tooltip="Azure settings: endpoint, key and prices" onPress={() => setEditingAzure(true)} />
-          ) : null}
-          {bedrock ? (
-            <IconButton
-              theme={theme}
-              icon="KeyRound"
-              label="Bedrock settings"
-              tooltip="Bedrock settings: region, credentials, models and prices"
-              onPress={() => setEditingBedrock(true)}
-            />
-          ) : null}
-          {account.proxyEditable ? (
-            <IconButton theme={theme} icon="Globe" label="Proxy" tooltip="Proxy: the network this account uses" onPress={() => setEditingProxy(true)} />
-          ) : null}
-          <IconButton theme={theme} icon="Pencil" label="Rename" tooltip="Rename this account" onPress={() => setRenaming(true)} />
-          {account.kind !== "main" ? (
-            <IconButton
-              theme={theme}
-              icon="Trash2"
-              label="Remove"
-              tooltip={
-                account.externalHome
-                  ? "Remove from ZeroSub only: its folder, key and script stay"
-                  : api
-                    ? "Remove: delete its saved key"
-                    : "Remove: sign it out and delete its saved login"
-              }
-              tone="danger"
-              busy={busy === "remove"}
-              onPress={() => setConfirmRemove(true)}
-            />
-          ) : null}
-        </View>
+        {compact ? null : actionRow}
       </View>
 
       <View style={[{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 }, faded]}>
@@ -601,7 +653,16 @@ function AccountCard({
         ) : bedrock ? (
           <BedrockUsage theme={theme} account={account} paidFallback={paidFallback} />
         ) : api ? (
-          <Text style={text.small}>Billed per use · used only as the default or when picked for an agent</Text>
+          <Text style={text.small}>
+            {[
+              "Billed per use · used only as the default or when picked for an agent",
+              account.api?.disableNonessentialTraffic
+                ? "nonessential traffic off"
+                : [account.api?.disableTelemetry ? "telemetry off" : null, account.api?.disableErrorReporting ? "error reporting off" : null].filter(Boolean).join(", ") || null,
+            ]
+              .filter(Boolean)
+              .join(" · ")}
+          </Text>
         ) : windows.length > 0 ? (
           windows.map((limit) => <UsageBar key={limit.id} theme={theme} limit={limit} />)
         ) : (
@@ -726,17 +787,7 @@ function AccountCard({
       <Modal title={`Remove ${account.label}?`} open={confirmRemove} onOpenChange={setConfirmRemove}>
         <Modal.Content>
           <Text style={text.body}>
-            {account.externalHome
-              ? `This only removes the account from ZeroSub. Its folder${account.home ? ` (${account.home})` : ""}, its key${account.launcher ? ` and its terminal script ${account.launcher}` : ""} stay as they are, and you can add it back from Add account. Agents using it move to the default account; their conversations are kept.`
-              : account.family === "pi"
-                ? "This deletes the account's folder and saved key on this machine. Agents using it move to the default account; their conversations are kept."
-                : bedrock
-                  ? "This deletes the account's folder on this machine, with its AWS settings (and access key, if it has one) and its token counts. Agents using it move to the default account; their conversations are kept."
-                  : azure
-                  ? "This deletes the account's saved key and endpoint on this machine, and its token counts. New agents use the default account. Existing ChatGPT conversations on it can't move, so start new agents for them."
-                  : account.family === "claude"
-                  ? "This signs the account out on this machine and deletes its saved login. Agents using it move to the default account; their conversations are kept."
-                  : `This signs the account out on this machine and deletes its saved login. New agents use the default account. Existing ${FAMILY_LABEL[account.family]} conversations on it can't move, so start new agents for them.`}
+            {removeText(account).body}
           </Text>
           <View style={{ flexDirection: "row", gap: 8, justifyContent: "flex-end" }}>
             <Button theme={theme} label="Cancel" tooltip="Keep this account" tooltipAlign="end" onPress={() => setConfirmRemove(false)} />
@@ -745,13 +796,7 @@ function AccountCard({
               tone="danger"
               icon="Trash2"
               label="Remove"
-              tooltip={
-                account.externalHome
-                  ? "Remove it from ZeroSub only; its agents move to the default"
-                  : api
-                    ? "Delete its saved key; its agents move to the default"
-                    : "Sign it out and delete its saved login; its agents move to the default"
-              }
+              tooltip={removeText(account).tooltip}
               tooltipAlign="end"
               busy={busy === "remove"}
               onPress={() => void remove()}
@@ -955,22 +1000,6 @@ function AutomationSettings({ theme, compact }: { theme: Theme; compact: boolean
 }
 
 /** Paseo stopped waiting for a change that moves agents; the daemon carries on with it. */
-/**
- * A Claude card's line about its key (an API account's) and its network: its own proxy and the
- * address Anthropic sees its requests come from.
- */
-function claudeCardDetails(account: AccountView): string | null {
-  if (account.family !== "claude") return null;
-  const api = account.api;
-  const parts = [
-    api ? `${api.keyKind === "api_key" ? "Key" : "Token"}${api.keyHint ? ` …${api.keyHint}` : ""} · ${api.baseUrl ?? "Anthropic API"}` : null,
-    account.proxy ? `Via ${account.proxy}` : null,
-    egressText(account.egress),
-    account.launcher ? `Terminal: ${account.launcher}` : null,
-  ].filter(Boolean);
-  return parts.length > 0 ? parts.join(" · ") : null;
-}
-
 function stillMoving(label: string): string {
   return `Still moving agents for ${label}. Their timelines say when each has switched.`;
 }
