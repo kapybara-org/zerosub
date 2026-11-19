@@ -44,6 +44,12 @@ function apiHeaders(token: string): Record<string, string> {
   };
 }
 
+function planFromTier(tier: string | null | undefined): string | null {
+  if (tier === "default_claude_max_5x") return "max";
+  if (tier === "default_claude_max_20x") return "ultra";
+  return null;
+}
+
 function isFresh(credentials: Credentials | null): credentials is Credentials {
   return Boolean(credentials?.accessToken) && (!credentials?.expiresAt || credentials.expiresAt > Date.now() + 60_000);
 }
@@ -130,7 +136,7 @@ export class ClaudeAdapter implements FamilyAdapter {
     return writeAccountApi(home, config, wanted);
   }
 
-  async identity(home: string | null): Promise<Identity> {
+  async identity(home: string | null, options: { livePlan?: boolean } = {}): Promise<Identity> {
     if (isBedrockHome(home)) {
       // Nothing signs in: the credentials are checked when they're saved, and a refusal is learned from a turn.
       const account = await readBedrockAccount(home);
@@ -159,14 +165,13 @@ export class ClaudeAdapter implements FamilyAdapter {
         (!orgId || str(profile?.organizationUuid) === orgId);
       const name = matches ? str(profile?.planDisplayName) : null;
       const tier = matches ? str(profile?.organizationRateLimitTier) : null;
-      // The profile can reflect a plan change while the credential still has its sign-in tier.
-      if (name) plan = name;
-      else if (tier === "default_claude_max_5x") plan = "max";
-      else if (tier === "default_claude_max_20x") plan = "ultra";
-      else if (!tier && plan === "max") {
-        const credentials = await readCredentials(home).catch(() => null);
-        if (credentials?.rateLimitTier === "default_claude_max_20x") plan = "ultra";
-      }
+      const livePlan = options.livePlan && email;
+      const credentials = livePlan || (!name && !tier && plan === "max")
+        ? await readCredentials(home).catch(() => null)
+        : null;
+      const live = livePlan ? await this.livePlan(home, credentials, livePlan, orgId).catch(() => null) : null;
+      // A live profile can reflect a plan change before either of Claude's local files updates.
+      plan = live ?? name ?? planFromTier(tier) ?? (!tier && plan === "max" ? planFromTier(credentials?.rateLimitTier) : null) ?? plan;
     }
     return {
       signedIn,
@@ -175,6 +180,23 @@ export class ClaudeAdapter implements FamilyAdapter {
       organization: str(status.orgName),
       identity: email ? `${orgId ?? "personal"}|${email.toLowerCase()}` : null,
     };
+  }
+
+  private async livePlan(home: string | null, credentials: Credentials | null, email: string, orgId: string | null): Promise<string | null> {
+    const token = isFresh(credentials) ? credentials.accessToken : null;
+    if (!token) return null;
+    const response = await apiFetch(home, `${API}/api/oauth/profile`, {
+      headers: apiHeaders(token), signal: AbortSignal.timeout(5_000),
+    });
+    if (!response.ok) return null;
+    const profile = await response.json() as {
+      account?: { email?: unknown };
+      organization?: { uuid?: unknown; plan_display_name?: unknown; rate_limit_tier?: unknown };
+    } | null;
+    const organization = profile?.organization;
+    if (str(profile?.account?.email)?.toLowerCase() !== email.toLowerCase() ||
+      (orgId && str(organization?.uuid) !== orgId)) return null;
+    return str(organization?.plan_display_name) ?? planFromTier(str(organization?.rate_limit_tier));
   }
 
   async usage(home: string | null, options: { renewLogin?: boolean } = {}): Promise<UsageRead> {

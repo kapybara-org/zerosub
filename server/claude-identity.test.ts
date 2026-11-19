@@ -85,6 +85,37 @@ describe("whether a Claude account is signed out", () => {
     }
   });
 
+  it("uses the live plan after an upgrade while Claude's local profile still shows Max", async () => {
+    const home = await mkdtemp(join(tmpdir(), "zerosub-live-plan-"));
+    status = { loggedIn: true, subscriptionType: "max", email: "ada@example.com", orgId: "org-1" };
+    keychain = { code: 0, stdout: '{"claudeAiOauth":{"accessToken":"test-only-token","rateLimitTier":"default_claude_max_5x"}}' };
+    const fetchProfile = vi.fn(async () => Response.json({
+      account: { email: "ada@example.com" },
+      organization: { uuid: "org-1", plan_display_name: "Ultra" },
+    }));
+    vi.stubGlobal("fetch", fetchProfile);
+    vi.stubEnv("NO_PROXY", "api.anthropic.com");
+    vi.stubEnv("no_proxy", "api.anthropic.com");
+    try {
+      await writeFile(join(home, ".claude.json"), JSON.stringify({ oauthAccount: {
+        emailAddress: "ada@example.com", organizationUuid: "org-1", organizationRateLimitTier: "default_claude_max_5x",
+      } }));
+      const adapter = new ClaudeAdapter();
+      expect((await adapter.identity(home)).plan).toBe("max");
+      expect((await adapter.identity(home, { livePlan: true })).plan).toBe("Ultra");
+      expect(fetchProfile).toHaveBeenCalledExactlyOnceWith("https://api.anthropic.com/api/oauth/profile", expect.any(Object));
+      fetchProfile.mockResolvedValueOnce(Response.json({
+        account: { email: "ada@example.com" },
+        organization: { uuid: "other-org", plan_display_name: "Ultra" },
+      }));
+      expect((await adapter.identity(home, { livePlan: true })).plan).toBe("max");
+    } finally {
+      vi.unstubAllGlobals();
+      vi.unstubAllEnvs();
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
   it("takes Claude Code's answer off macOS, where the sign-in is a file in the home", async () => {
     Object.defineProperty(process, "platform", { value: "linux" });
     keychain = { code: 36, stdout: "" };
