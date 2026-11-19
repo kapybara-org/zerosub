@@ -317,6 +317,25 @@ export const forkAgent = defineRpc({
   }),
 });
 
+/**
+ * Moves one agent, between turns, to the named account before its own account is at its limit. For a
+ * plugin that stops a session at its own threshold below 100% (where ZeroSub sees no limit yet), so
+ * it can move the session to an account with room instead of holding it. The move is ZeroSub's own,
+ * as after a limit: the agent isn't pinned to the account, and every guard of an automatic move applies.
+ */
+export const moveBeforeLimit = defineRpc({
+  name: "zerosub.agents.move_before_limit",
+  input: z.object({ agentId: z.string(), accountId: z.string() }),
+  output: z.object({
+    /**
+     * `moved`: it runs on the account now. `waiting`: it moves once its turn or background work ends.
+     * `already`: it runs there already. `refused`: not moved; `detail` says why.
+     */
+    outcome: z.enum(["moved", "waiting", "already", "refused"]),
+    detail: z.string().nullable(),
+  }),
+});
+
 export const setAgentAccount = defineRpc({
   name: "zerosub.agents.account",
   input: z.object({

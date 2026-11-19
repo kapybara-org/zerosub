@@ -4515,6 +4515,64 @@ export class Service {
     return this.answerBy(replyBy, this.reconcile(paseo, "manual", [agentId], undefined, { summary }), summary);
   }
 
+  /**
+   * Moves one agent, between turns, to `accountId` before its own account is at its limit (see the
+   * RPC). It's an automatic move, as after a limit: the binding is `auto`, the timeline says why, and
+   * the guards are the same. Automatic switching on, a usable subscription account of the agent's
+   * provider, a live agent whose conversation can move, not one the user pinned, the switch guard,
+   * and `reopenAgent`, which never wakes a closed agent and waits for a turn or background work.
+   */
+  async moveBeforeLimit(paseo: PaseoApi, agentId: string, accountId: string): Promise<{ outcome: "moved" | "waiting" | "already" | "refused"; detail: string | null }> {
+    this.attach(paseo);
+    const refused = (detail: string) => ({ outcome: "refused" as const, detail });
+    if (!this.prefs.autoSwitch) return refused("Automatic switching is off.");
+    const info = await agentInfo(paseo, agentId);
+    if (!info || info.archived || info.status === "closed") return refused("The agent isn't open.");
+    const family = (await this.families.resolve(paseo))[info.provider];
+    if (!family || !this.adapters[family].portable) return refused("This agent's conversation can't change accounts.");
+    const state = await this.store.read();
+    const target = findAccount(state, accountId);
+    const now = Date.now();
+    // A limit of one model's window rules an account out only for agents on that model.
+    await withTimeout(this.modelOf(paseo, agentId), 3_000);
+    if (!target || target.family !== family || !isUsable(target, now, this.agentModels.get(agentId)) || isPaidStandIn(target, this.prefs.paidApiFallback)) {
+      return refused("That account can't take it now.");
+    }
+    const current = this.runningOn(state, agentId, family);
+    if (current === target.id) return { outcome: "already", detail: null };
+    if (state.bindings[agentId]?.source === "user") return refused("It stays on the account picked for it.");
+    if (!this.switchGuard.allows(agentId, now)) return refused("It changed accounts too often just now.");
+    const release = this.tryClaim(agentId);
+    if (!release) return refused("It's changing accounts already.");
+    try {
+      await this.pin(agentId, target.id, state.bindings[agentId]);
+      this.switchGuard.note(agentId, now);
+      const row: SwitchRow = {
+        family,
+        from: findAccount(state, current)?.label ?? null,
+        to: target.label,
+        reason: "near_limit",
+        resetsAt: null,
+        continued: false,
+        continuedIn: null,
+        toFamily: null,
+        toProvider: null,
+        outcome: "switched",
+        detail: null,
+        at: new Date(now).toISOString(),
+      };
+      // Nobody asked from this agent's own tab, so background work it left running isn't cut short.
+      const result = await this.reopenAgent(paseo, agentId, { row, unattended: true });
+      await this.noteOutcome(paseo, agentId, row, result);
+      if (result.outcome === "reopened") return { outcome: "moved", detail: null };
+      if (result.outcome === "deferred") return { outcome: "waiting", detail: "It moves once its turn or background work ends." };
+      if (result.outcome === "failed") return refused(`It couldn't be reopened on that account: ${result.error}`);
+      return refused("The agent isn't open.");
+    } finally {
+      release();
+    }
+  }
+
   async rename(accountId: string, label: string): Promise<void> {
     const state = await this.store.update((draft) => {
       const account = findAccount(draft, accountId);

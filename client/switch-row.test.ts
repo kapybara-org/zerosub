@@ -118,6 +118,11 @@ describe("describing a switch row", () => {
     );
   });
 
+  it("says a move before the limit left an account nearly at its limit", () => {
+    const note = describeRow(row({ reason: "near_limit", from: "work", to: "personal", continued: false }));
+    expect(note).toBe("work is nearly at its usage limit. Switched to personal.");
+  });
+
   it("says a pacing move left an account close to its 5-hour limit", () => {
     const note = describeRow(row({ reason: "pacing", from: "work", to: "personal", continued: false }));
     expect(note).toBe("work is close to its 5-hour limit. Switched to personal.");

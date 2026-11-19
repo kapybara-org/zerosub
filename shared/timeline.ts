@@ -29,6 +29,8 @@ export const SwitchRowSchema = z.object({
     "room",
     /** `from` still works but is projected past the 5-hour pacing gate; a cold idle agent moved off it. */
     "pacing",
+    /** `from` is nearly at its limit, and another plugin asked to move the agent before it gets there. */
+    "near_limit",
   ]),
   /** When the exhausted account frees up again, if known. */
   resetsAt: z.string().nullable(),
