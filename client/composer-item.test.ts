@@ -84,6 +84,7 @@ function view(accounts: AccountView[], fields: Partial<StateView> = {}): StateVi
     showComposerPill: true,
     openCodeAvailable: false,
     autoSwitch: true,
+    autoContinue: true,
     agentMetadata: true,
     warnings: [],
     ...fields,

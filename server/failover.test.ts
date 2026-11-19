@@ -4600,6 +4600,36 @@ describe("answering before Paseo gives up", () => {
     expect(spent).toBe(1);
   });
 
+  it.each([
+    [true, "Still using the reset on marketing. Its limits show here once it's done, and the agent carries on; don't use another."],
+    [false, "Still using the reset on marketing. Its limits show here once it's done; don't use another."],
+  ])("says the agent carries on after a slow reset only when Keep going is on (%s)", async (autoContinue, message) => {
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const { service, paseo, sent } = await setUp(onMarketing(), hit, {
+      claude: {
+        redeemReset: async () => {
+          await gate;
+          return { outcome: "reset", message: "Limits reset.", left: 0 };
+        },
+      },
+      // The agent's last turn did stop at the limit.
+      recent: inTurn("t", { type: "assistant_message", text: "You've hit your session limit · resets 3pm" }),
+      detectLimit: detectClaudeLimit,
+    });
+    service.setPreferences(preferences.schema.parse({ autoSwitch: true, autoContinue }));
+    const asked = service.redeem(paseo as never, MAIN, AGENT);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(await asked).toEqual({ outcome: "pending", message, left: null, continued: false });
+
+    release();
+    if (autoContinue) await vi.waitFor(() => expect(sent).toHaveLength(1));
+    else {
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(sent).toEqual([]);
+    }
+  });
+
   it("answers a usage refresh that has to renew a sign-in", async () => {
     let release = () => {};
     const gate = new Promise<void>((resolve) => (release = resolve));

@@ -2017,7 +2017,7 @@ export class Service {
     task.catch((error: unknown) => log(`using a reset on ${account.label} failed`, error));
     if (await settles(task, replyBy - Date.now())) return task;
     return pending(
-      `Still using the reset on ${account.label}. Its limits show here once it's done${agentId ? ", and the agent carries on" : ""}; don't use another.`,
+      `Still using the reset on ${account.label}. Its limits show here once it's done${agentId && this.prefs.autoContinue ? ", and the agent carries on" : ""}; don't use another.`,
     );
   }
 
@@ -3974,6 +3974,7 @@ export class Service {
       pacedNext: this.pacedNextAccounts(state, now),
       agentMetadata: takesAgentMetadata(paseo),
       paidApiFallback: this.prefs.paidApiFallback,
+      autoContinue: this.prefs.autoContinue,
       warnings: await this.warnings(),
       launchers: claudeScripts.length > 0 ? launcherDir() : null,
       piLaunchers: piScripts.length > 0 ? piLauncherDir() : null,
