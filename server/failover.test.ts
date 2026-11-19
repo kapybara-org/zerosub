@@ -3095,11 +3095,11 @@ describe("changing the default account", () => {
 
   describe("moving idle agents off a busy account", () => {
     const ago = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
-    const reading = (percent: number): UsageRead => ({
+    const reading = (percent: number, week = 10): UsageRead => ({
       fetchedAt: new Date().toISOString(),
       windows: [
         { id: "five_hour", label: "5-hour", usedPercent: percent, resetsAt: new Date(Date.now() + 3 * 60 * 60_000).toISOString(), minutes: 300 },
-        { id: "seven_day", label: "Weekly", usedPercent: 10, resetsAt: new Date(Date.now() + 3 * 24 * 60 * 60_000).toISOString(), minutes: 10_080 },
+        { id: "seven_day", label: "Weekly", usedPercent: week, resetsAt: new Date(Date.now() + 3 * 24 * 60 * 60_000).toISOString(), minutes: 10_080 },
       ],
       error: null,
       cached: false,
@@ -3112,6 +3112,8 @@ describe("changing the default account", () => {
       updatedAt: string,
       options: {
         personal?: number;
+        /** `personal`'s weekly percent. */
+        personalWeek?: number;
         prefs?: Record<string, unknown>;
         bindings?: StoredState["bindings"];
         onList?: (service: Service) => void | Promise<void>;
@@ -3139,7 +3141,7 @@ describe("changing the default account", () => {
           claude: {
             usage: async (home: string | null) => {
               const byHome = (options.accounts ?? []).find((entry) => entry.home === home);
-              return home ? reading(options.usedBy?.[byHome?.id ?? ""] ?? options.personal ?? 20) : reading(60);
+              return home ? reading(options.usedBy?.[byHome?.id ?? ""] ?? options.personal ?? 20, options.personalWeek) : reading(60);
             },
           } as Partial<FamilyAdapter>,
           onList: options.onList,
@@ -3162,6 +3164,21 @@ describe("changing the default account", () => {
       expect(state.bindings["fix-build"]).toMatchObject({ accountId: HELLO, source: "auto" });
       expect(state.sessions["fix-build"]?.accountId).toBe(HELLO);
       expect(notes).toContainEqual({ agentId: "fix-build", data: expect.objectContaining({ reason: "pacing", from: "work", to: "personal" }) });
+    });
+
+    it("moves at most three agents in one pass", async () => {
+      const { reopened } = await setUpBusy("a1", ago(120), { others: ["a2", "a3", "a4", "a5"] });
+      expect(reopened).toHaveLength(3);
+    });
+
+    it("leaves an agent where it is when the other account has used 90% of its week", async () => {
+      const { reopened } = await setUpBusy("fix-build", ago(120), { personalWeek: 90 });
+      expect(reopened).toEqual([]);
+    });
+
+    it("leaves an agent idle for more than a day", async () => {
+      const { reopened } = await setUpBusy("old-spike", ago(26 * 60));
+      expect(reopened).toEqual([]);
     });
 
     it("leaves an agent used in the last hour", async () => {
@@ -3269,7 +3286,7 @@ describe("changing the default account", () => {
 
     it("stops moving agents once the account they go to would reach the gate", async () => {
       const others = ["agent-2", "agent-3", "agent-4", "agent-5", "agent-6"];
-      const { service, reopened } = await setUpBusy("fix-build", ago(120), { others });
+      const { service, reopened } = await setUpBusy("fix-build", ago(120), { others, personal: 45 });
       expect(reopened.length).toBeGreaterThan(0);
       expect(reopened.length).toBeLessThan(others.length + 1);
       const usage = (service as unknown as { usage: Map<string, Usage> }).usage.get(HELLO);

@@ -351,6 +351,8 @@ export type AccountStatus = z.infer<typeof AccountStatusSchema>;
 
 /** An account projected to this share of its 5-hour window, or already there, is held back when spreading. */
 export const PACE_GATE_PERCENT = 80;
+/** Weekly use at which an account counts as nearly used up; pacing holds it back. */
+export const WEEK_NEARLY_USED_PERCENT = 90;
 
 /** How pacing reads an account (see `paceScore` in server/routing.ts). Sent only while spreading is on. */
 export const PaceViewSchema = z.object({
