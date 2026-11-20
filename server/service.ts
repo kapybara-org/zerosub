@@ -3948,6 +3948,7 @@ export class Service {
     const bedrocks = new Map<string, BedrockSummary>();
     const apiMonths: ApiUsageFile = await this.apiUsage.read().catch(() => ({ accounts: {}, threads: {} }));
     const external = new Set<string>();
+    const sessions = new Map<string, boolean>();
     await Promise.all(
       state.accounts.map(async (account) => {
         const adapter = this.adapters[account.family];
@@ -3959,6 +3960,7 @@ export class Service {
         if (account.kind === "main" && adapter.mainApi && adapter.api) apis.set(account.id, await adapter.api(null).catch(() => null));
         if (account.kind !== "managed" || !account.home) return;
         if (adapter.homesInUse && !(await isOwnHome(account.home))) external.add(account.id);
+        if (adapter.sessionsShared) sessions.set(account.id, await adapter.sessionsShared(account.home).catch(() => false));
         if (account.auth === "api" && adapter.api) apis.set(account.id, await adapter.api(account.home).catch(() => null));
         if (isAzureAccount(account)) {
           // Only the key's hint goes to the app (see azureSummary).
@@ -4020,6 +4022,7 @@ export class Service {
         launcher: launcherOf.get(account.id) ?? null,
         egress: this.egress.get(account.id) ?? null,
         externalHome: external.has(account.id),
+        sessionsShared: sessions.get(account.id) ?? null,
         moving: moving(account),
         pace: this.prefs.balanceNewAgents && pacedFamilies.has(account.family) && canStandIn(account, now)
           ? paceView(this.usage.get(account.id), this.pendingOn(account.id, now), now)
@@ -4694,7 +4697,7 @@ export class Service {
    * `warning` says when they couldn't be checked. Secrets go only to the home's `bedrock.json`, and
    * the account is marked `provider: "bedrock"`.
    */
-  async addBedrockAccount(input: BedrockInput & { label: string }): Promise<{ accountId: string; warning: string | null }> {
+  async addBedrockAccount(input: BedrockInput & { label: string; shareSessions?: boolean }): Promise<{ accountId: string; warning: string | null }> {
     const account = bedrockFromInput(input, null);
     const identity = bedrockIdentity(account);
     const duplicate = accountsOf(await this.store.read(), "claude").find((entry) => entry.identity === identity);
@@ -4711,6 +4714,7 @@ export class Service {
       });
       await writeBedrockAccount(home, account);
       await this.adapters.claude.prepareHome(home);
+      if (input.shareSessions) await this.adapters.claude.shareSessions?.(home, true);
       await this.store.update((draft) => {
         const twin = accountsOf(draft, "claude").find((entry) => entry.identity === identity);
         if (twin) throw new Error(`Those AWS credentials in ${account.region} are already added as "${twin.label}".`);
@@ -4956,6 +4960,27 @@ export class Service {
     return proxy ? maskProxy(proxy) : null;
   }
 
+  /** Refuses sharing a new account's sessions folder where the family has no such choice. */
+  private canShareSessions(family: Family, share: boolean): void {
+    if (share && !this.adapters[family].shareSessions) throw new Error("Sessions can only be shared for Claude accounts.");
+  }
+
+  /**
+   * Shares an added Claude account's sessions folder with the CLI's own, or gives it its own again
+   * (see `shareClaudeSessions`). Says whether it's shared now.
+   */
+  async setSessionsShared(accountId: string, shared: boolean): Promise<boolean> {
+    return this.onAccount(accountId, async (account) => {
+      if (!account) throw new Error("That account no longer exists.");
+      const adapter = this.adapters[account.family];
+      if (!adapter.shareSessions || !adapter.sessionsShared || account.kind !== "managed" || !account.home) {
+        throw new Error("Sessions can only be shared for added Claude accounts.");
+      }
+      await adapter.shareSessions(account.home, shared, this.stillHas(account));
+      return adapter.sessionsShared(account.home);
+    });
+  }
+
   /**
    * A new proxy on the CLI login is also every added account's without one of its own, so it's
    * refused while one of those sends its key over plain http:// through it: to this machine too,
@@ -5060,13 +5085,16 @@ export class Service {
    * Adds a Pi account: an Anthropic API key, optionally sent to another base URL, with an optional
    * proxy. Set up in `homes/`, then moved to where Pi accounts are kept (see `placeHomes`).
    */
-  async addApiAccount(input: ApiAccountInput & { label: string; key: string; proxy?: string; family?: "claude" | "pi" }): Promise<string> {
+  async addApiAccount(
+    input: ApiAccountInput & { label: string; key: string; proxy?: string; family?: "claude" | "pi"; shareSessions?: boolean },
+  ): Promise<string> {
     // Pi's are an Anthropic API key and nothing else, so its form sends no kind; Claude's always says which.
     const family = input.family ?? (input.keyKind ? "claude" : "pi");
     const keyKind = input.keyKind ?? "api_key";
     const adapter = this.adapters[family];
     if (!adapter.setApi) throw new Error("API accounts aren't supported here.");
     if (family === "pi" && keyKind !== "api_key") throw new Error("Pi accounts use an API key (x-api-key), not an auth token.");
+    this.canShareSessions(family, input.shareSessions === true);
     const baseUrl = input.baseUrl?.trim() ? normalizeBaseUrl(input.baseUrl) : null;
     const proxy = input.proxy?.trim() ? normalizeProxy(input.proxy) : null;
     const key = input.key.trim();
@@ -5088,6 +5116,7 @@ export class Service {
       if (proxy) await adapter.setProxy?.(home, proxy);
       await adapter.setApi(home, { ...trafficSwitches(input), keyKind, key, baseUrl });
       await adapter.prepareHome(home);
+      if (input.shareSessions) await adapter.shareSessions?.(home, true);
       // A proxy typed in along with the key is the user's to trust; one the account would only inherit isn't.
       if (!proxy) await this.refuseClearText(adapter, home, baseUrl);
       await this.store.update((draft) => {
@@ -5556,11 +5585,11 @@ export class Service {
 
   // ------------------------------------------------------------------ RPC: sign-in
 
-  startLogin(family: Family, method: LoginMethod, accountId?: string, proxy?: string): Promise<LoginView> {
-    return this.loginLocks[family].run(() => this.beginLogin(family, method, accountId, proxy));
+  startLogin(family: Family, method: LoginMethod, accountId?: string, proxy?: string, shareSessions?: boolean): Promise<LoginView> {
+    return this.loginLocks[family].run(() => this.beginLogin(family, method, accountId, proxy, shareSessions));
   }
 
-  private async beginLogin(family: Family, method: LoginMethod, accountId?: string, proxyInput?: string): Promise<LoginView> {
+  private async beginLogin(family: Family, method: LoginMethod, accountId?: string, proxyInput?: string, shareSessions?: boolean): Promise<LoginView> {
     // Pi's added accounts are API keys, and its own login signs in inside Pi.
     if (family === "pi") throw new Error("Pi accounts use an Anthropic API key: add one with Add account, or change its key from its card. Sign Pi's own login in with /login inside Pi.");
     let availability = this.availability.get(family);
@@ -5585,6 +5614,9 @@ export class Service {
     // A new account's proxy is in place before the CLI starts, so the sign-in itself goes through it.
     const proxy = !existing && proxyInput?.trim() ? normalizeProxy(proxyInput) : null;
     if (proxy && !this.adapters[family].setProxy) throw new Error(`A proxy can't be set for ${FAMILY_LABEL[family]} accounts yet.`);
+    // Only a new account's sessions folder is chosen here; an existing one keeps what it has.
+    const share = !existing && shareSessions === true;
+    this.canShareSessions(family, share);
 
     const id = randomBytes(6).toString("hex");
     const home = existing ? existing.home : join(homesDir(), `${family}-${id}`);
@@ -5620,6 +5652,8 @@ export class Service {
       }
       if (home && proxy) await this.adapters[family].setProxy?.(home, proxy);
       if (home) await this.adapters[family].prepareHome(home, existing ? this.stillHas(existing) : undefined);
+      // Shared before the CLI starts, as the proxy is; an abandoned sign-in's home goes with its link.
+      if (home && share) await this.adapters[family].shareSessions?.(home, true);
       const handle = await this.adapters[family].login(home, method);
       if (session.finishedAt) {
         handle.cancel();

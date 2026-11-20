@@ -445,6 +445,11 @@ export const AccountViewSchema = z.object({
   bedrock: BedrockSummarySchema.nullable().default(null),
   /** What the provider said when it last refused an Azure or Bedrock account, while it's signed out for it. */
   apiError: z.string().nullable().default(null),
+  /**
+   * Whether this added Claude account's sessions folder is the CLI's own, so Claude Code started on
+   * any account that shares it sees the others' sessions; null where there's no such choice.
+   */
+  sessionsShared: z.boolean().nullable().default(null),
   /** The account's home is due to move to `to`, and hasn't yet: what it waits for, or what went wrong. */
   moving: z.object({ to: z.string(), waiting: z.string().nullable(), error: z.string().nullable() }).nullable().default(null),
   /** How pacing reads this account; null unless spreading is on and it's one of two or more accounts that can stand in. */

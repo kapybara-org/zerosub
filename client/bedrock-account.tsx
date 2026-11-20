@@ -5,6 +5,7 @@ import { Pressable, Text, View } from "react-native";
 import { apiUsageLines } from "../shared/format";
 import type { AccountView, ApiPrice, BedrockModels, BedrockSource } from "../shared/model";
 import { addBedrockAccount, detectBedrockRegion, updateBedrockAccount } from "../shared/rpc";
+import { SessionsSwitch } from "./sessions-switch";
 import { describe, type ZeroSubStore } from "./store";
 import { Button, IconButton, useText } from "./ui";
 
@@ -131,6 +132,7 @@ export function BedrockAccountForm({
   const current = account?.bedrock ?? null;
   const editing = Boolean(account);
   const [label, setLabel] = useState("");
+  const [shareSessions, setShareSessions] = useState(false);
   const [region, setRegion] = useState(current?.region ?? "");
   const [regionNote, setRegionNote] = useState<string | null>(null);
   const [source, setSource] = useState<BedrockSource>(current?.source ?? "host");
@@ -194,7 +196,7 @@ export function BedrockAccountForm({
         await store.refresh();
         onDone(account.id, result.warning);
       } else {
-        const result = await store.rpc(addBedrockAccount, { label: label.trim(), ...fields });
+        const result = await store.rpc(addBedrockAccount, { label: label.trim(), ...fields, shareSessions: shareSessions || undefined });
         await store.refresh();
         onDone(result.accountId, result.warning);
       }
@@ -203,7 +205,7 @@ export function BedrockAccountForm({
     } finally {
       setSaving(false);
     }
-  }, [ready, region, source, profile, accessKeyId, secret, sessionToken, models, account, rows, store, label, onDone]);
+  }, [ready, region, source, profile, accessKeyId, secret, sessionToken, models, account, rows, store, label, shareSessions, onDone]);
 
   const inputStyle = useMemo(
     () => ({
@@ -385,6 +387,7 @@ export function BedrockAccountForm({
           </View>
         </Field>
       ) : null}
+      {editing ? null : <SessionsSwitch value={shareSessions} onValueChange={setShareSessions} />}
       <Text style={text.small}>
         {paidFallback
           ? "Billed per token by AWS. With paid API accounts turned on, ZeroSub moves Claude agents onto it by itself only when every Claude subscription account is out, and back once one has room; you can always pick it for an agent or make it the default."

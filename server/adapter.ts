@@ -108,6 +108,10 @@ export interface FamilyAdapter {
    * `wanted`, if given, is asked once nothing else works on the home; false leaves it untouched.
    */
   prepareHome(home: string, wanted?: () => Promise<boolean>): Promise<void>;
+  /** Whether a managed home's sessions folder is main's (Claude only); each home has its own unless shared. */
+  sessionsShared?(home: string): Promise<boolean>;
+  /** Shares a managed home's sessions folder with main's, or gives it its own again; `wanted` as for `prepareHome`. */
+  shareSessions?(home: string, share: boolean, wanted?: () => Promise<boolean>): Promise<void>;
   /**
    * `home === null` is the CLI's own login. `session`, when the patch is for a session Paseo opens:
    * the folder it runs in.

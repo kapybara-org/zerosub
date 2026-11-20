@@ -18,7 +18,18 @@ import {
 import { bedrockEnv, bedrockIdentity, isBedrockHome, readBedrockAccount } from "./bedrock";
 import { browserCaptureScript, providerCommand } from "./binaries";
 import { CLAUDE_RESET_PROGRAM, describeResetBlock, parseClaudeResets, readClaimReply } from "./claude-resets";
-import { claudeClearTextProxy, claudeHomeHoldsAccount, prepareClaudeHome, readAccountApi, readAccountProxy, writeAccountApi, writeAccountProxy, type ApiConfig } from "./homes";
+import {
+  claudeClearTextProxy,
+  claudeHomeHoldsAccount,
+  claudeSessionsShared,
+  prepareClaudeHome,
+  readAccountApi,
+  readAccountProxy,
+  shareClaudeSessions,
+  writeAccountApi,
+  writeAccountProxy,
+  type ApiConfig,
+} from "./homes";
 import { readJson } from "./json-file";
 import { detectClaudeLimit, detectClaudeSignOut } from "./limits";
 import { inheritedClaudeProxy, mainProxyBlock, mainProxyEnv, mainSettingsEnv, readMainProxy, writeMainProxy } from "./main-proxy";
@@ -105,6 +116,14 @@ export class ClaudeAdapter implements FamilyAdapter {
 
   prepareHome(home: string, wanted?: () => Promise<boolean>): Promise<void> {
     return prepareClaudeHome(home, false, wanted);
+  }
+
+  sessionsShared(home: string): Promise<boolean> {
+    return claudeSessionsShared(home);
+  }
+
+  shareSessions(home: string, share: boolean, wanted?: () => Promise<boolean>): Promise<void> {
+    return shareClaudeSessions(home, share, wanted);
   }
 
   async proxyState(home: string | null): Promise<ProxyState> {

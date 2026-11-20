@@ -343,6 +343,21 @@ describe("AWS Bedrock accounts in the service", () => {
   });
 });
 
+// A new Bedrock account runs Claude Code too, so it can start on the default sessions folder.
+describe("a new Bedrock account's sessions", () => {
+  it("are the CLI's when asked, and its own otherwise", async () => {
+    const { service } = setUp();
+    const add = (label: string, region: string, shareSessions?: boolean) =>
+      service.addBedrockAccount({ label, region, source: "keys", accessKeyId: KEY_ID, secretAccessKey: SECRET, shareSessions });
+    const shared = await add("Shared", "eu-central-1", true);
+    const own = await add("Own", "us-east-1");
+    const { paseo } = fakePaseo();
+    const view = await service.view(paseo as never);
+    expect(view.accounts.find((entry) => entry.id === shared.accountId)?.sessionsShared).toBe(true);
+    expect(view.accounts.find((entry) => entry.id === own.accountId)?.sessionsShared).toBe(false);
+  });
+});
+
 describe("a Bedrock account's home (#69)", () => {
   it("stays in homes/ with no terminal script, is never imported as a subscription, and goes with its account", async () => {
     vi.spyOn(console, "log").mockImplementation(() => undefined);

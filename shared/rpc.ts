@@ -21,6 +21,8 @@ export const startLogin = defineRpc({
     method: LoginMethodSchema.default("browser"),
     /** A new account's proxy, set before the CLI signs in so the sign-in goes through it too. */
     proxy: z.string().trim().max(2048).optional(),
+    /** A new Claude account starts on the default sessions folder, `~/.claude/sessions` (see `setAccountSessionsShared`). */
+    shareSessions: z.boolean().optional(),
   }),
   output: LoginViewSchema,
 });
@@ -64,6 +66,8 @@ export const addApiAccount = defineRpc({
     label: z.string().trim().min(1).max(40),
     key: z.string().trim().min(1).max(4096),
     proxy: z.string().trim().max(2048).optional(),
+    /** A new Claude account starts on the default sessions folder, `~/.claude/sessions` (see `setAccountSessionsShared`). */
+    shareSessions: z.boolean().optional(),
   }),
   output: z.object({ accountId: z.string() }),
 });
@@ -129,7 +133,12 @@ const BedrockFields = {
  */
 export const addBedrockAccount = defineRpc({
   name: "zerosub.accounts.bedrock.add",
-  input: z.object({ label: z.string().trim().min(1).max(40), ...BedrockFields }),
+  input: z.object({
+    label: z.string().trim().min(1).max(40),
+    ...BedrockFields,
+    /** A new Claude account starts on the default sessions folder, `~/.claude/sessions` (see `setAccountSessionsShared`). */
+    shareSessions: z.boolean().optional(),
+  }),
   output: z.object({ accountId: z.string(), warning: z.string().nullable() }),
 });
 
@@ -162,6 +171,13 @@ export const setAccountProxy = defineRpc({
   name: "zerosub.accounts.proxy",
   input: z.object({ accountId: z.string(), proxy: z.string().trim().max(2048) }),
   output: z.object({ ok: z.literal(true), proxy: z.string().nullable() }),
+});
+
+/** Shares an added Claude account's sessions folder with the CLI's own, or gives it its own again. */
+export const setAccountSessionsShared = defineRpc({
+  name: "zerosub.accounts.sessions",
+  input: z.object({ accountId: z.string(), shared: z.boolean() }),
+  output: z.object({ ok: z.literal(true), shared: z.boolean() }),
 });
 
 /**

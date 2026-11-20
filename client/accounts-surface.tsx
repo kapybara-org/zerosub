@@ -11,6 +11,7 @@ import {
   removeAccount,
   renameAccount,
   setAccountEnabled,
+  setAccountSessionsShared,
   setDefaultAccount,
   setNextAgentAccount,
 } from "../shared/rpc";
@@ -344,7 +345,7 @@ function AccountCard({
 }) {
   const text = useText(theme);
   const toast = useToast();
-  const [busy, setBusy] = useState<"default" | "remove" | "clear" | "toggle" | "usage" | "next" | null>(null);
+  const [busy, setBusy] = useState<"default" | "remove" | "clear" | "toggle" | "usage" | "next" | "sessions" | null>(null);
   const [renaming, setRenaming] = useState(false);
   const [editingApi, setEditingApi] = useState(false);
   const [editingProxy, setEditingProxy] = useState(false);
@@ -361,6 +362,8 @@ function AccountCard({
   const [confirmRemove, setConfirmRemove] = useState(false);
   // A wide card's buttons past the first few, shown under the name (see `splitCardActions`).
   const [moreActions, setMoreActions] = useState(false);
+  // Moving the sessions folder copies and renames files, so the card's button asks first.
+  const [confirmSessions, setConfirmSessions] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const resets = account.usage?.resets ?? null;
   const credits = account.usage?.credits ?? null;
@@ -434,6 +437,22 @@ function AccountCard({
       setBusy(null);
     }
   }, [account.id, store]);
+
+  // Shares the account's sessions folder with the CLI's own, or gives it its own again.
+  const shareSessions = useCallback(async () => {
+    const share = !account.sessionsShared;
+    setBusy("sessions");
+    try {
+      await store.rpc(setAccountSessionsShared, { accountId: account.id, shared: share });
+      toast.show(share ? `${account.label} now uses the default sessions folder` : `${account.label} now uses its own sessions folder`, { variant: "success" });
+      await store.refresh();
+    } catch (error) {
+      toast.error(describe(error));
+    } finally {
+      setBusy(null);
+      setConfirmSessions(false);
+    }
+  }, [account, store, toast]);
 
   // For when the user knows better, e.g. after upgrading the plan or buying credits.
   const markAvailable = useCallback(async () => {
@@ -542,6 +561,16 @@ function AccountCard({
       onPress: () => setEditingBedrock(true),
     },
     proxy: { key: "proxy", icon: "Globe", label: "Proxy", tooltip: "Proxy: the network this account uses", onPress: () => setEditingProxy(true) },
+    sessions: {
+      key: "sessions",
+      icon: account.sessionsShared ? "Unlink" : "Link",
+      label: account.sessionsShared ? "Use its own sessions folder" : "Use the default sessions folder",
+      tooltip: account.sessionsShared
+        ? "Uses the default sessions folder (~/.claude/sessions). Asks before giving this account a folder of its own again"
+        : "Uses a sessions folder of its own. Asks before switching it to the default one (~/.claude/sessions)",
+      busy: busy === "sessions",
+      onPress: () => setConfirmSessions(true),
+    },
     rename: { key: "rename", icon: "Pencil", label: "Rename", tooltip: "Rename this account", onPress: () => setRenaming(true) },
     remove: {
       key: "remove",
@@ -570,10 +599,11 @@ function AccountCard({
       onPress={action.onPress}
     />
   );
-  // On a phone the buttons go on a row under the name, which leaves the name its room: up to eight 30 pt
+  // On a phone the buttons go on a row under the name, which leaves the name its room: up to nine 30 pt
   // buttons beside it would leave a 375 pt phone's card none. That row is 261 pt wide there (eight take
-  // 254) and starts 75 pt from the screen's left, so a 240 pt tip opens rightwards from the first two,
-  // centred over the next three and leftwards from the rest, and stays on screen.
+  // 254, a ninth wraps) and starts 75 pt from the screen's left, so a 240 pt tip opens rightwards from
+  // the first two, centred over the next three and leftwards from the rest, and stays on screen; a
+  // wrapped one counts from its row's start.
   const rowAlign = (index: number): TooltipAlign => (index % 8 < 2 ? "start" : index % 8 < 5 ? "center" : "end");
   const actionRow = compact ? (
     <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 2, marginLeft: -6 }}>
@@ -806,6 +836,32 @@ function AccountCard({
         <BedrockAccountModal theme={theme} store={store} account={account} paidFallback={paidFallback} onClose={() => setEditingBedrock(false)} />
       ) : null}
       {editingProxy ? <ProxyModal theme={theme} store={store} account={account} onClose={() => setEditingProxy(false)} /> : null}
+      <Modal
+        title={account.sessionsShared ? `Give ${account.label} its own sessions folder?` : `Use the default sessions folder for ${account.label}?`}
+        open={confirmSessions}
+        onOpenChange={setConfirmSessions}
+      >
+        <Modal.Content>
+          <Text style={text.body}>
+            {account.sessionsShared
+              ? `${account.label} gets an empty sessions folder of its own, and its sessions and the ones in ~/.claude/sessions stop seeing each other. What it registered in ~/.claude/sessions stays there.`
+              : `${account.label}'s sessions folder becomes Claude Code's default, ~/.claude/sessions, so its running sessions and those of the CLI and every account using that folder see each other. What its own folder holds is copied there first, without overwriting anything, and the folder is kept beside it as sessions.bak-<time>.`}
+          </Text>
+          <View style={{ flexDirection: "row", gap: 8, justifyContent: "flex-end" }}>
+            <Button theme={theme} label="Cancel" tooltip="Leave the sessions folder as it is" tooltipAlign="end" onPress={() => setConfirmSessions(false)} />
+            <Button
+              theme={theme}
+              tone="primary"
+              icon={account.sessionsShared ? "Unlink" : "Link"}
+              label={account.sessionsShared ? "Use its own folder" : "Use the default folder"}
+              tooltip={account.sessionsShared ? "Give this account an empty sessions folder of its own" : "Switch this account to ~/.claude/sessions"}
+              tooltipAlign="end"
+              busy={busy === "sessions"}
+              onPress={() => void shareSessions()}
+            />
+          </View>
+        </Modal.Content>
+      </Modal>
       <Modal title={`Remove ${account.label}?`} open={confirmRemove} onOpenChange={setConfirmRemove}>
         <Modal.Content>
           <Text style={text.body}>

@@ -178,6 +178,7 @@ describe("account presentation", () => {
     launcher: null,
     egress: null,
     externalHome: false,
+    sessionsShared: null,
     moving: null,
     pace: null,
     azure: null,

@@ -62,6 +62,15 @@ describe("an AWS Bedrock account's card", () => {
   });
 });
 
+describe("an added Claude account's sessions button", () => {
+  it("is offered where the server says whether they're shared, and nowhere else", () => {
+    expect(cardActions({ ...claude, sessionsShared: false })).toContain("sessions");
+    expect(cardActions({ ...claude, sessionsShared: true })).toContain("sessions");
+    expect(cardActions({ ...claude, sessionsShared: null })).not.toContain("sessions");
+    expect(cardActions(claude)).not.toContain("sessions");
+  });
+});
+
 describe("a card's details and Remove dialog with Grok and Cursor", () => {
   const removable = (family: AccountView["family"], extra: Partial<AccountView> = {}) =>
     ({ family, kind: "managed", auth: "subscription", label: "Work", home: `/p/homes/${family}-a`, externalHome: false, launcher: null, ...extra }) as AccountView;

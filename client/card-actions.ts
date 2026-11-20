@@ -1,11 +1,12 @@
 import { FAMILY_LABEL, type AccountView } from "../shared/model";
 import { egressText, isDisabled } from "../shared/format";
 
-export type CardActionKey = "clear" | "next" | "default" | "toggle" | "usage" | "api" | "azure" | "bedrock" | "proxy" | "rename" | "remove";
+export type CardActionKey = "clear" | "next" | "default" | "toggle" | "usage" | "api" | "azure" | "bedrock" | "proxy" | "sessions" | "rename" | "remove";
 
 /** Which buttons an account's card shows, in order. The card gives each its icon, label and handler. */
 export function cardActions(
-  account: Pick<AccountView, "family" | "kind" | "auth" | "status" | "disabled" | "isDefault" | "nextAgentUntil" | "apiEditable" | "proxyEditable" | "azure" | "bedrock">,
+  account: Pick<AccountView, "family" | "kind" | "auth" | "status" | "disabled" | "isDefault" | "nextAgentUntil" | "apiEditable" | "proxyEditable" | "azure" | "bedrock"> &
+    Partial<Pick<AccountView, "sessionsShared">>,
 ): CardActionKey[] {
   const disabled = isDisabled(account);
   const signedOut = account.status === "signed_out";
@@ -24,6 +25,8 @@ export function cardActions(
   else if (account.bedrock) keys.push("bedrock");
   else if (account.auth === "api" || account.apiEditable) keys.push("api");
   if (account.proxyEditable) keys.push("proxy");
+  // Only an added Claude account's can be shared, and an older server doesn't say.
+  if (typeof account.sessionsShared === "boolean") keys.push("sessions");
   keys.push("rename");
   if (account.kind !== "main") keys.push("remove");
   return keys;
@@ -36,7 +39,7 @@ export const INLINE_CARD_ACTIONS = 3;
 const INLINE_FIRST: readonly CardActionKey[] = ["clear", "usage", "default", "next"];
 
 /**
- * A wide card's buttons sit beside the account's name, and eight of them leave the name little
+ * A wide card's buttons sit beside the account's name, and nine of them leave the name little
  * room. So up to `INLINE_CARD_ACTIONS` stay there and the rest open from "…" into a row under it.
  * One button more than that fits as well as "…" does, so then they all stay. Both keep the card's order.
  */

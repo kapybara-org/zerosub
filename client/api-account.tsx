@@ -5,6 +5,7 @@ import { useCallback, useMemo, useState, type ReactNode } from "react";
 import { Text, View } from "react-native";
 import { onAnthropicApi, type AccountView, type ApiKeyKind, type TrafficSwitches } from "../shared/model";
 import { addApiAccount, updateApiAccount } from "../shared/rpc";
+import { SessionsSwitch } from "./sessions-switch";
 import { describe, useStore, type ZeroSubStore } from "./store";
 import { Button, useText } from "./ui";
 
@@ -43,6 +44,7 @@ export function ApiAccountForm({
   const [key, setKey] = useState("");
   const [baseUrl, setBaseUrl] = useState(current?.baseUrl ?? "");
   const [proxy, setProxy] = useState("");
+  const [shareSessions, setShareSessions] = useState(false);
   const [switches, setSwitches] = useState<TrafficSwitches>({
     disableTelemetry: current?.disableTelemetry ?? false,
     disableErrorReporting: current?.disableErrorReporting ?? false,
@@ -70,6 +72,7 @@ export function ApiAccountForm({
           label: label.trim(),
           key: key.trim(),
           proxy: proxy.trim() || undefined,
+          shareSessions: shareSessions || undefined,
         });
         await store.refresh();
         onDone(result.accountId);
@@ -79,7 +82,7 @@ export function ApiAccountForm({
     } finally {
       setSaving(false);
     }
-  }, [ready, keyKind, baseUrl, switches, account, store, key, label, proxy, onDone]);
+  }, [ready, keyKind, baseUrl, switches, account, store, key, label, proxy, shareSessions, onDone]);
 
   const inputStyle = useMemo(
     () => ({
@@ -160,6 +163,7 @@ export function ApiAccountForm({
           {input({ value: proxy, onChangeText: setProxy, placeholder: "http://127.0.0.1:7890", label: "Proxy URL", maxLength: 2048 })}
         </Field>
       )}
+      {editing ? null : <SessionsSwitch value={shareSessions} onValueChange={setShareSessions} />}
       <View style={{ gap: 6 }}>
         <Text style={text.strong}>Traffic to Anthropic</Text>
         <Text style={text.small}>
