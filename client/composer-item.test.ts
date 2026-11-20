@@ -32,6 +32,7 @@ vi.mock("react", async (importOriginal) => ({
   useEffect: () => undefined,
   useState: <T,>(initial: T) => [initial, () => undefined],
   useMemo: <T,>(make: () => T) => make(),
+  useCallback: <T,>(callback: T) => callback,
 }));
 vi.mock("./store", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./store")>()),
@@ -522,6 +523,18 @@ describe("a running agent's control, as the account button shows it", () => {
     // With the preference off, as before.
     app.compact = false;
     expect(setUp(running([main, work], {}, { keepComposerPill: false }), { context: "agent", metadata: named }).render()?.type).toBe("Select");
+  });
+
+  it("checks whether it's on screen whenever its view is laid out, as when its tab comes into view", () => {
+    app.Combobox = "Combobox";
+    for (const compact of [false, true]) {
+      app.compact = compact;
+      const { items } = setUp(running([main, work]), { context: "agent", metadata: named });
+      let element = items[0]!.Component(host());
+      while (element && typeof element.type === "function") element = (element.type as (props: unknown) => typeof element)(element.props);
+      expect(element?.type).toBe("View");
+      expect(typeof element?.props.onLayout).toBe("function");
+    }
   });
 
   it("is Paseo's own control in the native apps, also where the composer isn't compact (a tablet, a phone on its side)", () => {

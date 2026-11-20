@@ -1,12 +1,12 @@
 import type { PluginClientContext, PluginHostProps } from "@getpaseo/plugin/client";
 import * as paseoClient from "@getpaseo/plugin/client";
 import * as paseoUi from "@getpaseo/plugin/client/ui";
-import { useEffect, useMemo, useRef, useState, type ComponentType } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { View } from "react-native";
 import { accountPeak, formatCredits, formatPercent, isDisabled, paceVerdict, pillText } from "../shared/format";
 import { ACCOUNT_METADATA_KEY, AGENT_METADATA_KEY, HAND_OFF, type AccountView, type StateView } from "../shared/model";
 import { AccountPillButton } from "./account-pill-button";
-import { inDialog, onScreen, setControlShown } from "./control-visibility";
+import { watchControl } from "./control-visibility";
 import { accountName, agentMenu, pillLabel, pillTitle, usageLine } from "./pills";
 import { moveAgent, useStore, type ZeroSubStore } from "./store";
 
@@ -225,7 +225,7 @@ export function contributeComposerItem(client: PluginClientContext, store: ZeroS
   };
 
   const AgentControl = ({ state, agentId, provider, choices, host }: { state: StateView; agentId: string; provider: string | null; choices: AccountChoices; host: PluginHostProps }) => {
-    const { ref, inSheet } = useControlShown(agentId);
+    const { ref, inSheet, onLayout } = useControlShown(agentId);
     const Menu = useMemo(() => (provider ? agentMenu(client, store, { id: agentId, provider }) : null), [agentId, provider]);
     // As the account button shows it. Off a phone, on the web, the button itself: a pill that says
     // the usage and opens the button's own menu above it, which Paseo's lists can't draw (an entry a
@@ -237,13 +237,13 @@ export function contributeComposerItem(client: PluginClientContext, store: ZeroS
     // In the composer's sheet (a dialog of Paseo's), the list below too: see `inDialog`.
     if (face && Menu && host.layout.platform === "web" && !host.layout.compact && !inSheet) {
       return (
-        <View ref={ref} collapsable={false}>
+        <View ref={ref} collapsable={false} onLayout={onLayout}>
           <AccountPillButton host={host} agentId={agentId} title={face.tooltip} icon={face.icon} label={face.value.label} Menu={Menu} />
         </View>
       );
     }
     return (
-      <View ref={ref} collapsable={false}>
+      <View ref={ref} collapsable={false} onLayout={onLayout}>
         {face && Combobox ? (
           <Combobox
             title="Account"
@@ -307,25 +307,19 @@ const VISIBILITY_CHECK_MS = 500;
  */
 function useControlShown(agentId: string) {
   const ref = useRef<View>(null);
+  const watch = useRef<{ check(): void } | null>(null);
   const [inSheet, setInSheet] = useState(false);
   useEffect(() => {
-    const mount = {};
-    let last: boolean | null = null;
-    const check = () => {
-      setInSheet(inDialog(ref.current));
-      const visible = onScreen(ref.current);
-      if (visible === last) return;
-      last = visible;
-      setControlShown(agentId, mount, visible);
-    };
-    check();
-    const timer = setInterval(check, VISIBILITY_CHECK_MS);
+    const watcher = watchControl(agentId, () => ref.current, setInSheet, VISIBILITY_CHECK_MS);
+    watch.current = watcher;
     return () => {
-      clearInterval(timer);
-      setControlShown(agentId, mount, false);
+      watch.current = null;
+      watcher.stop();
     };
   }, [agentId]);
-  return { ref, inSheet };
+  // Laid out again as its tab comes into view or leaves it: checked then, not only on the timer.
+  const onLayout = useCallback(() => watch.current?.check(), []);
+  return { ref, inSheet, onLayout };
 }
 
 /** The entries whose name or usage has `query` in it, all of them for none. */

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { controlShown, forgetControlsShown, inDialog, onScreen, setControlShown, subscribeControlShown } from "./control-visibility";
+import { controlShown, forgetControlsShown, inDialog, onScreen, setControlShown, subscribeControlShown, watchControl } from "./control-visibility";
 
 afterEach(() => forgetControlsShown());
 
@@ -53,5 +53,34 @@ describe("which agents' Account controls are on screen", () => {
     // A phone app's view can't say.
     expect(inDialog({})).toBe(false);
     expect(inDialog(null)).toBe(false);
+  });
+
+  it("checks a mount at once, on the timer, and whenever asked (its view's onLayout), until stopped", () => {
+    vi.useFakeTimers();
+    try {
+      let visible = true;
+      const node = { checkVisibility: () => visible, closest: () => null };
+      const inSheet = vi.fn();
+      const watcher = watchControl("a", () => node, inSheet, 500);
+      expect(controlShown("a")).toBe(true);
+      expect(inSheet).toHaveBeenLastCalledWith(false);
+      // Its tab goes out of view: seen when it's laid out again, without waiting for the timer.
+      visible = false;
+      watcher.check();
+      expect(controlShown("a")).toBe(false);
+      visible = true;
+      vi.advanceTimersByTime(499);
+      expect(controlShown("a")).toBe(false);
+      vi.advanceTimersByTime(1);
+      expect(controlShown("a")).toBe(true);
+      // Gone: reported as not shown, and neither the timer nor a late layout brings it back.
+      watcher.stop();
+      expect(controlShown("a")).toBe(false);
+      watcher.check();
+      vi.advanceTimersByTime(1_000);
+      expect(controlShown("a")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
