@@ -31,6 +31,42 @@ export function subscribeControlShown(listener: () => void): () => void {
   };
 }
 
+/**
+ * Watches one mount of `agentId`'s control: reports whether it's on screen (`setControlShown`) and
+ * whether it's in one of Paseo's dialogs (`inSheet`), now, every `everyMs` (Paseo moves it without
+ * telling), and whenever `check` is called. Its view calls that from `onLayout`, so a tab that comes
+ * into view or goes out of it is seen at once, not up to `everyMs` later with both the account
+ * button and the control showing. `stop` reports it gone.
+ */
+export function watchControl(
+  agentId: string,
+  node: () => unknown,
+  inSheet: (inside: boolean) => void,
+  everyMs: number,
+): { check(): void; stop(): void } {
+  const mount = {};
+  let last: boolean | null = null;
+  let stopped = false;
+  const check = () => {
+    if (stopped) return;
+    inSheet(inDialog(node()));
+    const visible = onScreen(node());
+    if (visible === last) return;
+    last = visible;
+    setControlShown(agentId, mount, visible);
+  };
+  check();
+  const timer = setInterval(check, everyMs);
+  return {
+    check,
+    stop() {
+      stopped = true;
+      clearInterval(timer);
+      setControlShown(agentId, mount, false);
+    },
+  };
+}
+
 /** For tests. */
 export function forgetControlsShown(): void {
   shown.clear();
