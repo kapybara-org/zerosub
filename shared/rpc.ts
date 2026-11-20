@@ -229,7 +229,8 @@ export type ReopenSummary = z.infer<typeof ReopenSummarySchema>;
 /** `movedAgents`: how many agents ran on the account. `moves`: how moving them went (older servers don't say). */
 export const removeAccount = defineRpc({
   name: "zerosub.accounts.remove",
-  input: z.object({ accountId: z.string() }),
+  /** `signOut`: also sign out an account whose folder stays (one kept outside ZeroSub's own); an older server ignores it. */
+  input: z.object({ accountId: z.string(), signOut: z.boolean().optional() }),
   output: z.object({ ok: z.literal(true), movedAgents: z.number(), moves: ReopenSummarySchema.optional() }),
 });
 

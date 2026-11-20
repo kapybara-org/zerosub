@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readdir, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -174,6 +174,122 @@ describe("cleaning up homes", () => {
     expect(await exists(victim)).toBe(true);
     expect((await store.read()).cleanup).toEqual({});
     errors.mockRestore();
+  });
+
+  describe("a removed account's folder kept outside homes/", () => {
+    const outside = () => join(root, "elsewhere", "claude-work");
+    const kept = () => ({ ...account("claude-aaaaaaaaaaaa"), home: outside() });
+
+    it("stays signed in unless the user asks to sign it out", async () => {
+      await mkdir(outside(), { recursive: true });
+      const { service, store, loggedOut, paseo } = await setUp({ accounts: [kept()] as never });
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      await service.remove(paseo, "claude-aaaaaaaaaaaa");
+      await service.cleanUpHomes(paseo);
+      expect(loggedOut).toEqual([]);
+      expect(await exists(outside())).toBe(true);
+      expect((await store.read()).cleanup).toEqual({});
+    });
+
+    it("is signed out when asked, and never deleted", async () => {
+      await mkdir(outside(), { recursive: true });
+      const { service, store, loggedOut, paseo } = await setUp({ accounts: [kept()] as never });
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      await service.remove(paseo, "claude-aaaaaaaaaaaa", true);
+      expect((await store.read()).cleanup[outside()]).toMatchObject({ why: "removed", signOutOnly: true });
+      await service.cleanUpHomes(paseo);
+      expect(loggedOut).toEqual([outside()]);
+      expect(await exists(outside())).toBe(true);
+      expect((await store.read()).cleanup).toEqual({});
+    });
+
+    it("keeps its folder even once signing out keeps failing", async () => {
+      await mkdir(outside(), { recursive: true });
+      const { service, store, paseo } = await setUp({ accounts: [kept()] as never }, { signingOut: async () => Promise.reject(new Error("no network")) });
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      await service.remove(paseo, "claude-aaaaaaaaaaaa", true);
+      for (let pass = 0; pass < 5; pass++) await service.cleanUpHomes(paseo);
+      expect(await exists(outside())).toBe(true);
+      expect((await store.read()).cleanup).toEqual({});
+    });
+
+    it("gives up, keeping its folder, when it still reads as signed in after signing out", async () => {
+      await mkdir(outside(), { recursive: true });
+      // `claude auth logout` failing on Linux, say, without throwing.
+      const { service, store, loggedOut, paseo } = await setUp({ accounts: [kept()] as never }, { signedIn: () => true });
+      const logs = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      await service.remove(paseo, "claude-aaaaaaaaaaaa", true);
+      for (let pass = 0; pass < 2; pass++) await service.cleanUpHomes(paseo);
+      expect((await store.read()).cleanup[outside()]).toMatchObject({ signOutOnly: true });
+      expect(logs.mock.calls.flat().join("\n")).not.toContain(`signed out ${outside()}`);
+      await service.cleanUpHomes(paseo);
+      expect(loggedOut).toEqual([outside(), outside(), outside()]);
+      expect(logs.mock.calls.flat().join("\n")).toContain(`gave up signing out ${outside()}, so its sign-in may still be valid; its folder stays`);
+      expect(await exists(outside())).toBe(true);
+      expect((await store.read()).cleanup).toEqual({});
+    });
+
+    it("records nothing to sign out for a Claude API account, whose key is in the folder", async () => {
+      await mkdir(outside(), { recursive: true });
+      const { service, store, loggedOut, paseo } = await setUp({ accounts: [{ ...kept(), auth: "api" }] as never });
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      await service.remove(paseo, "claude-aaaaaaaaaaaa", true);
+      expect((await store.read()).cleanup).toEqual({});
+      await service.cleanUpHomes(paseo);
+      expect(loggedOut).toEqual([]);
+      expect(await exists(outside())).toBe(true);
+    });
+
+    it("never signs out a CLI's own login through a link to it", async () => {
+      const previous = process.env.CLAUDE_CONFIG_DIR;
+      const cli = join(root, "cli-claude");
+      const link = join(root, "elsewhere", "claude-link");
+      process.env.CLAUDE_CONFIG_DIR = cli;
+      try {
+        await mkdir(cli, { recursive: true });
+        await mkdir(join(root, "elsewhere"), { recursive: true });
+        await symlink(cli, link);
+        // Removed with "Also sign it out": nothing is recorded.
+        const { service, store, loggedOut, paseo } = await setUp({ accounts: [{ ...kept(), home: link }] as never });
+        vi.spyOn(console, "log").mockImplementation(() => undefined);
+        await service.remove(paseo, "claude-aaaaaaaaaaaa", true);
+        expect((await store.read()).cleanup).toEqual({});
+        // Listed anyway (a hand edit, say): the entry is dropped.
+        await store.update((draft) => {
+          draft.cleanup[link] = { family: "claude", accountId: "claude-aaaaaaaaaaaa", why: "removed", at: "x", signOutOnly: true };
+        });
+        vi.spyOn(console, "error").mockImplementation(() => undefined);
+        await service.cleanUpHomes(paseo);
+        expect(loggedOut).toEqual([]);
+        expect(await exists(cli)).toBe(true);
+        expect((await store.read()).cleanup).toEqual({});
+      } finally {
+        if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+        else process.env.CLAUDE_CONFIG_DIR = previous;
+      }
+    });
+
+    it("never signs out a CLI's own login, even listed to be", async () => {
+      const previous = process.env.CLAUDE_CONFIG_DIR;
+      const cli = join(root, "cli-claude");
+      process.env.CLAUDE_CONFIG_DIR = cli;
+      try {
+        await mkdir(cli, { recursive: true });
+        const { service, store, loggedOut, paseo } = await setUp({
+          cleanup: { [cli]: { family: "claude", accountId: "claude-aaaaaaaaaaaa", why: "removed", at: "x", signOutOnly: true } },
+        });
+        vi.spyOn(console, "error").mockImplementation(() => undefined);
+        await service.cleanUpHomes(paseo);
+        expect(loggedOut).toEqual([]);
+        expect(await exists(cli)).toBe(true);
+        expect((await store.read()).cleanup).toEqual({});
+      } finally {
+        if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+        else process.env.CLAUDE_CONFIG_DIR = previous;
+      }
+    });
   });
 
   it("drops the entry, signing nothing out, once an account uses the home again", async () => {

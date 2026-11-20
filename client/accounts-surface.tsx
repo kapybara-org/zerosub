@@ -25,7 +25,7 @@ import { PaceSection } from "./pace";
 import { ResetConfirm, redeemToast, resetBadge } from "./reset-confirm";
 import { describe, stoppedWaiting, useStore, VISIBLE_POLL_MS, type ZeroSubStore } from "./store";
 import { Badge, Button, Card, IconButton, UsageBar, useText, type TooltipAlign } from "./ui";
-import { cardActions, splitCardActions, claudeCardDetails, removeText, type CardActionKey } from "./card-actions";
+import { cardActions, splitCardActions, claudeCardDetails, offersSignOut, removeText, type CardActionKey } from "./card-actions";
 
 type Theme = PluginSurfaceProps["theme"];
 
@@ -364,6 +364,8 @@ function AccountCard({
   const [moreActions, setMoreActions] = useState(false);
   // Moving the sessions folder copies and renames files, so the card's button asks first.
   const [confirmSessions, setConfirmSessions] = useState(false);
+  // Asked in the Remove dialog of an account whose folder stays; off each time it opens.
+  const [signOut, setSignOut] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const resets = account.usage?.resets ?? null;
   const credits = account.usage?.credits ?? null;
@@ -470,8 +472,13 @@ function AccountCard({
   const remove = useCallback(async () => {
     setBusy("remove");
     try {
-      const result = await store.rpc(removeAccount, { accountId: account.id });
-      const removed = account.externalHome ? `Removed ${account.label} from ZeroSub; its sign-in and files are kept` : `Removed ${account.label}`;
+      const signingOut = signOut && offersSignOut(account);
+      const result = await store.rpc(removeAccount, { accountId: account.id, ...(signingOut ? { signOut: true } : {}) });
+      const removed = !account.externalHome
+        ? `Removed ${account.label}`
+        : signingOut
+          ? `Removed ${account.label} from ZeroSub; it's signed out once no agent runs on it, and its files are kept`
+          : `Removed ${account.label} from ZeroSub; its sign-in and files are kept`;
       // An older server only says how many agents ran on it, not how moving them went.
       const message = result.moves
         ? describeReopen(removed, result.moves)
@@ -494,7 +501,7 @@ function AccountCard({
       setBusy(null);
       setConfirmRemove(false);
     }
-  }, [account, store, toast]);
+  }, [account, signOut, store, toast]);
 
   const offered: Record<CardActionKey, CardAction> = {
     clear: {
@@ -581,7 +588,10 @@ function AccountCard({
           : "Remove: sign it out and delete its saved login",
       tone: "danger",
       busy: busy === "remove",
-      onPress: () => setConfirmRemove(true),
+      onPress: () => {
+        setSignOut(false);
+        setConfirmRemove(true);
+      },
     },
   };
   const keys = cardActions(account);
@@ -865,8 +875,19 @@ function AccountCard({
       <Modal title={`Remove ${account.label}?`} open={confirmRemove} onOpenChange={setConfirmRemove}>
         <Modal.Content>
           <Text style={text.body}>
-            {removeText(account).body}
+            {removeText(account, signOut).body}
           </Text>
+          {offersSignOut(account) ? (
+            <SettingsCard>
+              <SettingsSwitch
+                label="Also sign it out"
+                hint="Off, it stays signed in, so its terminal script still works and it can be added back. On, it's signed out on this machine once no agent runs on it. Its folder stays either way."
+                value={signOut}
+                disabled={busy === "remove"}
+                onValueChange={setSignOut}
+              />
+            </SettingsCard>
+          ) : null}
           <View style={{ flexDirection: "row", gap: 8, justifyContent: "flex-end" }}>
             <Button theme={theme} label="Cancel" tooltip="Keep this account" tooltipAlign="end" onPress={() => setConfirmRemove(false)} />
             <Button
@@ -874,7 +895,7 @@ function AccountCard({
               tone="danger"
               icon="Trash2"
               label="Remove"
-              tooltip={removeText(account).tooltip}
+              tooltip={removeText(account, signOut).tooltip}
               tooltipAlign="end"
               busy={busy === "remove"}
               onPress={() => void remove()}

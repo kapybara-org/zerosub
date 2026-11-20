@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AccountView } from "../shared/model";
-import { cardActions, claudeCardDetails, removeText, splitCardActions } from "./card-actions";
+import { cardActions, claudeCardDetails, offersSignOut, removeText, splitCardActions } from "./card-actions";
 
 type CardAccount = Parameters<typeof cardActions>[0];
 
@@ -103,6 +103,23 @@ describe("a card's details and Remove dialog with Grok and Cursor", () => {
     const outside = removeText(removable("claude", { externalHome: true, home: "/x/claude-work", launcher: "claude-work.sh" }));
     expect(outside.body).toContain("only removes the account from ZeroSub");
     expect(outside.tooltip).toContain("ZeroSub");
+  });
+
+  it("asks about signing out only where the folder stays, and says what happens either way", () => {
+    const outside = removable("claude", { externalHome: true, home: "/x/claude-work", launcher: "claude-work.sh" });
+    expect(offersSignOut(outside)).toBe(true);
+    expect(offersSignOut(removable("claude"))).toBe(false);
+    // A Pi account's key is in its folder, which stays.
+    expect(offersSignOut(removable("pi", { externalHome: true }))).toBe(false);
+    // Nor a Claude API account's: its key is in the folder too (settings.account.json, settings.json).
+    expect(offersSignOut(removable("claude", { externalHome: true, auth: "api" }))).toBe(false);
+    expect(removeText(outside).body).toContain("its sign-in, its files and its terminal script claude-work.sh stay as they are");
+    const signingOut = removeText(outside, true);
+    expect(signingOut.body).toContain("signs it out on this machine once no agent runs on it");
+    expect(signingOut.body).toContain("its files and its terminal script claude-work.sh stay.");
+    expect(signingOut.tooltip).toContain("Remove it from ZeroSub and sign it out");
+    // Where it isn't asked, it changes nothing.
+    expect(removeText(removable("pi", { externalHome: true }), true)).toEqual(removeText(removable("pi", { externalHome: true })));
   });
 
   it("says an API account's key is deleted, not signed out", () => {
