@@ -100,6 +100,7 @@ function setUp(aws: BedrockHost = fakeAws(), claude: FamilyAdapter = claudeAdapt
   const reopener = { locate: async () => null, reopen: async () => ({ ok: true as const }) } as unknown as Reopener;
   const apiUsage = new ApiUsageStore(join(root, "paseo", "zerosub", "api-usage.json"));
   const service = new Service({ claude, codex: { ...absentPi(), family: "codex" } as FamilyAdapter, pi: absentPi() }, store, families, reopener, apiUsage, aws);
+  service.signOutRecheckMs = 0;
   services.push(service);
   return { service, store, apiUsage };
 }
