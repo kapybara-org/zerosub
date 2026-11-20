@@ -21,6 +21,7 @@ import { accountMenu, type MenuEntry } from "./account-menu";
 import { forkPopover, openCodeForkPopover } from "./fork-confirm";
 import { resetPopover } from "./reset-confirm";
 import { stoppedWaiting, type ZeroSubStore } from "./store";
+import { controlShown, subscribeControlShown } from "./control-visibility";
 
 /** The most agents Paseo returns per page. */
 const PAGE_SIZE = 200;
@@ -65,6 +66,9 @@ type MoveStarted = (move: Move, answer: Promise<unknown>) => void;
  * of that provider's accounts. Pills only appear once a provider has more than one account, so a
  * single-account setup looks exactly like stock Paseo. With `inComposer`, the Account control in
  * the composer shows the account instead, and a pill appears only to offer a way out of a limit.
+ * While `keepComposerPill` is on (the default): the pill steps back only while the control
+ * is on screen, and shows where it isn't (a composer too narrow for it, which Paseo then moves to the
+ * composer's sheet, as on a phone), so the account shows once either way.
  */
 export function contributePills(client: PluginClientContext, store: ZeroSubStore, inComposer = false): () => void {
   const agents = new Map<string, TrackedAgent>();
@@ -136,6 +140,8 @@ export function contributePills(client: PluginClientContext, store: ZeroSubStore
   }
 
   const unsubscribeStore = store.subscribe(sync);
+  // A control coming on screen or going off it changes which agents get the button.
+  const unsubscribeControls = subscribeControlShown(sync);
 
   const track = (agent: { id: string; workspaceId?: string | null; provider: string }) => {
     if (!agent.workspaceId) return;
@@ -205,6 +211,7 @@ export function contributePills(client: PluginClientContext, store: ZeroSubStore
     if (lookAgain) clearTimeout(lookAgain);
     lifetime.abort();
     unsubscribeStore();
+    unsubscribeControls();
     for (const pill of pills.values()) pill.registration.remove();
     pills.clear();
   };
@@ -219,6 +226,18 @@ function pillMenu(client: PluginClientContext, store: ZeroSubStore, agent: Track
     const standing = standingOf(state, agent, inComposer);
     return standing ? menuEntries(client, store, state, standing, agent, moveStarted) : [];
   });
+}
+
+/**
+ * The account button's menu for `agent`, for the Account control to open in its place
+ * where the control shows instead of the button (see composer-item.tsx). The menu is whole there:
+ * nothing steps back for the control it opens from.
+ */
+export function agentMenu(client: PluginClientContext, store: ZeroSubStore, agent: { id: string; provider: string }) {
+  const tracked: TrackedAgent = { id: agent.id, workspaceId: "", provider: agent.provider };
+  // The control reads a move under way from the state, so it only needs that refreshed.
+  const moveStarted: MoveStarted = (_move, answer) => void answer.catch(() => undefined).then(() => store.refresh());
+  return pillMenu(client, store, tracked, moveStarted, false);
 }
 
 /** Where `agent` stands, or null when it gets no pill; `inComposer` as for `contributePills`. */
@@ -255,8 +274,11 @@ function standingOf(state: StateView, agent: TrackedAgent, inComposer: boolean):
   // Where the composer has the Account control (see composer-item.tsx), the account stays there for
   // a running agent too. The button is then only for what a control can't offer, each needing a
   // confirmation: continuing on OpenCode, or the way out of a limit. Or it stands in for an agent
-  // the control can't show for.
-  if (inComposer && state.agentMetadata && route?.inComposer !== false && !(offerOpenCode || (current.status === "limited" && (offerReset || offerFork)))) return null;
+  // the control can't show for. While `keepComposerPill` is on, only while the control is
+  // on screen, so the account shows once whether or not the composer has room for the control.
+  const control = inComposer && state.agentMetadata && route?.inComposer !== false;
+  const stepsBack = control && (!state.keepComposerPill || controlShown(agent.id));
+  if (stepsBack && !(offerOpenCode || (current.status === "limited" && (offerReset || offerFork)))) return null;
 
   return { family, accounts, route, current, offerReset, other, offerFork, offerOpenCode, autoSwitch: state.autoSwitch };
 }
@@ -277,19 +299,40 @@ function faceFor(state: StateView, { accounts, route, current }: Standing, movin
   if (moving && target !== current.id && !route?.pendingAccountId) {
     return { label: `${shortLabel(current, 12)} → ${shortLabel(moving, 12)}`, title: `Moving to ${moving.label}…`, icon };
   }
+  return { label: pillLabel(state, current, route, now), title: pillTitle(state, current, route, now), icon };
+}
+
+/**
+ * What the account button says: the account's usage without percent signs (`5h 17 · 7d 37`), else
+ * its name, or both accounts while a move is under way. The Account control says the same
+ * for a running agent (see composer-item.tsx).
+ */
+export function pillLabel(state: StateView, current: AccountView, route: StateView["agents"][number] | undefined, now: number): string {
   const running = route?.pendingAccountId ? state.accounts.find((account) => account.id === route.pendingAccountId) : undefined;
   const text = pillText(current, running ?? null, route?.waiting ?? (state.canReopen ? "idle" : "restart"));
   const windows = running ? [] : shownWindows(current, now);
+  return windows.length > 0 ? windows.map(({ name, percent }) => `${name} ${formatPercent(percent).slice(0, -1)}`).join(" · ") : text.label;
+}
+
+/**
+ * What the account button's tooltip says outside a move started here: the Account control
+ * says the same for a running agent (see composer-item.tsx).
+ */
+export function pillTitle(state: StateView, current: AccountView, route: StateView["agents"][number] | undefined, now: number): string {
+  const running = route?.pendingAccountId ? state.accounts.find((account) => account.id === route.pendingAccountId) : undefined;
+  const text = pillText(current, running ?? null, route?.waiting ?? (state.canReopen ? "idle" : "restart"));
+  const windows = running ? [] : shownWindows(current, now);
+  return titleFor(text.title, windows, running ?? current, now);
+}
+
+/** The button's tooltip: the account, a line per window, and the address Anthropic sees. */
+function titleFor(first: string, windows: ReturnType<typeof shownWindows>, account: AccountView, now: number): string {
   const details = windows.map(({ name, percent, resetsAt }) => {
     const at = formatResetAt(resetsAt, now);
     return `${name} ${formatPercent(percent)}${at ? ` · resets in ${formatCountdown(resetsAt, now)} (${at})` : ""}`;
   });
-  const ip = egressText((running ?? current).egress, now);
-  return {
-    label: windows.length > 0 ? windows.map(({ name, percent }) => `${name} ${formatPercent(percent).slice(0, -1)}`).join(" · ") : text.label,
-    title: [text.title, ...details, ...(ip ? [ip] : [])].join("\n"),
-    icon,
-  };
+  const ip = egressText(account.egress, now);
+  return [first, ...details, ...(ip ? [ip] : [])].join("\n");
 }
 
 /** The agent's menu: the provider's accounts, a way out when it's stuck on a limit, and the rest. */
@@ -414,7 +457,7 @@ function menuEntries(
  * an account the provider reports no usage for (an API account, a Grok or Cursor account, any Pi
  * account; see `reportsUsage`) has none.
  */
-function usageLine(account: AccountView, now: number): string | null {
+export function usageLine(account: AccountView, now: number): string | null {
   const windows = shownWindows(account, now);
   const credits = account.status === "signed_out" ? null : (account.usage?.credits ?? null);
   const creditsText = credits ? ` · ${formatCredits(credits)}` : "";
@@ -430,7 +473,7 @@ function usageLine(account: AccountView, now: number): string | null {
 }
 
 /** The account, and why it can't be used, if it can't. */
-function accountName(state: StateView, account: AccountView, now: number): string {
+export function accountName(state: StateView, account: AccountView, now: number): string {
   if (account.status === "signed_out") return `${account.label} (signed out${account.disabled ? ", disabled" : ""})`;
   if (isDisabled(account)) return `${account.label} (disabled)`;
   if (account.status === "limited") {

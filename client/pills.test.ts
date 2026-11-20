@@ -1,9 +1,11 @@
 import type { PluginButton, PluginClientContext } from "@getpaseo/plugin/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AccountView, StateView } from "../shared/model";
+import { preferences } from "../shared/preferences";
 import { setAgentAccount } from "../shared/rpc";
 import type { MenuEntry } from "./account-menu";
-import { contributePills } from "./pills";
+import { forgetControlsShown, setControlShown } from "./control-visibility";
+import { agentMenu, contributePills } from "./pills";
 import { resetPopover } from "./reset-confirm";
 import type { StoreSnapshot, ZeroSubStore } from "./store";
 
@@ -83,6 +85,7 @@ function view(accounts: AccountView[], overrides: Partial<StateView> = {}, provi
     piLaunchers: null,
     piHomes: null,
     showComposerPill: true,
+    keepComposerPill: true,
     openCodeAvailable: false,
     autoSwitch: false,
     autoContinue: true,
@@ -421,11 +424,12 @@ describe("account pills", () => {
 });
 
 /** Whether one Claude agent on `work`, with `home` to move to, gets a pill, and its menu if it does. */
-async function buttons(options: { inComposer: boolean; agentMetadata?: boolean; route?: Partial<StateView["agents"][number]> | null; work?: Partial<AccountView>; openCodeAvailable?: boolean }) {
+async function buttons(options: { inComposer: boolean; keep?: boolean; agentMetadata?: boolean; route?: Partial<StateView["agents"][number]> | null; work?: Partial<AccountView>; openCodeAvailable?: boolean }) {
   const state = view([account("work", { isDefault: true, ...options.work }), account("home")], {
     openCodeAvailable: options.openCodeAvailable ?? false,
     autoSwitch: true,
     agentMetadata: options.agentMetadata,
+    keepComposerPill: options.keep ?? false,
   });
   const agents = options.route === null ? [] : state.agents.map((route) => ({ ...route, ...options.route }));
   const pill = await harness({ ...state, agents }, "claude", options.inComposer);
@@ -435,7 +439,10 @@ async function buttons(options: { inComposer: boolean; agentMetadata?: boolean; 
 
 describe("the account button, where the composer has the Account control", () => {
   beforeEach(() => void vi.useFakeTimers());
-  afterEach(() => vi.useRealTimers());
+  afterEach(() => {
+    vi.useRealTimers();
+    forgetControlsShown();
+  });
 
   it("steps back for a running agent, also one the daemon hasn't listed yet", async () => {
     expect((await buttons({ inComposer: true, agentMetadata: true, route: { inComposer: true } })).count).toBe(0);
@@ -469,6 +476,47 @@ describe("the account button, where the composer has the Account control", () =>
     expect(kept.ids).toContain("fork-opencode");
     // Also for an agent the daemon hasn't listed yet.
     expect((await buttons({ inComposer: true, agentMetadata: true, route: null, openCodeAvailable: true })).count).toBe(1);
+  });
+
+  // The control shows only the account's name, and on a phone it sits in a sheet.
+  // With keepComposerPill on, the button steps back only while the control is on screen.
+  it("stays for a running agent while keepComposerPill is on and its control isn't on screen", async () => {
+    expect((await buttons({ inComposer: true, keep: true, agentMetadata: true, route: { inComposer: true } })).count).toBe(1);
+    expect((await buttons({ inComposer: true, keep: true, agentMetadata: true, route: null })).count).toBe(1);
+    expect((await buttons({ inComposer: true, keep: true, agentMetadata: true, route: { inComposer: true }, work: { status: "limited" } })).count).toBe(1);
+  });
+
+  it("steps back while the control is on screen, and comes back when it goes off", async () => {
+    const state = view([account("work", { isDefault: true }), account("home")], { autoSwitch: true, agentMetadata: true, keepComposerPill: true });
+    const pill = await harness(state, "claude", true);
+    expect(pill.client.addComposerPill).toHaveBeenCalledTimes(1);
+    // The toolbar's control and a split pane's: the agent counts as shown while either is.
+    const toolbar = {};
+    const pane = {};
+    setControlShown(AGENT, toolbar, true);
+    setControlShown(AGENT, pane, true);
+    expect(pill.registration.remove).toHaveBeenCalledTimes(1);
+    setControlShown(AGENT, toolbar, false);
+    expect(pill.client.addComposerPill).toHaveBeenCalledTimes(1);
+    // The window narrows and Paseo moves the control into the composer's sheet.
+    setControlShown(AGENT, pane, false);
+    expect(pill.client.addComposerPill).toHaveBeenCalledTimes(2);
+    // With the preference off it steps back as before, on screen or not.
+    pill.publish({ ...state, keepComposerPill: false });
+    expect(pill.registration.remove).toHaveBeenCalledTimes(2);
+    pill.stop();
+  });
+
+  it("still offers the way out of a limit while the control is on screen", async () => {
+    const resets = { available: 1, usableNow: true, expiresAt: null };
+    const usage = { fetchedAt: "2026-11-09T12:00:00Z", windows: [], error: null, cached: false, resets, credits: null } as unknown as AccountView["usage"];
+    setControlShown(AGENT, {}, true);
+    expect((await buttons({ inComposer: true, keep: true, agentMetadata: true, route: { inComposer: true }, work: { status: "limited", usage } })).count).toBe(1);
+    expect((await buttons({ inComposer: true, keep: true, agentMetadata: true, route: { inComposer: true } })).count).toBe(0);
+  });
+
+  it("keeps the pill unless the preference was turned off", () => {
+    expect(preferences.schema.parse({}).keepComposerPill).toBe(true);
   });
 });
 
@@ -589,5 +637,25 @@ describe("the OpenCode entry", () => {
     const pill = await harness(view([account("solo", { family: "codex", isDefault: true })], openCode, "codex"), "codex");
     expect(pill.client.addComposerPill).not.toHaveBeenCalled();
     pill.stop();
+  });
+});
+
+// The Account control opens the account button's own menu where it shows instead.
+describe("the account button's menu, opened from the Account control", () => {
+  afterEach(() => forgetControlsShown());
+
+  it("lists the accounts as the button does, whole while the control is on screen, and moves the agent", async () => {
+    const state = view([account("work", { isDefault: true, usage: used(20) }), account("home", { usage: used(31) })], { agentMetadata: true, keepComposerPill: true });
+    setControlShown(AGENT, {}, true);
+    const rpc = vi.fn(async () => ({ reopened: [AGENT], deferred: [], failed: [], pending: [], continuedIn: null }));
+    const store = { current: { state, error: null, updatedAt: 0 }, refresh: vi.fn(async () => undefined), rpc } as unknown as ZeroSubStore;
+    const menu = agentMenu({ openSurface: vi.fn() } as unknown as PluginClientContext, store, { id: AGENT, provider: "claude" }) as unknown as {
+      entriesOf(state: StateView): readonly MenuEntry[];
+    };
+    const items = menu.entriesOf(state);
+    expect(rows(items).map(([title]) => title)).toEqual(["work", "home"]);
+    await press(items, "account-1");
+    expect(rpc).toHaveBeenCalledWith(setAgentAccount, { agentId: AGENT, accountId: "home" });
+    await vi.waitFor(() => expect(store.refresh).toHaveBeenCalled());
   });
 });

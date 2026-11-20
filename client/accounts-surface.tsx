@@ -19,6 +19,7 @@ import { AddAccountModal } from "./add-account";
 import { ApiAccountModal } from "./api-account";
 import { AzureAccountModal, AzureUsage, azureCardDetails } from "./azure-account";
 import { BedrockAccountModal, BedrockUsage, bedrockCardDetails } from "./bedrock-account";
+import { ComposerPillRows } from "./composer-settings";
 import { ForkDestinationRows, OpenCodeForkRows } from "./fork-settings";
 import { AddPiAccountModal, ApiKeyModal, HomesHint, PiSectionNotes, ProxyModal, ShellHint, piCardDetails } from "./pi-accounts";
 import { PaceSection } from "./pace";
@@ -1083,6 +1084,14 @@ function AutomationSettings({ theme, compact }: { theme: Theme; compact: boolean
             disabled={settings.saving || !settings.values.autoSwitch}
             onValueChange={(codexSameConversation) => save({ codexSameConversation })}
           />
+        </SettingsCard>
+      </View>
+      <View style={{ gap: 10 }}>
+        <Text style={text.heading} accessibilityRole="header">
+          Composer
+        </Text>
+        <SettingsCard>
+          <ComposerPillRows values={settings.values} saving={settings.saving} onSave={save} />
         </SettingsCard>
       </View>
       <View style={{ gap: 10 }}>

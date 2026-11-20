@@ -1,9 +1,13 @@
-import type { PluginClientContext } from "@getpaseo/plugin/client";
+import type { PluginClientContext, PluginHostProps } from "@getpaseo/plugin/client";
 import * as paseoClient from "@getpaseo/plugin/client";
 import * as paseoUi from "@getpaseo/plugin/client/ui";
-import type { ComponentType } from "react";
+import { useEffect, useMemo, useRef, useState, type ComponentType } from "react";
+import { View } from "react-native";
 import { accountPeak, formatCredits, formatPercent, isDisabled, paceVerdict, pillText } from "../shared/format";
 import { ACCOUNT_METADATA_KEY, AGENT_METADATA_KEY, HAND_OFF, type AccountView, type StateView } from "../shared/model";
+import { AccountPillButton } from "./account-pill-button";
+import { inDialog, onScreen, setControlShown } from "./control-visibility";
+import { accountName, agentMenu, pillLabel, pillTitle, usageLine } from "./pills";
 import { moveAgent, useStore, type ZeroSubStore } from "./store";
 
 /**
@@ -26,8 +30,23 @@ interface SelectProps {
   onValueChange(event: { value: string }): void | Promise<void>;
 }
 
+/** Paseo 0.16's searchable list: what it shows on the control is `value.label`, apart from the entries. */
+interface ComboboxProps {
+  title: string;
+  icon: string;
+  value: { id: string; label: string } | null;
+  search(input: { query: string }): Promise<readonly ComboboxEntry[]>;
+  onSelect(input: { item: ComboboxEntry }): void | Promise<void>;
+}
+
+export interface ComboboxEntry {
+  id: string;
+  label: string;
+  description?: string;
+}
+
 interface ComposerItems {
-  addComposerItem?(item: { id: string; Component: ComponentType }): () => void;
+  addComposerItem?(item: { id: string; Component: ComponentType<PluginHostProps> }): () => void;
 }
 
 export interface AccountOption {
@@ -127,6 +146,33 @@ export function agentChoices(state: StateView, agentId: string): AccountChoices 
   return { value: current.id, options, icon: current.status === "limited" ? "CircleAlert" : "CircleUserRound" };
 }
 
+/**
+ * A running agent's control as the account button shows it (see pills.ts), while
+ * `keepComposerPill` is on: the control says the account's usage (`5h 71 · 7d 66`), and each entry
+ * the account's name and state, with its usage and how long until each window resets. The same
+ * entries as `agentChoices`, in the same order. Null where that is.
+ */
+export function agentFace(
+  state: StateView,
+  agentId: string,
+  now = Date.now(),
+): { icon: string; value: { id: string; label: string }; tooltip: string; entries: ComboboxEntry[]; choices: AccountChoices } | null {
+  const choices = agentChoices(state, agentId);
+  const route = state.agents.find((entry) => entry.agentId === agentId);
+  const current = state.accounts.find((account) => account.id === choices?.value);
+  if (!choices || !route || !current) return null;
+  const entries = choices.options.map((option): ComboboxEntry => {
+    const account = state.accounts.find((candidate) => candidate.id === option.value);
+    // The way back to the default and the Accounts screen; and the agent's own while it's moving,
+    // which names both accounts as the button does.
+    if (!account || (account === current && route.pendingAccountId)) return { id: option.value, label: option.label };
+    const name = accountName(state, account, now);
+    const usage = usageLine(account, now);
+    return { id: option.value, label: account === current || route.movable ? name : `Continue on ${name}`, ...(usage ? { description: usage } : {}) };
+  });
+  return { icon: choices.icon, value: { id: choices.value, label: pillLabel(state, current, route, now) }, tooltip: pillTitle(state, current, route, now), entries, choices };
+}
+
 /** As routing takes them: an account at its limit only with automatic switching off. */
 function takesAgents(state: StateView, account: AccountView): boolean {
   return account.status !== "signed_out" && !isDisabled(account) && !(state.autoSwitch && account.status === "limited");
@@ -156,11 +202,16 @@ function detail(account: AccountView, next: boolean, lead?: string): string | un
  * `AGENT_METADATA_KEY`), and until it's there the control shows nothing.
  *
  * `added` says whether the control is there, for the account button to step back (see pills.ts).
+ * With `keepComposerPill` on, the button steps back only while a running agent's control
+ * is on screen, which each control reports (see `useControlShown`).
  */
 export function contributeComposerItem(client: PluginClientContext, store: ZeroSubStore): { added: boolean; stop(): void } {
   const none = { added: false, stop() {} };
   const { useComposer } = paseoClient as unknown as { useComposer?: () => Composer };
-  const { Select } = paseoUi as unknown as { Select?: ComponentType<SelectProps> };
+  const { Select, Combobox } = paseoUi as unknown as {
+    Select?: ComponentType<SelectProps>;
+    Combobox?: ComponentType<ComboboxProps>;
+  };
   const host = client as unknown as ComposerItems;
   if (typeof host.addComposerItem !== "function" || typeof useComposer !== "function" || !Select) return none;
 
@@ -173,7 +224,48 @@ export function contributeComposerItem(client: PluginClientContext, store: ZeroS
     return moveAgent(store, agentId, accountId, to?.label ?? "the default account");
   };
 
-  const AccountItem = () => {
+  const AgentControl = ({ state, agentId, provider, choices, host }: { state: StateView; agentId: string; provider: string | null; choices: AccountChoices; host: PluginHostProps }) => {
+    const { ref, inSheet } = useControlShown(agentId);
+    const Menu = useMemo(() => (provider ? agentMenu(client, store, { id: agentId, provider }) : null), [agentId, provider]);
+    // As the account button shows it. Off a phone, on the web, the button itself: a pill that says
+    // the usage and opens the button's own menu above it, which Paseo's lists can't draw (an entry a
+    // line); on a phone, where the control is only ever in the composer's sheet, a list that says
+    // the usage, rather than a menu over the sheet. The native apps get the list too, also on a
+    // tablet or a phone on its side, where the composer isn't compact: the pill's menu is placed
+    // with `position: fixed`, which only React Native for the web has.
+    const face = state.keepComposerPill ? agentFace(state, agentId) : null;
+    // In the composer's sheet (a dialog of Paseo's), the list below too: see `inDialog`.
+    if (face && Menu && host.layout.platform === "web" && !host.layout.compact && !inSheet) {
+      return (
+        <View ref={ref} collapsable={false}>
+          <AccountPillButton host={host} agentId={agentId} title={face.tooltip} icon={face.icon} label={face.value.label} Menu={Menu} />
+        </View>
+      );
+    }
+    return (
+      <View ref={ref} collapsable={false}>
+        {face && Combobox ? (
+          <Combobox
+            title="Account"
+            icon={face.icon}
+            value={face.value}
+            search={async ({ query }) => matching(face.entries, query)}
+            onSelect={({ item }) => move(state, agentId, face.choices, item.id)}
+          />
+        ) : (
+          <Select
+            title="Account"
+            icon={choices.icon}
+            value={choices.value}
+            options={choices.options}
+            onValueChange={({ value }) => move(state, agentId, choices, value)}
+          />
+        )}
+      </View>
+    );
+  };
+
+  const AccountItem = (host: PluginHostProps) => {
     const composer = useComposer();
     const { state } = useStore(store);
     if (!state) return null;
@@ -181,15 +273,7 @@ export function contributeComposerItem(client: PluginClientContext, store: ZeroS
       const agentId = composer.agent.metadata[AGENT_METADATA_KEY];
       const choices = typeof agentId === "string" ? agentChoices(state, agentId) : null;
       if (!choices || typeof agentId !== "string") return null;
-      return (
-        <Select
-          title="Account"
-          icon={choices.icon}
-          value={choices.value}
-          options={choices.options}
-          onValueChange={({ value }) => move(state, agentId, choices, value)}
-        />
-      );
+      return <AgentControl state={state} agentId={agentId} provider={composer.agent.provider} choices={choices} host={host} />;
     }
     const choices = accountChoices(state, composer.agent.provider, composer.agent.metadata[ACCOUNT_METADATA_KEY]);
     if (!choices) return null;
@@ -210,4 +294,43 @@ export function contributeComposerItem(client: PluginClientContext, store: ZeroS
     console.warn("[ZeroSub] could not add the account control to composers", error);
     return none;
   }
+}
+
+/** How often a mounted control checks whether it's on screen: Paseo moves it without telling. */
+const VISIBILITY_CHECK_MS = 500;
+
+/**
+ * Reports whether this mount of `agentId`'s control is on screen (see control-visibility.ts),
+ * for the account button to show only where it isn't: in a composer too narrow for the control,
+ * which Paseo then hides in the toolbar and moves to the composer's sheet. And whether this mount
+ * is the one in that sheet.
+ */
+function useControlShown(agentId: string) {
+  const ref = useRef<View>(null);
+  const [inSheet, setInSheet] = useState(false);
+  useEffect(() => {
+    const mount = {};
+    let last: boolean | null = null;
+    const check = () => {
+      setInSheet(inDialog(ref.current));
+      const visible = onScreen(ref.current);
+      if (visible === last) return;
+      last = visible;
+      setControlShown(agentId, mount, visible);
+    };
+    check();
+    const timer = setInterval(check, VISIBILITY_CHECK_MS);
+    return () => {
+      clearInterval(timer);
+      setControlShown(agentId, mount, false);
+    };
+  }, [agentId]);
+  return { ref, inSheet };
+}
+
+/** The entries whose name or usage has `query` in it, all of them for none. */
+export function matching(entries: readonly ComboboxEntry[], query: string): ComboboxEntry[] {
+  const wanted = query.trim().toLowerCase();
+  if (!wanted) return [...entries];
+  return entries.filter((entry) => `${entry.label} ${entry.description ?? ""}`.toLowerCase().includes(wanted));
 }
