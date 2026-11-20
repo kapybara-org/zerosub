@@ -472,14 +472,24 @@ describe("the accounts screen", () => {
     });
 
     it("says on a card where its folder is moving and what it waits for, or why it couldn't", () => {
-      const waiting = { to: "~/.claude-config", waiting: "Claude Code runs on it (an agent or a terminal); it moves once that stops", error: null };
-      const failed = { to: "~/.claude-config/claude-home", waiting: null, error: "the Keychain entry is locked" };
+      const waiting = { to: "~/.claude-config", waiting: "Claude Code runs on it (an agent or a terminal); it moves once that stops", error: null, stays: null };
+      const failed = { to: "~/.claude-config/claude-home", waiting: null, error: "the Keychain entry is locked", stays: null };
       expect(textOf(setUp({ accounts: [account("home", { moving: waiting })] }).card("home")())).toContain(
         "Moving its folder to ~/.claude-config: Claude Code runs on it (an agent or a terminal); it moves once that stops",
       );
       expect(textOf(setUp({ accounts: [account("home", { moving: failed })] }).card("home")())).toContain(
         "Couldn't move its folder to ~/.claude-config/claude-home: the Keychain entry is locked",
       );
+    });
+
+    it("says on a card why its folder stays where it is, which isn't an error", () => {
+      const stays = { to: "~/.claude-config", waiting: null, error: null, stays: "its Keychain sign-in is too long to copy without showing it in the process list" };
+      const shown = textOf(setUp({ accounts: [account("home", { moving: stays })] }).card("home")());
+      expect(shown).toContain(
+        "Its folder stays where it is instead of moving to ~/.claude-config: its Keychain sign-in is too long to copy without showing it in the process list",
+      );
+      expect(shown).not.toContain("Couldn't move");
+      expect(shown).not.toContain("Moving its folder");
     });
   });
 

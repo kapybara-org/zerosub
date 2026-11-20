@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Moving a home moves its Keychain entry: Claude Code names the entry after the folder's path. These
 // run against an in-memory Keychain behind a stand-in for `security`; the real one is never touched.
@@ -25,6 +25,7 @@ vi.mock("./process", async (original) => ({
 }));
 
 const { ClaudeAdapter, homesInEnvironment, keychainService } = await import("./claude");
+const { run } = await import("./process");
 
 afterEach(() => {
   keychain.clear();
@@ -88,6 +89,61 @@ describe.runIf(process.platform === "darwin")("moving a home's Keychain entry", 
     keychain.set(keychainService(TO), SIGN_IN);
     await new ClaudeAdapter().dropCopiedCredentials(FROM, TO);
     expect([...keychain.keys()]).toEqual([keychainService(FROM)]);
+  });
+});
+
+// On every platform, as if it were macOS: the stand-in for `security` works anywhere.
+describe("a Keychain entry too long to copy", () => {
+  const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  const user = process.env.USER;
+  beforeEach(() => {
+    Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
+    process.env.USER = "ada";
+    vi.mocked(run).mockClear();
+  });
+  afterEach(() => {
+    Object.defineProperty(process, "platform", platform);
+    if (user === undefined) delete process.env.USER;
+    else process.env.USER = user;
+  });
+
+  /** A sign-in of exactly `bytes` bytes, as Claude Code writes one: its own, then MCP servers' records. */
+  const signIn = (bytes: number) => {
+    const [head, tail] = ['{"claudeAiOauth":{"accessToken":"sk-ant-oat-…"},"mcpOAuth":{"plugin:x":{"discoveryState":"', '"}}}'];
+    return `${head}${"x".repeat(bytes - Buffer.byteLength(head + tail))}${tail}`;
+  };
+  // `security -i` takes 4,000 characters a line, and the sign-in goes on it as hex, with the entry's name.
+  const longest = Math.floor((4_000 - `add-generic-password -U -a "ada" -s "${keychainService(TO)}" -X ""\n`.length) / 2);
+
+  it("keeps the folder where it is by the rule the copy goes by, and never puts the sign-in in a command's arguments", async () => {
+    const adapter = new ClaudeAdapter();
+    expect(await adapter.homeStays(FROM)).toBeNull();
+
+    // As long as fits: it can move, and does.
+    keychain.set(keychainService(FROM), signIn(longest));
+    expect(await adapter.homeStays(FROM)).toBeNull();
+    await adapter.copyCredentials(FROM, TO);
+    expect(keychain.get(keychainService(TO))).toBe(signIn(longest));
+
+    // A byte longer, or as long as the ~9 KB ones in #111: it stays, and the copy writes nothing.
+    for (const bytes of [longest + 1, 9_100]) {
+      keychain.delete(keychainService(TO));
+      keychain.set(keychainService(FROM), signIn(bytes));
+      expect(await adapter.homeStays(FROM)).toBe("its Keychain sign-in is too long to copy without showing it in the process list");
+      await expect(adapter.copyCredentials(FROM, TO)).rejects.toThrow("too long to write");
+      expect(keychain.has(keychainService(TO))).toBe(false);
+    }
+    // Neither the sign-in nor its hex was ever in a command's arguments, only in security's standard input.
+    const marks = ["mcpOAuth", Buffer.from("mcpOAuth", "utf8").toString("hex")];
+    expect(vi.mocked(run).mock.calls.flatMap(([, args]) => args).filter((arg) => marks.some((mark) => arg.includes(mark)))).toEqual([]);
+    expect(vi.mocked(run).mock.calls.filter(([, args]) => args[0] === "-i")).toHaveLength(1);
+  });
+
+  it("isn't asked off macOS, where the sign-in is in the folder and moves with it", async () => {
+    keychain.set(keychainService(FROM), signIn(9_100));
+    Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+    expect(await new ClaudeAdapter().homeStays(FROM)).toBeNull();
+    expect(commands).toEqual([]);
   });
 });
 

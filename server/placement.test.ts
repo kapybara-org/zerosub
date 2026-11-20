@@ -68,6 +68,10 @@ function newFake(): Fake {
   return { calls: [], keychain: new Map(), inUse: new Set(), signedIn: new Set(), emails: new Map(), holdCopy: null, copying: () => undefined, finish: () => undefined };
 }
 
+/** The longest sign-in the fake Keychain copies: the real one's is what fits on a line of `security -i`. */
+const LONGEST_SIGN_IN = 1_900;
+const TOO_LONG = "its Keychain sign-in is too long to copy without showing it in the process list";
+
 /** A Claude adapter with the real one's rules for moving a sign-in, over an in-memory Keychain. */
 function fakeAdapter(fake: Fake): FamilyAdapter {
   return {
@@ -103,7 +107,14 @@ function fakeAdapter(fake: Fake): FamilyAdapter {
       await mkdir(home, { recursive: true });
       await writeFile(join(home, "settings.account.json"), '{"env":{"ANTHROPIC_API_KEY":"sk-test"}}');
     },
-    homesInUse: async (list: readonly string[]) => new Set(list.filter((home) => fake.inUse.has(home))),
+    homesInUse: async (list: readonly string[]) => {
+      fake.calls.push(`scan ${list.join(" ")}`);
+      return new Set(list.filter((home) => fake.inUse.has(home)));
+    },
+    homeStays: async (home: string) => {
+      fake.calls.push(`stays ${home}`);
+      return (fake.keychain.get(home)?.length ?? 0) > LONGEST_SIGN_IN ? TOO_LONG : null;
+    },
     copyCredentials: async (from: string, to: string) => {
       fake.calls.push(`copy ${from} ${to}`);
       fake.copying();
@@ -113,6 +124,7 @@ function fakeAdapter(fake: Fake): FamilyAdapter {
       const there = fake.keychain.get(to);
       if (there === secret) return;
       if (there !== undefined) throw new Error(`the Keychain entry for ${to} already holds another one`);
+      if (secret.length > LONGEST_SIGN_IN) throw new Error(`the sign-in is too long to write to the Keychain entry for ${to} without showing it in the process list`);
       fake.keychain.set(to, secret);
     },
     dropCopiedCredentials: async (from: string, to: string) => {
@@ -228,7 +240,7 @@ describe("moving an account's home", () => {
     await service.placeHomes();
     expect(await homeOf(store, "claude-aaaaaaaaaaaa")).toBe(home);
     const waiting = (await service.view(paseo)).accounts.find((account) => account.id === "claude-aaaaaaaaaaaa")?.moving;
-    expect(waiting).toEqual({ to: kept(), waiting: "Claude Code runs on it (an agent or a terminal); it moves once that stops", error: null });
+    expect(waiting).toEqual({ to: kept(), waiting: "Claude Code runs on it (an agent or a terminal); it moves once that stops", error: null, stays: null });
 
     fake.inUse.clear();
     await service.placeHomes();
@@ -346,6 +358,55 @@ describe("moving an account's home", () => {
     expect(fake.keychain.get(join(kept(), "claude-work"))).toBe("someone else's");
     expect((await store.read()).moves).toEqual({});
     expect((await service.view(paseo)).accounts.find((account) => account.id === "claude-aaaaaaaaaaaa")?.moving?.error).toContain("already holds another one");
+  });
+
+  it("leaves an account whose Keychain sign-in is too long to copy where it is, without an error or a try every pass, and moves it once it fits", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const { service, store, fake } = start();
+    const home = join(homes(), "claude-aaaaaaaaaaaa");
+    await makeHome(home);
+    // Claude Code's records of MCP servers' sign-ins (`mcpOAuth`) make it this long.
+    const long = JSON.stringify({ claudeAiOauth: { accessToken: "t" }, mcpOAuth: { "plugin:x": { discoveryState: "x".repeat(LONGEST_SIGN_IN) } } });
+    fake.keychain.set(home, long);
+    await seed({ accounts: [main, managed("claude-aaaaaaaaaaaa", "Work", home)] });
+    const logged = vi.mocked(console.log);
+    const said = () => logged.mock.calls.filter(([line]) => String(line).includes(`the home of Work stays in ${home}: ${TOO_LONG}`)).length;
+    const moving = async () => (await service.view(paseo)).accounts.find((account) => account.id === "claude-aaaaaaaaaaaa")?.moving;
+    try {
+      await service.placeHomes();
+      expect(await homeOf(store, "claude-aaaaaaaaaaaa")).toBe(home);
+      expect(await there(join(home, ".claude.json"))).toBe(true);
+      expect([...fake.keychain]).toEqual([[home, long]]);
+      expect((await store.read()).moves).toEqual({});
+      expect(await moving()).toEqual({ to: kept(), waiting: null, error: null, stays: TOO_LONG });
+      // Asked once nothing ran on it, and not tried: nothing copied, nothing written down.
+      expect(fake.calls).toEqual([`scan ${home}`, `stays ${home}`]);
+      expect(said()).toBe(1);
+
+      // Passes after that leave it be, without even a look at what runs on it, or asking again for half an hour.
+      fake.calls.length = 0;
+      vi.setSystemTime(Date.now() + 29 * 60_000);
+      await service.placeHomes();
+      expect(fake.calls).toEqual([]);
+      expect((await moving())?.stays).toBe(TOO_LONG);
+      // Then it's asked again, and still stays, which the log already said.
+      vi.setSystemTime(Date.now() + 2 * 60_000);
+      await service.placeHomes();
+      expect(fake.calls).toEqual([`stays ${home}`]);
+      expect(await homeOf(store, "claude-aaaaaaaaaaaa")).toBe(home);
+      expect(said()).toBe(1);
+
+      // Once the sign-in fits, the next time it's asked, the folder moves with it.
+      const short = JSON.stringify({ claudeAiOauth: { accessToken: "t" } });
+      fake.keychain.set(home, short);
+      vi.setSystemTime(Date.now() + 31 * 60_000);
+      await service.placeHomes();
+      expect(await homeOf(store, "claude-aaaaaaaaaaaa")).toBe(join(kept(), "claude-work"));
+      expect([...fake.keychain]).toEqual([[join(kept(), "claude-work"), short]]);
+      expect(await moving()).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("finishes a move the plugin stopped in the middle of", async () => {
@@ -582,6 +643,27 @@ describe("changing where accounts are kept", () => {
     }
     process.env.CURSOR_CONFIG_DIR = join(root, "cursor-settings");
     await expect(chooseHomesDir(join(root, "cursor-settings", "accounts"), [])).rejects.toThrow("a CLI's own folder");
+  });
+
+  it("doesn't count an account whose folder stays where it is among those that move", async () => {
+    const { service, store, fake } = start();
+    const stays = join(homes(), "claude-aaaaaaaaaaaa");
+    const moves = join(homes(), "claude-bbbbbbbbbbbb");
+    await makeHome(stays);
+    await makeHome(moves);
+    fake.keychain.set(stays, "x".repeat(LONGEST_SIGN_IN + 1));
+    fake.inUse.add(moves);
+    await seed({ accounts: [main, managed("claude-aaaaaaaaaaaa", "Long", stays), managed("claude-bbbbbbbbbbbb", "Busy", moves)] });
+    await service.placeHomes();
+
+    const elsewhere = join(root, "elsewhere");
+    expect(await service.setClaudeHomesDir(elsewhere)).toEqual({ dir: elsewhere, moving: 1 });
+    await service.placeHomes();
+    expect(await homeOf(store, "claude-aaaaaaaaaaaa")).toBe(stays);
+    const card = (await service.view(paseo)).accounts.find((account) => account.id === "claude-aaaaaaaaaaaa")?.moving;
+    expect(card).toEqual({ to: elsewhere, waiting: null, error: null, stays: TOO_LONG });
+    // One waiting for what runs on it isn't asked meanwhile: asking reads its Keychain entry.
+    expect(fake.calls).not.toContain(`stays ${moves}`);
   });
 
   it("leaves accounts kept anywhere else where they are", async () => {
