@@ -195,6 +195,8 @@ const USAGE_REPLY_MS = 15_000;
 const EGRESS_MS = 30 * 60_000;
 /** A home an agent was routed to this recently isn't moved yet: its session may only now be starting. */
 const ROUTED_SETTLE_MS = 30_000;
+/** A home that has to stay where it is (see `FamilyAdapter.homeStays`) is asked about again after this long. */
+const HOME_STAYS_MS = 30 * 60_000;
 const USAGE_HISTORY_SIZE = 12;
 
 const DEFAULT_PREFERENCES: Preferences = {
@@ -551,6 +553,8 @@ export class Service {
   private readonly routedAt = new Map<string, number>();
   /** Why each account whose home is due to move hasn't moved yet: what it waits for, or what went wrong. */
   private readonly moveNotes = new Map<string, { waiting: string | null; error: string | null }>();
+  /** Accounts whose home has to stay where it is: which home, why, and when that was asked (see `whyStays`). */
+  private readonly staying = new Map<string, { home: string; why: string; at: number }>();
   /** Each account's script, as the launchers were last written. */
   private launcherFiles: Map<string, string> | null = null;
   /** OpenCode fork handoffs in flight, by source agent; duplicate requests join the first call. */
@@ -4014,7 +4018,13 @@ export class Service {
       const move = state.moves[account.id];
       if (!move && !due.has(account.id)) return null;
       const note = this.moveNotes.get(account.id);
-      return { to: shownPath(move?.to ?? homesNow(account.family === "pi" ? "pi" : "claude")), waiting: note?.waiting ?? null, error: note?.error ?? null };
+      const stays = this.staying.get(account.id);
+      return {
+        to: shownPath(move?.to ?? homesNow(account.family === "pi" ? "pi" : "claude")),
+        waiting: note?.waiting ?? null,
+        error: note?.error ?? null,
+        stays: !move && stays?.home === account.home ? stays.why : null,
+      };
     };
     // Pacing only chooses between two or more accounts that can take agents by themselves.
     const pacedFamilies = new Set(
@@ -5341,7 +5351,8 @@ export class Service {
     const dir = homesDirFor(family, updated[key]);
     console.log(`[ZeroSub] added ${FAMILY_LABEL[family]} accounts' homes are kept in ${dir} now`);
     void this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
-    return { dir: shownPath(dir), moving: (await this.dueMoves(updated)).filter((account) => account.family === family).length };
+    const moving = (await this.dueMoves(updated)).filter((account) => account.family === family && this.staying.get(account.id)?.home !== account.home);
+    return { dir: shownPath(dir), moving: moving.length };
   }
 
   setClaudeHomesDir(input: string): Promise<{ dir: string; moving: number }> {
@@ -5404,16 +5415,24 @@ export class Service {
     for (const accountId of this.moveNotes.keys()) {
       if (!due.some((account) => account.id === accountId) && !state.moves[accountId]) this.moveNotes.delete(accountId);
     }
+    for (const accountId of this.staying.keys()) {
+      if (!due.some((account) => account.id === accountId)) this.staying.delete(accountId);
+    }
     if (due.length === 0) return this.forgetEmptiedFolders(state);
+    // A home known to stay where it is is left alone, not even scanned, until it's asked about again (see `whyStays`).
+    const movable: typeof due = [];
+    for (const account of due) {
+      if (this.staying.get(account.id)?.home !== account.home || !(await this.whyStays(account))) movable.push(account);
+    }
     const inUse = new Set<string>();
     const unknown = new Set<string>();
     for (const family of PLACED) {
-      const homes = due.filter((account) => account.family === family).map((account) => account.home);
+      const homes = movable.filter((account) => account.family === family).map((account) => account.home);
       if (homes.length === 0) continue;
       try {
         for (const home of await this.adapters[family].homesInUse!(homes)) inUse.add(home);
       } catch (error) {
-        for (const account of due.filter((entry) => entry.family === family)) {
+        for (const account of movable.filter((entry) => entry.family === family)) {
           unknown.add(account.id);
           this.moveNotes.set(account.id, { waiting: null, error: `ZeroSub couldn't tell whether anything runs on it: ${describe(error)}` });
         }
@@ -5421,12 +5440,17 @@ export class Service {
     }
     const taken = new Set(state.accounts.flatMap((account) => (account.home ? [resolve(account.home)] : [])));
     let moved = false;
-    for (const account of due) {
+    for (const account of movable) {
       if (unknown.has(account.id)) continue;
       const family = account.family as PlacedFamily;
       const waiting = this.moveBlocker(account, inUse);
       if (waiting) {
         this.moveNotes.set(account.id, { waiting, error: null });
+        continue;
+      }
+      // Asked once nothing else holds it back: a home that has to stay where it is would only fail again.
+      if (await this.whyStays(account)) {
+        this.moveNotes.delete(account.id);
         continue;
       }
       const to = await placeFor(account, homesDirFor(family, state[HOMES_KEY[family]]), taken);
@@ -5476,6 +5500,24 @@ export class Service {
     if ((this.homeCalls.get(home) ?? 0) > 0) return "ZeroSub is working on it";
     if (Date.now() - (this.routedAt.get(account.id) ?? 0) < ROUTED_SETTLE_MS) return "an agent has just started on it";
     return null;
+  }
+
+  /**
+   * Why an account's home has to stay where it is (see `FamilyAdapter.homeStays`), or null when it
+   * can move. Once it stays, it's asked again only after `HOME_STAYS_MS`, and moves once the answer
+   * changes. When asking fails, the move is tried, and says what went wrong.
+   */
+  private async whyStays(account: StoredAccount & { home: string }): Promise<string | null> {
+    const known = this.staying.get(account.id);
+    if (known?.home === account.home && Date.now() - known.at < HOME_STAYS_MS) return known.why;
+    const why = (await this.adapters[account.family].homeStays?.(account.home).catch(() => null)) ?? null;
+    if (!why) {
+      this.staying.delete(account.id);
+      return null;
+    }
+    if (known?.home !== account.home || known.why !== why) console.log(`[ZeroSub] the home of ${account.label} stays in ${account.home}: ${why}`);
+    this.staying.set(account.id, { home: account.home, why, at: Date.now() });
+    return why;
   }
 
   /**

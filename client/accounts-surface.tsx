@@ -696,7 +696,9 @@ function AccountCard({
         <Text style={[account.moving.error ? text.danger : text.small, faded]}>
           {account.moving.error
             ? `Couldn't move its folder to ${account.moving.to}: ${account.moving.error}`
-            : `Moving its folder to ${account.moving.to}${account.moving.waiting ? `: ${account.moving.waiting}` : "…"}`}
+            : account.moving.stays
+              ? `Its folder stays where it is instead of moving to ${account.moving.to}: ${account.moving.stays}`
+              : `Moving its folder to ${account.moving.to}${account.moving.waiting ? `: ${account.moving.waiting}` : "…"}`}
         </Text>
       ) : null}
 

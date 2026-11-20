@@ -171,6 +171,12 @@ export interface FamilyAdapter {
    */
   holdsAccount?(home: string): Promise<boolean>;
   /**
+   * Why `home`'s folder has to stay where it is, though it's due to move: what the CLI keeps for it
+   * outside the folder can't be carried along safely (Claude's Keychain entry, when it's too long to
+   * write without showing it in the process list). Null when it can move.
+   */
+  homeStays?(home: string): Promise<string | null>;
+  /**
    * Before a home's folder moves from `from` to `to`: copies what the CLI keeps for it outside the
    * folder (Claude's Keychain entry on macOS) to where it looks for `to`'s, and checks the copy.
    * Nothing to do where the sign-in lives in the folder. Repeating it after it worked does nothing.

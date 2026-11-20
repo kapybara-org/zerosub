@@ -450,8 +450,14 @@ export const AccountViewSchema = z.object({
    * any account that shares it sees the others' sessions; null where there's no such choice.
    */
   sessionsShared: z.boolean().nullable().default(null),
-  /** The account's home is due to move to `to`, and hasn't yet: what it waits for, or what went wrong. */
-  moving: z.object({ to: z.string(), waiting: z.string().nullable(), error: z.string().nullable() }).nullable().default(null),
+  /**
+   * The account's home is due to move to `to`, and hasn't yet: what it waits for, or what went wrong.
+   * `stays`: why it stays where it is instead, which isn't an error (null from older servers).
+   */
+  moving: z
+    .object({ to: z.string(), waiting: z.string().nullable(), error: z.string().nullable(), stays: z.string().nullable().default(null) })
+    .nullable()
+    .default(null),
   /** How pacing reads this account; null unless spreading is on and it's one of two or more accounts that can stand in. */
   pace: PaceViewSchema.nullable().default(null),
 });
