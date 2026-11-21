@@ -5798,3 +5798,71 @@ describe("a sign-out read while the token is being renewed", () => {
     expect(reopened).toEqual([AGENT]);
   });
 });
+
+// A plugin that stops a session at its own threshold (95% of the week, say) sees the limit coming
+// before ZeroSub does: to ZeroSub the account isn't out yet, so nothing moves the session and it stays
+// stopped while another account has room. `moveBeforeLimit` lets that plugin move this one agent,
+// between turns, with ZeroSub's own guards.
+describe("a move asked for before the limit", () => {
+  const nearly = (extra: Partial<StoredState> = {}) => ({
+    accounts: [account(MAIN, "main", "main"), account(HELLO, "seat", "managed")] as never,
+    defaults: { claude: MAIN, codex: null, pi: null },
+    sessions: { [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt: new Date().toISOString() } },
+    ...extra,
+  });
+  const unused = () => ({ kind: "window" as const, resetsAt: inFuture(), message: "" });
+
+  it("moves an idle agent to the named account without pinning it there", async () => {
+    const { service, store, reopened, notes, paseo } = await setUp(nearly(), unused);
+    expect(await service.moveBeforeLimit(paseo as never, AGENT, HELLO)).toEqual({ outcome: "moved", detail: null });
+    expect(reopened).toEqual([AGENT]);
+    const state = await store.read();
+    expect(state.sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(state.bindings[AGENT]).toMatchObject({ accountId: HELLO, source: "auto" });
+    expect(notes.at(-1)).toMatchObject({ from: "main", to: "seat", reason: "near_limit", outcome: "switched" });
+  });
+
+  it("says so when it's already there, and does nothing", async () => {
+    const { service, reopened, paseo } = await setUp(nearly(), unused);
+    expect((await service.moveBeforeLimit(paseo as never, AGENT, MAIN)).outcome).toBe("already");
+    expect(reopened).toEqual([]);
+  });
+
+  it("waits for background work and a running turn", async () => {
+    const jobs = await setUp(nearly(), unused);
+    (jobs.agent as Record<string, unknown>).backgroundWork = { count: 2 };
+    expect((await jobs.service.moveBeforeLimit(jobs.paseo as never, AGENT, HELLO)).outcome).toBe("waiting");
+    expect(jobs.reopened).toEqual([]);
+    const busy = await setUp(nearly(), unused);
+    busy.agent.status = "running";
+    expect((await busy.service.moveBeforeLimit(busy.paseo as never, AGENT, HELLO)).outcome).toBe("waiting");
+    expect(busy.reopened).toEqual([]);
+  });
+
+  it("refuses an account that can't take it, a closed agent, one the user pinned, and automatic switching off", async () => {
+    const limited = await setUp(nearly({ accounts: [account(MAIN, "main", "main"), { ...account(HELLO, "seat", "managed"), limitedUntil: inFuture() }] as never }), unused);
+    expect((await limited.service.moveBeforeLimit(limited.paseo as never, AGENT, HELLO)).outcome).toBe("refused");
+    const closed = await setUp(nearly(), unused);
+    closed.agent.status = "closed";
+    expect((await closed.service.moveBeforeLimit(closed.paseo as never, AGENT, HELLO)).outcome).toBe("refused");
+    const pinned = await setUp(nearly({ bindings: { [AGENT]: { accountId: MAIN, source: "user", at: new Date().toISOString() } } }), unused);
+    expect(await pinned.service.moveBeforeLimit(pinned.paseo as never, AGENT, HELLO)).toEqual({ outcome: "refused", detail: "It stays on the account picked for it." });
+    const off = await setUp(nearly(), unused);
+    off.service.setPreferences(preferences.schema.parse({ autoSwitch: false }));
+    expect((await off.service.moveBeforeLimit(off.paseo as never, AGENT, HELLO)).outcome).toBe("refused");
+    for (const run of [limited, closed, pinned, off]) expect(run.reopened).toEqual([]);
+    expect((await pinned.store.read()).bindings[AGENT]).toMatchObject({ accountId: MAIN, source: "user" });
+  });
+
+  it("keeps the switch guard", async () => {
+    const { service, store, paseo } = await setUp(nearly(), unused);
+    const back = async () => store.update((draft) => {
+      draft.sessions[AGENT] = { accountId: MAIN, family: "claude", openedAt: new Date().toISOString() };
+    });
+    for (let move = 0; move < 4; move += 1) {
+      expect((await service.moveBeforeLimit(paseo as never, AGENT, HELLO)).outcome).toBe("moved");
+      await back();
+    }
+    expect((await service.moveBeforeLimit(paseo as never, AGENT, HELLO)).outcome).toBe("refused");
+  });
+});
