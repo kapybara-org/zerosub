@@ -75,7 +75,9 @@ export async function chooseImportedHome(input: string, accounts: readonly Store
   const notClaudeCode = `${shown} isn't a Claude Code folder`;
   const example = "Enter the folder Claude Code was started with as CLAUDE_CONFIG_DIR.";
   if (home === resolve(homedir()) || home === resolve("/")) throw new Error(`${notClaudeCode}. ${example}`);
-  if (home === resolve(mainClaudeDir())) throw new Error(`${shown} is the CLI login's own folder, which ZeroSub has already as the CLI login.`);
+  const cliHome = resolve(mainClaudeDir());
+  const cliFolder = `${shown} is the CLI login's own folder, which ZeroSub has already as the CLI login.`;
+  if (home === cliHome) throw new Error(cliFolder);
   const added = accounts.find((account) => account.home && resolve(account.home) === home);
   if (added) throw new Error(`${shown} is already added, as ${added.label}.`);
   const holder = accounts.find((account) => account.home && within(home, account.home));
@@ -86,6 +88,8 @@ export async function chooseImportedHome(input: string, accounts: readonly Store
   const entry = await stat(home).catch(() => null);
   if (!entry) throw new Error(`There's no folder at ${shown}.`);
   if (!entry.isDirectory()) throw new Error(`${shown} is a file, not a folder.`);
+  const cliEntry = await stat(cliHome).catch(() => null);
+  if (cliEntry && entry.dev === cliEntry.dev && entry.ino === cliEntry.ino) throw new Error(cliFolder);
   if (!(await stat(join(home, ".claude.json")).catch(() => null))?.isFile()) throw new Error(`${notClaudeCode}: there's no .claude.json in it. ${example}`);
   return home;
 }
