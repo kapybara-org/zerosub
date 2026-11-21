@@ -16,6 +16,7 @@ import {
   redeemReset,
   removeAccount,
   renameAccount,
+  setQuotaCeiling,
   setAgentAccount,
   setDefaultAccount,
   setNextAgentAccount,
@@ -113,6 +114,10 @@ export default function contribute(server: PluginServerContext) {
   server.handle(startLogin, ({ family, method, accountId, proxy, shareSessions }) => service.startLogin(family, method, accountId, proxy, shareSessions));
   server.handle(submitLoginCode, ({ loginId, code }) => service.submitCode(loginId, code));
   server.handle(cancelLogin, ({ loginId }) => service.cancelLogin(loginId));
+  server.handle(setQuotaCeiling, async ({ accountId, windowId, percent }) => {
+    await service.setQuotaCeiling(accountId, windowId, percent);
+    return { ok: true as const };
+  });
   server.handle(renameAccount, async ({ accountId, label }) => {
     await service.rename(accountId, label);
     return { ok: true as const };

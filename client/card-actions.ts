@@ -6,12 +6,12 @@ export type CardActionKey = "clear" | "next" | "default" | "toggle" | "usage" | 
 /** Which buttons an account's card shows, in order. The card gives each its icon, label and handler. */
 export function cardActions(
   account: Pick<AccountView, "family" | "kind" | "auth" | "status" | "disabled" | "isDefault" | "nextAgentUntil" | "apiEditable" | "proxyEditable" | "azure" | "bedrock"> &
-    Partial<Pick<AccountView, "sessionsShared">>,
+    Partial<Pick<AccountView, "sessionsShared" | "ceilingHit">>,
 ): CardActionKey[] {
   const disabled = isDisabled(account);
   const signedOut = account.status === "signed_out";
   const keys: CardActionKey[] = [];
-  if (account.status === "limited") keys.push("clear");
+  if (account.status === "limited" && !account.ceilingHit) keys.push("clear");
   // A pick waiting here can always be canceled, whatever has become of the account since.
   if (account.nextAgentUntil || (!signedOut && !disabled)) keys.push("next");
   if (!account.isDefault && !signedOut && !disabled) keys.push("default");
