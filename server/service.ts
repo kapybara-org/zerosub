@@ -4318,6 +4318,7 @@ export class Service {
         throw new Error(`Sign in to ${target.label} before switching away from ${peer.label}.`);
       }
       target.disabled = !enabled;
+      delete target.pausedFor;
       if (enabled && target.signedIn && peer) preferClaudeLogin(draft, target, peer);
       if (!enabled) dropNextPick(draft, target);
     });
@@ -4582,7 +4583,16 @@ export class Service {
     const kept = account.home !== null && !(await isOwnHome(account.home));
     const signsOut = kept && signOut && account.family !== "pi" && account.auth !== "api" && !(await reachesCliHome(account.home!));
     await this.store.update((draft) => {
+      const removed = findAccount(draft, accountId);
+      const peer = removed && claudeLoginPeer(draft, removed);
+      if (removed && peer?.kind === "main" && peer.signedIn && peer.disabled && peer.pausedFor === removed.id) {
+        peer.disabled = false;
+        preferClaudeLogin(draft, peer, removed);
+      }
       draft.accounts = draft.accounts.filter((entry) => entry.id !== accountId);
+      for (const entry of draft.accounts) {
+        if (entry.pausedFor === accountId) delete entry.pausedFor;
+      }
       if (account.home && (!kept || signsOut)) {
         draft.cleanup[account.home] = { family: account.family, accountId, why: "removed", at: new Date().toISOString(), ...(signsOut ? { signOutOnly: true } : {}) };
       }
@@ -5276,6 +5286,7 @@ export class Service {
       account = newAccount({ id, family: "claude", kind: "managed", home });
       draft.accounts.push(account);
       applyIdentity(account, identity, draft);
+      enforceClaudeLoginPair(draft, account);
       // A removed account's folder that's back isn't cleaned up after all.
       for (const folder of Object.keys(draft.cleanup)) if (resolve(folder) === home) delete draft.cleanup[folder];
     });
@@ -5840,6 +5851,7 @@ export class Service {
         account.limitKind = null;
         account.modelLimits = {};
         handedOver = applyIdentity(account, identity, draft);
+        enforceClaudeLoginPair(draft, account);
       });
     } catch (error) {
       // A new account's home is then cleaned up as an unfinished sign-in, like any that failed.
@@ -6055,6 +6067,8 @@ function claudeLoginPeer(state: StoredState, account: StoredAccount): StoredAcco
 
 /** The two logins share a subscription. Transfer routing and known limits without changing either sign-in. */
 function preferClaudeLogin(state: StoredState, account: StoredAccount, peer: StoredAccount): void {
+  delete account.pausedFor;
+  if (!peer.disabled) peer.pausedFor = account.id;
   peer.disabled = true;
   if (defaultAccount(state, "claude")?.id === peer.id) state.defaults.claude = account.id;
   if (state.nextAgent.claude?.accountId === peer.id) state.nextAgent.claude.accountId = account.id;
@@ -6077,10 +6091,7 @@ function preferClaudeLogin(state: StoredState, account: StoredAccount, peer: Sto
 function applyIdentity(account: StoredAccount, identity: Identity, state: StoredState): boolean {
   const handedOver = account.kind === "main" && identity.signedIn && !!account.identity && !!identity.identity && !sameAccountIdentity(account.family, account, identity);
   applyIdentityFields(account, identity, state);
-  if (!handedOver) {
-    enforceClaudeLoginPair(state, account, identity);
-    return false;
-  }
+  if (!handedOver) return false;
   account.limitedUntil = null;
   account.limitKind = null;
   account.limitedAt = null;
@@ -6099,12 +6110,11 @@ function applyIdentity(account: StoredAccount, identity: Identity, state: Stored
       if (Date.parse(limit.until) > now) account.modelLimits[scope] = limit;
     }
   }
-  enforceClaudeLoginPair(state, account, identity);
   return true;
 }
 
-function enforceClaudeLoginPair(state: StoredState, account: StoredAccount, identity: Identity): void {
-  if (!identity.signedIn || !identity.identity || account.disabled) return;
+function enforceClaudeLoginPair(state: StoredState, account: StoredAccount): void {
+  if (!account.signedIn || !account.identity || account.disabled) return;
   const peer = claudeLoginPeer(state, account);
   if (peer && account.kind === "managed") preferClaudeLogin(state, account, peer);
   else if (peer?.signedIn && !peer.disabled) preferClaudeLogin(state, peer, account);

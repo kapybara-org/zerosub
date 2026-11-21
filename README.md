@@ -375,7 +375,7 @@ ZeroSub never implements OAuth itself and never copies credentials between accou
 - An Azure OpenAI account's key is in its home's `azure.json` only (see [Azure OpenAI accounts](#azure-openai-accounts)), and is sent nowhere but its endpoint.
 - An AWS Bedrock account's access key, if it has one, is in its home's `bedrock.json` only (see [AWS Bedrock accounts](#aws-bedrock-accounts)), and is handed only to its own sessions and the `aws` command that checks it. The region the Bedrock form fills in is looked up when it opens, never at startup.
 - An account that still has ChatGPT conversations on it can't be removed until you archive them or continue them elsewhere, because they can't move. Grok and Cursor conversations can only be archived.
-- Your CLI login can't be removed from ZeroSub. To use the same Claude subscription in a separate folder, add it under Claude or import its separately signed-in folder. ZeroSub pauses the matching CLI entry and moves its routing to the added account. Enabling either entry in ZeroSub pauses the other. Your terminal's regular Claude sign-in stays signed in.
+- Your CLI login can't be removed from ZeroSub. To use the same Claude subscription in a separate folder, add it under Claude or import its separately signed-in folder. ZeroSub pauses the matching CLI entry and moves its routing to the added account. Enabling either entry in ZeroSub pauses the other. Removing the added account restores the CLI entry and its routing if ZeroSub paused it for that account and it is still signed in to the same subscription.
 
 ## Limitations
 
