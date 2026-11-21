@@ -1,7 +1,7 @@
 import type { PluginHostProps } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/react-native";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { ActivityIndicator, Pressable, Text, View } from "react-native";
+import { ActivityIndicator, Platform, Pressable, Text, View } from "react-native";
 import { formatPercent, formatResetIn } from "../shared/format";
 import type { UsageWindow } from "../shared/model";
 
@@ -267,7 +267,32 @@ export function Badge({
   );
 }
 
-export function UsageBar({ theme, limit }: { theme: Theme; limit: UsageWindow }) {
+export function UsageBar({ theme, limit, ceiling, onCeiling }: {
+  theme: Theme;
+  limit: UsageWindow;
+  ceiling: number;
+  onCeiling(percent: number): Promise<void>;
+}) {
+  const [draft, setDraft] = useState<number | null>(null);
+  const trackWidth = useRef(0);
+  const drag = useRef<{ offset: number; percent: number } | null>(null);
+  const saving = useRef(false);
+  const max = draft ?? ceiling;
+  const toPercent = (x: number) => Math.round(Math.min(100, Math.max(1, x / Math.max(1, trackWidth.current) * 100)));
+  const save = async (value: number) => {
+    if (saving.current || value === ceiling) {
+      if (!saving.current) setDraft(null);
+      return;
+    }
+    saving.current = true;
+    setDraft(value);
+    try {
+      await onCeiling(value);
+    } finally {
+      saving.current = false;
+      setDraft(null);
+    }
+  };
   const colors = theme.colors;
   const percent = Math.min(100, Math.max(0, limit.usedPercent));
   const fill =
@@ -282,13 +307,67 @@ export function UsageBar({ theme, limit }: { theme: Theme; limit: UsageWindow })
           {reset ? ` · resets ${reset}` : ""}
         </Text>
       </View>
-      <View
-        accessibilityRole="progressbar"
-        accessibilityLabel={`${limit.label} usage`}
-        accessibilityValue={{ min: 0, max: 100, now: Math.round(percent) }}
-        style={{ height: 6, borderRadius: 3, backgroundColor: colors.surface2, overflow: "hidden" }}
-      >
-        <View style={{ width: `${percent}%`, height: 6, borderRadius: 3, backgroundColor: fill }} />
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+        <View
+          accessible
+          accessibilityRole="adjustable"
+          accessibilityLabel={`${limit.label} quota maximum, ${formatPercent(percent)} used`}
+          accessibilityValue={{ min: 1, max: 100, now: max, text: `${max}%` }}
+          accessibilityActions={[{ name: "increment" }, { name: "decrement" }]}
+          onAccessibilityAction={(event) => {
+            const step = event.nativeEvent.actionName === "increment" ? 1 : -1;
+            void save(Math.min(100, Math.max(1, max + step)));
+          }}
+          {...(Platform.OS === "web" ? {
+            tabIndex: 0,
+            onKeyDown: (event: { key: string; preventDefault(): void }) => {
+              let next: number;
+              switch (event.key) {
+                case "ArrowLeft":
+                case "ArrowDown": next = Math.max(1, max - 1); break;
+                case "ArrowRight":
+                case "ArrowUp": next = Math.min(100, max + 1); break;
+                case "Home": next = 1; break;
+                case "End": next = 100; break;
+                default: return;
+              }
+              event.preventDefault();
+              void save(next);
+            },
+          } : {})}
+          onLayout={(event) => { trackWidth.current = event.nativeEvent.layout.width; }}
+          onStartShouldSetResponder={() => !saving.current}
+          onResponderGrant={({ nativeEvent }) => {
+            const value = toPercent(nativeEvent.locationX);
+            drag.current = { offset: nativeEvent.pageX - nativeEvent.locationX, percent: value };
+            setDraft(value);
+          }}
+          onResponderMove={({ nativeEvent }) => {
+            if (!drag.current) return;
+            drag.current.percent = toPercent(nativeEvent.pageX - drag.current.offset);
+            setDraft(drag.current.percent);
+          }}
+          onResponderRelease={() => {
+            const value = drag.current?.percent;
+            drag.current = null;
+            if (value !== undefined) void save(value);
+          }}
+          onResponderTerminate={() => { drag.current = null; setDraft(null); }}
+          style={{ flex: 1, minHeight: 32, justifyContent: "center" }}
+        >
+          <View pointerEvents="none" style={{ height: 6, borderRadius: 3, backgroundColor: colors.surface2, overflow: "hidden" }}>
+            <View style={{ width: `${percent}%`, height: 6, backgroundColor: fill }} />
+          </View>
+          <View
+            pointerEvents="none"
+            style={{
+              position: "absolute", left: `${max}%`, top: "50%",
+              marginLeft: -4, marginTop: -9, width: 8, height: 18, borderRadius: 4,
+              backgroundColor: colors.foreground, borderWidth: 1, borderColor: colors.surface1,
+            }}
+          />
+        </View>
+        <Text style={{ color: colors.foregroundMuted, fontSize: 12 }}>Max {max}%</Text>
       </View>
     </View>
   );

@@ -61,6 +61,40 @@ const base = {
   portable: true,
 };
 
+it("routes around an account at a configured usage ceiling until that window resets", () => {
+  const first = account({ id: "first", quotaCeilings: { five_hour: 60 } });
+  const second = account({ id: "second" });
+  const state = stateWith([first, second], { defaults: { claude: first.id, codex: null, pi: null } });
+  const reading = usage(60);
+  reading.windows[0]!.resetsAt = new Date(NOW + 60_000).toISOString();
+  const input = { ...base, reason: "create" as const, usageOf: (id: string) => id === first.id ? reading : usage(85) };
+  expect(chooseAccount(state, input)?.account.id).toBe(second.id);
+  expect(chooseAccount(state, { ...input, now: NOW + 60_000 })?.account.id).toBe(first.id);
+});
+
+it("applies a Fable ceiling only to Fable agents", () => {
+  const first = account({ id: "first", quotaCeilings: { weekly_fable: 80 } });
+  const second = account({ id: "second" });
+  const state = stateWith([first, second], { defaults: { claude: first.id, codex: null, pi: null } });
+  const reading = usage(90);
+  reading.windows = [{ id: "weekly_fable", label: "Weekly · Fable", usedPercent: 90, resetsAt: null }];
+  const input = { ...base, reason: "create" as const, usageOf: (id: string) => id === first.id ? reading : null };
+  expect(chooseAccount(state, { ...input, model: "claude-fable-5" })?.account.id).toBe(second.id);
+  expect(chooseAccount(state, { ...input, model: "claude-sonnet-5" })?.account.id).toBe(first.id);
+  expect(chooseAccount(state, input)?.account.id).toBe(first.id);
+});
+
+it("moves an agent from a capped stand-in to a third account with room", () => {
+  const limited = account({ id: "limited", limitedUntil: new Date(NOW + 60_000).toISOString() });
+  const capped = account({ id: "capped", quotaCeilings: { five_hour: 80 } });
+  const free = account({ id: "free" });
+  const state = stateWith([limited, capped, free], { defaults: { claude: limited.id, codex: null, pi: null } });
+  const route = chooseAccount(state, {
+    ...base, reason: "refresh", current: capped.id, usageOf: (id) => usage(id === capped.id ? 80 : 85),
+  });
+  expect(route?.account.id).toBe(free.id);
+});
+
 describe("chooseAccount", () => {
   const main = account({ id: "claude-main", kind: "main", home: null });
   const work = account({ id: "claude-work" });

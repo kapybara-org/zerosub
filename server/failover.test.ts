@@ -4139,6 +4139,33 @@ describe("aligning agents with their accounts", () => {
     expect(notes[0]).toMatchObject({ from: "marketing", to: "hello", reason: "limit", outcome: "switched" });
   });
 
+  it("queues a quota-cap switch as soon as usage arrives and moves the agent after its turn", async () => {
+    const redeemReset = vi.fn<FamilyAdapter["redeemReset"]>(async () => ({ outcome: "reset", message: "reset", left: 0 }));
+    const { service, store, reopened, paseo, agent } = await setUp(onMarketing(), hit, {
+      claude: { redeemReset },
+      usage: () => ({
+        fetchedAt: new Date().toISOString(),
+        windows: [{ id: "five_hour", label: "5-hour", usedPercent: 81, resetsAt: inFuture() }],
+        error: null, cached: false, resets: null,
+      }),
+    });
+    await store.update((draft) => { draft.accounts.find((entry) => entry.id === MAIN)!.quotaCeilings = { five_hour: 80 }; });
+    service.setPreferences(preferences.schema.parse({ autoRedeem: true }));
+    agent.status = "running";
+    await service.onTurnStarted({ id: AGENT, provider: "claude" }, { paseo } as never);
+    await service.refreshUsage(MAIN, true);
+    await vi.waitFor(async () => {
+      const view = await service.view(paseo as never);
+      expect(view.agents.find((entry) => entry.agentId === AGENT)?.waiting).toBe("turn");
+    });
+    // A second pass waits for the same turn, without reloading a live session.
+    expect(reopened).toEqual([]);
+    agent.status = "idle";
+    await service.onTurnEnded(turnEnded, { paseo } as never);
+    await vi.waitFor(() => expect(reopened).toEqual([AGENT]));
+    expect(redeemReset).not.toHaveBeenCalled();
+  });
+
   it("leaves an agent on a full account when switching is off", async () => {
     const { service, store, reopened, paseo } = await setUp(onMarketing(), hit);
     service.setPreferences(preferences.schema.parse({ autoSwitch: false }));
@@ -5270,6 +5297,24 @@ describe("AWS Bedrock as the last resort", () => {
       expect(notes.at(-1)).toMatchObject({ outcome: "reset" });
     });
 
+    it("does not redeem a banked reset when a capped account also hits a provider limit", async () => {
+      const calls: Array<string | null> = [];
+      const { service, store, notes, limitTurn } = await setUp(onlyMain, window, {
+        ...redeeming("reset", calls),
+        usage: () => ({
+          fetchedAt: new Date().toISOString(),
+          windows: [{ id: "five_hour", label: "5-hour", usedPercent: 100, resetsAt: inFuture() }],
+          error: null, cached: false,
+          resets: { available: 1, usableNow: true, blockedReason: null, expiresAt: null, refills: [], label: null },
+        }),
+      });
+      await store.update((draft) => { draft.accounts.find((entry) => entry.id === MAIN)!.quotaCeilings = { five_hour: 80 }; });
+      service.setPreferences(preferences.schema.parse({ autoRedeem: true }));
+      await limitTurn();
+      expect(calls).toEqual([]);
+      expect(notes.at(-1)).toMatchObject({ outcome: "stayed" });
+    });
+
     it("moves onto Bedrock only once no reset could be spent", async () => {
       const calls: Array<string | null> = [];
       const { service, store, reopened, notes, limitTurn } = await setUp(onlyMain, window, redeeming("none", calls));
@@ -5314,6 +5359,13 @@ describe("AWS Bedrock as the last resort", () => {
       t.service.setPreferences(preferences.schema.parse({ paidApiFallback: true, autoRedeem: true, balanceNewAgents: true }));
       await t.open("spread", "create");
       expect((await t.store.read()).sessions.spread?.accountId).toBe(MAIN);
+    });
+
+    it("does not route a new agent to a capped subscription for its banked reset", async () => {
+      const t = await limitedWithReset(true, {});
+      await t.store.update((draft) => { draft.accounts.find((entry) => entry.id === MAIN)!.quotaCeilings = { five_hour: 80 }; });
+      await t.open("fresh", "create");
+      expect((await t.store.read()).sessions.fresh?.accountId).toBe(bedrock.id);
     });
 
     it("keeps an existing agent on its limited subscription when it resumes or is aligned, so its next turn spends the reset", async () => {
