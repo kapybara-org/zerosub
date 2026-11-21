@@ -15,11 +15,13 @@ import {
   readAccountApi,
   readAccountProxy,
   removeHome,
+  setShareMcpSignIns,
   shareClaudeSessions,
   writeAccountApi,
   writeAccountProxy,
 } from "./homes";
 import { isAzureHome, writeAzureAccount } from "./azure";
+import { preferences } from "../shared/preferences";
 
 let root: string;
 const saved = {
@@ -467,6 +469,18 @@ describe.skipIf(process.platform === "darwin")("MCP sign-ins shared between acco
     delete process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR;
     await mkdir(main, { recursive: true });
     await mkdir(home, { recursive: true });
+    setShareMcpSignIns(true);
+  });
+  afterEach(() => setShareMcpSignIns(false));
+
+  it("copies nothing while the preference is off, as it is by default", async () => {
+    expect(preferences.schema.parse({}).shareMcpSignIns).toBe(false);
+    setShareMcpSignIns(false);
+    await store(main, { claudeAiOauth: {}, mcpOAuth: { [LINEAR]: signedIn("plugin:linear:linear", "main-linear", 2_000) } });
+    await store(home, { claudeAiOauth: {}, mcpOAuth: { [NOTION]: signedIn("plugin:Notion:notion", "notion", 3_000) } });
+    await prepareClaudeHome(home, true);
+    expect((await credentials(home)).mcpOAuth).toEqual({ [NOTION]: signedIn("plugin:Notion:notion", "notion", 3_000) });
+    expect((await credentials(main)).mcpOAuth).toEqual({ [LINEAR]: signedIn("plugin:linear:linear", "main-linear", 2_000) });
   });
 
   const credentials = async (dir: string) => JSON.parse(await readFile(join(dir, ".credentials.json"), "utf8"));

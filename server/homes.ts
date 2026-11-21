@@ -458,6 +458,15 @@ async function syncClaudeGlobalConfig(home: string): Promise<void> {
   }
 }
 
+/** The `shareMcpSignIns` preference; off until the service reads the preferences. */
+let shareMcpSignIns = false;
+
+/** Turned on, the next sync of every home runs in full, so sign-ins are shared at once. */
+export function setShareMcpSignIns(on: boolean): void {
+  if (on && !shareMcpSignIns) forgetSyncs();
+  shareMcpSignIns = on;
+}
+
 const CLAUDE_CREDENTIALS = ".credentials.json";
 /**
  * Claude Code writes its credential store holding `<dir>/.storage-write.lock` (proper-lockfile,
@@ -530,10 +539,11 @@ async function forgetNeedsAuth(home: string, servers: ReadonlySet<string>): Prom
  * Shares MCP servers' OAuth sign-ins between main and an account: each entry of `mcpOAuth` in
  * `.credentials.json` goes wherever it's fresher (see `fresherMcpOAuth`), both ways, so a sign-in
  * or a token refresh on any account reaches every other through main. The account's own Claude
- * sign-in (`claudeAiOauth`) is never touched. Off macOS only: there the store is the Keychain.
+ * sign-in (`claudeAiOauth`) is never touched. Only with `shareMcpSignIns` on, and off macOS: there
+ * the store is the Keychain.
  */
 async function syncClaudeMcpOAuth(home: string): Promise<void> {
-  if (process.platform === "darwin") return;
+  if (!shareMcpSignIns || process.platform === "darwin") return;
   const mainDir = mainClaudeStorageDir();
   if (resolve(mainDir) === resolve(home)) return;
   const [main, own] = await Promise.all([readJsonObject(join(mainDir, CLAUDE_CREDENTIALS)), readJsonObject(join(home, CLAUDE_CREDENTIALS))]);
