@@ -359,7 +359,7 @@ Sign-in runs the official CLIs:
 - Grok: `grok login --oauth`, or `grok login --device-auth` for the code.
 - Cursor: `cursor-agent login`.
 
-ZeroSub never implements OAuth itself and never copies credentials between accounts.
+ZeroSub never implements OAuth itself and never copies an account's own sign-in to another. The one thing it carries between accounts is MCP servers' OAuth sign-ins (see below).
 
 ## Privacy and security
 
@@ -379,7 +379,7 @@ ZeroSub never implements OAuth itself and never copies credentials between accou
 
 ## Limitations
 
-- **MCP servers that use OAuth** (Linear, Notion, …) store their tokens per Claude account, so sign in to them once on each account.
+- **MCP servers that use OAuth** (Linear, Notion, …) are signed in once for every Claude account wherever Claude Code keeps sign-ins in a `.credentials.json` file (not on macOS, where they're in each account's Keychain entry: sign in to them once on each account there). Claude Code keeps them in `.credentials.json` beside the account's own sign-in, under `mcpOAuth`; every 30 seconds ZeroSub copies each server's entry between your CLI login and every added account, whichever way it's newer (it holds a token and the other doesn't, or it expires later), under Claude Code's own lock on that file, and never touches the account's own sign-in. A server it just brought in is dropped from that account's `mcp-needs-auth-cache.json`, so a new session uses it at once; a session already open may need `/mcp` to reconnect. Signing out of a server on one account doesn't carry: another account's token comes back. When a server replaces its refresh token on every refresh, two accounts refreshing the same token at once can leave one of them with a spent token until the next copy (up to 30 seconds).
 - **A long Keychain sign-in keeps an added Claude account's folder where it is (macOS).** Added Claude accounts move out of ZeroSub's `homes/` into `~/.claude-config` (or the folder picked under the Claude accounts) with their Keychain entry, which ZeroSub copies through `security -i`'s standard input so the sign-in never shows in the process list. `security -i` takes about 4,000 characters a line, and the sign-in goes on it as hex, so an entry over about 1.9 KB can't be copied that way; Claude Code's records of MCP servers' sign-ins (`mcpOAuth`) can make it that long. Such an account keeps its folder and works as before, and its card says why. ZeroSub looks at the entry again every 30 minutes, and moves the folder once it fits.
 - **Shared settings apply to every account.** If `~/.claude/settings.json` sets an `apiKeyHelper` or API-key `env`, every account uses that key instead of its subscription. Likewise, an `[auth]` command, customer SSO (`[grok_com_config.oidc]`) or a model's own `api_key` in `~/.grok/config.toml` signs every Grok account in the same way.
 - **A Grok sign-in set in the daemon's environment** (`GROK_AUTH_PROVIDER_COMMAND`, or `GROK_OIDC_ISSUER` and `GROK_OIDC_CLIENT_ID`) is used by your CLI login only. ZeroSub clears it for added Grok accounts, so one that can only sign in that way may fail to sign in or stay signed in; ZeroSub shows a warning when it's set.

@@ -7,7 +7,7 @@ import { BEDROCK_FILE, bedrockSettings, isBedrockHome, readBedrockAccount } from
 import { Mutex, readJson } from "./json-file";
 import { NO_PROXY_KEYS, PROXY_KEYS, REQUIRED_NO_PROXY, bypassesProxy, maskProxy, noProxyFromEnv, proxyFromEnv, withClaudeNoProxy, withRequiredNoProxy, withoutClaudeDomains, withoutDomains } from "./proxy";
 import { providerEnv } from "./provider-env";
-import { homesDir, isOwnHome, mainClaudeDir, mainClaudeGlobalConfig, mainCodexHome, mainConfigHome, mainCursorConfigDir, mainGrokHome, mainPiDir } from "./paths";
+import { homesDir, isOwnHome, mainClaudeDir, mainClaudeGlobalConfig, mainClaudeStorageDir, mainCodexHome, mainConfigHome, mainCursorConfigDir, mainGrokHome, mainPiDir } from "./paths";
 
 /**
  * A managed account home is a real directory holding that account's own credentials and account
@@ -382,13 +382,13 @@ async function writeJsonAtomically(path: string, value: unknown): Promise<void> 
  * Claude Code guards `.claude.json` writes with a `<file>.lock` directory; take it too. False while
  * someone else holds it, else what `action` returns.
  */
-async function withClaudeConfigLock(file: string, action: () => Promise<boolean>): Promise<boolean> {
+async function withClaudeConfigLock(file: string, action: () => Promise<boolean>, staleMs = 10_000): Promise<boolean> {
   const lock = `${file}.lock`;
   try {
     await mkdir(lock);
   } catch {
     const held = await stat(lock).catch(() => null);
-    if (held && Date.now() - held.mtimeMs < 10_000) return false;
+    if (held && Date.now() - held.mtimeMs < staleMs) return false;
     await rmdir(lock).catch(() => undefined);
     try {
       await mkdir(lock);
@@ -456,6 +456,92 @@ async function syncClaudeGlobalConfig(home: string): Promise<void> {
     lastMcpSync.set(home, sourceStat.mtimeMs);
     lastMcpKeys.set(home, new Set(Object.keys(mainServers)));
   }
+}
+
+const CLAUDE_CREDENTIALS = ".credentials.json";
+/**
+ * Claude Code writes its credential store holding `<dir>/.storage-write.lock` (proper-lockfile,
+ * stale after 15 s), reading the file again under it, so a write made under the same lock is kept.
+ */
+const CLAUDE_STORAGE_LOCK = ".storage-write";
+const CLAUDE_STORAGE_STALE_MS = 15_000;
+
+function holdsMcpToken(entry: unknown): boolean {
+  return isObject(entry) && ((typeof entry.accessToken === "string" && entry.accessToken !== "") || (typeof entry.refreshToken === "string" && entry.refreshToken !== ""));
+}
+
+/**
+ * Whether `candidate`, one MCP server's OAuth entry, should replace `current`: it holds a token and
+ * `current` doesn't, or it expires later (it was issued later: a refresh, or a sign-in made since).
+ * An entry without a token never replaces anything, so signing out of a server on one account is
+ * undone by another account's token.
+ */
+export function fresherMcpOAuth(candidate: unknown, current: unknown): boolean {
+  if (!holdsMcpToken(candidate)) return false;
+  if (!holdsMcpToken(current)) return true;
+  const expiry = (entry: unknown) => (isObject(entry) && typeof entry.expiresAt === "number" ? entry.expiresAt : 0);
+  return expiry(candidate) > expiry(current);
+}
+
+/**
+ * Writes the entries of `from` fresher than the ones in `dir`'s credential store into it, under
+ * Claude Code's lock; returns them. Nothing when the store isn't there (the account isn't signed
+ * in: a file made here would read as a sign-in), doesn't read, or Claude Code is writing it now.
+ */
+async function carryMcpOAuth(dir: string, from: Json): Promise<Json[]> {
+  const file = join(dir, CLAUDE_CREDENTIALS);
+  const carried: Json[] = [];
+  await withClaudeConfigLock(
+    join(dir, CLAUDE_STORAGE_LOCK),
+    async () => {
+      const current = await readJsonObject(file);
+      if (!current) return false;
+      const entries: Json = isObject(current.mcpOAuth) ? current.mcpOAuth : {};
+      const next: Json = { ...entries };
+      for (const [key, entry] of Object.entries(from)) {
+        if (isObject(entry) && fresherMcpOAuth(entry, entries[key])) {
+          next[key] = entry;
+          carried.push(entry);
+        }
+      }
+      if (carried.length === 0) return true;
+      // Write through a dotfiles symlink rather than replacing it.
+      await writeJsonAtomically(await realpath(file).catch(() => file), { ...current, mcpOAuth: next });
+      return true;
+    },
+    CLAUDE_STORAGE_STALE_MS,
+  );
+  return carried;
+}
+
+/**
+ * Drops `servers` from a home's needs-auth cache: Claude Code skips a server listed there for up to
+ * 4 hours without looking for a token, so one carried in would go unused until then.
+ */
+async function forgetNeedsAuth(home: string, servers: ReadonlySet<string>): Promise<void> {
+  const file = join(home, "mcp-needs-auth-cache.json");
+  const cache = await readJsonObject(file);
+  if (!cache || ![...servers].some((server) => server in cache)) return;
+  for (const server of servers) delete cache[server];
+  await writeJsonAtomically(file, cache);
+}
+
+/**
+ * Shares MCP servers' OAuth sign-ins between main and an account: each entry of `mcpOAuth` in
+ * `.credentials.json` goes wherever it's fresher (see `fresherMcpOAuth`), both ways, so a sign-in
+ * or a token refresh on any account reaches every other through main. The account's own Claude
+ * sign-in (`claudeAiOauth`) is never touched. Off macOS only: there the store is the Keychain.
+ */
+async function syncClaudeMcpOAuth(home: string): Promise<void> {
+  if (process.platform === "darwin") return;
+  const mainDir = mainClaudeStorageDir();
+  if (resolve(mainDir) === resolve(home)) return;
+  const [main, own] = await Promise.all([readJsonObject(join(mainDir, CLAUDE_CREDENTIALS)), readJsonObject(join(home, CLAUDE_CREDENTIALS))]);
+  if (!main || !own) return;
+  const toHome = await carryMcpOAuth(home, isObject(main.mcpOAuth) ? main.mcpOAuth : {});
+  await carryMcpOAuth(mainDir, isObject(own.mcpOAuth) ? own.mcpOAuth : {});
+  const servers = new Set(toHome.map((entry) => entry.serverName).filter((name): name is string => typeof name === "string"));
+  if (servers.size > 0) await forgetNeedsAuth(home, servers);
 }
 
 /** Settings whose lists Claude Code joins across settings files rather than letting one replace another. */
@@ -935,6 +1021,8 @@ export function prepareClaudeHome(home: string, force = false, wanted?: () => Pr
     });
     await syncClaudeGlobalConfig(home);
     await syncClaudeSettings(home);
+    // Last, and on its own: a credential store that can't be written now is tried again next sync.
+    await syncClaudeMcpOAuth(home).catch((error: unknown) => console.warn(`[ZeroSub] could not share MCP sign-ins with ${home}`, error instanceof Error ? error.message : error));
     lastSync.set(home, Date.now());
   });
 }
