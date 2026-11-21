@@ -1717,6 +1717,11 @@ export class Service {
     }
 
     if (!this.prefs.autoSwitch) return;
+    if (problem.kind === "limit" && keptAtLimit((await this.store.read()).bindings[agentId], account.id)) {
+      // Pinned there with `allowLimited`: its work belongs on this account, so it stops where it is.
+      console.log(`[ZeroSub] ${agentId} is kept on ${account.label} past its limit; not moving it`);
+      return;
+    }
     if (elsewhere) {
       await this.noteElsewhere(paseo, agentId, account, problem.kind, resetsAt, elsewhere, "switch");
       return;
@@ -2265,6 +2270,7 @@ export class Service {
           families[agent.provider] === family &&
           this.runningOn(state, agent.id, family) === accountId &&
           !(reason === "pacing" && state.bindings[agent.id]?.source === "user") &&
+          !(reason === "limit" && keptAtLimit(state.bindings[agent.id], accountId)) &&
           (!scope || scopeCoversModel(scope, this.agentModels.get(agent.id))),
       )
       .map((agent) => agent.id);
@@ -4437,8 +4443,19 @@ export class Service {
    * an account at its limit is refused, since the agent would be moved straight off it. A failover
    * under way finishes first; the agent then moves to the account picked here.
    */
-  async setAgentAccount(paseo: PaseoApi, agentId: string, accountId: string | null): Promise<ReopenSummary> {
+  /**
+   * Pins an agent to an account, or (`null`) lets it follow the default again. With `allowLimited`, an
+   * account at its limit is taken too, and the agent stays on it while it's limited (see `Binding`).
+   */
+  async setAgentAccount(
+    paseo: PaseoApi,
+    agentId: string,
+    accountId: string | null,
+    options: { allowLimited?: boolean } = {},
+  ): Promise<ReopenSummary> {
     const replyBy = Date.now() + REPLY_WAIT_MS;
+    const allowLimited = options.allowLimited === true;
+    if (allowLimited && !accountId) throw new Error("Name the account to keep the agent on.");
     this.attach(paseo);
     const info = await lookUpAgent(paseo, agentId);
     if (!info) throw new Error("That agent is no longer available.");
@@ -4450,7 +4467,7 @@ export class Service {
     if (!target || target.family !== family) throw new Error("That account can't be used with this agent.");
     if (!target.signedIn) throw new Error(`${target.label} is signed out. Sign it in first.`);
     if (accountId && target.disabled) throw new Error(`${target.label} is disabled. Enable it in Accounts first.`);
-    if (accountId && this.prefs.autoSwitch) {
+    if (accountId && this.prefs.autoSwitch && !allowLimited) {
       const now = Date.now();
       if (isLimited(target, now)) throw new Error(limitedPick(target.label));
       // Only a limit of this agent's own model refuses it; another model's leaves the account open.
@@ -4518,8 +4535,14 @@ export class Service {
     }
 
     await this.store.update((draft) => {
-      if (accountId) draft.bindings[agentId] = { accountId, source: adapter.portable ? "user" : "thread", at: new Date().toISOString() };
-      else delete draft.bindings[agentId];
+      if (accountId) {
+        draft.bindings[agentId] = {
+          accountId,
+          source: adapter.portable ? "user" : "thread",
+          at: new Date().toISOString(),
+          ...(allowLimited ? { allowLimited: true as const } : {}),
+        };
+      } else delete draft.bindings[agentId];
     });
     const summary = emptySummary();
     return this.answerBy(replyBy, this.reconcile(paseo, "manual", [agentId], undefined, { summary }), summary);
@@ -6039,6 +6062,11 @@ function sameSubscription(state: StoredState, account: StoredAccount): StoredAcc
 }
 
 /** Returns true when the CLI login's account was replaced by a different one, which drops what the slot knew of the old one's limit. */
+/** The agent is pinned to `accountId` with `allowLimited`, so a limit there doesn't move it. */
+function keptAtLimit(binding: Binding | undefined, accountId: string): boolean {
+  return binding?.allowLimited === true && binding.accountId === accountId;
+}
+
 function applyIdentity(account: StoredAccount, identity: Identity, state: StoredState): boolean {
   const handedOver = account.kind === "main" && identity.signedIn && !!account.identity && !!identity.identity && !sameAccountIdentity(account.family, account, identity);
   applyIdentityFields(account, identity, state);

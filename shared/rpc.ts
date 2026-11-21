@@ -323,6 +323,11 @@ export const setAgentAccount = defineRpc({
     agentId: z.string(),
     /** `null` makes the agent follow the default account again. */
     accountId: z.string().nullable(),
+    /**
+     * Keep the agent on `accountId` even while that account is at its limit, for an account that
+     * keeps working past it (extra usage). Needs an account; signed-out and disabled ones still swap.
+     */
+    allowLimited: z.boolean().optional(),
   }),
   output: ReopenSummarySchema,
 });
