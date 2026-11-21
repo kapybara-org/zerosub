@@ -243,6 +243,7 @@ export class ClaudeAdapter implements FamilyAdapter {
           return {
             fetchedAt, windows, error: null, cached: false, resets: resetStatus.offer, credits: null,
             checkResetsInClaude: resetStatus.checkInClaude ?? false,
+            fableResets: resetStatus.fableResets,
             ...(withSpend ? { extraUsage: parseExtraUsage(body.extra_usage) } : {}),
           };
         }

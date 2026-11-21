@@ -92,6 +92,11 @@ export interface ClaudeResetStatus {
   /** Claude sees the account at a usage limit right now. */
   atLimit: boolean;
   checkInClaude?: boolean;
+  fableResets?: number;
+}
+
+function isFableOnly(grant: Grant): boolean {
+  return grant.clears.includes("seven_day_overage_included") && !grant.clears.includes("seven_day");
 }
 
 /** Reads the `cedar_ember` block. `offer` is null when nothing is banked. */
@@ -100,8 +105,15 @@ export function parseClaudeResets(block: unknown, now: number = Date.now()): Cla
   const atLimit = block.at_limit === true;
   const grants = (Array.isArray(block.grants) ? block.grants : []).map(parseGrant).filter((grant): grant is Grant => grant !== null);
   const available = grants.reduce((sum, grant) => sum + grant.resetsLeft, 0);
+  let fableResets: number | undefined;
+  if (block.eligible === true && Array.isArray(block.grants)) {
+    fableResets = grants.filter((grant) => isFableOnly(grant) && (!grant.endsAt || Date.parse(grant.endsAt) > now))
+      .reduce((sum, grant) => sum + grant.resetsLeft, 0);
+  } else if (block.eligible === false && block.ineligible_reason === "no_grant" && available === 0) {
+    fableResets = 0;
+  }
   const webOnly = block.eligible === false && block.ineligible_reason === "surface";
-  if (available === 0) return { offer: null, nextGrantId: null, atLimit, checkInClaude: webOnly };
+  if (available === 0) return { offer: null, nextGrantId: null, atLimit, checkInClaude: webOnly, fableResets };
 
   const nextId = typeof block.next_grant_id === "string" && grants.some((grant) => grant.id === block.next_grant_id) ? block.next_grant_id : null;
   const next = grants.find((grant) => grant.id === nextId) ?? grants.find((grant) => grant.resetsLeft > 0) ?? null;
@@ -109,7 +121,7 @@ export function parseClaudeResets(block: unknown, now: number = Date.now()): Cla
   const cooldown = isoTime(block.cooldown_until);
 
   // A Fable reset restores only the Fable share of weekly usage. Leave it to Claude’s supported surface.
-  const fable = !!next && next.clears.includes("seven_day_overage_included") && !next.clears.includes("seven_day");
+  const fable = !!next && isFableOnly(next);
   let blockedReason: string | null = null;
   if (fable) {
     blockedReason = "Use this Fable reset in Claude under Settings → Usage.";
@@ -133,6 +145,7 @@ export function parseClaudeResets(block: unknown, now: number = Date.now()): Cla
   return {
     nextGrantId: nextId,
     checkInClaude: webOnly || fable,
+    fableResets,
     atLimit,
     offer: {
       available,
