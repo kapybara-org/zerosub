@@ -1060,6 +1060,13 @@ function AutomationSettings({ theme, compact }: { theme: Theme; compact: boolean
             onValueChange={(moveAgentsOnDefaultChange) => save({ moveAgentsOnDefaultChange })}
           />
           <SettingsSwitch
+            label="Share MCP sign-ins between Claude accounts"
+            hint="Off unless you turn it on. MCP servers you sign in to on one Claude account (Linear, Notion, …) work on the others too: each server's newest sign-in is copied between them every 30 seconds. Each account keeps its own Claude sign-in. Not on macOS. Turned off, nothing more is copied, and sign-ins already copied stay."
+            value={settings.values.shareMcpSignIns}
+            disabled={settings.saving}
+            onValueChange={(shareMcpSignIns) => save({ shareMcpSignIns })}
+          />
+          <SettingsSwitch
             label="Use banked resets when every account is out"
             hint="Spends one of the account's banked resets instead of stopping. Resets are scarce, so this is off unless you turn it on."
             value={settings.values.autoRedeem}

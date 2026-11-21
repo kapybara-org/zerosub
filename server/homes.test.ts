@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, rmdir, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -6,6 +6,7 @@ import {
   accountSettings,
   claudeSessionsShared,
   codexSessionsShared,
+  fresherMcpOAuth,
   mergeSettings,
   mergeShared,
   normalizeBaseUrl,
@@ -14,15 +15,18 @@ import {
   readAccountApi,
   readAccountProxy,
   removeHome,
+  setShareMcpSignIns,
   shareClaudeSessions,
   writeAccountApi,
   writeAccountProxy,
 } from "./homes";
 import { isAzureHome, writeAzureAccount } from "./azure";
+import { preferences } from "../shared/preferences";
 
 let root: string;
 const saved = {
   CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
+  CLAUDE_SECURESTORAGE_CONFIG_DIR: process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR,
   CODEX_HOME: process.env.CODEX_HOME,
   PASEO_HOME: process.env.PASEO_HOME,
   ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
@@ -441,6 +445,113 @@ describe("prepareClaudeHome", () => {
   });
 
 
+});
+
+describe.skipIf(process.platform === "darwin")("MCP sign-ins shared between accounts", () => {
+  const LINEAR = "plugin:linear:linear|638130d5ab3558f4";
+  const NOTION = "plugin:Notion:notion|eac663db915250e7";
+  const signedIn = (serverName: string, accessToken: string, expiresAt: number) => ({
+    serverName,
+    serverUrl: `https://${serverName}.example/mcp`,
+    accessToken,
+    refreshToken: `${accessToken}-refresh`,
+    expiresAt,
+    clientId: "client",
+  });
+  const signedOut = (serverName: string) => ({ serverName, serverUrl: `https://${serverName}.example/mcp`, accessToken: "", discoveryState: {} });
+
+  let main: string;
+  let home: string;
+  beforeEach(async () => {
+    main = join(root, "main");
+    home = join(root, "homes", "claude-m");
+    process.env.CLAUDE_CONFIG_DIR = main;
+    delete process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR;
+    await mkdir(main, { recursive: true });
+    await mkdir(home, { recursive: true });
+    setShareMcpSignIns(true);
+  });
+  afterEach(() => setShareMcpSignIns(false));
+
+  it("copies nothing while the preference is off, as it is by default", async () => {
+    expect(preferences.schema.parse({}).shareMcpSignIns).toBe(false);
+    setShareMcpSignIns(false);
+    await store(main, { claudeAiOauth: {}, mcpOAuth: { [LINEAR]: signedIn("plugin:linear:linear", "main-linear", 2_000) } });
+    await store(home, { claudeAiOauth: {}, mcpOAuth: { [NOTION]: signedIn("plugin:Notion:notion", "notion", 3_000) } });
+    await prepareClaudeHome(home, true);
+    expect((await credentials(home)).mcpOAuth).toEqual({ [NOTION]: signedIn("plugin:Notion:notion", "notion", 3_000) });
+    expect((await credentials(main)).mcpOAuth).toEqual({ [LINEAR]: signedIn("plugin:linear:linear", "main-linear", 2_000) });
+  });
+
+  const credentials = async (dir: string) => JSON.parse(await readFile(join(dir, ".credentials.json"), "utf8"));
+  const store = (dir: string, value: unknown) => writeFile(join(dir, ".credentials.json"), JSON.stringify(value), { mode: 0o600 });
+
+  it("gives an account main's sign-ins without touching its own Claude sign-in", async () => {
+    await store(main, { claudeAiOauth: { accessToken: "main-claude" }, mcpOAuth: { [LINEAR]: signedIn("plugin:linear:linear", "main-linear", 2_000) } });
+    await store(home, { claudeAiOauth: { accessToken: "home-claude" }, mcpOAuth: { [LINEAR]: signedOut("plugin:linear:linear") } });
+    await writeFile(join(home, "mcp-needs-auth-cache.json"), JSON.stringify({ "plugin:linear:linear": { timestamp: Date.now() }, "plugin:figma:figma": { timestamp: 1 } }));
+    await prepareClaudeHome(home, true);
+
+    const own = await credentials(home);
+    expect(own.claudeAiOauth).toEqual({ accessToken: "home-claude" });
+    expect(own.mcpOAuth[LINEAR]).toEqual(signedIn("plugin:linear:linear", "main-linear", 2_000));
+    expect((await stat(join(home, ".credentials.json"))).mode & 0o777).toBe(0o600);
+    // Only the server whose sign-in arrived stops being skipped as needing one.
+    expect(JSON.parse(await readFile(join(home, "mcp-needs-auth-cache.json"), "utf8"))).toEqual({ "plugin:figma:figma": { timestamp: 1 } });
+    expect((await credentials(main)).claudeAiOauth).toEqual({ accessToken: "main-claude" });
+  });
+
+  it("brings an account's sign-in or refreshed token back to main, so every other account gets it", async () => {
+    const other = join(root, "homes", "claude-o");
+    await mkdir(other, { recursive: true });
+    await store(main, { claudeAiOauth: {}, mcpOAuth: { [LINEAR]: signedIn("plugin:linear:linear", "old", 1_000) } });
+    await store(home, { claudeAiOauth: {}, mcpOAuth: { [LINEAR]: signedIn("plugin:linear:linear", "rotated", 5_000), [NOTION]: signedIn("plugin:Notion:notion", "notion", 3_000) } });
+    await store(other, { claudeAiOauth: {}, mcpOAuth: { [LINEAR]: signedIn("plugin:linear:linear", "old", 1_000) } });
+    await prepareClaudeHome(home, true);
+    await prepareClaudeHome(other, true);
+
+    for (const dir of [main, other]) {
+      const { mcpOAuth } = await credentials(dir);
+      expect(mcpOAuth[LINEAR].accessToken).toBe("rotated");
+      expect(mcpOAuth[NOTION].accessToken).toBe("notion");
+    }
+  });
+
+  it("leaves an account that isn't signed in without a credential store", async () => {
+    await store(main, { claudeAiOauth: {}, mcpOAuth: { [LINEAR]: signedIn("plugin:linear:linear", "main-linear", 2_000) } });
+    await prepareClaudeHome(home, true);
+    expect(await lstat(join(home, ".credentials.json")).catch(() => null)).toBeNull();
+  });
+
+  it("waits while Claude Code is writing an account's credential store", async () => {
+    await store(main, { claudeAiOauth: {}, mcpOAuth: { [LINEAR]: signedIn("plugin:linear:linear", "main-linear", 2_000) } });
+    await store(home, { claudeAiOauth: {} });
+    await mkdir(join(home, ".storage-write.lock"));
+    await prepareClaudeHome(home, true);
+    expect((await credentials(home)).mcpOAuth).toBeUndefined();
+
+    await rmdir(join(home, ".storage-write.lock"));
+    await prepareClaudeHome(home, true);
+    expect((await credentials(home)).mcpOAuth[LINEAR].accessToken).toBe("main-linear");
+  });
+
+  it("reads main's sign-ins where CLAUDE_SECURESTORAGE_CONFIG_DIR puts them", async () => {
+    const secure = join(root, "secure");
+    await mkdir(secure, { recursive: true });
+    process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR = secure;
+    await store(secure, { claudeAiOauth: {}, mcpOAuth: { [LINEAR]: signedIn("plugin:linear:linear", "secure-linear", 2_000) } });
+    await store(home, { claudeAiOauth: {} });
+    await prepareClaudeHome(home, true);
+    expect((await credentials(home)).mcpOAuth[LINEAR].accessToken).toBe("secure-linear");
+  });
+
+  it("decides which entry is fresher", () => {
+    expect(fresherMcpOAuth(signedOut("s"), signedIn("s", "t", 1))).toBe(false);
+    expect(fresherMcpOAuth(signedIn("s", "t", 1), signedOut("s"))).toBe(true);
+    expect(fresherMcpOAuth(signedIn("s", "t", 1), undefined)).toBe(true);
+    expect(fresherMcpOAuth(signedIn("s", "new", 2), signedIn("s", "old", 1))).toBe(true);
+    expect(fresherMcpOAuth(signedIn("s", "same", 1), signedIn("s", "other", 1))).toBe(false);
+  });
 });
 
 describe("prepareCodexHome", () => {

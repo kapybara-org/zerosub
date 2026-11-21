@@ -58,6 +58,13 @@ export const preferences = defineSettings({
      * default, and so is a key for another endpoint either way. Pi accounts never stand in.
      */
     paidApiFallback: z.boolean().default(false),
+    /**
+     * Off unless turned on. Claude accounts share MCP servers' OAuth sign-ins (Linear, Notion, …)
+     * with the CLI login and each other: each server's newest sign-in is copied into every signed-in
+     * Claude account's credential store, never the account's own Claude sign-in. Off, nothing is
+     * copied, and sign-ins already copied stay where they are.
+     */
+    shareMcpSignIns: z.boolean().default(false),
     /** Show the account pill in the composer of Claude and Codex agents. */
     showComposerPill: z.boolean().default(true),
     /**
