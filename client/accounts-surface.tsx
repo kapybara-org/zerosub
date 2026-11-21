@@ -369,6 +369,7 @@ function AccountCard({
   const [signOut, setSignOut] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const resets = account.usage?.resets ?? null;
+  const fableResets = account.usage?.fableResets;
   const credits = account.usage?.credits ?? null;
   const extraUsage = account.usage?.extraUsage ? formatExtraUsage(account.usage.extraUsage) : null;
   const plan = azure || bedrock ? null : formatPlan(account.plan);
@@ -741,6 +742,14 @@ function AccountCard({
         {!signedOut && credits ? <Text style={text.small}>{formatCredits(credits)}</Text> : null}
         {!signedOut && extraUsage ? <Text style={text.small}>{extraUsage}</Text> : null}
         {!signedOut && windows.length > 0 && account.usage?.error ? <Text style={text.small}>{account.usage.error}</Text> : null}
+        {!signedOut && fableResets !== undefined ? (
+          <Text style={text.small}>
+            {fableResets} banked Fable {fableResets === 1 ? "reset" : "resets"}
+            {fableResets > 0 && !resets?.blockedReason ? " · Use in Claude Settings → Usage" : ""}
+          </Text>
+        ) : !signedOut && account.usage?.checkResetsInClaude && !resets?.blockedReason ? (
+          <Text style={text.small}>Check for banked Fable resets in Claude under Settings → Usage.</Text>
+        ) : null}
         {!signedOut && resets?.blockedReason ? <Text style={text.small}>{resets.blockedReason}</Text> : null}
       </View>
 

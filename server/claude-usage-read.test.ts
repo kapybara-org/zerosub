@@ -81,6 +81,32 @@ describe("Claude usage read", () => {
     expect(usage.extraUsage).toEqual({ enabled: true, spend: 1234, limit: 5000, currency: "USD" });
   });
 
+  it("shows live Fable-only counts from the normal usage response", async () => {
+    answer([() => Response.json({ ...body, cedar_ember: { eligible: true, grants: [
+      { id: "weekly", resets_left: 3, clears: ["seven_day", "seven_day_overage_included"] },
+      { id: "fable", resets_left: 2, clears: ["seven_day_overage_included"] },
+      { id: "expired", resets_left: 1, clears: ["seven_day_overage_included"], ends_at: "2000-01-01T00:00:00Z" },
+    ] } })]);
+    expect((await new ClaudeAdapter().usage(home)).fableResets).toBe(2);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("keeps usage and the check-in-Claude hint when the response hides the count", async () => {
+    answer([() => Response.json({ ...body, cedar_ember: { eligible: false, ineligible_reason: "surface", grants: [] } })]);
+    const usage = await new ClaudeAdapter().usage(home);
+    expect(usage.windows[0]?.usedPercent).toBe(12);
+    expect(usage.checkResetsInClaude).toBe(true);
+    expect(usage.fableResets).toBeUndefined();
+    expect(usage.retryAt).toBeUndefined();
+    expect(calls).toHaveLength(1);
+  });
+
+  it("shows zero when the normal usage response confirms there are no grants", async () => {
+    answer([() => Response.json({ ...body, cedar_ember: { eligible: false, ineligible_reason: "no_grant", grants: [] } })]);
+    expect((await new ClaudeAdapter().usage(home)).fableResets).toBe(0);
+    expect(calls).toHaveLength(1);
+  });
+
   it("never loses the windows for spend: a server error falls back to the read without it", async () => {
     const { extra_usage: _spend, ...withoutSpend } = body;
     answer([() => new Response("spend limit unavailable", { status: 503 }), () => Response.json(withoutSpend)]);
@@ -127,6 +153,15 @@ describe("Claude's calls with an account's token", () => {
   afterEach(async () => {
     await new Promise((resolve) => (proxy ? proxy.close(resolve) : resolve(undefined)));
     proxy = null;
+  });
+
+  it("keeps a banked Fable reset when an automatic check finds the account has room", async () => {
+    answer([() => Response.json({ cedar_ember: {
+      eligible: true, at_limit: false, next_grant_id: "grant_1",
+      grants: [{ id: "grant_1", resets_left: 1, clears: ["seven_day_overage_included"], usable_now: true }],
+    } })]);
+    expect(await new ClaudeAdapter().redeemReset(home, { onlyAtLimit: true })).toMatchObject({ outcome: "not_limited", left: 1 });
+    expect(calls).toEqual(["https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1"]);
   });
 
   it("go through the account's own proxy: the usage read, and the read before redeeming a reset", async () => {

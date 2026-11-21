@@ -239,8 +239,11 @@ export class ClaudeAdapter implements FamilyAdapter {
           const body = (await response.json()) as { cedar_ember?: unknown; extra_usage?: unknown };
           const windows = parseUsage(body);
           this.noteResetStatus(home, body.cedar_ember);
+          const resetStatus = parseClaudeResets(body.cedar_ember);
           return {
-            fetchedAt, windows, error: null, cached: false, resets: parseClaudeResets(body.cedar_ember).offer, credits: null,
+            fetchedAt, windows, error: null, cached: false, resets: resetStatus.offer, credits: null,
+            checkResetsInClaude: resetStatus.checkInClaude ?? false,
+            fableResets: resetStatus.fableResets,
             ...(withSpend ? { extraUsage: parseExtraUsage(body.extra_usage) } : {}),
           };
         }
@@ -318,10 +321,14 @@ export class ClaudeAdapter implements FamilyAdapter {
     } catch (error) {
       return { outcome: "error", message: `Couldn't check the account's resets: ${describe(error)}`, left: null };
     }
-    if (!status.offer || !status.nextGrantId) return { outcome: "none", message: "No banked resets left on this account.", left: 0 };
-    if (options.onlyAtLimit && !status.atLimit) {
+    if (status.offer && options.onlyAtLimit && !status.atLimit) {
       // Something refilled the account since the limit hit, e.g. another host sharing it spent a reset.
       return { outcome: "not_limited", message: "Claude says this account has room again, so the reset was kept.", left: status.offer.available };
+    }
+    if (!status.offer || !status.nextGrantId) {
+      return status.checkInClaude
+        ? { outcome: "unavailable", message: "Check for banked resets in Claude under Settings → Usage.", left: 0 }
+        : { outcome: "none", message: "No banked resets left on this account.", left: 0 };
     }
     if (!status.offer.usableNow) {
       return {
