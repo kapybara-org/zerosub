@@ -20,6 +20,11 @@ const claude: CardAccount = {
 const pi: CardAccount = { ...claude, family: "pi", auth: "api", apiEditable: true };
 
 describe("an account card's buttons", () => {
+  it("only offers Mark as available when the quota ceiling allows it", () => {
+    expect(cardActions({ ...claude, status: "limited" })).toContain("clear");
+    expect(cardActions({ ...claude, status: "limited", ceilingHit: true })).not.toContain("clear");
+  });
+
   it("offers Disable on an account another one can stand in for", () => {
     expect(cardActions(claude)).toContain("toggle");
     expect(cardActions({ ...claude, family: "codex" })).toContain("toggle");

@@ -389,6 +389,8 @@ export const PaceViewSchema = z.object({
 export type PaceView = z.infer<typeof PaceViewSchema>;
 
 export const AccountViewSchema = z.object({
+  ceilingHit: z.boolean().optional(),
+  quotaCeilings: z.record(z.string(), z.number().int().min(1).max(99)).optional(),
   id: z.string(),
   family: FamilySchema,
   label: z.string(),

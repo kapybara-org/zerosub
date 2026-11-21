@@ -39,6 +39,12 @@ export const cancelLogin = defineRpc({
   output: LoginViewSchema.nullable(),
 });
 
+export const setQuotaCeiling = defineRpc({
+  name: "zerosub.accounts.quota-ceiling",
+  input: z.object({ accountId: z.string(), windowId: z.string().min(1).max(128), percent: z.number().int().min(1).max(100) }),
+  output: z.object({ ok: z.literal(true) }),
+});
+
 export const renameAccount = defineRpc({
   name: "zerosub.accounts.rename",
   input: z.object({ accountId: z.string(), label: z.string().trim().min(1).max(40) }),
