@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -19,7 +19,7 @@ let root: string;
 const saved: Record<string, string | undefined> = {};
 /** The services a test started, whose moves run on after it unless they're waited for. */
 const started: Service[] = [];
-const VARIABLES = ["PASEO_HOME", "ZEROSUB_LAUNCHER_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "GROK_HOME", "CURSOR_CONFIG_DIR", "XDG_CONFIG_HOME"];
+const VARIABLES = ["PASEO_HOME", "ZEROSUB_LAUNCHER_DIR", "CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "CODEX_HOME", "GROK_HOME", "CURSOR_CONFIG_DIR", "XDG_CONFIG_HOME"];
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "zerosub-placement-"));
@@ -27,6 +27,7 @@ beforeEach(async () => {
   process.env.PASEO_HOME = root;
   process.env.ZEROSUB_LAUNCHER_DIR = join(root, "claude-config");
   process.env.CLAUDE_CONFIG_DIR = join(root, "main");
+  delete process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR;
   process.env.CODEX_HOME = join(root, "codex");
   process.env.GROK_HOME = join(root, "grok");
   process.env.XDG_CONFIG_HOME = join(root, "xdg");
@@ -713,6 +714,122 @@ describe("adding a folder that's already signed in", () => {
     const again = await service.importAccount(folder);
     expect(await homeOf(store, again)).toBe(folder);
   });
+
+  it("imports the CLI subscription into an isolated home and keeps one entry enabled", async () => {
+    const { service, store, fake } = start();
+    const folder = join(root, "elsewhere", "claude-isolated");
+    const duplicate = join(root, "elsewhere", "claude-duplicate");
+    for (const home of [folder, duplicate]) {
+      await makeHome(home);
+      await writeFile(join(home, ".claude.json"), "{}");
+      fake.signedIn.add(home);
+    }
+    const limitedUntil = new Date(Date.now() + 60_000).toISOString();
+    await seed({
+      accounts: [{ ...main, email: "ada@example.com", identity: "personal|ada@example.com", limitedUntil }],
+      bindings: { agent: { accountId: main.id, source: "user", at: main.createdAt } },
+    });
+
+    const id = await service.importAccount(folder);
+    const state = await store.read();
+    expect(state.defaults.claude).toBe(id);
+    expect(state.bindings.agent?.accountId).toBe(id);
+    expect(state.accounts.find((account) => account.id === id)).toMatchObject({ home: folder, disabled: false, limitedUntil });
+    expect(state.accounts.find((account) => account.id === main.id)).toMatchObject({ signedIn: true, disabled: true });
+    await expect(service.importAccount(duplicate)).rejects.toThrow("already added");
+    expect(fake.calls.filter((call) => call.startsWith("logout"))).toEqual([]);
+
+    await service.setAccountEnabled(paseo, main.id, true);
+    const switchedBack = await store.read();
+    expect(switchedBack.defaults.claude).toBe(main.id);
+    expect(switchedBack.bindings.agent?.accountId).toBe(main.id);
+    expect(switchedBack.accounts.filter((account) => !account.disabled).map((account) => account.id)).toEqual([main.id]);
+  });
+
+  it.each([false, true])("restores the CLI routing on removal only if ZeroSub paused it (manually disabled: %s)", async (disabled) => {
+    const { service, store, fake } = start();
+    const folder = join(root, "elsewhere", "claude-isolated");
+    await makeHome(folder);
+    fake.signedIn.add(folder);
+    const binding = { accountId: main.id, source: "user", at: main.createdAt };
+    await seed({
+      accounts: [{ ...main, signedIn: true, email: "ada@example.com", identity: "personal|ada@example.com", disabled }],
+      bindings: { agent: binding },
+    });
+
+    const id = await service.importAccount(folder);
+    expect(findAccount(await store.read(), main.id)?.pausedFor).toBe(disabled ? undefined : id);
+    expect((await store.read()).bindings.agent?.accountId).toBe(id);
+
+    await service.remove(paseo, id);
+    const state = await store.read();
+    expect(findAccount(state, main.id)).toMatchObject({ disabled, signedIn: true });
+    expect(findAccount(state, main.id)?.pausedFor).toBeUndefined();
+    expect(state.defaults.claude).toBe(disabled ? null : main.id);
+    expect(state.bindings.agent).toEqual(disabled ? undefined : binding);
+  });
+
+  it("leaves existing matching logins and pins alone during identity refresh", async () => {
+    const { service, store, fake } = start();
+    const folder = join(root, "elsewhere", "claude-isolated");
+    await makeHome(folder);
+    fake.signedIn.add(folder);
+    const id = "claude-aaaaaaaaaaaa";
+    const identity = { signedIn: true, email: "ada@example.com", identity: "personal|ada@example.com" };
+    await seed({
+      accounts: [{ ...main, ...identity }, { ...managed(id, "Isolated", folder), ...identity }],
+      bindings: { agent: { accountId: main.id, source: "user", at: main.createdAt } },
+    });
+
+    await service.view(paseo, true, id);
+    const state = await store.read();
+    expect(fake.calls).toContain(`identity ${folder}`);
+    expect(state.accounts.filter((account) => !account.disabled).map((account) => account.id)).toEqual([main.id, id]);
+    expect(state.defaults.claude).toBeNull();
+    expect(state.bindings.agent?.accountId).toBe(main.id);
+  });
+
+  it("refuses to import an alias of the CLI login folder", async () => {
+    const { service, fake } = start();
+    const cli = join(root, "main");
+    const alias = join(root, "cli-alias");
+    await makeHome(cli);
+    await symlink(cli, alias, "junction");
+    await expect(service.importAccount(alias)).rejects.toThrow("the CLI login's own folder");
+    expect(fake.calls).not.toContain(`identity ${alias}`);
+  });
+
+  it.skipIf(process.platform === "darwin").each(["copy", "hard link", "symbolic link", "separate sign-in"] as const)(
+    "checks the credentials of a matching import with a %s",
+    async (kind) => {
+      const { service, store, fake } = start();
+      const cli = join(root, "main");
+      const folder = join(root, "elsewhere", "claude-isolated");
+      await makeHome(cli);
+      await makeHome(folder);
+      fake.signedIn.add(folder);
+      await seed({ accounts: [{ ...main, signedIn: true, email: "ada@example.com", identity: "personal|ada@example.com" }] });
+      const cliFile = join(cli, ".credentials.json");
+      const importFile = join(folder, ".credentials.json");
+      const credentials = (refreshToken: string, accessToken: string) => JSON.stringify({ claudeAiOauth: { refreshToken, accessToken } });
+      await writeFile(cliFile, credentials("cli-refresh", "cli-access"));
+      switch (kind) {
+        case "hard link": await link(cliFile, importFile); break;
+        case "symbolic link": await symlink(cliFile, importFile, "file"); break;
+        case "copy": await writeFile(importFile, credentials("cli-refresh", "different-access")); break;
+        case "separate sign-in": await writeFile(importFile, credentials("isolated-refresh", "isolated-access")); break;
+      }
+
+      if (kind === "separate sign-in") {
+        const id = await service.importAccount(folder);
+        expect(findAccount(await store.read(), main.id)?.pausedFor).toBe(id);
+      } else {
+        await expect(service.importAccount(folder)).rejects.toThrow("Use Add account → Claude sign-in");
+        expect((await store.read()).accounts).toHaveLength(1);
+        expect(findAccount(await store.read(), main.id)?.disabled).toBe(false);
+      }
+    },
+  );
 
   it("refuses a folder it can't add, saying why", async () => {
     const { service, store, fake } = start();

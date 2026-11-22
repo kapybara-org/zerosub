@@ -30,6 +30,8 @@ export const StoredAccountSchema = z.object({
   signedIn: z.boolean().default(true),
   /** Set aside by the user for a while: stays signed in, but nothing is routed to it. */
   disabled: z.boolean().default(false),
+  /** The paired login that paused this one. A manual disable has no partner. */
+  pausedFor: z.string().optional(),
   limitedUntil: z.string().nullable().default(null),
   /** What kind of limit `limitedUntil` records; only `window` limits clear from usage readings. */
   limitKind: z.enum(["window", "budget"]).nullable().default(null),

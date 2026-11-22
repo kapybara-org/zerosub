@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { readFile, rm } from "node:fs/promises";
+import { lstat, readFile, rm, stat } from "node:fs/promises";
 import { homedir, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import type { ApiSummary, ExtraUsage, LoginMethod, Usage, UsageWindow } from "../shared/model";
@@ -635,6 +635,7 @@ async function apiFetch(home: string | null, url: string, init: { method?: strin
 
 interface Credentials {
   accessToken: string | null;
+  refreshToken: string | null;
   expiresAt: number | null;
   scopes: string[] | null;
   rateLimitTier: string | null;
@@ -748,10 +749,36 @@ function parseCredentials(raw: string): Credentials | null {
   if (!oauth) return null;
   return {
     accessToken: str(oauth.accessToken),
+    refreshToken: str(oauth.refreshToken),
     rateLimitTier: str(oauth.rateLimitTier),
     expiresAt: typeof oauth.expiresAt === "number" ? oauth.expiresAt : null,
     scopes: Array.isArray(oauth.scopes) ? oauth.scopes.filter((scope): scope is string => typeof scope === "string") : null,
   };
+}
+
+/** Detects a file-backed import using the CLI's login. Secrets are compared only in memory. */
+export async function sharesClaudeCliCredentials(home: string): Promise<boolean> {
+  if (process.platform === "darwin") return false;
+  const file = join(storageDir(home).path, ".credentials.json");
+  const cliFile = join(storageDir(null).path, ".credentials.json");
+  const missing = (error: NodeJS.ErrnoException): null => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  };
+  const entry = await lstat(file).catch(missing);
+  if (!entry) return false;
+  if (!entry.isFile()) return true;
+
+  const cliEntry = await stat(cliFile).catch(missing);
+  if (!cliEntry?.isFile()) return false;
+  if (entry.dev === cliEntry.dev && entry.ino === cliEntry.ino) return true;
+
+  const [candidate, cli] = await Promise.all([
+    readFile(file, "utf8").catch(missing),
+    readFile(cliFile, "utf8").catch(missing),
+  ]);
+  const token = candidate && parseCredentials(candidate)?.refreshToken;
+  return !!token && !!cli && token === parseCredentials(cli)?.refreshToken;
 }
 
 /** Reads the account's OAuth token only to ask Anthropic for its usage. Never logged or stored. */

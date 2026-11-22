@@ -85,6 +85,7 @@ import {
   type BedrockHost,
   type RegionSource,
 } from "./bedrock";
+import { sharesClaudeCliCredentials } from "./claude";
 import { codexHandoffMode, encryptedResumeFailure, sameWorkspace, turnFailedText } from "./codex-same-conversation";
 import { CodexContinuations, MESSAGE_PREFIX, UnresolvableEpochError, fitInstructions, matchesTransfer, readUpdates, ready, sentDigestOf, snapshot, transferMarker, waitForCreated, waitForSource, type Agent } from "./continuations";
 import { CONTINUED_FROM_LABEL, PARENT_LABEL, buildTranscript, continueInNewAgent, continuationPrompt, promptInstruction, updatePrompt, type Continuation } from "./handoff";
@@ -4312,8 +4313,15 @@ export class Service {
     }
     await this.store.update((draft) => {
       const target = findAccount(draft, accountId);
-      if (target) target.disabled = !enabled;
-      if (target && !enabled) dropNextPick(draft, target);
+      if (!target) return;
+      const peer = claudeLoginPeer(draft, target);
+      if (enabled && peer && !peer.disabled && !target.signedIn) {
+        throw new Error(`Sign in to ${target.label} before switching away from ${peer.label}.`);
+      }
+      target.disabled = !enabled;
+      delete target.pausedFor;
+      if (enabled && target.signedIn && peer) preferClaudeLogin(draft, target, peer);
+      if (!enabled) dropNextPick(draft, target);
     });
     console.log(`[ZeroSub] ${account.label} is ${enabled ? "enabled" : "disabled"}`);
     let stayed = 0;
@@ -4576,7 +4584,16 @@ export class Service {
     const kept = account.home !== null && !(await isOwnHome(account.home));
     const signsOut = kept && signOut && account.family !== "pi" && account.auth !== "api" && !(await reachesCliHome(account.home!));
     await this.store.update((draft) => {
+      const removed = findAccount(draft, accountId);
+      const peer = removed && claudeLoginPeer(draft, removed);
+      if (removed && peer?.kind === "main" && peer.signedIn && peer.disabled && peer.pausedFor === removed.id) {
+        peer.disabled = false;
+        preferClaudeLogin(draft, peer, removed);
+      }
       draft.accounts = draft.accounts.filter((entry) => entry.id !== accountId);
+      for (const entry of draft.accounts) {
+        if (entry.pausedFor === accountId) delete entry.pausedFor;
+      }
       if (account.home && (!kept || signsOut)) {
         draft.cleanup[account.home] = { family: account.family, accountId, why: "removed", at: new Date().toISOString(), ...(signsOut ? { signOutOnly: true } : {}) };
       }
@@ -5259,11 +5276,15 @@ export class Service {
       );
     }
     if (!identity.identity) throw new Error(`${shown} uses an API key or token, not a Claude subscription. Add it with "API key or token" instead.`);
+    const sharesCredentials = await sharesClaudeCliCredentials(home);
     let account: StoredAccount | undefined;
     await this.store.update((draft) => {
       if (draft.accounts.some((entry) => entry.home && resolve(entry.home) === home)) throw new Error(`${shown} is already added.`);
-      // The CLI's own login counts too: an added account must be one of its own.
-      const duplicate = accountsOf(draft, "claude").find((entry) => entry.identity === identity.identity);
+      const cli = mainAccount(draft, "claude");
+      if (sharesCredentials && cli?.auth === "subscription" && sameAccountIdentity("claude", cli, identity)) {
+        throw new Error(`${shown} shares the Claude CLI login's credentials. Use Add account → Claude sign-in for a separate sign-in.`);
+      }
+      const duplicate = managedLoginDuplicate(draft, "claude", identity);
       if (duplicate) throw new Error(`${identity.email ?? shown} is already added as "${duplicate.label}".`);
       // A folder of ZeroSub's own gets its ID back: a managed account's ID matches its folder's name there.
       const name = basename(home);
@@ -5271,6 +5292,7 @@ export class Service {
       account = newAccount({ id, family: "claude", kind: "managed", home });
       draft.accounts.push(account);
       applyIdentity(account, identity, draft);
+      enforceClaudeLoginPair(draft, account);
       // A removed account's folder that's back isn't cleaned up after all.
       for (const folder of Object.keys(draft.cleanup)) if (resolve(folder) === home) delete draft.cleanup[folder];
     });
@@ -5797,13 +5819,7 @@ export class Service {
           : `Couldn't tell which workspace member signed in, because Codex didn't return an email. Sign in again as ${expected}.`,
       );
     }
-    // The CLI's own login is whatever the user signs it into; only added accounts must be distinct.
-    const duplicate =
-      identity.identity && existing?.kind !== "main"
-        ? accountsOf(state, session.family).find(
-            (account) => account.id !== session.accountId && sameAccountIdentity(session.family, account, identity, true),
-          )
-        : undefined;
+    const duplicate = existing?.kind === "main" ? undefined : managedLoginDuplicate(state, session.family, identity, session.accountId);
     if (duplicate) {
       if (!existing && session.home) await adapter.logout(session.home).catch(() => undefined);
       return this.failLogin(
@@ -5826,6 +5842,9 @@ export class Service {
           removed = true;
           return;
         }
+        if (account?.kind !== "main" && managedLoginDuplicate(draft, session.family, identity, accountId)) {
+          throw new Error(`${identity.email ?? "That account"} was already added while you were signing in.`);
+        }
         if (!account) {
           // A managed account's ID matches its home's folder name, as its cleanup entry does.
           accountId = `${session.family}-${session.id}`;
@@ -5838,6 +5857,7 @@ export class Service {
         account.limitKind = null;
         account.modelLimits = {};
         handedOver = applyIdentity(account, identity, draft);
+        enforceClaudeLoginPair(draft, account);
       });
     } catch (error) {
       // A new account's home is then cleaned up as an unfinished sign-in, like any that failed.
@@ -6038,6 +6058,41 @@ function sameSubscription(state: StoredState, account: StoredAccount): StoredAcc
   return accountsOf(state, account.family).filter((other) => other.id !== account.id && sameAccountIdentity(account.family, other, account));
 }
 
+/** Claude allows one managed login beside its native CLI login. Other duplicates are still refused. */
+function managedLoginDuplicate(state: StoredState, family: Family, identity: Identity, except?: string | null): StoredAccount | undefined {
+  return accountsOf(state, family).find((other) =>
+    other.id !== except && (family !== "claude" || other.kind !== "main" || other.auth !== "subscription") &&
+    sameAccountIdentity(family, other, identity, true),
+  );
+}
+
+function claudeLoginPeer(state: StoredState, account: StoredAccount): StoredAccount | undefined {
+  if (account.family !== "claude" || account.auth !== "subscription") return undefined;
+  return sameSubscription(state, account).find((other) => other.kind !== account.kind && other.auth === "subscription");
+}
+
+/** The two logins share a subscription. Transfer routing and known limits without changing either sign-in. */
+function preferClaudeLogin(state: StoredState, account: StoredAccount, peer: StoredAccount): void {
+  delete account.pausedFor;
+  if (!peer.disabled) peer.pausedFor = account.id;
+  peer.disabled = true;
+  if (defaultAccount(state, "claude")?.id === peer.id) state.defaults.claude = account.id;
+  if (state.nextAgent.claude?.accountId === peer.id) state.nextAgent.claude.accountId = account.id;
+  for (const binding of Object.values(state.bindings)) {
+    if (binding.accountId === peer.id) binding.accountId = account.id;
+  }
+  const now = Date.now();
+  if (isLimited(peer, now) && !isLimited(account, now)) {
+    const { limitedUntil, limitKind, limitedAt, limitSource } = peer;
+    Object.assign(account, { limitedUntil, limitKind, limitedAt, limitSource });
+  }
+  for (const [scope, limit] of Object.entries(peer.modelLimits)) {
+    if (Date.parse(limit.until) > now && !(Date.parse(account.modelLimits[scope]?.until ?? "") >= Date.parse(limit.until))) {
+      account.modelLimits[scope] = limit;
+    }
+  }
+}
+
 /** Returns true when the CLI login's account was replaced by a different one, which drops what the slot knew of the old one's limit. */
 function applyIdentity(account: StoredAccount, identity: Identity, state: StoredState): boolean {
   const handedOver = account.kind === "main" && identity.signedIn && !!account.identity && !!identity.identity && !sameAccountIdentity(account.family, account, identity);
@@ -6062,6 +6117,13 @@ function applyIdentity(account: StoredAccount, identity: Identity, state: Stored
     }
   }
   return true;
+}
+
+function enforceClaudeLoginPair(state: StoredState, account: StoredAccount): void {
+  if (!account.signedIn || !account.identity || account.disabled) return;
+  const peer = claudeLoginPeer(state, account);
+  if (peer && account.kind === "managed") preferClaudeLogin(state, account, peer);
+  else if (peer?.signedIn && !peer.disabled) preferClaudeLogin(state, peer, account);
 }
 
 function applyIdentityFields(account: StoredAccount, identity: Identity, state: StoredState): void {
