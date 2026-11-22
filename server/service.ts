@@ -85,6 +85,7 @@ import {
   type BedrockHost,
   type RegionSource,
 } from "./bedrock";
+import { sharesClaudeCliCredentials } from "./claude";
 import { codexHandoffMode, encryptedResumeFailure, sameWorkspace, turnFailedText } from "./codex-same-conversation";
 import { CodexContinuations, MESSAGE_PREFIX, UnresolvableEpochError, fitInstructions, matchesTransfer, readUpdates, ready, sentDigestOf, snapshot, transferMarker, waitForCreated, waitForSource, type Agent } from "./continuations";
 import { CONTINUED_FROM_LABEL, PARENT_LABEL, buildTranscript, continueInNewAgent, continuationPrompt, promptInstruction, updatePrompt, type Continuation } from "./handoff";
@@ -5275,9 +5276,14 @@ export class Service {
       );
     }
     if (!identity.identity) throw new Error(`${shown} uses an API key or token, not a Claude subscription. Add it with "API key or token" instead.`);
+    const sharesCredentials = await sharesClaudeCliCredentials(home);
     let account: StoredAccount | undefined;
     await this.store.update((draft) => {
       if (draft.accounts.some((entry) => entry.home && resolve(entry.home) === home)) throw new Error(`${shown} is already added.`);
+      const cli = mainAccount(draft, "claude");
+      if (sharesCredentials && cli?.auth === "subscription" && sameAccountIdentity("claude", cli, identity)) {
+        throw new Error(`${shown} shares the Claude CLI login's credentials. Use Add account → Claude sign-in for a separate sign-in.`);
+      }
       const duplicate = managedLoginDuplicate(draft, "claude", identity);
       if (duplicate) throw new Error(`${identity.email ?? shown} is already added as "${duplicate.label}".`);
       // A folder of ZeroSub's own gets its ID back: a managed account's ID matches its folder's name there.

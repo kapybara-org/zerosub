@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -19,7 +19,7 @@ let root: string;
 const saved: Record<string, string | undefined> = {};
 /** The services a test started, whose moves run on after it unless they're waited for. */
 const started: Service[] = [];
-const VARIABLES = ["PASEO_HOME", "ZEROSUB_LAUNCHER_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "GROK_HOME", "CURSOR_CONFIG_DIR", "XDG_CONFIG_HOME"];
+const VARIABLES = ["PASEO_HOME", "ZEROSUB_LAUNCHER_DIR", "CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "CODEX_HOME", "GROK_HOME", "CURSOR_CONFIG_DIR", "XDG_CONFIG_HOME"];
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "zerosub-placement-"));
@@ -27,6 +27,7 @@ beforeEach(async () => {
   process.env.PASEO_HOME = root;
   process.env.ZEROSUB_LAUNCHER_DIR = join(root, "claude-config");
   process.env.CLAUDE_CONFIG_DIR = join(root, "main");
+  delete process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR;
   process.env.CODEX_HOME = join(root, "codex");
   process.env.GROK_HOME = join(root, "grok");
   process.env.XDG_CONFIG_HOME = join(root, "xdg");
@@ -797,6 +798,38 @@ describe("adding a folder that's already signed in", () => {
     await expect(service.importAccount(alias)).rejects.toThrow("the CLI login's own folder");
     expect(fake.calls).not.toContain(`identity ${alias}`);
   });
+
+  it.skipIf(process.platform === "darwin").each(["copy", "hard link", "symbolic link", "separate sign-in"] as const)(
+    "checks the credentials of a matching import with a %s",
+    async (kind) => {
+      const { service, store, fake } = start();
+      const cli = join(root, "main");
+      const folder = join(root, "elsewhere", "claude-isolated");
+      await makeHome(cli);
+      await makeHome(folder);
+      fake.signedIn.add(folder);
+      await seed({ accounts: [{ ...main, signedIn: true, email: "ada@example.com", identity: "personal|ada@example.com" }] });
+      const cliFile = join(cli, ".credentials.json");
+      const importFile = join(folder, ".credentials.json");
+      const credentials = (refreshToken: string, accessToken: string) => JSON.stringify({ claudeAiOauth: { refreshToken, accessToken } });
+      await writeFile(cliFile, credentials("cli-refresh", "cli-access"));
+      switch (kind) {
+        case "hard link": await link(cliFile, importFile); break;
+        case "symbolic link": await symlink(cliFile, importFile, "file"); break;
+        case "copy": await writeFile(importFile, credentials("cli-refresh", "different-access")); break;
+        case "separate sign-in": await writeFile(importFile, credentials("isolated-refresh", "isolated-access")); break;
+      }
+
+      if (kind === "separate sign-in") {
+        const id = await service.importAccount(folder);
+        expect(findAccount(await store.read(), main.id)?.pausedFor).toBe(id);
+      } else {
+        await expect(service.importAccount(folder)).rejects.toThrow("Use Add account → Claude sign-in");
+        expect((await store.read()).accounts).toHaveLength(1);
+        expect(findAccount(await store.read(), main.id)?.disabled).toBe(false);
+      }
+    },
+  );
 
   it("refuses a folder it can't add, saying why", async () => {
     const { service, store, fake } = start();
