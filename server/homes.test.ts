@@ -19,6 +19,7 @@ import {
   shareClaudeSessions,
   writeAccountApi,
   writeAccountProxy,
+  writeJsonAtomically,
 } from "./homes";
 import { isAzureHome, writeAzureAccount } from "./azure";
 import { preferences } from "../shared/preferences";
@@ -551,6 +552,33 @@ describe.skipIf(process.platform === "darwin")("MCP sign-ins shared between acco
     expect(fresherMcpOAuth(signedIn("s", "t", 1), undefined)).toBe(true);
     expect(fresherMcpOAuth(signedIn("s", "new", 2), signedIn("s", "old", 1))).toBe(true);
     expect(fresherMcpOAuth(signedIn("s", "same", 1), signedIn("s", "other", 1))).toBe(false);
+    // Claude Code saves no expiresAt for a token response without expires_in: nothing then says which is newer.
+    const noExpiry = (token: string) => {
+      const { expiresAt: _, ...entry } = signedIn("s", token, 0);
+      return entry;
+    };
+    expect(fresherMcpOAuth(signedIn("s", "older", 1), noExpiry("newer"))).toBe(false);
+    expect(fresherMcpOAuth(noExpiry("newer"), signedIn("s", "older", 1))).toBe(false);
+    expect(fresherMcpOAuth(noExpiry("a"), noExpiry("b"))).toBe(false);
+    expect(fresherMcpOAuth(noExpiry("a"), signedOut("s"))).toBe(true);
+  });
+
+  it("keeps an account's newer sign-in that has no expiry over main's older one that has", async () => {
+    const { expiresAt: _, ...newer } = signedIn("plugin:linear:linear", "newer", 0);
+    await store(main, { claudeAiOauth: {}, mcpOAuth: { [LINEAR]: signedIn("plugin:linear:linear", "older", 1_000) } });
+    await store(home, { claudeAiOauth: {}, mcpOAuth: { [LINEAR]: newer } });
+    await prepareClaudeHome(home, true);
+    expect((await credentials(home)).mcpOAuth[LINEAR]).toEqual(newer);
+  });
+});
+
+describe("writeJsonAtomically", () => {
+  it("leaves no copy behind when the file can't be replaced", async () => {
+    // A folder with something in it can't be replaced by a file: the rename fails.
+    const target = join(root, "store");
+    await mkdir(join(target, "inside"), { recursive: true });
+    await expect(writeJsonAtomically(target, { secret: "token" })).rejects.toThrow();
+    expect((await readdir(root)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
   });
 });
 

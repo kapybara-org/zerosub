@@ -120,13 +120,13 @@ On 2026-11-15, my fork continued one conversation from member A to member B of t
 
 Off by default. Claude Code keeps MCP servers' OAuth sign-ins (Linear, Notion, …) per Claude account, so an agent moved to another account finds those servers asking for a sign-in again. Turn on **Share MCP sign-ins between Claude accounts** and a server you sign in to on one Claude account works on the others too. Leave it off when your accounts sign in to the same server as different people (a work Linear on one, a personal one on another): with it on, they'd all end up with whichever sign-in is newest.
 
-- Claude Code keeps these sign-ins in `.credentials.json`, under `mcpOAuth`, beside the account's own sign-in. Every 30 seconds ZeroSub copies each server's entry between your CLI login and each added Claude account, whichever way it's newer: it holds a token and the other doesn't, or it expires later. So a sign-in or a token refresh on any account reaches the others within a minute.
+- Claude Code keeps these sign-ins in `.credentials.json`, under `mcpOAuth`, beside the account's own sign-in. Every 30 seconds ZeroSub copies each server's entry between your CLI login and each added Claude account, whichever way it's newer: it holds a token and the other doesn't, or both have an expiry and it expires later. So a sign-in or a token refresh on any account reaches the others within a minute. A token saved without an expiry (the server didn't give one) only goes to accounts that have no token for that server.
 - It writes under Claude Code's own lock on that file (`.storage-write.lock`), reading the file again under it, and changes only `mcpOAuth`. The account's own Claude sign-in is never copied or changed, and an account that isn't signed in gets no `.credentials.json`.
 - A server it just brought in is dropped from that account's `mcp-needs-auth-cache.json`, so a new session uses it at once. A session already open may need `/mcp` to reconnect.
-- Signing out of a server on one account doesn't carry: another account's token comes back.
-- When a server replaces its refresh token on every refresh, two accounts refreshing the same token at once can leave one of them with a spent token until the next copy, up to 30 seconds.
+- Signing out of a server on one account signs every account out of it. Claude Code revokes the tokens with the server, and they're the same tokens on every account; sign in again on any account and the new sign-in reaches the others. Signing in to a server again on one account revokes the old tokens too, so the other accounts can't use the server until the new sign-in reaches them.
+- Accounts holding the same token tend to refresh it together, near its expiry. With a server that replaces its refresh token on every refresh, one of them can be left with a spent token and need `/mcp` again; a server that treats a reused refresh token as stolen may sign every account out of it.
 - Turned off, nothing more is copied, and sign-ins already copied stay where they are.
-- Not on macOS: there Claude Code keeps these sign-ins in each account's Keychain entry.
+- Not on macOS, where Claude Code keeps these sign-ins in each account's Keychain entry, nor on Windows where it uses Credential Manager: only a `.credentials.json` file is read or written.
 
 ### Banked resets
 

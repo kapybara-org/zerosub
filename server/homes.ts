@@ -372,10 +372,16 @@ async function readPiOwnObject(path: string, comments = false): Promise<Record<s
   return isObject(value) ? value : null;
 }
 
-async function writeJsonAtomically(path: string, value: unknown): Promise<void> {
+export async function writeJsonAtomically(path: string, value: unknown): Promise<void> {
   const temporary = `${path}.zerosub.${randomBytes(4).toString("hex")}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  await rename(temporary, path);
+  try {
+    await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+    await rename(temporary, path);
+  } catch (error) {
+    // The copy can hold secrets (a credential store's tokens): never leave it behind.
+    await unlink(temporary).catch(() => undefined);
+    throw error;
+  }
 }
 
 /**
@@ -481,15 +487,18 @@ function holdsMcpToken(entry: unknown): boolean {
 
 /**
  * Whether `candidate`, one MCP server's OAuth entry, should replace `current`: it holds a token and
- * `current` doesn't, or it expires later (it was issued later: a refresh, or a sign-in made since).
- * An entry without a token never replaces anything, so signing out of a server on one account is
- * undone by another account's token.
+ * `current` doesn't, or both have an expiry and the candidate's is later (it was issued later: a
+ * refresh, or a sign-in made since). Claude Code saves no `expiresAt` when the server's token
+ * response has no `expires_in`, so without one on either side nothing says which is newer, and
+ * `current` stays. An entry without a token never replaces anything.
  */
 export function fresherMcpOAuth(candidate: unknown, current: unknown): boolean {
   if (!holdsMcpToken(candidate)) return false;
   if (!holdsMcpToken(current)) return true;
-  const expiry = (entry: unknown) => (isObject(entry) && typeof entry.expiresAt === "number" ? entry.expiresAt : 0);
-  return expiry(candidate) > expiry(current);
+  const expiry = (entry: unknown) => (isObject(entry) && typeof entry.expiresAt === "number" && Number.isFinite(entry.expiresAt) ? entry.expiresAt : null);
+  const later = expiry(candidate);
+  const earlier = expiry(current);
+  return later !== null && earlier !== null && later > earlier;
 }
 
 /**
