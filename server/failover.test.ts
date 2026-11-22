@@ -4166,6 +4166,30 @@ describe("aligning agents with their accounts", () => {
     expect(redeemReset).not.toHaveBeenCalled();
   });
 
+  it("waits for an idle agent on a capped account to settle before reloading it", async () => {
+    const { service, store, reopened, paseo, agent } = await setUp(onMarketing(), hit, {
+      usage: () => ({
+        fetchedAt: new Date().toISOString(),
+        windows: [{ id: "five_hour", label: "5-hour", usedPercent: 81, resetsAt: inFuture() }],
+        error: null, cached: false, resets: null,
+      }),
+    });
+    await store.update((draft) => { draft.accounts.find((entry) => entry.id === MAIN)!.quotaCeilings = { five_hour: 80 }; });
+    agent.lastUserMessageAt = new Date().toISOString();
+    await service.refreshUsage(MAIN, true);
+    expect((await service.alignSessions(paseo as never)).deferred).toEqual([AGENT]);
+    expect((await service.alignSessions(paseo as never)).reopened).toEqual([]);
+    expect(reopened).toEqual([]);
+
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + 60_001 });
+    try {
+      await service.alignSessions(paseo as never);
+      expect(reopened).toEqual([AGENT]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("leaves an agent on a full account when switching is off", async () => {
     const { service, store, reopened, paseo } = await setUp(onMarketing(), hit);
     service.setPreferences(preferences.schema.parse({ autoSwitch: false }));
@@ -5313,6 +5337,27 @@ describe("AWS Bedrock as the last resort", () => {
       await limitTurn();
       expect(calls).toEqual([]);
       expect(notes.at(-1)).toMatchObject({ outcome: "stayed" });
+    });
+
+    it("spends a reset for a five-hour provider limit when only the Opus ceiling was hit", async () => {
+      const calls: Array<string | null> = [];
+      const { service, store, notes, limitTurn } = await setUp(onlyMain, window, {
+        ...redeeming("reset", calls),
+        usage: () => ({
+          fetchedAt: new Date().toISOString(),
+          windows: [
+            { id: "five_hour", label: "5-hour", usedPercent: 100, resetsAt: inFuture() },
+            { id: "seven_day_opus", label: "Weekly · Opus", usedPercent: 81, resetsAt: inFuture() },
+          ],
+          error: null, cached: false,
+          resets: { available: 1, usableNow: true, blockedReason: null, expiresAt: null, refills: [], label: null },
+        }),
+      });
+      await store.update((draft) => { draft.accounts.find((entry) => entry.id === MAIN)!.quotaCeilings = { seven_day_opus: 80 }; });
+      service.setPreferences(preferences.schema.parse({ autoRedeem: true }));
+      await limitTurn();
+      expect(calls).toHaveLength(1);
+      expect(notes.at(-1)).toMatchObject({ outcome: "reset" });
     });
 
     it("moves onto Bedrock only once no reset could be spent", async () => {

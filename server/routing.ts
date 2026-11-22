@@ -323,7 +323,7 @@ export function withBankedReset(
     .filter((account) => {
       const usage = usageOf(account.id);
       const resets = usage?.resets;
-      return !quotaCeilingHit(account, usage, now) && !!resets && resets.available > 0 && resets.usableNow;
+      return !quotaCeilingHit(account, usage, now, null) && !!resets && resets.available > 0 && resets.usableNow;
     })
     .sort((a, b) =>
       (a.id === preferred ? 0 : 1) - (b.id === preferred ? 0 : 1) ||

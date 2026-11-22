@@ -1977,7 +1977,7 @@ export class Service {
     if (!lock) this.redeemLocks.set(account.id, (lock = new Mutex()));
     return lock.run(async () => {
       // Recheck after taking the lock: a cap can be set while a failover waits to redeem.
-      if (automatic && this.atQuotaCeiling(await this.store.read(), account.id, Date.now())) {
+      if (automatic && this.atQuotaCeiling(await this.store.read(), account.id, Date.now(), null)) {
         return { outcome: "unavailable", message: "The account has reached its configured quota maximum.", left: null };
       }
       if (this.recentlyRedeemed(account.id)) {
@@ -3464,9 +3464,7 @@ export class Service {
     }
     if (!latest || latest.archived || latest.status === "closed") return { outcome: "closed" };
     const now = Date.now();
-    const recentlyActive = background && this.recentlyActive(latest, now);
-    const capped = recentlyActive && family && this.atQuotaCeiling(state, this.runningOn(state, agentId, family), now, this.agentModels.get(agentId) ?? null);
-    if (busy(latest) || (unattended && hasBackgroundWork(latest)) || (recentlyActive && !capped)) {
+    if (busy(latest) || (unattended && hasBackgroundWork(latest)) || (background && this.recentlyActive(latest, now))) {
       return this.defer(agentId, row, unattended);
     }
     const reload: Reload = { opens: 0 };
@@ -3648,13 +3646,14 @@ export class Service {
         // A reload can't move an agent of a family that isn't available here: its session opens on
         // the CLI login again (see `route`).
         if (!family || this.availability.get(family)?.ok === false || routing.has(agentId) || this.switching.has(agentId)) continue;
+        const active = this.recentlyActive(agent, now);
         if (this.deferred.has(agentId)) {
           // Its switch waited for a turn that never came (it was only starting), or ended without it.
-          if (settled(agent.status)) waiting.push({ agentId, family });
+          if (!active && settled(agent.status)) waiting.push({ agentId, family });
           continue;
         }
         const current = this.runningOn(state, agentId, family);
-        if (this.recentlyActive(agent, now) && !this.atQuotaCeiling(state, current, now, this.agentModels.get(agentId) ?? null)) continue;
+        if (active && !this.atQuotaCeiling(state, current, now, this.agentModels.get(agentId) ?? null)) continue;
         const target = this.targetFor(state, agentId, family, current);
         if (!current || !target || target === current) continue;
         // A reload cancels what the agent is doing, so nobody having asked, it only leaves an account
