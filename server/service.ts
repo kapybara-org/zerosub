@@ -101,7 +101,7 @@ import { maskProxy, normalizeProxy } from "./proxy";
 import { Reopener, hostCanReload } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
-import { canStandIn, chooseAccount, fiveHourWindow, headroomScore, isLastResort, isLimited, isPaidStandIn, isLimitedFor, isUsable, mostAvailable, paceScore, paceView, PENDING_MS, scopeCoversModel, weeklyWindow, withBankedReset, type Pacing, type RouteDecision, type RouteInput } from "./routing";
+import { canStandIn, chooseAccount, fiveHourWindow, headroomScore, isLastResort, isLimited, isPaidStandIn, isLimitedFor, isUsable, mostAvailable, paceScore, paceView, PENDING_MS, quotaCeilingHit, scopeCoversModel, weeklyWindow, withBankedReset, type Pacing, type RouteDecision, type RouteInput } from "./routing";
 import {
   ALL_SOURCES,
   MAIN_ACCOUNT_ID,
@@ -1140,7 +1140,7 @@ export class Service {
 
   /** One log line per balanced placement: every candidate's pace scores and recent 5-hour readings. */
   private logPlacement(state: StoredState, family: Family, agentId: string, chosen: StoredAccount, now: number, why: string): void {
-    const parts = accountsOf(state, family).filter((account) => canStandIn(account, now)).map((account) => {
+    const parts = accountsOf(state, family).filter((account) => canStandIn(account, now, null, this.usage.get(account.id))).map((account) => {
       const pace = paceScore(this.usage.get(account.id), this.pendingOn(account.id, now), now);
       const seen = (this.usageHistory.get(account.id) ?? []).slice(-4).map((entry) => entry.fiveHour ?? "?").join("/") || "none";
       return `${account.label} 5h ${pace.fiveHour.toFixed(1)} wk ${pace.weekly.toFixed(1)} score ${pace.score.toFixed(1)} gated ${pace.gated ? "yes" : "no"} pending ${this.pendingOn(account.id, now)} seen 5h ${seen}`;
@@ -1977,6 +1977,10 @@ export class Service {
     let lock = this.redeemLocks.get(account.id);
     if (!lock) this.redeemLocks.set(account.id, (lock = new Mutex()));
     return lock.run(async () => {
+      // Recheck after taking the lock: a cap can be set while a failover waits to redeem.
+      if (automatic && this.atQuotaCeiling(await this.store.read(), account.id, Date.now(), null)) {
+        return { outcome: "unavailable", message: "The account has reached its configured quota maximum.", left: null };
+      }
       if (this.recentlyRedeemed(account.id)) {
         if (automatic) return { outcome: "reset", message: "A reset was just used on this account.", left: null };
         const minutes = Math.floor((Date.now() - (this.lastRedeemAt.get(account.id) ?? 0)) / 60_000);
@@ -2225,7 +2229,7 @@ export class Service {
     const now = Date.now();
     const model = this.agentModels.get(agentId);
     const routed = this.routeFor(state, agentId, family, exhausted, paid);
-    if (routed && routed.account.id !== exhausted && !routed.skipped && isUsable(routed.account, now, model)) return { account: routed.account, pin: false };
+    if (routed && routed.account.id !== exhausted && !routed.skipped && isUsable(routed.account, now, model, this.usage.get(routed.account.id))) return { account: routed.account, pin: false };
     const roomiest = mostAvailable(state, family, (id) => this.usage.get(id), now, new Set([exhausted]), paid, this.pacing(now), model);
     return roomiest && { account: roomiest, pin: true };
   }
@@ -3362,6 +3366,11 @@ export class Service {
     return label && row.outcome === "switched" ? { ...row, to: label } : row;
   }
 
+  private atQuotaCeiling(state: StoredState, accountId: string | undefined, now: number, model?: string | null): boolean {
+    const account = findAccount(state, accountId);
+    return !!account && !!quotaCeilingHit(account, this.usage.get(account.id), now, model);
+  }
+
   /** The user was using the agent a moment ago: a turn started or ended, or they sent a message. */
   private recentlyActive(agent: AgentInfo, now: number): boolean {
     return now - Math.max(this.turnAt.get(agent.id) ?? 0, agent.lastMessageAt) < TURN_SETTLE_MS;
@@ -3378,7 +3387,7 @@ export class Service {
 
   /** The account can still take agents but is projected past the 5-hour gate. */
   private paced(account: StoredAccount | undefined, now: number): account is StoredAccount {
-    return !!account && canStandIn(account, now) &&
+    return !!account && canStandIn(account, now, null, this.usage.get(account.id)) &&
       paceScore(this.usage.get(account.id), this.pendingOn(account.id, now), now).gated;
   }
 
@@ -3455,7 +3464,8 @@ export class Service {
       return unchecked(error);
     }
     if (!latest || latest.archived || latest.status === "closed") return { outcome: "closed" };
-    if (busy(latest) || (unattended && hasBackgroundWork(latest)) || (background && this.recentlyActive(latest, Date.now()))) {
+    const now = Date.now();
+    if (busy(latest) || (unattended && hasBackgroundWork(latest)) || (background && this.recentlyActive(latest, now))) {
       return this.defer(agentId, row, unattended);
     }
     const reload: Reload = { opens: 0 };
@@ -3636,13 +3646,15 @@ export class Service {
         const family = families[agent.provider];
         // A reload can't move an agent of a family that isn't available here: its session opens on
         // the CLI login again (see `route`).
-        if (!family || this.availability.get(family)?.ok === false || routing.has(agentId) || this.switching.has(agentId) || this.recentlyActive(agent, now)) continue;
+        if (!family || this.availability.get(family)?.ok === false || routing.has(agentId) || this.switching.has(agentId)) continue;
+        const active = this.recentlyActive(agent, now);
         if (this.deferred.has(agentId)) {
           // Its switch waited for a turn that never came (it was only starting), or ended without it.
-          if (settled(agent.status)) waiting.push({ agentId, family });
+          if (!active && settled(agent.status)) waiting.push({ agentId, family });
           continue;
         }
         const current = this.runningOn(state, agentId, family);
+        if (active && !this.atQuotaCeiling(state, current, now, this.agentModels.get(agentId) ?? null)) continue;
         const target = this.targetFor(state, agentId, family, current);
         if (!current || !target || target === current) continue;
         // A reload cancels what the agent is doing, so nobody having asked, it only leaves an account
@@ -3713,7 +3725,7 @@ export class Service {
     // that is out too, so the agent would just be reopened where it can't work.
     const from = findAccount(state, current);
     const to = findAccount(state, target);
-    if (from && isPaidStandIn(from, this.prefs.paidApiFallback) && isLimited(from, now) && (!to || !isUsable(to, now, this.agentModels.get(agent.id)))) return false;
+    if (from && isPaidStandIn(from, this.prefs.paidApiFallback) && isLimited(from, now) && (!to || !isUsable(to, now, this.agentModels.get(agent.id), this.usage.get(to.id)))) return false;
     return stranded || (reason !== "manual" && reason !== "default");
   }
 
@@ -3723,7 +3735,7 @@ export class Service {
     if (!from) return "removed";
     if (!from.signedIn) return "signed_out";
     if (from.disabled) return "disabled";
-    if (isLimitedFor(from, now, this.agentModels.get(agentId))) return "limit";
+    if (isLimitedFor(from, now, this.agentModels.get(agentId), this.usage.get(from.id))) return "limit";
     if (this.leavesPaid(state, agentId, current, target, now)) return "room";
     return state.bindings[agentId]?.accountId === target ? "manual" : "default";
   }
@@ -3746,7 +3758,7 @@ export class Service {
     if (!from || !to) return false;
     if (isPaidStandIn(to, this.prefs.paidApiFallback) && this.routeOf(state, agentId, to.family)?.id !== to.id) return false;
     if (isPaidStandIn(from, this.prefs.paidApiFallback)) return true;
-    if (!isUsable(to, now, this.agentModels.get(agentId))) return false;
+    if (!isUsable(to, now, this.agentModels.get(agentId), this.usage.get(to.id))) return false;
     const session = state.sessions[agentId];
     const binding = state.bindings[agentId];
     return (session?.standIn === true && session.accountId === current) || (binding?.standIn === true && binding.accountId === current);
@@ -3826,6 +3838,9 @@ export class Service {
       this.usageLive.add(accountId);
       this.noteHistory(accountId, usage);
       const now = Date.now();
+      if (this.prefs.autoSwitch && this.paseo && quotaCeilingHit(account, usage, now)) {
+        void this.alignSessions(this.paseo).catch((error: unknown) => log("aligning agents failed", error));
+      }
       // With "Use ChatGPT credits when a limit is reached" on, credits keep an account going past a
       // full window, so a full window alone isn't a limit then.
       const creditsCover = this.prefs.useCredits && usage.credits != null;
@@ -4029,10 +4044,11 @@ export class Service {
     };
     // Pacing only chooses between two or more accounts that can take agents by themselves.
     const pacedFamilies = new Set(
-      FAMILIES.filter((family) => state.accounts.filter((other) => other.family === family && canStandIn(other, now)).length > 1),
+      FAMILIES.filter((family) => state.accounts.filter((other) => other.family === family && canStandIn(other, now, null, this.usage.get(other.id))).length > 1),
     );
     const accounts: AccountView[] = state.accounts.map((account) => {
-      const limited = isLimited(account, now);
+      const ceiling = quotaCeilingHit(account, this.usage.get(account.id), now, null);
+      const limited = isLimited(account, now) || !!ceiling;
       const proxy = proxies.get(account.id);
       return {
         id: account.id,
@@ -4046,7 +4062,9 @@ export class Service {
         disabled: account.disabled,
         isDefault: defaultAccount(state, account.family)?.id === account.id,
         nextAgentUntil: nextPickUntil(state, account.id, account.family, now),
-        limitedUntil: limited ? account.limitedUntil : null,
+        limitedUntil: isLimited(account, now) ? account.limitedUntil : ceiling?.resetsAt ?? null,
+        quotaCeilings: account.quotaCeilings,
+        ceilingHit: !!ceiling,
         usage: this.usage.get(account.id) ?? null,
         agentCount: counts.get(account.id) ?? 0,
         home: account.home,
@@ -4065,7 +4083,7 @@ export class Service {
         externalHome: external.has(account.id),
         sessionsShared: sessions.get(account.id) ?? null,
         moving: moving(account),
-        pace: this.prefs.balanceNewAgents && pacedFamilies.has(account.family) && canStandIn(account, now)
+        pace: this.prefs.balanceNewAgents && pacedFamilies.has(account.family) && canStandIn(account, now, null, this.usage.get(account.id))
           ? paceView(this.usage.get(account.id), this.pendingOn(account.id, now), now)
           : null,
         azure: azures.get(account.id) ?? null,
@@ -4408,7 +4426,7 @@ export class Service {
         // Still starting, and not routed yet: it will be, by the new default.
         if (agent.status === "initializing" && !draft.sessions[agent.id]) continue;
         const current = findAccount(draft, this.runningOn(draft, agent.id, family));
-        if (!current || current.family !== family || !isUsable(current, now, this.agentModels.get(agent.id))) moving.push(agent.id);
+        if (!current || current.family !== family || !isUsable(current, now, this.agentModels.get(agent.id), this.usage.get(current.id))) moving.push(agent.id);
         else if (current.id !== newDefault) {
           // "auto", like a limit switch, so the account button still offers "Follow default". On a paid
           // stand-in it wasn't on by the old default, it's there only because every subscription was out:
@@ -4428,6 +4446,7 @@ export class Service {
 
   async clearLimit(accountId: string): Promise<void> {
     const state = await this.store.update((draft) => {
+      if (this.atQuotaCeiling(draft, accountId, Date.now(), null)) throw new Error("Raise the quota maximum before marking this account available.");
       const account = findAccount(draft, accountId);
       if (!account) return;
       for (const slot of [account, ...sameSubscription(draft, account)]) {
@@ -4463,6 +4482,7 @@ export class Service {
       if (isLimited(target, now)) throw new Error(limitedPick(target.label));
       // Only a limit of this agent's own model refuses it; another model's leaves the account open.
       const model = await this.modelOf(paseo, agentId);
+      if (this.atQuotaCeiling(state, target.id, now, model)) throw new Error(`${target.label} reached its quota maximum. Raise it in Accounts or pick another account.`);
       const scope = Object.entries(target.modelLimits).find(([name, limit]) => Date.parse(limit.until) > now && scopeCoversModel(name, model))?.[0];
       if (scope) throw new Error(limitedModelPick(target.label, scope));
     }
@@ -4531,6 +4551,21 @@ export class Service {
     });
     const summary = emptySummary();
     return this.answerBy(replyBy, this.reconcile(paseo, "manual", [agentId], undefined, { summary }), summary);
+  }
+
+  async setQuotaCeiling(accountId: string, windowId: string, percent: number): Promise<void> {
+    if (!this.usage.get(accountId)?.windows.some((window) => window.id === windowId)) {
+      throw new Error("That usage window is no longer available.");
+    }
+    await this.store.update((draft) => {
+      const account = findAccount(draft, accountId);
+      if (!account) throw new Error("That account no longer exists.");
+      const ceilings = { ...account.quotaCeilings };
+      if (percent === 100) delete ceilings[windowId];
+      else ceilings[windowId] = percent;
+      account.quotaCeilings = ceilings;
+    });
+    if (this.paseo) void this.alignSessions(this.paseo).catch((error: unknown) => log("aligning agents failed", error));
   }
 
   async rename(accountId: string, label: string): Promise<void> {
