@@ -4,6 +4,7 @@ import type { AccountView, StateView } from "../shared/model";
 import { DEFAULT_CONTINUE_PROMPT, preferences, type Preferences } from "../shared/preferences";
 import { accountMenu, type MenuEntry } from "./account-menu";
 import { AccountsSurface } from "./accounts-surface";
+import { shellPathLine } from "./pi-accounts";
 import { PreferencesScreen } from "./settings-screen";
 import type { StoreSnapshot, ZeroSubStore } from "./store";
 
@@ -573,6 +574,41 @@ describe("the accounts screen", () => {
     await vi.waitFor(() => expect(paseo.toast.show).toHaveBeenCalled());
     expect(paseo.toast.error).not.toHaveBeenCalled();
     expect(paseo.toast.show).toHaveBeenCalledWith(expect.stringMatching(/^Still removing home/), expect.objectContaining({ variant: "info" }));
+  });
+
+  it("shows PowerShell PATH and .cmd hints for Windows hosts, and POSIX export PATH and .sh hints otherwise", () => {
+    const claudeSection = (overrides: Partial<StateView>) => {
+      const section = find(setUp(overrides).surface(), (element) => typeof element.type === "function" && element.type.name === "FamilySection");
+      const tree = mount(section.type as (props: unknown) => ReactNode, section.props)();
+      const hint = find(tree, (element) => typeof element.type === "function" && element.type.name === "ShellHint");
+      return textOf(mount(hint.type as (props: unknown) => ReactNode, hint.props)());
+    };
+
+    const posix = claudeSection({
+      launchers: "/home/user/.claude-config",
+      accounts: [account("work", { isDefault: true, launcher: "claude-work.sh" })],
+    });
+    expect(posix).toContain('export PATH="/home/user/.claude-config:$PATH"');
+    expect(posix).toContain("then run claude-work.sh.");
+    expect(posix).not.toContain("$env:PATH");
+
+    const win = claudeSection({
+      launchers: "C:\\Users\\user\\.claude-config",
+      accounts: [account("work", { isDefault: true, launcher: "claude-work.cmd" })],
+    });
+    expect(win).toContain("$env:PATH = 'C:\\Users\\user\\.claude-config;' + $env:PATH");
+    expect(win).toContain("From PowerShell on this host: add this line to your $PROFILE once");
+    expect(win).toContain("then run claude-work.cmd.");
+    expect(win).not.toContain("export PATH");
+
+    const winFallback = claudeSection({
+      launchers: "C:\\Users\\user\\.claude-config",
+      accounts: [account("work", { isDefault: true, launcher: null })],
+    });
+    expect(winFallback).toContain("then run claude-<account>.cmd.");
+
+    expect(shellPathLine("/home/user/my scripts")).toBe(`export PATH='/home/user/my scripts':"$PATH"`);
+    expect(shellPathLine("C:\\Users\\O'Brien\\.claude-config")).toBe("$env:PATH = 'C:\\Users\\O''Brien\\.claude-config;' + $env:PATH");
   });
 });
 

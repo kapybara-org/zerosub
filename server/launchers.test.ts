@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { launcherDir, launcherNames, paseoHomeTag, piLauncherDir, renderLauncher, writeLaunchers } from "./launchers";
@@ -34,7 +34,7 @@ describe("launcherDir", () => {
       delete process.env.ZEROSUB_LAUNCHER_DIR;
       expect(launcherDir()).toBe(join(homedir(), ".claude-config"));
       process.env.ZEROSUB_LAUNCHER_DIR = "/tmp/scripts/";
-      expect(launcherDir()).toBe("/tmp/scripts");
+      expect(launcherDir()).toBe(resolve("/tmp/scripts/"));
     } finally {
       if (previous === undefined) delete process.env.ZEROSUB_LAUNCHER_DIR;
       else process.env.ZEROSUB_LAUNCHER_DIR = previous;
@@ -44,14 +44,32 @@ describe("launcherDir", () => {
 
 describe("launcherNames", () => {
   it("names each account after its label and keeps names unique", () => {
-    const names = launcherNames([
-      { id: "claude-aaaaaa111", label: "Work", home: "/h/1" },
-      { id: "claude-bbbbbb222", label: "work", home: "/h/2" },
-      { id: "claude-cccccc333", label: "Ünïcode & Spaces!", home: "/h/3" },
-      { id: "claude-dddddd444", label: "工作", home: "/h/4" },
-      { id: "claude-eeeeee555", label: "work@example.com", home: "/h/5" },
-    ]);
+    const names = launcherNames(
+      [
+        { id: "claude-aaaaaa111", label: "Work", home: "/h/1" },
+        { id: "claude-bbbbbb222", label: "work", home: "/h/2" },
+        { id: "claude-cccccc333", label: "Ünïcode & Spaces!", home: "/h/3" },
+        { id: "claude-dddddd444", label: "工作", home: "/h/4" },
+        { id: "claude-eeeeee555", label: "work@example.com", home: "/h/5" },
+      ],
+      new Map(),
+      "claude",
+      "linux",
+    );
     expect([...names.values()]).toEqual(["claude-work.sh", "claude-work-bbbbbb.sh", "claude-unicode-spaces.sh", "claude-dddddd.sh", "claude-work-example-com.sh"]);
+  });
+
+  it("uses .cmd extensions on Windows", () => {
+    const names = launcherNames(
+      [
+        { id: "claude-aaaaaa111", label: "Work", home: "C:\\h\\1" },
+        { id: "claude-bbbbbb222", label: "work", home: "C:\\h\\2" },
+      ],
+      new Map(),
+      "claude",
+      "win32",
+    );
+    expect([...names.values()]).toEqual(["claude-work.cmd", "claude-work-bbbbbb.cmd"]);
   });
 });
 
@@ -78,23 +96,25 @@ describe("generated scripts", () => {
 
   it("writes one executable script per account, quoted safely, only rewritten when it changes", async () => {
     const directory = join(root, "launchers");
-    expect(renderLauncher({ ...work(), home: "/tmp/zero sub/homes/claude-it's" })).toContain(`export CLAUDE_CONFIG_DIR='/tmp/zero sub/homes/claude-it'\\''s'`);
-    await writeLaunchers([work(), personal()], directory);
+    expect(renderLauncher({ ...work(), home: "/tmp/zero sub/homes/claude-it's" }, "claude", "linux")).toContain(
+      `export CLAUDE_CONFIG_DIR='/tmp/zero sub/homes/claude-it'\\''s'`,
+    );
+    await writeLaunchers([work(), personal()], directory, [], new Map(), "claude", "linux");
     expect((await readdir(directory)).sort()).toEqual(["claude-personal.sh", "claude-work.sh"]);
     const path = join(directory, "claude-work.sh");
-    expect((await stat(path)).mode & 0o111).not.toBe(0);
+    if (process.platform !== "win32") expect((await stat(path)).mode & 0o111).not.toBe(0);
     const before = await stat(path);
-    await writeLaunchers([work(), personal()], directory);
+    await writeLaunchers([work(), personal()], directory, [], new Map(), "claude", "linux");
     expect((await stat(path)).mtimeMs).toBe(before.mtimeMs);
   });
 
   it("removes its scripts for accounts in homes/ that are gone or renamed, and nothing else", async () => {
     const directory = join(root, "launchers");
-    await writeLaunchers([work(), personal()], directory);
+    await writeLaunchers([work(), personal()], directory, [], new Map(), "claude", "linux");
     await writeFile(join(directory, "claude-mine"), "#!/bin/sh\necho mine\n");
-    await writeLaunchers([{ ...work(), label: "Office" }], directory);
+    await writeLaunchers([{ ...work(), label: "Office" }], directory, [], new Map(), "claude", "linux");
     expect((await readdir(directory)).sort()).toEqual(["claude-mine", "claude-office.sh"]);
-    await writeLaunchers([], directory);
+    await writeLaunchers([], directory, [], new Map(), "claude", "linux");
     expect(await readdir(directory)).toEqual(["claude-mine"]);
     expect(await readFile(join(directory, "claude-mine"), "utf8")).toBe("#!/bin/sh\necho mine\n");
   });
@@ -102,26 +122,26 @@ describe("generated scripts", () => {
   it("keeps the script of an account the registry lost while its home is there, and deletes it once the home is up for cleanup", async () => {
     const directory = join(root, "launchers");
     await mkdir(personal().home, { recursive: true });
-    await writeLaunchers([work(), personal()], directory);
+    await writeLaunchers([work(), personal()], directory, [], new Map(), "claude", "linux");
     const path = join(directory, "claude-personal.sh");
     // A damaged registry lost the account; nobody removed it, so its home isn't up for cleanup.
-    await writeLaunchers([work()], directory);
+    await writeLaunchers([work()], directory, [], new Map(), "claude", "linux");
     expect((await readFile(path, "utf8")).split("\n")[1]).toMatch(/^# No longer managed by ZeroSub/);
     // The account comes back (from a backup, say) and takes its script back.
-    await writeLaunchers([work(), personal()], directory);
-    expect(await readFile(path, "utf8")).toBe(renderLauncher(personal()));
+    await writeLaunchers([work(), personal()], directory, [], new Map(), "claude", "linux");
+    expect(await readFile(path, "utf8")).toBe(renderLauncher(personal(), "claude", "linux"));
     // Removed: its home is listed for cleanup, so the script goes now.
-    await writeLaunchers([work()], directory, [personal().home]);
+    await writeLaunchers([work()], directory, [personal().home], new Map(), "claude", "linux");
     expect(await readdir(directory)).toEqual(["claude-work.sh"]);
   });
 
   it("leaves a copy of one of its scripts under another name to the user", async () => {
     const directory = join(root, "launchers");
-    await writeLaunchers([work()], directory);
+    await writeLaunchers([work()], directory, [], new Map(), "claude", "linux");
     const copy = (await readFile(join(directory, "claude-work.sh"), "utf8")).replace('exec claude "$@"', 'exec claude --verbose "$@"');
     await writeFile(join(directory, "claude-work-yolo.sh"), copy);
-    await writeLaunchers([work()], directory);
-    await writeLaunchers([{ ...work(), label: "Office" }], directory);
+    await writeLaunchers([work()], directory, [], new Map(), "claude", "linux");
+    await writeLaunchers([{ ...work(), label: "Office" }], directory, [], new Map(), "claude", "linux");
     expect((await readdir(directory)).sort()).toEqual(["claude-office.sh", "claude-work-yolo.sh"]);
     const kept = (await readFile(join(directory, "claude-work-yolo.sh"), "utf8")).split("\n");
     expect(kept[1]).toMatch(/^# No longer managed by ZeroSub/);
@@ -139,7 +159,7 @@ describe("generated scripts", () => {
   for (const shell of ["sh", "bash", "zsh"] as const) {
     it.skipIf(process.platform === "win32" || !installed(shell))(`starts the CLI on the account from ${shell}, leaving the caller's shell alone`, async () => {
       const directory = join(root, "launchers");
-      await writeLaunchers([work()], directory);
+      await writeLaunchers([work()], directory, [], new Map(), "claude", "linux");
       const out = await launch(shell, directory, `claude-work.sh -p "two words" --flag`, { CLAUDE_CONFIG_DIR: "/caller" });
       expect(out).toBe(
         [`dir=${home()}`, `secure=${home()}`, "token=unset", "key=unset", "arg=-p", "arg=two words", "arg=--flag", "after=/caller", ""].join("\n"),
@@ -155,58 +175,60 @@ describe("scripts for homes outside homes/", () => {
 
   it("are kept, working, when their account goes, and become the user's", async () => {
     const directory = join(root, "launchers");
-    await writeLaunchers([mine()], directory);
+    await writeLaunchers([mine()], directory, [], new Map(), "claude", "linux");
     const path = join(directory, "claude-mine.sh");
     const generated = await readFile(path, "utf8");
 
-    await writeLaunchers([], directory);
+    await writeLaunchers([], directory, [], new Map(), "claude", "linux");
     const kept = await readFile(path, "utf8");
     expect(kept.split("\n")[1]).toMatch(/^# No longer managed by ZeroSub/);
     // Only the marker line changed, so it starts the same account as before.
     expect(kept.split("\n").filter((_, index) => index !== 1)).toEqual(generated.split("\n").filter((_, index) => index !== 1));
-    expect((await stat(path)).mode & 0o111).not.toBe(0);
-    const out = await launch("sh", directory, "claude-mine.sh auth status");
-    expect(out).toContain(`dir=${external()}\nsecure=${external()}\n`);
+    if (process.platform !== "win32") {
+      expect((await stat(path)).mode & 0o111).not.toBe(0);
+      const out = await launch("sh", directory, "claude-mine.sh auth status");
+      expect(out).toContain(`dir=${external()}\nsecure=${external()}\n`);
+    }
 
     // Later passes leave it alone.
     const before = await stat(path);
-    await writeLaunchers([], directory);
+    await writeLaunchers([], directory, [], new Map(), "claude", "linux");
     expect(await readFile(path, "utf8")).toBe(kept);
     expect((await stat(path)).mtimeMs).toBe(before.mtimeMs);
   });
 
   it("are kept under their old name when the account is renamed", async () => {
     const directory = join(root, "launchers");
-    await writeLaunchers([mine()], directory);
-    await writeLaunchers([{ ...mine(), label: "Office" }], directory);
+    await writeLaunchers([mine()], directory, [], new Map(), "claude", "linux");
+    await writeLaunchers([{ ...mine(), label: "Office" }], directory, [], new Map(), "claude", "linux");
     expect((await readdir(directory)).sort()).toEqual(["claude-mine.sh", "claude-office.sh"]);
     expect((await readFile(join(directory, "claude-mine.sh"), "utf8")).split("\n")[1]).toMatch(/^# No longer managed by ZeroSub/);
   });
 
   it("aren't taken over by another account with the same name, but are by the same home added back", async () => {
     const directory = join(root, "launchers");
-    await writeLaunchers([mine()], directory);
-    await writeLaunchers([], directory);
+    await writeLaunchers([mine()], directory, [], new Map(), "claude", "linux");
+    await writeLaunchers([], directory, [], new Map(), "claude", "linux");
     const kept = await readFile(join(directory, "claude-mine.sh"), "utf8");
 
     const other = { id: "claude-other01", label: "Mine", home: own("claude-other01") };
-    const names = await writeLaunchers([other], directory);
+    const names = await writeLaunchers([other], directory, [], new Map(), "claude", "linux");
     expect(names.get(other.id)).toBe("claude-mine-other0.sh");
     expect(await readFile(join(directory, "claude-mine.sh"), "utf8")).toBe(kept);
 
     // Registered again by hand: its script is ZeroSub's to manage again.
-    await writeLaunchers([other, mine()], directory);
-    expect(await readFile(join(directory, "claude-mine.sh"), "utf8")).toBe(renderLauncher(mine()));
+    await writeLaunchers([other, mine()], directory, [], new Map(), "claude", "linux");
+    expect(await readFile(join(directory, "claude-mine.sh"), "utf8")).toBe(renderLauncher(mine(), "claude", "linux"));
   });
 
   it("aren't taken back by their account once changed: it gets another name", async () => {
     const directory = join(root, "launchers");
-    await writeLaunchers([mine()], directory);
-    await writeLaunchers([], directory);
+    await writeLaunchers([mine()], directory, [], new Map(), "claude", "linux");
+    await writeLaunchers([], directory, [], new Map(), "claude", "linux");
     const path = join(directory, "claude-mine.sh");
     const changed = (await readFile(path, "utf8")).replace('exec claude "$@"', 'exec claude --verbose "$@"');
     await writeFile(path, changed);
-    expect((await writeLaunchers([mine()], directory)).get(mine().id)).toBe("claude-mine-mine01.sh");
+    expect((await writeLaunchers([mine()], directory, [], new Map(), "claude", "linux")).get(mine().id)).toBe("claude-mine-mine01.sh");
     expect(await readFile(path, "utf8")).toBe(changed);
   });
 
@@ -215,7 +237,7 @@ describe("scripts for homes outside homes/", () => {
     await mkdir(directory, { recursive: true });
     await writeFile(join(directory, "claude-work.sh"), "#!/bin/sh\necho mine\n");
     const work = { id: "claude-abc123", label: "Work", home: own("claude-abc123") };
-    expect((await writeLaunchers([work], directory)).get(work.id)).toBe("claude-work-abc123.sh");
+    expect((await writeLaunchers([work], directory, [], new Map(), "claude", "linux")).get(work.id)).toBe("claude-work-abc123.sh");
     expect(await readFile(join(directory, "claude-work.sh"), "utf8")).toBe("#!/bin/sh\necho mine\n");
   });
 });
@@ -230,13 +252,13 @@ describe("what isn't a plain script of ZeroSub's", () => {
     await mkdir(directory, { recursive: true });
     await writeFile(elsewhere, "#!/bin/sh\necho mine\n");
     await symlink(elsewhere, join(directory, "claude-work.sh"));
-    expect((await writeLaunchers([work()], directory)).get(work().id)).toBe("claude-work-abc123.sh");
+    expect((await writeLaunchers([work()], directory, [], new Map(), "claude", "linux")).get(work().id)).toBe("claude-work-abc123.sh");
     expect((await lstat(join(directory, "claude-work.sh"))).isSymbolicLink()).toBe(true);
     expect(await readFile(elsewhere, "utf8")).toBe("#!/bin/sh\necho mine\n");
 
     // An alias the user made for one of ZeroSub's own scripts outlives the account.
     await symlink(join(directory, "claude-work-abc123.sh"), join(directory, "cw.sh"));
-    await writeLaunchers([], directory);
+    await writeLaunchers([], directory, [], new Map(), "claude", "linux");
     expect(await readlink(join(directory, "cw.sh"))).toBe(join(directory, "claude-work-abc123.sh"));
     expect((await readdir(directory)).sort()).toEqual(["claude-work.sh", "cw.sh"]);
   });
@@ -244,9 +266,9 @@ describe("what isn't a plain script of ZeroSub's", () => {
   it("is never taken over, even when it starts the account's own home", async () => {
     const directory = join(root, "launchers");
     await mkdir(directory, { recursive: true });
-    const handmade = renderLauncher(work()).replace(/^# Generated by ZeroSub.*$/m, "# My own copy").replace('exec claude "$@"', 'exec claude --verbose "$@"');
+    const handmade = renderLauncher(work(), "claude", "linux").replace(/^# Generated by ZeroSub.*$/m, "# My own copy").replace('exec claude "$@"', 'exec claude --verbose "$@"');
     await writeFile(join(directory, "claude-work.sh"), handmade);
-    expect((await writeLaunchers([work()], directory)).get(work().id)).toBe("claude-work-abc123.sh");
+    expect((await writeLaunchers([work()], directory, [], new Map(), "claude", "linux")).get(work().id)).toBe("claude-work-abc123.sh");
     expect(await readFile(join(directory, "claude-work.sh"), "utf8")).toBe(handmade);
   });
 });
@@ -271,15 +293,15 @@ describe("daemons sharing the directory", () => {
     const work = { id: "claude-aaa111", label: "Work", home: home(first(), "claude-aaa111") };
     const play = { id: "claude-bbb222", label: "Play", home: home(second(), "claude-bbb222") };
     const twin = { id: "claude-ccc333", label: "Work", home: home(second(), "claude-ccc333") };
-    await as(first(), () => writeLaunchers([work], directory));
-    expect((await as(second(), () => writeLaunchers([play, twin], directory))).get(twin.id)).toBe("claude-work-ccc333.sh");
+    await as(first(), () => writeLaunchers([work], directory, [], new Map(), "claude", "linux"));
+    expect((await as(second(), () => writeLaunchers([play, twin], directory, [], new Map(), "claude", "linux"))).get(twin.id)).toBe("claude-work-ccc333.sh");
     const written = new Map<string, string>();
     for (const name of await readdir(directory)) written.set(name, await readFile(join(directory, name), "utf8"));
 
     // Either one running again, even with no accounts left, changes nothing of the other's.
-    await as(first(), () => writeLaunchers([work], directory));
-    await as(second(), () => writeLaunchers([play, twin], directory));
-    await as(first(), () => writeLaunchers([], directory));
+    await as(first(), () => writeLaunchers([work], directory, [], new Map(), "claude", "linux"));
+    await as(second(), () => writeLaunchers([play, twin], directory, [], new Map(), "claude", "linux"));
+    await as(first(), () => writeLaunchers([], directory, [], new Map(), "claude", "linux"));
     expect((await readdir(directory)).sort()).toEqual(["claude-play.sh", "claude-work-ccc333.sh"]);
     expect(await readFile(join(directory, "claude-play.sh"), "utf8")).toBe(written.get("claude-play.sh"));
     expect((await readFile(join(directory, "claude-play.sh"), "utf8")).split("\n")[1]).toContain(`(Paseo home ${await as(second(), async () => paseoHomeTag())})`);
@@ -293,7 +315,7 @@ describe("piLauncherDir", () => {
       delete process.env.ZEROSUB_PI_DIR;
       expect(piLauncherDir()).toBe(join(homedir(), ".pi-config"));
       process.env.ZEROSUB_PI_DIR = "/tmp/scripts/";
-      expect(piLauncherDir()).toBe("/tmp/scripts");
+      expect(piLauncherDir()).toBe(resolve("/tmp/scripts/"));
     } finally {
       if (previous === undefined) delete process.env.ZEROSUB_PI_DIR;
       else process.env.ZEROSUB_PI_DIR = previous;
@@ -304,26 +326,26 @@ describe("piLauncherDir", () => {
 describe("Pi scripts", () => {
   it("start pi on the account's folder with its proxy file, and share a directory with Claude's untouched", async () => {
     const dir = join(root, "scripts");
-    const claude = await writeLaunchers([{ id: "claude-aaaaaaaaaaaa", label: "Work", home: own("claude-aaaaaaaaaaaa") }], dir);
+    const claude = await writeLaunchers([{ id: "claude-aaaaaaaaaaaa", label: "Work", home: own("claude-aaaaaaaaaaaa") }], dir, [], new Map(), "claude", "linux");
     await mkdir(own("pi-bbbbbbbbbbbb"), { recursive: true });
-    const pi = await writeLaunchers([{ id: "pi-bbbbbbbbbbbb", label: "Pi-Work", home: own("pi-bbbbbbbbbbbb") }], dir, [], new Map(), "pi");
+    const pi = await writeLaunchers([{ id: "pi-bbbbbbbbbbbb", label: "Pi-Work", home: own("pi-bbbbbbbbbbbb") }], dir, [], new Map(), "pi", "linux");
     expect(claude.get("claude-aaaaaaaaaaaa")).toBe("claude-work.sh");
     // A label already starting with "pi-" isn't doubled.
     expect(pi.get("pi-bbbbbbbbbbbb")).toBe("pi-work.sh");
     const script = await readFile(join(dir, "pi-work.sh"), "utf8");
-    expect(script).toBe(renderLauncher({ id: "pi-bbbbbbbbbbbb", label: "Pi-Work", home: own("pi-bbbbbbbbbbbb") }, "pi"));
+    expect(script).toBe(renderLauncher({ id: "pi-bbbbbbbbbbbb", label: "Pi-Work", home: own("pi-bbbbbbbbbbbb") }, "pi", "linux"));
     expect(script).toContain(`export PI_CODING_AGENT_DIR='${own("pi-bbbbbbbbbbbb")}'`);
-    expect((await stat(join(dir, "pi-work.sh"))).mode & 0o777).toBe(0o755);
+    if (process.platform !== "win32") expect((await stat(join(dir, "pi-work.sh"))).mode & 0o777).toBe(0o755);
 
     // Each kind leaves the other's scripts alone, even with no accounts of its own left.
-    await writeLaunchers([], dir);
+    await writeLaunchers([], dir, [], new Map(), "claude", "linux");
     expect(await readFile(join(dir, "pi-work.sh"), "utf8")).toBe(script);
-    await writeLaunchers([], dir, [own("pi-bbbbbbbbbbbb")], new Map(), "pi");
+    await writeLaunchers([], dir, [own("pi-bbbbbbbbbbbb")], new Map(), "pi", "linux");
     await expect(stat(join(dir, "pi-work.sh"))).rejects.toThrow();
     expect(await readdir(dir)).toEqual([]);
   });
 
-  it("run pi with the account's folder and the proxy ZeroSub keeps for it", async () => {
+  it.skipIf(process.platform === "win32")("run pi with the account's folder and the proxy ZeroSub keeps for it", async () => {
     const home = join(root, "pi-home");
     await mkdir(home);
     await writeFile(join(home, "zerosub.env"), "export HTTPS_PROXY='http://127.0.0.1:7890'\n");
@@ -331,17 +353,22 @@ describe("Pi scripts", () => {
     await mkdir(bin);
     await writeFile(join(bin, "pi"), '#!/bin/sh\necho "$PI_CODING_AGENT_DIR|$HTTPS_PROXY|$*"\n', { mode: 0o755 });
     const dir = join(root, "scripts");
-    await writeLaunchers([{ id: "pi-cccccccccccc", label: "Gateway", home }], dir, [], new Map(), "pi");
+    await writeLaunchers([{ id: "pi-cccccccccccc", label: "Gateway", home }], dir, [], new Map(), "pi", "linux");
     const { stdout } = await exec(join(dir, "pi-gateway.sh"), ["--version"], { env: { PATH: `${bin}:/usr/bin:/bin`, HTTPS_PROXY: "http://shell:1" } });
     expect(stdout.trim()).toBe(`${home}|http://127.0.0.1:7890|--version`);
   });
 
   it("are named after their accounts, once with pi-, and fall back to the account's ID", () => {
-    const names = launcherNames([
-      { id: "pi-aaaaaaaaaaaa", label: "Work", home: "/a" },
-      { id: "pi-bbbbbbbbbbbb", label: "Pi-Work", home: "/b" },
-      { id: "pi-cccccccccccc", label: "日本", home: "/c" },
-    ], new Map(), "pi");
+    const names = launcherNames(
+      [
+        { id: "pi-aaaaaaaaaaaa", label: "Work", home: "/a" },
+        { id: "pi-bbbbbbbbbbbb", label: "Pi-Work", home: "/b" },
+        { id: "pi-cccccccccccc", label: "日本", home: "/c" },
+      ],
+      new Map(),
+      "pi",
+      "linux",
+    );
     expect([...names.values()]).toEqual(["pi-work.sh", "pi-work-bbbbbb.sh", "pi-cccccc.sh"]);
   });
 
@@ -359,28 +386,146 @@ describe("Pi scripts", () => {
       [],
       new Map(),
       "pi",
+      "linux",
     );
     expect((await readdir(dir)).sort()).toEqual(["pi-kept.sh", "pi-own.sh"]);
-    await writeLaunchers([], dir, [own("pi-aaaaaaaaaaaa")], new Map(), "pi");
+    await writeLaunchers([], dir, [own("pi-aaaaaaaaaaaa")], new Map(), "pi", "linux");
     expect(await readdir(dir)).toEqual(["pi-kept.sh"]);
     const released = await readFile(join(dir, "pi-kept.sh"), "utf8");
     expect(released.split("\n")[1]).toMatch(/^# No longer managed by ZeroSub/);
     // Added back, it gets its script back.
-    await writeLaunchers([{ id: "pi-dddddddddddd", label: "Kept", home: kept }], dir, [], new Map(), "pi");
-    expect(await readFile(join(dir, "pi-kept.sh"), "utf8")).toBe(renderLauncher({ id: "pi-dddddddddddd", label: "Kept", home: kept }, "pi"));
+    await writeLaunchers([{ id: "pi-dddddddddddd", label: "Kept", home: kept }], dir, [], new Map(), "pi", "linux");
+    expect(await readFile(join(dir, "pi-kept.sh"), "utf8")).toBe(renderLauncher({ id: "pi-dddddddddddd", label: "Kept", home: kept }, "pi", "linux"));
   });
 
   it("never touch hand-written scripts, other daemons' scripts or links", async () => {
     const dir = join(root, "scripts");
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, "pi-work.sh"), "#!/bin/sh\nexec pi\n");
-    const other = renderLauncher({ id: "pi-eeeeeeeeeeee", label: "Other", home: "/elsewhere" }, "pi").replace(paseoHomeTag(), "00000000");
+    const other = renderLauncher({ id: "pi-eeeeeeeeeeee", label: "Other", home: "/elsewhere" }, "pi", "linux").replace(paseoHomeTag(), "00000000");
     await writeFile(join(dir, "pi-other.sh"), other);
     await symlink("/dev/null", join(dir, "pi-link.sh"));
-    const names = await writeLaunchers([{ id: "pi-ffffffffffff", label: "Work", home: join(root, "work") }], dir, [], new Map(), "pi");
+    const names = await writeLaunchers([{ id: "pi-ffffffffffff", label: "Work", home: join(root, "work") }], dir, [], new Map(), "pi", "linux");
     expect(names.get("pi-ffffffffffff")).toBe("pi-work-ffffff.sh");
     expect(await readFile(join(dir, "pi-work.sh"), "utf8")).toBe("#!/bin/sh\nexec pi\n");
     expect(await readFile(join(dir, "pi-other.sh"), "utf8")).toBe(other);
     expect((await readdir(dir)).sort()).toEqual(["pi-link.sh", "pi-other.sh", "pi-work-ffffff.sh", "pi-work.sh"]);
+  });
+});
+
+describe("Windows .cmd scripts", () => {
+  it("renders valid .cmd scripts, escaping % and guarding non-ASCII paths only when needed", () => {
+    const ascii = renderLauncher({ id: "claude-abc123", label: "Work", home: "C:\\Users\\user\\.paseo\\zerosub\\homes\\claude-abc123" }, "claude", "win32");
+    expect(ascii).toContain("\r\n");
+    expect(ascii).toContain("@echo off\r\nrem Generated by ZeroSub");
+    expect(ascii).toContain('set "CLAUDE_CONFIG_DIR=C:\\Users\\user\\.paseo\\zerosub\\homes\\claude-abc123"\r\n');
+    expect(ascii).not.toContain("chcp 65001");
+    expect(ascii).toContain("call claude %*\r\nexit /b %ERRORLEVEL%\r\n");
+
+    const pct = renderLauncher({ id: "claude-abc123", label: "Work", home: "C:\\Users\\100% legit\\claude-abc123" }, "claude", "win32");
+    expect(pct).toContain('set "CLAUDE_CONFIG_DIR=C:\\Users\\100%% legit\\claude-abc123"\r\n');
+
+    const nonAscii = renderLauncher({ id: "claude-abc123", label: "Work", home: "C:\\Users\\José\\.paseo\\claude-abc123" }, "claude", "win32");
+    expect(nonAscii).toContain("chcp 65001 >nul");
+    expect(nonAscii).toContain('set "CLAUDE_CONFIG_DIR=C:\\Users\\José\\.paseo\\claude-abc123"\r\n');
+  });
+
+  it("writes, releases, re-adopts .cmd scripts, keeps hand-written ones, and tidies legacy .sh scripts", async () => {
+    const dir = join(root, "win-launchers");
+    const ownHome = own("claude-abc123");
+    const external = join(root, "external", "claude-mine");
+    await mkdir(ownHome, { recursive: true });
+    await mkdir(external, { recursive: true });
+
+    // Legacy .sh scripts from an earlier version: own-home one is removed, hand-written .sh stays.
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "claude-work.sh"), renderLauncher({ id: "claude-abc123", label: "Work", home: ownHome }, "claude", "linux"));
+    await writeFile(join(dir, "claude-custom.sh"), "#!/bin/sh\necho mine\n");
+    await writeFile(join(dir, "claude-hand.cmd"), "@echo off\r\necho mine\r\n");
+
+    const written = await writeLaunchers(
+      [
+        { id: "claude-abc123", label: "Work", home: ownHome },
+        { id: "claude-def456", label: "Mine", home: external },
+        { id: "claude-123abc", label: "Hand", home: own("claude-123abc") },
+      ],
+      dir,
+      [],
+      new Map(),
+      "claude",
+      "win32",
+    );
+    expect(written.get("claude-abc123")).toBe("claude-work.cmd");
+    expect(written.get("claude-def456")).toBe("claude-mine.cmd");
+    expect(written.get("claude-123abc")).toBe("claude-hand-123abc.cmd");
+    expect((await readdir(dir)).sort()).toEqual([
+      "claude-custom.sh",
+      "claude-hand-123abc.cmd",
+      "claude-hand.cmd",
+      "claude-mine.cmd",
+      "claude-work.cmd",
+    ]);
+
+    // Removing the external account releases its .cmd script; re-adding takes it back.
+    await writeLaunchers([], dir, [ownHome, own("claude-123abc")], new Map(), "claude", "win32");
+    expect((await readdir(dir)).sort()).toEqual(["claude-custom.sh", "claude-hand.cmd", "claude-mine.cmd"]);
+    const released = await readFile(join(dir, "claude-mine.cmd"), "utf8");
+    expect(released.split("\r\n")[1]).toMatch(/^rem No longer managed by ZeroSub/);
+    await writeLaunchers([{ id: "claude-def999", label: "Mine", home: external }], dir, [], new Map(), "claude", "win32");
+    expect(await readFile(join(dir, "claude-mine.cmd"), "utf8")).toBe(
+      renderLauncher({ id: "claude-def999", label: "Mine", home: external }, "claude", "win32"),
+    );
+  });
+
+  it.skipIf(process.platform !== "win32")("starts Claude and Pi from cmd.exe and PowerShell, leaving caller env alone", async () => {
+    const dir = join(root, "win-exec");
+    const bin = join(root, "win-bin");
+    const claudeHome = own("claude-100% legit");
+    const piHome = join(root, "pi-home");
+    await mkdir(bin, { recursive: true });
+    await mkdir(piHome, { recursive: true });
+    await writeFile(
+      join(bin, "claude.cmd"),
+      `@echo off\r\n"${process.execPath}" -e "console.log(JSON.stringify({dir: process.env.CLAUDE_CONFIG_DIR, secure: process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR, token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? 'unset', key: process.env.ANTHROPIC_API_KEY ?? 'unset', args: process.argv.slice(1)}))" -- %*\r\nexit /b 7\r\n`,
+    );
+    await writeFile(
+      join(bin, "pi.cmd"),
+      `@echo off\r\n"${process.execPath}" -e "console.log([process.env.PI_CODING_AGENT_DIR, process.env.HTTPS_PROXY, process.argv.slice(1).join(' ')].join('|'))" -- %*\r\n`,
+    );
+    await writeFile(join(piHome, "zerosub.cmd"), '@echo off\r\nset "HTTPS_PROXY=http://127.0.0.1:7890"\r\n');
+
+    await writeLaunchers([{ id: "claude-aaa111", label: "Work", home: claudeHome }], dir, [], new Map(), "claude", "win32");
+    await writeLaunchers([{ id: "pi-bbb222", label: "Gateway", home: piHome }], dir, [], new Map(), "pi", "win32");
+
+    const env = {
+      ...process.env,
+      PATH: `${dir};${bin};${process.env.PATH ?? ""}`,
+      CLAUDE_CONFIG_DIR: "C:\\caller",
+      CLAUDE_CODE_OAUTH_TOKEN: "leak",
+      ANTHROPIC_API_KEY: "leak",
+      HTTPS_PROXY: "http://shell:1",
+    };
+
+    // cmd.exe: runs claude-work, preserves args and exit code, leaves caller's CLAUDE_CONFIG_DIR intact.
+    const runner = join(root, "run-cmd.cmd");
+    await writeFile(runner, '@echo off\r\ncall claude-work -p "two words" --flag\r\necho EXIT=%ERRORLEVEL% AFTER=%CLAUDE_CONFIG_DIR%\r\n');
+    const { stdout: cmdOut } = await exec(process.env.ComSpec ?? "cmd.exe", ["/d", "/c", runner], { env });
+    const [jsonLine, statusLine] = cmdOut.trim().split(/\r?\n/);
+    expect(JSON.parse(jsonLine!)).toEqual({
+      dir: claudeHome,
+      secure: claudeHome,
+      token: "unset",
+      key: "unset",
+      args: ["-p", "two words", "--flag"],
+    });
+    expect(statusLine).toBe("EXIT=7 AFTER=C:\\caller");
+
+    // PowerShell: runs pi-gateway without extension, picks up zerosub.cmd proxy, leaves caller's HTTPS_PROXY intact.
+    const { stdout: psOut } = await exec(
+      "powershell.exe",
+      ["-NoProfile", "-Command", "pi-gateway --version; Write-Output $env:HTTPS_PROXY"],
+      { env },
+    );
+    expect(psOut.trim().split(/\r?\n/)).toEqual([`${piHome}|http://127.0.0.1:7890|--version`, "http://shell:1"]);
   });
 });

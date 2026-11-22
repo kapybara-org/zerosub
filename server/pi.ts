@@ -5,7 +5,7 @@ import type { ApiSummary, LoginMethod } from "../shared/model";
 import type { EnvPatch, FamilyAdapter, Identity, LoginHandle, ProxyState, RedeemReply, TurnEvent, UsageRead } from "./adapter";
 import { providerCommand } from "./binaries";
 import { clearTextProviders, crossesInheritedProxy, forgetSyncs, normalizeBaseUrl, piAgentNoProxy, piHomeHoldsAccount, piKeepsDirect, piLiteral, preparePiHome, readPiAccount, readPiOwnJson, readPiAccountApi, readPiAccountForAgents, writePiAccountApi, writePiAccountProxy } from "./homes";
-import { PI_LAUNCH_ENV } from "./launchers";
+import { PI_LAUNCH_CMD, PI_LAUNCH_ENV, renderCmdSetLines } from "./launchers";
 import { Mutex, readJson, writeJsonAtomic } from "./json-file";
 import { eachProcessEnvironment, homesInEnvironment, parseTrace } from "./processes";
 import { detectPiSignOut } from "./limits";
@@ -353,25 +353,37 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-/**
- * Writes the account's `zerosub.env`, which its `pi-<account>.sh` script reads: the proxy variables
- * its agents get in Paseo (its own proxy), so Pi run from the script goes the same way, whatever the
- * shell exports. Without a proxy it only says so, and the shell's own settings stand, as the
- * daemon's do for its agents. Readable only by you: a proxy can hold a password. Only written when
- * it changes.
- */
-async function writeLaunchEnv(home: string, variables: Record<string, string>): Promise<void> {
-  const lines = ["# Written by ZeroSub: the proxy and environment this account's Pi agents get in Paseo. Don't edit: it's rewritten when that changes."];
-  for (const [key, value] of Object.entries(variables)) lines.push(`export ${key}=${shellQuote(value)}`);
-  const content = `${lines.join("\n")}\n`;
-  const path = join(home, PI_LAUNCH_ENV);
+async function writeIfChanged(home: string, file: string, content: string): Promise<void> {
+  const path = join(home, file);
   if ((await readFile(path, "utf8").catch(() => null)) === content) return;
-  const temporary = join(home, `.${PI_LAUNCH_ENV}.${randomBytes(4).toString("hex")}.tmp`);
+  const temporary = join(home, `.${file}.${randomBytes(4).toString("hex")}.tmp`);
   try {
     await writeFile(temporary, content, { mode: 0o600 });
     await rename(temporary, path);
   } finally {
     await rm(temporary, { force: true });
+  }
+}
+
+/**
+ * Writes the account's `zerosub.env` (and `zerosub.cmd` on Windows), which its `pi-<account>`
+ * script reads: the proxy variables its agents get in Paseo (its own proxy), so Pi run from the
+ * script goes the same way, whatever the shell exports. Without a proxy it only says so, and the
+ * shell's own settings stand, as the daemon's do for its agents. Readable only by you: a proxy can
+ * hold a password. Only written when it changes.
+ */
+async function writeLaunchEnv(home: string, variables: Record<string, string>): Promise<void> {
+  const entries = Object.entries(variables);
+  const lines = ["# Written by ZeroSub: the proxy and environment this account's Pi agents get in Paseo. Don't edit: it's rewritten when that changes."];
+  for (const [key, value] of entries) lines.push(`export ${key}=${shellQuote(value)}`);
+  await writeIfChanged(home, PI_LAUNCH_ENV, `${lines.join("\n")}\n`);
+  if (process.platform === "win32") {
+    const cmdLines = [
+      "@echo off",
+      "rem Written by ZeroSub: the proxy and environment this account's Pi agents get in Paseo. Don't edit: it's rewritten when that changes.",
+      ...renderCmdSetLines(entries),
+    ];
+    await writeIfChanged(home, PI_LAUNCH_CMD, `${cmdLines.join("\r\n")}\r\n`);
   }
 }
 

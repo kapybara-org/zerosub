@@ -1213,6 +1213,7 @@ function piPrivate(name: string): boolean {
   return (
     name === PI_ACCOUNT_FILE ||
     name === "zerosub.env" ||
+    name === "zerosub.cmd" ||
     name.startsWith("auth.json") ||
     name.startsWith("models.json") ||
     name.startsWith("models-store.json") ||

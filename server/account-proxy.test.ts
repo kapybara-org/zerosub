@@ -171,9 +171,12 @@ describe("shell launchers", () => {
     const { service } = await setUp({ accounts: [work] as never });
     await service.rename(work.id, "Personal");
     const directory = join(root, "launchers");
-    expect(await readdir(directory)).toEqual(["claude-personal.sh"]);
-    expect(await readFile(join(directory, "claude-personal.sh"), "utf8")).toContain(`export CLAUDE_CONFIG_DIR='${work.home}'`);
+    const expectedName = process.platform === "win32" ? "claude-personal.cmd" : "claude-personal.sh";
+    const expectedLine =
+      process.platform === "win32" ? `set "CLAUDE_CONFIG_DIR=${work.home}"` : `export CLAUDE_CONFIG_DIR='${work.home}'`;
+    expect(await readdir(directory)).toEqual([expectedName]);
+    expect(await readFile(join(directory, expectedName), "utf8")).toContain(expectedLine);
     const paseo = { agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false, nextCursor: null } }) } } as never;
-    expect((await service.view(paseo)).accounts.find((account) => account.id === work.id)?.launcher).toBe("claude-personal.sh");
+    expect((await service.view(paseo)).accounts.find((account) => account.id === work.id)?.launcher).toBe(expectedName);
   });
 });

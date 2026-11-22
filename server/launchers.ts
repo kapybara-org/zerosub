@@ -5,18 +5,20 @@ import { isOwnHome, launcherDir, paseoHome, piLauncherDir } from "./paths";
 
 /**
  * A script per added Claude account that starts the Claude CLI on it, for use outside Paseo: put
- * `~/.claude-config` on `PATH` once, then run `claude-work.sh`. Accounts added later get theirs
- * without touching the shell profile again. `ZEROSUB_LAUNCHER_DIR` puts them somewhere else.
+ * `~/.claude-config` on `PATH` once, then run `claude-work.sh` (or `claude-work.cmd` on Windows).
+ * Accounts added later get theirs without touching the shell profile again. `ZEROSUB_LAUNCHER_DIR`
+ * puts them somewhere else.
  *
  * Each script sets exactly what ZeroSub sets for an agent on that account, then hands over to
  * `claude`, so the caller's shell is untouched. The account's proxy (and an API account's key,
  * base URL and blanked credential variables) needs nothing here: it lives in the home's
  * `settings.json` `env`, which Claude Code applies over whatever the shell exports.
  *
- * Each added Pi account gets one too, `pi-<account>.sh` in `~/.pi-config` (`ZEROSUB_PI_DIR`): it
- * sets the account's agent directory, takes the proxy ZeroSub gives its agents from the account's
- * `zerosub.env` (kept up to date there, see `PiAdapter.prepareHome`) and runs `pi`. Each kind only
- * ever touches its own scripts, so both can share a directory.
+ * Each added Pi account gets one too, `pi-<account>.sh` (`.cmd` on Windows) in `~/.pi-config`
+ * (`ZEROSUB_PI_DIR`): it sets the account's agent directory, takes the proxy ZeroSub gives its
+ * agents from the account's `zerosub.env` (`zerosub.cmd` on Windows, kept up to date there, see
+ * `PiAdapter.prepareHome`) and runs `pi`. Each kind only ever touches its own scripts, so both can
+ * share a directory.
  */
 export { launcherDir, piLauncherDir };
 
@@ -27,22 +29,57 @@ interface KindSpec {
   /** Script names start with `<prefix>-`. */
   prefix: string;
   /** Third line: says which account the script is for. */
-  describe(label: string): string;
+  describe(label: string, platform: NodeJS.Platform): string;
   describePattern: RegExp;
   /** The variable whose value is the account's home. */
   homeVariable: string;
-  /** The lines after the third. */
+  /** The lines after the third, for POSIX shells. */
   body(home: string): string[];
+  /** The lines after the third, for Windows `.cmd` scripts. */
+  cmdBody(home: string): string[];
 }
 
 /** File in a Pi account's home holding the proxy variables its agents get, which its script reads. */
 export const PI_LAUNCH_ENV = "zerosub.env";
+/** Windows counterpart of `PI_LAUNCH_ENV`, read by `pi-<account>.cmd`. */
+export const PI_LAUNCH_CMD = "zerosub.cmd";
+
+/** Script file extension for `platform`: `.cmd` on Windows, `.sh` elsewhere. */
+export function launcherExtension(platform: NodeJS.Platform = process.platform): ".cmd" | ".sh" {
+  return platform === "win32" ? ".cmd" : ".sh";
+}
+
+/** Escapes a value for `set "VAR=value"` in a Windows `.cmd` file (double quotes and line breaks can't appear in paths). */
+export function quoteCmd(value: string): string {
+  return value.replace(/[\r\n"]/g, "").replace(/%/g, "%%");
+}
+
+/**
+ * Emits `set "KEY=value"` lines for a `.cmd` file, temporarily switching the console code page to
+ * UTF-8 (65001) only when a value holds non-ASCII characters so default OEM code pages don't mangle it.
+ */
+export function renderCmdSetLines(entries: ReadonlyArray<readonly [string, string]>): string[] {
+  const nonAscii = entries.some(([, value]) => /[^\x00-\x7f]/.test(value));
+  const lines: string[] = [];
+  if (nonAscii) {
+    lines.push(
+      'for /f "tokens=2 delims=:" %%a in (\'chcp\') do set "_zerosub_cp=%%a"',
+      'if defined _zerosub_cp set "_zerosub_cp=%_zerosub_cp:.=%"',
+      "chcp 65001 >nul",
+    );
+  }
+  for (const [key, value] of entries) lines.push(`set "${key}=${quoteCmd(value)}"`);
+  if (nonAscii) {
+    lines.push("if defined _zerosub_cp chcp %_zerosub_cp% >nul", 'set "_zerosub_cp="');
+  }
+  return lines;
+}
 
 const KINDS: Record<LauncherKind, KindSpec> = {
   claude: {
     prefix: "claude",
-    describe: (label) => `# Starts the Claude CLI on "${label}", an account added in Paseo.`,
-    describePattern: /^# Starts the Claude CLI on "(.*)", an account added in Paseo\.$/,
+    describe: (label, platform) => `${platform === "win32" ? "rem" : "#"} Starts the Claude CLI on "${label}", an account added in Paseo.`,
+    describePattern: /^(?:#|rem) Starts the Claude CLI on "(.*)", an account added in Paseo\.$/,
     homeVariable: "CLAUDE_CONFIG_DIR",
     body: (home) => [
       `unset ${OVERRIDING_AUTH.join(" ")}`,
@@ -50,11 +87,21 @@ const KINDS: Record<LauncherKind, KindSpec> = {
       `export CLAUDE_SECURESTORAGE_CONFIG_DIR=${quote(home)}`,
       'exec claude "$@"',
     ],
+    cmdBody: (home) => [
+      "setlocal DisableDelayedExpansion",
+      ...renderCmdSetLines([
+        ...OVERRIDING_AUTH.map((key) => [key, ""] as const),
+        ["CLAUDE_CONFIG_DIR", home],
+        ["CLAUDE_SECURESTORAGE_CONFIG_DIR", home],
+      ]),
+      "call claude %*",
+      "exit /b %ERRORLEVEL%",
+    ],
   },
   pi: {
     prefix: "pi",
-    describe: (label) => `# Starts Pi on "${label}", an account added in Paseo.`,
-    describePattern: /^# Starts Pi on "(.*)", an account added in Paseo\.$/,
+    describe: (label, platform) => `${platform === "win32" ? "rem" : "#"} Starts Pi on "${label}", an account added in Paseo.`,
+    describePattern: /^(?:#|rem) Starts Pi on "(.*)", an account added in Paseo\.$/,
     homeVariable: "PI_CODING_AGENT_DIR",
     body: (home) => [
       `export PI_CODING_AGENT_DIR=${quote(home)}`,
@@ -62,12 +109,20 @@ const KINDS: Record<LauncherKind, KindSpec> = {
       `[ -f "$PI_CODING_AGENT_DIR/${PI_LAUNCH_ENV}" ] && . "$PI_CODING_AGENT_DIR/${PI_LAUNCH_ENV}"`,
       'exec pi "$@"',
     ],
+    cmdBody: (home) => [
+      "setlocal DisableDelayedExpansion",
+      ...renderCmdSetLines([["PI_CODING_AGENT_DIR", home]]),
+      "rem The proxy this account's agents use in Paseo, kept up to date by ZeroSub; it wins over the shell's.",
+      `if exist "%PI_CODING_AGENT_DIR%\\${PI_LAUNCH_CMD}" call "%PI_CODING_AGENT_DIR%\\${PI_LAUNCH_CMD}"`,
+      "call pi %*",
+      "exit /b %ERRORLEVEL%",
+    ],
   },
 };
 
 /** Which kind of ZeroSub script `content` is, by its third line; null when it's neither. */
 function kindOf(content: string): LauncherKind | null {
-  const line = content.split("\n")[2] ?? "";
+  const line = content.split(/\r?\n/)[2] ?? "";
   for (const kind of Object.keys(KINDS) as LauncherKind[]) if (KINDS[kind].describePattern.test(line)) return kind;
   return null;
 }
@@ -87,11 +142,12 @@ const OVERRIDING_AUTH = ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANT
  * removes or releases scripts carrying its own. Of those, only the ones that start a home of
  * ZeroSub's own are ever removed; the rest are released (see `RELEASED`).
  */
-function marker(): string {
-  return `# Generated by ZeroSub (Paseo home ${paseoHomeTag()}). Don't edit: it's rewritten whenever accounts change.`;
+function marker(platform: NodeJS.Platform = process.platform): string {
+  const comment = platform === "win32" ? "rem" : "#";
+  return `${comment} Generated by ZeroSub (Paseo home ${paseoHomeTag()}). Don't edit: it's rewritten whenever accounts change.`;
 }
 
-const MARKER_PATTERN = /^# Generated by ZeroSub \(Paseo home ([0-9a-f]{8})\)\. /;
+const MARKER_PATTERN = /^(?:#|rem) Generated by ZeroSub \(Paseo home ([0-9a-f]{8})\)\. /;
 
 /** Short tag for this daemon's Paseo home in the marker: the first 8 hex digits of its path's SHA-256. */
 export function paseoHomeTag(): string {
@@ -104,6 +160,7 @@ export function paseoHomeTag(): string {
  * home is still there after its account went missing, or a copy under another name.
  */
 const RELEASED = "# No longer managed by ZeroSub (its account was removed or renamed there). ZeroSub won't delete it.";
+const RELEASED_CMD = "rem No longer managed by ZeroSub (its account was removed or renamed there). ZeroSub won't delete it.";
 
 export function slug(label: string): string {
   return label
@@ -129,23 +186,25 @@ export function idSuffix(id: string): string {
 }
 
 /**
- * `claude-<label>.sh` (`pi-<label>.sh` for `kind` "pi"), made unique: a label that's empty or taken falls back to the account's ID.
- * `kept` lists scripts ZeroSub must not overwrite, by file name, with the home each starts (null
- * when no account may take it over); an account only gets one of those names if the script starts
- * that account's own home.
+ * `claude-<label>.sh` (`pi-<label>.sh` for `kind` "pi", or `.cmd` on Windows), made unique: a label
+ * that's empty or taken falls back to the account's ID. `kept` lists scripts ZeroSub must not
+ * overwrite, by file name, with the home each starts (null when no account may take it over); an
+ * account only gets one of those names if the script starts that account's own home.
  */
 export function launcherNames(
   accounts: readonly LauncherAccount[],
   kept: ReadonlyMap<string, string | null> = new Map(),
   kind: LauncherKind = "claude",
+  platform: NodeJS.Platform = process.platform,
 ): Map<string, string> {
   const { prefix } = KINDS[kind];
+  const ext = launcherExtension(platform);
   const names = new Map<string, string>();
   const taken = new Set<string>();
   for (const account of accounts) {
     const free = (name: string) => {
       if (taken.has(name)) return false;
-      const home = kept.get(`${name}.sh`);
+      const home = kept.get(`${name}${ext}`);
       return home === undefined || (home !== null && resolve(home) === resolve(account.home));
     };
     const suffix = idSuffix(account.id);
@@ -154,7 +213,7 @@ export function launcherNames(
     if (!free(name)) name = `${name}-${suffix}`;
     for (let n = 2; !free(name); n++) name = `${base}-${suffix}-${n}`;
     taken.add(name);
-    names.set(account.id, `${name}.sh`);
+    names.set(account.id, `${name}${ext}`);
   }
   return names;
 }
@@ -163,23 +222,36 @@ function quote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-export function renderLauncher(account: LauncherAccount, kind: LauncherKind = "claude"): string {
+export function renderLauncher(
+  account: LauncherAccount,
+  kind: LauncherKind = "claude",
+  platform: NodeJS.Platform = process.platform,
+): string {
   const spec = KINDS[kind];
-  return ["#!/bin/sh", marker(), spec.describe(account.label.replace(/[\r\n]+/g, " ")), ...spec.body(account.home), ""].join("\n");
+  const cleanLabel = account.label.replace(/[\r\n]+/g, " ");
+  if (platform === "win32") {
+    return ["@echo off", marker("win32"), spec.describe(cleanLabel, "win32"), ...spec.cmdBody(account.home), ""].join("\r\n");
+  }
+  return ["#!/bin/sh", marker(platform), spec.describe(cleanLabel, platform), ...spec.body(account.home), ""].join("\n");
+}
+
+function platformOf(content: string): NodeJS.Platform {
+  return content.split(/\r?\n/)[0] === "@echo off" ? "win32" : "linux";
 }
 
 /** Who wrote a script: this or another daemon's tag, or null if not ZeroSub. */
 function writer(content: string): string | null {
-  return MARKER_PATTERN.exec(content.split("\n")[1] ?? "")?.[1] ?? null;
+  return MARKER_PATTERN.exec(content.split(/\r?\n/)[1] ?? "")?.[1] ?? null;
 }
 
 function released(content: string): boolean {
-  return content.split("\n")[1] === RELEASED;
+  const line = content.split(/\r?\n/)[1];
+  return line === RELEASED || line === RELEASED_CMD;
 }
 
 /** The account a script says it's for, read back from the line `renderLauncher` writes. */
 function scriptLabel(content: string, kind: LauncherKind): string | null {
-  return KINDS[kind].describePattern.exec(content.split("\n")[2] ?? "")?.[1] ?? null;
+  return KINDS[kind].describePattern.exec(content.split(/\r?\n/)[2] ?? "")?.[1] ?? null;
 }
 
 /** Whether a script is where `launcherNames` puts the account it's for (account IDs are hex). A copy under a name of the user's is the user's. */
@@ -189,22 +261,34 @@ function namedFor(name: string, content: string, kind: LauncherKind): boolean {
   const id = "[0-9a-f]{6}";
   const { prefix } = KINDS[kind];
   const base = slug(label) ? kindName(kind, label) : `${prefix}-${id}`;
-  return new RegExp(`^(?:${base}|${prefix}-${id})(?:-${id}(?:-[0-9]+)?)?\\.sh$`).test(name);
+  const ext = launcherExtension(platformOf(content)).replace(".", "\\.");
+  return new RegExp(`^(?:${base}|${prefix}-${id})(?:-${id}(?:-[0-9]+)?)?${ext}$`).test(name);
 }
 
 /** Whether a released script is still exactly as ZeroSub released it, so its account may have it back. */
 function asReleased(content: string, home: string, kind: LauncherKind): boolean {
   const label = scriptLabel(content, kind);
   if (label === null) return false;
-  const lines = renderLauncher({ id: "", label, home }, kind).split("\n");
-  lines[1] = RELEASED;
-  return lines.join("\n") === content;
+  const platform = platformOf(content);
+  const eol = platform === "win32" ? "\r\n" : "\n";
+  const lines = renderLauncher({ id: "", label, home }, kind, platform).split(eol);
+  lines[1] = platform === "win32" ? RELEASED_CMD : RELEASED;
+  return lines.join(eol) === content;
 }
 
 /** The home a script starts the CLI on, read back from the line `renderLauncher` writes. */
 function scriptHome(content: string, kind: LauncherKind): string | null {
-  const prefix = `export ${KINDS[kind].homeVariable}=`;
-  const value = content.split("\n").find((line) => line.startsWith(prefix))?.slice(prefix.length);
+  const variable = KINDS[kind].homeVariable;
+  const lines = content.split(/\r?\n/);
+  if (platformOf(content) === "win32") {
+    const prefix = `set "${variable}=`;
+    const line = lines.find((entry) => entry.startsWith(prefix) && entry.endsWith('"'));
+    if (!line) return null;
+    const raw = line.slice(prefix.length, -1);
+    return raw.includes('"') ? null : raw.replace(/%%/g, "%");
+  }
+  const prefix = `export ${variable}=`;
+  const value = lines.find((line) => line.startsWith(prefix))?.slice(prefix.length);
   if (!value || !/^'(?:[^']|'\\'')*'$/.test(value)) return null;
   return value.slice(1, -1).replace(/'\\''/g, "'");
 }
@@ -221,11 +305,13 @@ async function readEntry(path: string): Promise<string | null | undefined> {
 }
 
 /** The entries in `directory` that could be scripts, as `readEntry` sees them. */
-async function readScripts(directory: string): Promise<Map<string, string | null>> {
+async function readScripts(directory: string, platform: NodeJS.Platform = process.platform): Promise<Map<string, string | null>> {
   const scripts = new Map<string, string | null>();
   for (const entry of await readdir(directory).catch(() => [] as string[])) {
     // Dot files include another write's temporary file, about to be renamed into place.
-    if (entry.startsWith(".") || !entry.endsWith(".sh")) continue;
+    if (entry.startsWith(".")) continue;
+    // On Windows also inspect `.sh` so legacy scripts from earlier versions are tidied up or released.
+    if (platform === "win32" ? !entry.endsWith(".cmd") && !entry.endsWith(".sh") : !entry.endsWith(".sh")) continue;
     const content = await readEntry(join(directory, entry));
     if (content !== undefined) scripts.set(entry, content);
   }
@@ -266,8 +352,9 @@ export async function writeLaunchers(
   leaving: Iterable<string> = [],
   moved: ReadonlyMap<string, string> = new Map(),
   kind: LauncherKind = "claude",
+  platform: NodeJS.Platform = process.platform,
 ): Promise<Map<string, string>> {
-  const scripts = await readScripts(directory);
+  const scripts = await readScripts(directory, platform);
   // The other kind's scripts are that kind's to manage: neither this kind's nor names it may take.
   for (const [name, content] of scripts) {
     const of = content === null ? null : kindOf(content);
@@ -298,8 +385,8 @@ export async function writeLaunchers(
       kept.set(name, content !== null && home !== null && released(content) && asReleased(content, home, kind) ? home : null);
     }
   }
-  const names = launcherNames(accounts, kept, kind);
-  const wanted = new Map(accounts.map((account) => [names.get(account.id)!, renderLauncher(account, kind)]));
+  const names = launcherNames(accounts, kept, kind, platform);
+  const wanted = new Map(accounts.map((account) => [names.get(account.id)!, renderLauncher(account, kind, platform)]));
   if (wanted.size > 0) await mkdir(directory, { recursive: true, mode: 0o700 });
   for (const [name, content] of wanted) {
     const current = scripts.get(name);
@@ -308,9 +395,10 @@ export async function writeLaunchers(
   for (const [name, content] of mine) {
     if (wanted.has(name)) continue;
     if (kept.has(name)) {
-      const lines = content.split("\n");
-      lines[1] = RELEASED;
-      await writeScript(directory, name, lines.join("\n"), content);
+      const eol = content.includes("\r\n") ? "\r\n" : "\n";
+      const lines = content.split(/\r?\n/);
+      lines[1] = platformOf(content) === "win32" ? RELEASED_CMD : RELEASED;
+      await writeScript(directory, name, lines.join(eol), content);
     } else if ((await readEntry(join(directory, name))) === content) {
       await rm(join(directory, name), { force: true });
     }

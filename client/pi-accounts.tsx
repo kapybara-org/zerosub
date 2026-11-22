@@ -107,6 +107,18 @@ function PiProxyNote({ theme }: { theme: Theme }) {
   );
 }
 
+/** Whether `directory` is a Windows path (drive letter or UNC share), so the hint matches the daemon's host. */
+function isWindowsPath(directory: string): boolean {
+  return /^[A-Za-z]:[\\/]|^\\\\/.test(directory);
+}
+
+/** The shell-profile line that puts `directory` on `PATH` for the host's shell. */
+export function shellPathLine(directory: string): string {
+  if (isWindowsPath(directory)) return `$env:PATH = '${directory.replace(/'/g, "''")};' + $env:PATH`;
+  // Readable when the path needs no quoting, which is nearly always.
+  return /^[\w./~+@%-]+$/.test(directory) ? `export PATH="${directory}:$PATH"` : `export PATH='${directory.replace(/'/g, "'\\''")}':"$PATH"`;
+}
+
 /** The line to put the scripts' directory on `PATH`, and the scripts there. */
 export function ShellHint({
   theme,
@@ -125,9 +137,10 @@ export function ShellHint({
 }) {
   const text = useText(theme);
   const toast = useToast();
-  // Readable when the path needs no quoting, which is nearly always.
-  const line = /^[\w./~+@%-]+$/.test(directory) ? `export PATH="${directory}:$PATH"` : `export PATH='${directory.replace(/'/g, "'\\''")}':"$PATH"`;
+  const windows = isWindowsPath(directory);
+  const line = shellPathLine(directory);
   const commands = accounts.flatMap((account) => (account.launcher ? [account.launcher] : []));
+  const fallback = windows ? example.replace(/\.sh$/, ".cmd") : example;
   const copy = useCallback(async () => {
     try {
       await copyText(line);
@@ -141,14 +154,23 @@ export function ShellHint({
       <Icon name="SquareTerminal" size={16} color={theme.colors.foregroundMuted} />
       <View style={{ flex: 1, gap: 4 }}>
         <Text style={text.small}>
-          From a terminal on this host: add this line to your shell profile once, then run {commands.length > 0 ? commands.join(", ") : example}.
-          Accounts added later work without changing it. {note}
+          {windows
+            ? `From PowerShell on this host: add this line to your $PROFILE once (or add that folder to your Windows Path for cmd.exe and other shells), then run ${commands.length > 0 ? commands.join(", ") : fallback}.`
+            : `From a terminal on this host: add this line to your shell profile once, then run ${commands.length > 0 ? commands.join(", ") : fallback}.`}
+          {" Accounts added later work without changing it. "}
+          {note}
         </Text>
         <Text selectable style={[text.small, { color: theme.colors.foreground }]}>
           {line}
         </Text>
       </View>
-      <IconButton theme={theme} icon="Copy" label="Copy" tooltip="Copy the line for your shell profile" onPress={() => void copy()} />
+      <IconButton
+        theme={theme}
+        icon="Copy"
+        label="Copy"
+        tooltip={windows ? "Copy the line for your PowerShell $PROFILE" : "Copy the line for your shell profile"}
+        onPress={() => void copy()}
+      />
     </View>
   );
 }

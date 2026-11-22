@@ -4969,10 +4969,10 @@ export class Service {
   }
 
   /**
-   * Added accounts of `kind`, which each get a `<kind>-<account>.sh` script. An AWS Bedrock account
-   * gets none: its credentials (an access key's secret) reach its sessions in their environment, which
-   * a script would have to read from bedrock.json, so a terminal would run on whatever AWS credentials
-   * the shell has instead.
+   * Added accounts of `kind`, which each get a `<kind>-<account>.sh` (`.cmd` on Windows) script. An
+   * AWS Bedrock account gets none: its credentials (an access key's secret) reach its sessions in
+   * their environment, which a script would have to read from bedrock.json, so a terminal would run
+   * on whatever AWS credentials the shell has instead.
    */
   private launcherAccounts(state: StoredState, kind: LauncherKind = "claude"): LauncherAccount[] {
     return state.accounts.flatMap((account) =>
