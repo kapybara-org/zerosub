@@ -138,7 +138,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(setAgentAccount, ({ agentId, accountId, allowLimited }, { paseo }) =>
     service.setAgentAccount(paseo, agentId, accountId, { allowLimited: allowLimited === true }),
   );
-  server.handle(moveBeforeLimit, ({ agentId, accountId }, { paseo }) => service.moveBeforeLimit(paseo, agentId, accountId));
+  server.handle(moveBeforeLimit, ({ agentId, accountId, stopBackgroundWork }, { paseo }) => service.moveBeforeLimit(paseo, agentId, accountId, { stopBackgroundWork }));
   server.handle(forkAgent, ({ agentId, destination }, { paseo }) => service.forkAgent(paseo, agentId, destination));
   server.handle(setAccountEnabled, ({ accountId, enabled }, { paseo }) => service.setAccountEnabled(paseo, accountId, enabled));
   server.handle(addApiAccount, async (input) => ({ accountId: await service.addApiAccount(input) }));

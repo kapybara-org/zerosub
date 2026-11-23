@@ -41,7 +41,7 @@ import {
 } from "../shared/model";
 import { capsAccount, limitedModelPick, limitedPick, windowScope } from "../shared/format";
 import { DEFAULT_CONTINUE_PROMPT, type Preferences } from "../shared/preferences";
-import type { RedeemResult, ReopenSummary } from "../shared/rpc";
+import type { BackgroundJob, RedeemResult, ReopenSummary } from "../shared/rpc";
 import { SWITCH_ROW_KIND, SWITCH_ROW_VERSION, type SwitchRow } from "../shared/timeline";
 import {
   applyEnv,
@@ -420,6 +420,64 @@ function busy(agent: AgentInfo): boolean {
  */
 function hasBackgroundWork(agent: AgentInfo): boolean {
   return agent.backgroundWork > 0;
+}
+
+/** `zerosub.agents.move_before_limit`'s reply (see the RPC). */
+type MoveBeforeLimitReply = {
+  outcome: "moved" | "waiting" | "already" | "refused";
+  detail: string | null;
+  waitingFor: "turn" | "background" | null;
+  backgroundWork: BackgroundJob[];
+  stopped: BackgroundJob[];
+};
+
+/** What a caller asks of one reopen beyond the default, and what it learns back (see `reopenAgent`). */
+interface ReopenAsk {
+  /** Stop the agent's background work and reopen it, rather than wait for the work to end. */
+  stopBackgroundWork: boolean;
+  /** Set when the reopen waits: for a running turn, or background work. */
+  waitingFor?: "turn" | "background";
+  /** The background work it waits for, or that it stopped to reopen. */
+  jobs?: BackgroundJob[];
+}
+
+/** One item of Paseo's background-work list, as a plugin's agent handle returns it. */
+interface ListedWork { id: string; kind?: string; description?: string | null; command?: string; canStop?: boolean }
+interface BackgroundWorkHandle {
+  list(options?: { timeout?: number }): Promise<ListedWork[]>;
+  stop(item: ListedWork, options?: { timeout?: number }): Promise<void>;
+}
+
+/** Work the daemon itself runs for an agent (Paseo gives its ids this prefix). It outlives a reopen. */
+const DAEMON_WORK_PREFIX = "daemon:";
+
+/** The agent's background-work handle, on a Paseo that has one; null otherwise. */
+function backgroundWorkOf(paseo: PaseoApi, agentId: string): BackgroundWorkHandle | null {
+  try {
+    const handle = (paseo.agents.ref(agentId) as { backgroundWork?: Partial<BackgroundWorkHandle> }).backgroundWork;
+    return typeof handle?.list === "function" && typeof handle.stop === "function" ? (handle as BackgroundWorkHandle) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The background work a reopen would end: Paseo's list less the daemon's own work. Null when it can't be listed. */
+async function workAReopenEnds(paseo: PaseoApi, agentId: string): Promise<ListedWork[] | null> {
+  const handle = backgroundWorkOf(paseo, agentId);
+  if (!handle) return null;
+  try {
+    const items = await handle.list({ timeout: 5_000 });
+    return Array.isArray(items) ? items.filter((item) => !String(item.id).startsWith(DAEMON_WORK_PREFIX)) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The jobs as the caller reads them; unnamed ones fill up to the count Paseo reported. */
+function describeWork(listed: ListedWork[] | null, count: number): BackgroundJob[] {
+  const jobs: BackgroundJob[] = (listed ?? []).map((item) => ({ kind: item.kind ?? "other", description: item.description ?? null, command: item.command ?? null }));
+  while (listed === null && jobs.length < count) jobs.push({ kind: "other", description: null, command: null });
+  return jobs;
 }
 
 function sameBinding(a: Binding | undefined, b: Binding | undefined): boolean {
@@ -3537,7 +3595,7 @@ export class Service {
   private async reopenAgent(
     paseo: PaseoApi,
     agentId: string,
-    options: { row?: SwitchRow | null; settle?: boolean; background?: boolean; unattended?: boolean; sameConversation?: boolean; retried?: boolean } = {},
+    options: { row?: SwitchRow | null; settle?: boolean; background?: boolean; unattended?: boolean; sameConversation?: boolean; retried?: boolean; ask?: ReopenAsk } = {},
   ): Promise<ReopenResult> {
     const { row = null, settle = false, background = false, unattended = background } = options;
     let info: AgentInfo | null;
@@ -3551,7 +3609,10 @@ export class Service {
       return unchecked(error);
     }
     if (!info) return { outcome: "closed" };
-    if (busy(info)) return this.defer(agentId, row, unattended);
+    if (busy(info)) {
+      if (options.ask) options.ask.waitingFor = "turn";
+      return this.defer(agentId, row, unattended);
+    }
     // Reloading an archived agent would unarchive it; a closed one routes itself when it next opens.
     if (info.archived || info.status === "closed") return { outcome: "closed" };
     const family = (await this.families.resolve(paseo))[info.provider];
@@ -3579,7 +3640,22 @@ export class Service {
     }
     if (!latest || latest.archived || latest.status === "closed") return { outcome: "closed" };
     const now = Date.now();
-    if (busy(latest) || (unattended && hasBackgroundWork(latest)) || (background && this.recentlyActive(latest, now))) {
+    // Background work holds an unattended move back, unless the caller asked to stop it. Work the
+    // daemon owns outlives the reopen, so it doesn't count once Paseo can list it.
+    const listed = unattended && hasBackgroundWork(latest) ? await workAReopenEnds(paseo, agentId) : null;
+    const working = unattended && hasBackgroundWork(latest) && (listed === null || listed.length > 0);
+    const ask = options.ask;
+    if (working && ask?.stopBackgroundWork && !busy(latest)) {
+      const handle = backgroundWorkOf(paseo, agentId);
+      for (const item of listed ?? []) {
+        if (item.canStop && handle) await handle.stop(item, { timeout: 10_000 }).catch((error: unknown) => log(`stopping background work of ${agentId} failed`, error));
+      }
+      ask.jobs = describeWork(listed, latest.backgroundWork);
+    } else if (busy(latest) || working || (background && this.recentlyActive(latest, now))) {
+      if (ask) {
+        ask.waitingFor = working && !busy(latest) ? "background" : "turn";
+        if (ask.waitingFor === "background") ask.jobs = describeWork(listed, latest.backgroundWork);
+      }
       return this.defer(agentId, row, unattended);
     }
     const reload: Reload = { opens: 0 };
@@ -4716,9 +4792,16 @@ export class Service {
    * provider, a live agent whose conversation can move, not one the user pinned, the switch guard,
    * and `reopenAgent`, which never wakes a closed agent and waits for a turn or background work.
    */
-  async moveBeforeLimit(paseo: PaseoApi, agentId: string, accountId: string): Promise<{ outcome: "moved" | "waiting" | "already" | "refused"; detail: string | null }> {
+  async moveBeforeLimit(
+    paseo: PaseoApi,
+    agentId: string,
+    accountId: string,
+    options: { stopBackgroundWork?: boolean } = {},
+  ): Promise<MoveBeforeLimitReply> {
     this.attach(paseo);
-    const refused = (detail: string) => ({ outcome: "refused" as const, detail });
+    const reply = (outcome: MoveBeforeLimitReply["outcome"], detail: string | null, more: Partial<MoveBeforeLimitReply> = {}): MoveBeforeLimitReply =>
+      ({ outcome, detail, waitingFor: null, backgroundWork: [], stopped: [], ...more });
+    const refused = (detail: string) => reply("refused", detail);
     if (!this.prefs.autoSwitch) return refused("Automatic switching is off.");
     const info = await agentInfo(paseo, agentId);
     if (!info || info.archived || info.status === "closed") return refused("The agent isn't open.");
@@ -4733,14 +4816,19 @@ export class Service {
       return refused("That account can't take it now.");
     }
     const current = this.runningOn(state, agentId, family);
-    if (current === target.id) return { outcome: "already", detail: null };
+    if (current === target.id) return reply("already", null);
     if (state.bindings[agentId]?.source === "user") return refused("It stays on the account picked for it.");
-    if (!this.switchGuard.allows(agentId, now)) return refused("It changed accounts too often just now.");
+    // Asking again for a move that already waits (to stop its background work now, say) is the same
+    // move: the switch guard doesn't count it twice.
+    const again = this.deferred.has(agentId) && state.bindings[agentId]?.accountId === target.id && state.bindings[agentId]?.source === "auto";
+    if (!again && !this.switchGuard.allows(agentId, now)) return refused("It changed accounts too often just now.");
     const release = this.tryClaim(agentId);
     if (!release) return refused("It's changing accounts already.");
     try {
-      await this.pin(agentId, target.id, state.bindings[agentId]);
-      this.switchGuard.note(agentId, now);
+      if (!again) {
+        await this.pin(agentId, target.id, state.bindings[agentId]);
+        this.switchGuard.note(agentId, now);
+      }
       const row: SwitchRow = {
         family,
         from: findAccount(state, current)?.label ?? null,
@@ -4755,11 +4843,19 @@ export class Service {
         detail: null,
         at: new Date(now).toISOString(),
       };
-      // Nobody asked from this agent's own tab, so background work it left running isn't cut short.
-      const result = await this.reopenAgent(paseo, agentId, { row, unattended: true });
-      await this.noteOutcome(paseo, agentId, row, result);
-      if (result.outcome === "reopened") return { outcome: "moved", detail: null };
-      if (result.outcome === "deferred") return { outcome: "waiting", detail: "It moves once its turn or background work ends." };
+      // Nobody asked from this agent's own tab, so background work it left running isn't cut short,
+      // unless the caller asked for exactly that.
+      const ask: ReopenAsk = { stopBackgroundWork: options.stopBackgroundWork === true };
+      const result = await this.reopenAgent(paseo, agentId, { row, unattended: true, ask });
+      const stopped = result.outcome === "reopened" ? ask.jobs ?? [] : [];
+      await this.noteOutcome(paseo, agentId, stopped.length > 0
+        ? { ...row, detail: `${stopped.length === 1 ? "Its background job was" : `Its ${stopped.length} background jobs were`} stopped to move it.` }
+        : row, result);
+      if (result.outcome === "reopened") return reply("moved", null, { stopped });
+      if (result.outcome === "deferred") {
+        const why = ask.waitingFor ?? "turn";
+        return reply("waiting", why === "background" ? "It moves once its background work ends." : "It moves once its turn ends.", { waitingFor: why, backgroundWork: why === "background" ? ask.jobs ?? [] : [] });
+      }
       if (result.outcome === "failed") return refused(`It couldn't be reopened on that account: ${result.error}`);
       return refused("The agent isn't open.");
     } finally {

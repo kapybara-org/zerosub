@@ -96,12 +96,26 @@ function fakePaseo(recent: readonly Row[] | (() => Promise<{ entries: readonly R
     // Not Auto mode, which Bedrock can't run (see "Claude's Auto mode and Bedrock").
     currentModeId: "acceptEdits",
   };
+  /** Paseo's background-work handle: off (a Paseo without one) until a test turns it on. */
+  const work = {
+    supported: false,
+    items: [] as Array<{ id: string; kind: string; description: string | null; command?: string; canStop?: boolean }>,
+    stopped: [] as string[],
+  };
+  const backgroundWork = {
+    list: async () => work.items,
+    stop: async (item: { id: string }) => {
+      work.stopped.push(item.id);
+      work.items = work.items.filter((entry) => entry.id !== item.id);
+    },
+  };
   const paseo = {
     config: { get: async () => ({ config: { providers: {} } }) },
     agents: {
       list: async () => ({ entries: [{ agent }], pageInfo: { hasMore: false, nextCursor: null } }),
       // Only the agent Paseo has: a new one's session opens before Paseo can say anything about it.
       ref: (id: string = AGENT) => ({
+        ...(work.supported ? { backgroundWork } : {}),
         refresh: async () => ({ agent: id === agent.id ? agent : null }),
         send: async (text: string) => void sent.push(text),
         timeline: {
@@ -115,7 +129,7 @@ function fakePaseo(recent: readonly Row[] | (() => Promise<{ entries: readonly R
       }),
     },
   };
-  return { paseo, sent, notes, refetches, agent };
+  return { paseo, sent, notes, refetches, agent, work };
 }
 
 /** How a `paseo agent reload` ends. `fails after another` fails once another reload has opened a session too. */
@@ -6313,7 +6327,7 @@ describe("a move asked for before the limit", () => {
 
   it("moves an idle agent to the named account without pinning it there", async () => {
     const { service, store, reopened, notes, paseo } = await setUp(nearly(), unused);
-    expect(await service.moveBeforeLimit(paseo as never, AGENT, HELLO)).toEqual({ outcome: "moved", detail: null });
+    expect(await service.moveBeforeLimit(paseo as never, AGENT, HELLO)).toEqual({ outcome: "moved", detail: null, waitingFor: null, backgroundWork: [], stopped: [] });
     expect(reopened).toEqual([AGENT]);
     const state = await store.read();
     expect(state.sessions[AGENT]?.accountId).toBe(HELLO);
@@ -6338,6 +6352,51 @@ describe("a move asked for before the limit", () => {
     expect(busy.reopened).toEqual([]);
   });
 
+  const withJobs = async () => {
+    const run = await setUp(nearly(), unused);
+    run.work.supported = true;
+    run.work.items = [{ id: "b1", kind: "shell", description: "Run the test suite", command: "npm test", canStop: true }];
+    (run.agent as Record<string, unknown>).backgroundWork = { count: 1 };
+    return run;
+  };
+
+  it("says what it waits for, naming the background work", async () => {
+    const { service, paseo, reopened } = await withJobs();
+    expect(await service.moveBeforeLimit(paseo as never, AGENT, HELLO)).toEqual({
+      outcome: "waiting", detail: "It moves once its background work ends.", waitingFor: "background",
+      backgroundWork: [{ kind: "shell", description: "Run the test suite", command: "npm test" }], stopped: [],
+    });
+    expect(reopened).toEqual([]);
+    const busy = await setUp(nearly(), unused);
+    busy.agent.status = "running";
+    expect(await busy.service.moveBeforeLimit(busy.paseo as never, AGENT, HELLO)).toMatchObject({ outcome: "waiting", waitingFor: "turn", backgroundWork: [] });
+  });
+
+  it("stops the background work and moves at once when asked to", async () => {
+    const { service, paseo, reopened, work, notes, store } = await withJobs();
+    const result = await service.moveBeforeLimit(paseo as never, AGENT, HELLO, { stopBackgroundWork: true });
+    expect(result).toMatchObject({ outcome: "moved", waitingFor: null, stopped: [{ kind: "shell", description: "Run the test suite", command: "npm test" }] });
+    expect(work.stopped).toEqual(["b1"]);
+    expect(reopened).toEqual([AGENT]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(notes.at(-1)).toMatchObject({ to: "seat", reason: "near_limit", outcome: "switched", detail: "Its background job was stopped to move it." });
+  });
+
+  it("isn't held back by work the daemon owns, which outlives the move", async () => {
+    const { service, paseo, reopened, work } = await withJobs();
+    work.items = [{ id: "daemon:heartbeat:h1", kind: "heartbeat", description: "Check the deploy" }];
+    expect(await service.moveBeforeLimit(paseo as never, AGENT, HELLO)).toMatchObject({ outcome: "moved", stopped: [] });
+    expect(work.stopped).toEqual([]);
+    expect(reopened).toEqual([AGENT]);
+  });
+
+  it("asking again for a move that waits isn't counted by the switch guard", async () => {
+    const { service, paseo, reopened } = await withJobs();
+    for (let ask = 0; ask < 6; ask += 1) expect((await service.moveBeforeLimit(paseo as never, AGENT, HELLO)).outcome).toBe("waiting");
+    expect((await service.moveBeforeLimit(paseo as never, AGENT, HELLO, { stopBackgroundWork: true })).outcome).toBe("moved");
+    expect(reopened).toEqual([AGENT]);
+  });
+
   it("refuses an account that can't take it, a closed agent, one the user pinned, and automatic switching off", async () => {
     const limited = await setUp(nearly({ accounts: [account(MAIN, "main", "main"), { ...account(HELLO, "seat", "managed"), limitedUntil: inFuture() }] as never }), unused);
     expect((await limited.service.moveBeforeLimit(limited.paseo as never, AGENT, HELLO)).outcome).toBe("refused");
@@ -6345,7 +6404,7 @@ describe("a move asked for before the limit", () => {
     closed.agent.status = "closed";
     expect((await closed.service.moveBeforeLimit(closed.paseo as never, AGENT, HELLO)).outcome).toBe("refused");
     const pinned = await setUp(nearly({ bindings: { [AGENT]: { accountId: MAIN, source: "user", at: new Date().toISOString() } } }), unused);
-    expect(await pinned.service.moveBeforeLimit(pinned.paseo as never, AGENT, HELLO)).toEqual({ outcome: "refused", detail: "It stays on the account picked for it." });
+    expect(await pinned.service.moveBeforeLimit(pinned.paseo as never, AGENT, HELLO, { stopBackgroundWork: true })).toMatchObject({ outcome: "refused", detail: "It stays on the account picked for it." });
     const off = await setUp(nearly(), unused);
     off.service.setPreferences(preferences.schema.parse({ autoSwitch: false }));
     expect((await off.service.moveBeforeLimit(off.paseo as never, AGENT, HELLO)).outcome).toBe("refused");

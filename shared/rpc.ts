@@ -329,9 +329,27 @@ export const forkAgent = defineRpc({
  * it can move the session to an account with room instead of holding it. The move is ZeroSub's own,
  * as after a limit: the agent isn't pinned to the account, and every guard of an automatic move applies.
  */
+/** One piece of background work an agent left running after its turn, as Paseo describes it. */
+export const BackgroundJobSchema = z.object({
+  /** Paseo's kind: `shell`, `monitor` (a watcher), or `other`. */
+  kind: z.string(),
+  description: z.string().nullable(),
+  command: z.string().nullable(),
+});
+export type BackgroundJob = z.infer<typeof BackgroundJobSchema>;
+
 export const moveBeforeLimit = defineRpc({
   name: "zerosub.agents.move_before_limit",
-  input: z.object({ agentId: z.string(), accountId: z.string() }),
+  input: z.object({
+    agentId: z.string(),
+    accountId: z.string(),
+    /**
+     * Move now even though the agent has background work: stop the work Paseo can stop, then reopen
+     * it (which ends the rest). Off by default: the move waits for its background work to end. Work
+     * the daemon owns (heartbeats, change-request watches) outlives a reopen and never holds one back.
+     */
+    stopBackgroundWork: z.boolean().optional(),
+  }),
   output: z.object({
     /**
      * `moved`: it runs on the account now. `waiting`: it moves once its turn or background work ends.
@@ -339,6 +357,12 @@ export const moveBeforeLimit = defineRpc({
      */
     outcome: z.enum(["moved", "waiting", "already", "refused"]),
     detail: z.string().nullable(),
+    /** Why a `waiting` move waits: a running `turn` or `background` work. Null otherwise. */
+    waitingFor: z.enum(["turn", "background"]).nullable().default(null),
+    /** The background work a `waiting` move waits for. */
+    backgroundWork: z.array(BackgroundJobSchema).default([]),
+    /** The background work a `moved` agent had, which `stopBackgroundWork` stopped (or the reopen ended). */
+    stopped: z.array(BackgroundJobSchema).default([]),
   }),
 });
 
