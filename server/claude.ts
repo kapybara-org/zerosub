@@ -757,8 +757,8 @@ function parseCredentials(raw: string): Credentials | null {
 }
 
 /** Detects a file-backed import using the CLI's login. Secrets are compared only in memory. */
-export async function sharesClaudeCliCredentials(home: string): Promise<boolean> {
-  if (process.platform === "darwin") return false;
+export async function claudeCliCredentialConflict(home: string): Promise<"shared" | "indirect" | null> {
+  if (process.platform === "darwin") return null;
   const file = join(storageDir(home).path, ".credentials.json");
   const cliFile = join(storageDir(null).path, ".credentials.json");
   const missing = (error: NodeJS.ErrnoException): null => {
@@ -766,19 +766,21 @@ export async function sharesClaudeCliCredentials(home: string): Promise<boolean>
     throw error;
   };
   const entry = await lstat(file).catch(missing);
-  if (!entry) return false;
-  if (!entry.isFile()) return true;
+  if (!entry) return null;
+  const indirect = entry.isFile() ? null : "indirect";
+  const resolved = entry.isSymbolicLink() ? await stat(file).catch(missing) : entry;
+  if (!resolved?.isFile()) return indirect;
 
   const cliEntry = await stat(cliFile).catch(missing);
-  if (!cliEntry?.isFile()) return false;
-  if (entry.dev === cliEntry.dev && entry.ino === cliEntry.ino) return true;
+  if (!cliEntry?.isFile()) return indirect;
+  if (resolved.dev === cliEntry.dev && resolved.ino === cliEntry.ino) return "shared";
 
   const [candidate, cli] = await Promise.all([
     readFile(file, "utf8").catch(missing),
     readFile(cliFile, "utf8").catch(missing),
   ]);
   const token = candidate && parseCredentials(candidate)?.refreshToken;
-  return !!token && !!cli && token === parseCredentials(cli)?.refreshToken;
+  return token && cli && token === parseCredentials(cli)?.refreshToken ? "shared" : indirect;
 }
 
 /** Reads the account's OAuth token only to ask Anthropic for its usage. Never logged or stored. */

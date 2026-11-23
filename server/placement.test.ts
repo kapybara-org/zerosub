@@ -799,16 +799,21 @@ describe("adding a folder that's already signed in", () => {
     expect(fake.calls).not.toContain(`identity ${alias}`);
   });
 
-  it.skipIf(process.platform === "darwin").each(["copy", "hard link", "symbolic link", "separate sign-in"] as const)(
-    "checks the credentials of a matching import with a %s",
-    async (kind) => {
+  it.skipIf(process.platform === "darwin").each([
+    ["copy", true], ["hard link", true], ["symbolic link", true], ["separate sign-in", true],
+    ["copy", false], ["hard link", false], ["symbolic link", false], ["separate sign-in", false],
+    ["link to separate sign-in", true], ["link to separate sign-in", false],
+  ] as const)(
+    "checks a Claude import with a %s (saved CLI identity matches: %s)",
+    async (kind, matching) => {
       const { service, store, fake } = start();
       const cli = join(root, "main");
       const folder = join(root, "elsewhere", "claude-isolated");
       await makeHome(cli);
       await makeHome(folder);
       fake.signedIn.add(folder);
-      await seed({ accounts: [{ ...main, signedIn: true, email: "ada@example.com", identity: "personal|ada@example.com" }] });
+      const email = matching ? "ada@example.com" : "previous@example.com";
+      await seed({ accounts: [{ ...main, signedIn: true, email, identity: `personal|${email}` }] });
       const cliFile = join(cli, ".credentials.json");
       const importFile = join(folder, ".credentials.json");
       const credentials = (refreshToken: string, accessToken: string) => JSON.stringify({ claudeAiOauth: { refreshToken, accessToken } });
@@ -818,11 +823,17 @@ describe("adding a folder that's already signed in", () => {
         case "symbolic link": await symlink(cliFile, importFile, "file"); break;
         case "copy": await writeFile(importFile, credentials("cli-refresh", "different-access")); break;
         case "separate sign-in": await writeFile(importFile, credentials("isolated-refresh", "isolated-access")); break;
+        case "link to separate sign-in": {
+          const separate = join(root, "separate-credentials.json");
+          await writeFile(separate, credentials("isolated-refresh", "isolated-access"));
+          await symlink(separate, importFile, "file");
+          break;
+        }
       }
 
-      if (kind === "separate sign-in") {
+      if (kind === "separate sign-in" || (kind === "link to separate sign-in" && !matching)) {
         const id = await service.importAccount(folder);
-        expect(findAccount(await store.read(), main.id)?.pausedFor).toBe(id);
+        expect(findAccount(await store.read(), main.id)?.pausedFor).toBe(matching ? id : undefined);
       } else {
         await expect(service.importAccount(folder)).rejects.toThrow("Use Add account → Claude sign-in");
         expect((await store.read()).accounts).toHaveLength(1);
