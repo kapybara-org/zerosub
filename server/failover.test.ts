@@ -5392,7 +5392,7 @@ describe("AWS Bedrock as the last resort", () => {
           { paseo: t.paseo } as never,
         );
       };
-      return { ...t, open };
+      return { ...t, open, reading };
     }
 
     it("opens a new agent on a limited subscription with a usable banked reset, not on Bedrock", async () => {
@@ -5411,6 +5411,18 @@ describe("AWS Bedrock as the last resort", () => {
       await t.store.update((draft) => { draft.accounts.find((entry) => entry.id === MAIN)!.quotaCeilings = { five_hour: 80 }; });
       await t.open("fresh", "create");
       expect((await t.store.read()).sessions.fresh?.accountId).toBe(bedrock.id);
+    });
+
+    it("routes a new agent to a banked reset before Bedrock when only the Opus ceiling is reached", async () => {
+      const t = await limitedWithReset(true, {});
+      t.reading.windows.push({ id: "seven_day_opus", label: "Weekly · Opus", usedPercent: 81, resetsAt: inFuture() });
+      await t.store.update((draft) => {
+        draft.accounts.find((entry) => entry.id === MAIN)!.quotaCeilings = { seven_day_opus: 80 };
+      });
+
+      await t.open("fresh", "create");
+
+      expect((await t.store.read()).sessions.fresh?.accountId).toBe(MAIN);
     });
 
     it("keeps an existing agent on its limited subscription when it resumes or is aligned, so its next turn spends the reset", async () => {
