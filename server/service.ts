@@ -85,7 +85,7 @@ import {
   type BedrockHost,
   type RegionSource,
 } from "./bedrock";
-import { sharesClaudeCliCredentials } from "./claude";
+import { claudeCliCredentialConflict } from "./claude";
 import { codexHandoffMode, encryptedResumeFailure, sameWorkspace, turnFailedText } from "./codex-same-conversation";
 import { CodexContinuations, MESSAGE_PREFIX, UnresolvableEpochError, fitInstructions, matchesTransfer, readUpdates, ready, sentDigestOf, snapshot, transferMarker, waitForCreated, waitForSource, type Agent } from "./continuations";
 import { CONTINUED_FROM_LABEL, PARENT_LABEL, buildTranscript, continueInNewAgent, continuationPrompt, promptInstruction, updatePrompt, type Continuation } from "./handoff";
@@ -5311,12 +5311,12 @@ export class Service {
       );
     }
     if (!identity.identity) throw new Error(`${shown} uses an API key or token, not a Claude subscription. Add it with "API key or token" instead.`);
-    const sharesCredentials = await sharesClaudeCliCredentials(home);
+    const conflict = await claudeCliCredentialConflict(home);
     let account: StoredAccount | undefined;
     await this.store.update((draft) => {
       if (draft.accounts.some((entry) => entry.home && resolve(entry.home) === home)) throw new Error(`${shown} is already added.`);
       const cli = mainAccount(draft, "claude");
-      if (sharesCredentials && cli?.auth === "subscription" && sameAccountIdentity("claude", cli, identity)) {
+      if (conflict === "shared" || (conflict === "indirect" && cli?.auth === "subscription" && sameAccountIdentity("claude", cli, identity))) {
         throw new Error(`${shown} shares the Claude CLI login's credentials. Use Add account → Claude sign-in for a separate sign-in.`);
       }
       const duplicate = managedLoginDuplicate(draft, "claude", identity);
