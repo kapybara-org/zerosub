@@ -3,6 +3,7 @@ import { Icon, Modal, TextInput, useToast } from "@getpaseo/plugin/client/react-
 import { SettingsCard, SettingsSwitch } from "@getpaseo/plugin/client/ui";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ScrollView, Text, View } from "react-native";
+import { codexFastExpiresAt } from "../shared/codex-fast-date";
 import { accountSubtitle, describeReopen, formatAge, formatCredits, formatExtraUsage, formatPlan, isDisabled, staleNotice, usageSummary } from "../shared/format";
 import { FAMILY_LABEL, HAND_OFF, shownFamilies, type AccountView, type Family, type StateView } from "../shared/model";
 import { preferences } from "../shared/preferences";
@@ -20,6 +21,7 @@ import { AddAccountModal } from "./add-account";
 import { ApiAccountModal } from "./api-account";
 import { AzureAccountModal, AzureUsage, azureCardDetails } from "./azure-account";
 import { BedrockAccountModal, BedrockUsage, bedrockCardDetails } from "./bedrock-account";
+import { CodexFastModal } from "./codex-fast";
 import { ComposerPillRows } from "./composer-settings";
 import { ForkDestinationRows, OpenCodeForkRows } from "./fork-settings";
 import { AddPiAccountModal, ApiKeyModal, HomesHint, PiSectionNotes, ProxyModal, ShellHint, piCardDetails } from "./pi-accounts";
@@ -351,6 +353,8 @@ function AccountCard({
   const [renaming, setRenaming] = useState(false);
   const [editingApi, setEditingApi] = useState(false);
   const [editingProxy, setEditingProxy] = useState(false);
+  const [editingFast, setEditingFast] = useState(false);
+  const fastUntil = Date.now() < codexFastExpiresAt(account.codexFastUntil) ? account.codexFastUntil : undefined;
   const api = account.auth === "api";
   // An Azure OpenAI account's endpoint, key and prices have a form of their own.
   const azure = account.azure !== null;
@@ -541,6 +545,15 @@ function AccountCard({
       busy: busy === "toggle",
       onPress: () => void toggle(),
     },
+    fast: {
+      key: "fast",
+      icon: "Zap",
+      label: "Fast mode",
+      tooltip: fastUntil
+        ? `Fast mode scheduled through the end of ${fastUntil} UTC`
+        : "Set when temporary Fast mode ends for this account",
+      onPress: () => setEditingFast(true),
+    },
     usage: {
       key: "usage",
       icon: "RefreshCw",
@@ -686,6 +699,7 @@ function AccountCard({
         {account.status === "limited" ? <Badge theme={theme} label="Limit reached" tone="danger" /> : null}
         {account.status === "signed_out" ? <Badge theme={theme} label="Signed out" tone="warning" /> : null}
         {account.pace?.gated ? <Badge theme={theme} label="Held back" tone="warning" /> : null}
+        {fastUntil ? <Badge theme={theme} label={`Fast until ${fastUntil}`} tone="accent" /> : null}
         {resets && !signedOut ? <Badge theme={theme} label={resetBadge(resets)} tone="accent" /> : null}
       </View>
 
@@ -874,6 +888,7 @@ function AccountCard({
         <BedrockAccountModal theme={theme} store={store} account={account} paidFallback={paidFallback} onClose={() => setEditingBedrock(false)} />
       ) : null}
       {editingProxy ? <ProxyModal theme={theme} store={store} account={account} onClose={() => setEditingProxy(false)} /> : null}
+      {editingFast ? <CodexFastModal theme={theme} store={store} account={account} onClose={() => setEditingFast(false)} /> : null}
       <Modal
         title={account.sessionsShared ? `Give ${account.label} its own sessions folder?` : `Use the default sessions folder for ${account.label}?`}
         open={confirmSessions}

@@ -50,6 +50,8 @@ export const StoredAccountSchema = z.object({
    */
   modelLimits: z.record(z.string(), z.object({ until: z.string(), at: z.string(), source: z.enum(["turn", "reading"]) })).default({}),
   quotaCeilings: z.record(z.string(), z.number().int().min(1).max(99)).optional(),
+  /** Last UTC calendar day on which ZeroSub may enable Fast on this ChatGPT login. */
+  codexFastUntil: z.iso.date().optional(),
   createdAt: z.string(),
 });
 export type StoredAccount = z.infer<typeof StoredAccountSchema>;
