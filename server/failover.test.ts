@@ -5921,11 +5921,11 @@ describe("the state contract", () => {
     expect(StateViewSchema.safeParse(view).success).toBe(true);
   });
 
-  it("rejects a state response without a version, or with another one", async () => {
+  it("defaults an unversioned response to version 1 and rejects other versions", async () => {
     const { service, paseo } = await setUp(oneAccount(), () => null as never);
     const view = await service.view(paseo as never);
     const { version: _dropped, ...unversioned } = view;
-    expect(StateViewSchema.safeParse(unversioned).success).toBe(false);
+    expect(StateViewSchema.parse(unversioned).version).toBe(1);
     expect(StateViewSchema.safeParse({ ...view, version: 2 }).success).toBe(false);
   });
 });

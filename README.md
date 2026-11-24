@@ -401,7 +401,7 @@ ZeroSub never implements OAuth itself and never copies credentials between accou
 
 ### The `zerosub.state` RPC (read-only)
 
-Call `zerosub.state` on the `zerosub` plugin to read its account and routing state. The response carries `version: 1` as defined by `StateViewSchema`. Set `refreshUsage` to request a fresh usage reading and pass `accountId` to limit the refresh to one account. [StateViewSchema](shared/model.ts)
+Call `zerosub.state` on the `zerosub` plugin to read its account and routing state. The response carries `version: 1` as defined by `StateViewSchema`. ZeroSub 1.30.0 and earlier omit `version`. Treat a missing `version` as `1`. Set `refreshUsage` to request a fresh usage reading and pass `accountId` to limit the refresh to one account. [StateViewSchema](shared/model.ts)
 
 Each `accounts[]` entry exposes these stable fields.
 
