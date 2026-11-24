@@ -231,7 +231,7 @@ function HostScope({ theme, label }: { theme: Theme; label: string }) {
   );
 }
 
-const SECTION_TITLE: Record<Family, string> = { claude: "Claude", codex: "ChatGPT (Codex)", pi: "Pi", grok: "Grok", cursor: "Cursor" };
+const SECTION_TITLE: Record<Family, string> = { claude: "Claude", codex: "ChatGPT (Codex)", pi: "Pi", grok: "Grok", cursor: "Cursor", antigravity: "Antigravity" };
 
 function FamilySection({
   family,
@@ -737,7 +737,7 @@ function AccountCard({
               theme={theme}
               limit={limit}
               ceiling={account.quotaCeilings?.[limit.id] ?? 100}
-              onCeiling={async (percent) => {
+              onCeiling={account.family === "antigravity" ? undefined : async (percent) => {
                 try {
                   await store.rpc(setQuotaCeiling, { accountId: account.id, windowId: limit.id, percent });
                   await store.refresh();

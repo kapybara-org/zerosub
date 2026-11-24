@@ -1,4 +1,5 @@
 import type { PluginServerContext, PluginSettingsState } from "@getpaseo/plugin/server";
+import { AntigravityAdapter } from "./server/antigravity";
 import { ClaudeAdapter } from "./server/claude";
 import { CodexAdapter } from "./server/codex";
 import { CursorAdapter } from "./server/cursor";
@@ -37,7 +38,7 @@ import {
 } from "./shared/rpc";
 
 export default function contribute(server: PluginServerContext) {
-  const service = new Service({ claude: new ClaudeAdapter(), codex: new CodexAdapter(), pi: new PiAdapter(), grok: new GrokAdapter(), cursor: new CursorAdapter() });
+  const service = new Service({ claude: new ClaudeAdapter(), codex: new CodexAdapter(), pi: new PiAdapter(), grok: new GrokAdapter(), cursor: new CursorAdapter(), antigravity: new AntigravityAdapter() });
 
   const settings = server.registerSettings(preferences);
   const applySettings = (state: PluginSettingsState<typeof preferences.schema>) => {

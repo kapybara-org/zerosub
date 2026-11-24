@@ -430,3 +430,9 @@ Remove added accounts from **Accounts** first, so they're signed out. Then run:
 paseo plugin remove zerosub
 rm -rf ~/.paseo/zerosub
 ```
+
+## Antigravity accounts
+
+On Linux, ZeroSub works with Paseo's built-in Antigravity provider and `agy` 1.5 or later. The CLI login uses the same environment as Paseo. To add an isolated sign-in, choose **Antigravity → Add account**, open Google's sign-in page, then paste the code it returns.
+
+Each added account runs `agy` with a private home directory and its own file-backed sign-in. Tools launched by that agent inherit the account's home. Select an account or make it the default for new agents. Existing conversations stay with their original home. When the same personal Google sign-in is identified in both entries, ZeroSub pauses one for new agents, as it does for Claude. For an existing pair, make the entry you want the default. Desktop identity detection uses Linux Secret Service via `secret-tool` (provided by `libsecret-tools` on Debian and Ubuntu). ZeroSub shows the quota buckets from `agy /usage` for reference.

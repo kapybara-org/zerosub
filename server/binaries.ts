@@ -34,7 +34,7 @@ export async function providerCommand(provider: Family): Promise<Command> {
     cache = { at: Date.now(), value };
   }
   // Paseo's Pi provider also takes its binary from PI_COMMAND (or the older PI_ACP_PI_COMMAND).
-  const fallback = provider === "pi" ? process.env.PI_COMMAND?.trim() || process.env.PI_ACP_PI_COMMAND?.trim() || "pi" : provider;
+  const fallback = provider === "pi" ? process.env.PI_COMMAND?.trim() || process.env.PI_ACP_PI_COMMAND?.trim() || "pi" : provider === "antigravity" ? "agy" : provider;
   return cache.value[provider] ?? { command: fallback, prefix: [] };
 }
 

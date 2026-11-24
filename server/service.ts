@@ -125,7 +125,7 @@ import {
 type PaseoApi = PluginHookContext["paseo"];
 type TurnEnded = PluginLifecycleEvents["agent.turn_ended"];
 
-const PROVIDER_NAME: Record<Family, string> = { claude: "Claude Code", codex: "Codex", pi: "Pi", grok: "Grok", cursor: "Cursor" };
+const PROVIDER_NAME: Record<Family, string> = { claude: "Claude Code", codex: "Codex", pi: "Pi", grok: "Grok", cursor: "Cursor", antigravity: "Antigravity" };
 /** How often to read usage: accounts in use, the defaults, and the rest. Adapters space reads further. */
 const USAGE_BUSY_MS = 60_000;
 const USAGE_DEFAULT_MS = 5 * 60_000;
@@ -496,7 +496,7 @@ export class Service {
   private readonly identityCheckedAt = new Map<string, number>();
   private readonly availability = new Map<Family, { ok: boolean; detail: string | null; at: number }>();
   private readonly logins = new Map<string, LoginSession>();
-  private readonly loginLocks: Record<Family, Mutex> = { claude: new Mutex(), codex: new Mutex(), pi: new Mutex(), grok: new Mutex(), cursor: new Mutex() };
+  private readonly loginLocks: Record<Family, Mutex> = { claude: new Mutex(), codex: new Mutex(), pi: new Mutex(), grok: new Mutex(), cursor: new Mutex(), antigravity: new Mutex() };
   /** Homes of API accounts being set up, which cleanup must leave alone. */
   private readonly creatingHomes = new Set<string>();
   /**
@@ -3949,7 +3949,7 @@ export class Service {
       // Renewing a sign-in can take longer than Paseo waits for an answer; later readings show at the next poll.
       await settles(Promise.allSettled(accounts.map(async (account) => {
         await this.refreshUsage(account.id, true, true);
-        if (account.family === "claude") await this.refreshIdentity(account.id, true);
+        if (account.family === "claude" || account.family === "antigravity") await this.refreshIdentity(account.id, true);
       })), USAGE_REPLY_MS);
     }
     void this.prune(paseo).catch(() => undefined);
@@ -4280,6 +4280,10 @@ export class Service {
       await this.store.update((draft) => {
         previous = draft.defaults[account.family] ?? null;
         draft.defaults[account.family] = account.id;
+        // Explicitly choosing an Antigravity default can pair entries added before identity was available.
+        const target = account.family === "antigravity" ? findAccount(draft, account.id) : undefined;
+        const peer = target && subscriptionLoginPeer(draft, target);
+        if (target?.signedIn && !target.disabled && peer?.signedIn) preferSubscriptionLogin(draft, target, peer, portable);
       });
       if (portable && !this.prefs.moveAgentsOnDefaultChange) {
         // The new default is for what comes next: open agents stay on the account they run on. If they
@@ -4560,6 +4564,7 @@ export class Service {
     await this.store.update((draft) => {
       const account = findAccount(draft, accountId);
       if (!account) throw new Error("That account no longer exists.");
+      if (account.family === "antigravity") throw new Error("Antigravity usage is display-only.");
       const ceilings = { ...account.quotaCeilings };
       if (percent === 100) delete ceilings[windowId];
       else ceilings[windowId] = percent;
@@ -4588,7 +4593,7 @@ export class Service {
     const account = findAccount(state, accountId);
     if (!account) throw new Error("That account no longer exists.");
     if (account.kind === "main") {
-      throw new Error("Your CLI login can't be removed here. Sign out with `claude auth logout`, `codex logout`, `grok logout`, `cursor-agent logout` or Pi's /logout instead.");
+      throw new Error("Your CLI login can't be removed here. Sign out with `claude auth logout`, `codex logout`, `grok logout`, `cursor-agent logout`, Antigravity's /logout, or Pi's /logout instead.");
     }
     if (!this.adapters[account.family].portable) {
       // These conversations can't move to another ChatGPT account, so removing theirs would strand them.
@@ -5854,7 +5859,10 @@ export class Service {
           : `Couldn't tell which workspace member signed in, because Codex didn't return an email. Sign in again as ${expected}.`,
       );
     }
-    const duplicate = existing?.kind === "main" ? undefined : managedLoginDuplicate(state, session.family, identity, session.accountId);
+    const refreshCli = session.family === "antigravity" && existing?.kind !== "main";
+    if (refreshCli) await this.refreshIdentity(MAIN_ACCOUNT_ID.antigravity);
+    const duplicate = existing?.kind === "main" ? undefined :
+      managedLoginDuplicate(refreshCli ? await this.store.read() : state, session.family, identity, session.accountId);
     if (duplicate) {
       if (!existing && session.home) await adapter.logout(session.home).catch(() => undefined);
       return this.failLogin(
@@ -6189,10 +6197,10 @@ function applyIdentityFields(account: StoredAccount, identity: Identity, state: 
   }
   // A key read without its workspace says less than the one stored for the same person, which stays.
   const vaguer = withoutWorkspace(identity.identity) && !withoutWorkspace(account.identity) && sameAccountIdentity(account.family, account, identity);
-  account.email = identity.email ?? account.email;
+  account.email = account.family === "antigravity" ? identity.email : identity.email ?? account.email;
   account.plan = identity.plan ?? account.plan;
   account.organization = identity.organization ?? account.organization;
-  if (!vaguer) account.identity = identity.identity ?? account.identity;
+  if (!vaguer) account.identity = account.family === "antigravity" ? identity.identity : identity.identity ?? account.identity;
   // An identity without an email (Pi's) has nothing better to call an account that has a name.
   if ((account.autoLabel && (identity.email || !account.label)) || !account.label) {
     account.label = suggestLabel(account, state);

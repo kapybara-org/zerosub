@@ -42,7 +42,7 @@ export function AddAccountModal({
   // Phones start with a code; the browser stays on offer for someone at the host's computer.
   const mobile = layout.platform === "ios" || layout.platform === "android";
   const hostBrowser = state?.browserSignIn !== false;
-  const [method, setMethod] = useState<LoginMethod>(hostBrowser && !mobile ? "browser" : "code");
+  const [method, setMethod] = useState<LoginMethod>(family !== "antigravity" && hostBrowser && !mobile ? "browser" : "code");
   const [loginId, setLoginId] = useState<string | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
   // A new Claude account can get a proxy of its own first, so the sign-in itself goes through it.
@@ -338,7 +338,7 @@ function SignInSteps({
   // Claude: the browser link completes by itself; the code link works from any device. Cursor's one
   // link works from any device too: cursor-agent asks Cursor whether it was used.
   const anywhere = family === "cursor";
-  const pasteFlow = family === "claude" && (method === "code" || !login.url) && Boolean(login.codeUrl);
+  const pasteFlow = (family === "claude" || family === "antigravity") && (method === "code" || !login.url) && Boolean(login.codeUrl);
   const link = pasteFlow ? login.codeUrl : login.url ?? login.codeUrl;
 
   const open = useCallback(() => {
@@ -384,7 +384,7 @@ function SignInSteps({
   );
 
   const service = family === "codex" ? "ChatGPT" : FAMILY_LABEL[family];
-  const canSwitch = browserUsable && !anywhere && (family !== "claude" || (Boolean(login.url) && Boolean(login.codeUrl)));
+  const canSwitch = family !== "antigravity" && browserUsable && !anywhere && (family !== "claude" || (Boolean(login.url) && Boolean(login.codeUrl)));
   return (
     <View style={{ gap: 16 }}>
       <Step theme={theme} number={1} title={`Open the ${service} sign-in page`}>
