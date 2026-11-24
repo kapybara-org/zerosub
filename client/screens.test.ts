@@ -267,6 +267,7 @@ describe("the accounts screen", () => {
 
   function setUp(overrides: Partial<StateView> = {}) {
     const state: StateView = {
+      version: 1,
       accounts: [account("work", { isDefault: true }), account("home")],
       agents: [],
       logins: [],

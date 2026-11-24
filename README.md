@@ -397,6 +397,59 @@ ZeroSub never implements OAuth itself and never copies credentials between accou
 - **ChatGPT device-code sign-in** has to be enabled in ChatGPT → Settings → Security. The browser option works from a browser on the host's own computer.
 - Tested on macOS with Claude Code 2.1.280, Codex 0.156.1 and Paseo 0.9.1; Grok accounts are built against Grok 1.0.77 and Paseo 0.15.4 on Linux, Cursor accounts against cursor-agent 2026.11.13 and Paseo 0.15.4 on Linux. Linux should work. Windows is untested.
 
+## Plugin contracts
+
+### The `zerosub.state` RPC (read-only)
+
+Call `zerosub.state` on the `zerosub` plugin to read its account and routing state. The response carries `version: 1` as defined by `StateViewSchema`. Set `refreshUsage` to request a fresh usage reading and pass `accountId` to limit the refresh to one account. [StateViewSchema](shared/model.ts)
+
+Each `accounts[]` entry exposes these stable fields.
+
+| Field | Meaning |
+| --- | --- |
+| `id` | Stable account ID, such as `claude-main`. |
+| `family` | Provider family, such as `claude` or `codex`. |
+| `status` | The server reports `ready`, `signed_out`, `limited` or `disabled`. A signed-out account reports `signed_out` even when disabled. A provider limit or a quota ceiling can make an account `limited`. |
+| `limitedUntil` | ISO 8601 timestamp when the limit lifts, or `null` when there is no known limit end. |
+| `usage` | Latest reading, or `null` when unavailable. Each `usage.windows[]` entry has an `id` (a stable key such as `five_hour`), a display `label`, `usedPercent` (100 means full), and `resetsAt` (an ISO 8601 timestamp or `null` when unknown). |
+
+Each `agents[]` entry exposes these stable fields.
+
+| Field | Meaning |
+| --- | --- |
+| `agentId` | Paseo agent ID. |
+| `accountId` | ID of the account the agent is routed to. During a pending move this is already the destination. |
+| `pinned` | True for an account choice recorded for this agent, including a user pick or an automatic switch. |
+| `pendingAccountId` | ID of the account the live session still runs on while an in-place move is pending. It is `null` otherwise, including during Codex hand-offs to another agent. |
+| `movable` | True if the provider supports moving a conversation in place or the agent has no history yet. |
+
+On Paseo 0.16 and later, pass `metadata: {"zerosub.account": id}` at agent creation to request a starting account. ZeroSub reads the choice at creation and applies it if the account can take the agent.
+
+Consumers accept unknown `family` values and missing optional fields. The version increases only when a stable field is renamed, removed, or changes meaning.
+
+### The `zerosub-switch` timeline row
+
+ZeroSub records switch outcomes in the agent's timeline. The envelope has `type: "plugin"` and `kind: "zerosub-switch"`. Its `version` comes from `SWITCH_ROW_VERSION` (currently 1) and is independent of the RPC version. [SwitchRowSchema](shared/timeline.ts)
+
+These fields in the envelope's `data` have been stable since ZeroSub 1.0.0.
+
+| Field | Meaning |
+| --- | --- |
+| `family` | Provider family of the source agent. |
+| `from` | Display label of the source account, or `null` when unknown. |
+| `to` | Display label for the destination. It can be an account ID if the label is unavailable, or the provider name for an OpenCode fork. On a `stayed` row it may name the current account or an attempted destination. |
+| `toFamily` | Destination family for a continuation in another managed family, or `null` otherwise. |
+| `at` | ISO 8601 timestamp of the timeline event. |
+| `reason` | What prompted the switch or attempt, such as `limit`, `manual`, or `exhausted`. |
+| `outcome` | `switched`, `pending`, `continued`, `stayed` or `reset`. |
+| `resetsAt` | ISO 8601 timestamp when the relevant limit lifts, or `null` when unknown. |
+| `continuedIn` | A continuation reference with `agentId` and `title`, or `null`. Follow the reference whenever present, including on `stayed` rows. |
+| `continued` | `true` only means ZeroSub sent a follow-up. This can happen on an ordinary switch that keeps the same conversation. |
+
+Treat `detail` as display text only. A row with `reason: "exhausted"` and `outcome: "stayed"` means no eligible replacement account was available in the source family.
+
+Consumers accept unknown `reason` and `family` values and missing optional fields. The row version increases only when a stable field is renamed, removed, or changes meaning.
+
 ## Development
 
 ```bash

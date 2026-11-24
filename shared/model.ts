@@ -553,6 +553,8 @@ export const ACCOUNT_METADATA_KEY = "zerosub.account";
 export const AGENT_METADATA_KEY = "zerosub.agent";
 
 export const StateViewSchema = z.object({
+  /** Contract version of the read-only `zerosub.state` RPC. See the README's plugin contracts. */
+  version: z.literal(1),
   accounts: z.array(AccountViewSchema),
   agents: z.array(AgentRouteSchema),
   logins: z.array(LoginViewSchema),

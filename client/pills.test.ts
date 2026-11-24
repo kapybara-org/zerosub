@@ -72,6 +72,7 @@ function view(accounts: AccountView[], overrides: Partial<StateView> = {}, provi
   const family = provider === "codex" ? "codex" : provider === "pi" ? "pi" : "claude";
   const current = accounts.find((entry) => entry.family === family);
   return {
+    version: 1,
     accounts,
     agents: current
       ? [{ agentId: AGENT, family, accountId: current.id, pinned: false, pendingAccountId: null, waiting: null, movable: true }]
