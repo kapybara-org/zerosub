@@ -5,6 +5,11 @@ import { rememberProviderEnvs } from "./provider-env";
 
 type PaseoApi = PluginHandlerContext["paseo"];
 
+export const ANTIGRAVITY_AUTH_ENV = [
+  "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS",
+  "AGY_ADC_AUTH", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION",
+] as const;
+
 /**
  * Environment keys that mean a provider entry brings its own credentials or endpoint. Such entries
  * (API keys, Bedrock/Vertex, a proxy, a hand-made config dir) are left exactly as configured.
@@ -43,6 +48,7 @@ const OWN_AUTH_KEYS: Record<Family, readonly string[]> = {
   ],
   // An API key or session token (cursor-agent saves either as its login), another endpoint, or a
   // login or settings folder of the entry's own: any of them means it isn't the usual Cursor login.
+  antigravity: ["HOME", "USERPROFILE", ...ANTIGRAVITY_AUTH_ENV],
   cursor: [
     "CURSOR_API_KEY",
     "CURSOR_AUTH_TOKEN",
@@ -56,7 +62,16 @@ const OWN_AUTH_KEYS: Record<Family, readonly string[]> = {
  * Families Paseo has a provider of its own for. Grok and Cursor only run as custom ACP providers (see
  * `ACP_COMMANDS`).
  */
-const BUILT_IN: readonly Family[] = ["claude", "codex", "pi"];
+const BUILT_IN: readonly Family[] = ["claude", "codex", "pi", "antigravity"];
+
+function hasOwnAntigravityCommand(entry: Record<string, unknown> | undefined): boolean {
+  const command = entry?.command;
+  if (command === undefined) return false;
+  if (!Array.isArray(command) || typeof command[0] !== "string" || !command.every((arg) => typeof arg === "string")) return true;
+  return !/^agy(?:-\d[\w.]*)?(?:\.exe)?$/i.test(basename(command[0])) ||
+    !command.includes("acp") ||
+    command.some((arg) => typeof arg === "string" && /^--(?:gemini[-_]dir|app[-_]data[-_]dir|cli_dir_name|cloud_code_endpoint|use_stubby_auth)(?:=|$)/.test(arg));
+}
 
 const isFamily = (id: unknown): id is Family => typeof id === "string" && (FAMILIES as readonly string[]).includes(id);
 
@@ -126,6 +141,7 @@ export function familiesFromConfig(providers: Record<string, unknown> | undefine
   const entries = providers ?? {};
   for (const family of BUILT_IN) {
     const entry = asRecord(entries[family]);
+    if (family === "antigravity" && (entry?.enabled === false || hasOwnAntigravityCommand(entry))) continue;
     if (!entry || !bringsOwnAuth(family, asRecord(entry.env))) result[family] = family;
   }
   for (const [id, value] of Object.entries(entries)) {
@@ -134,6 +150,7 @@ export function familiesFromConfig(providers: Record<string, unknown> | undefine
     const base = entry?.extends;
     if (!isFamily(base)) continue;
     if (bringsOwnAuth(base, asRecord(entry?.env))) continue;
+    if (base === "antigravity" && (!(base in result) || entry?.enabled === false || hasOwnAntigravityCommand(entry))) continue;
     result[id] = base;
   }
   for (const family of ACP_FAMILIES) {

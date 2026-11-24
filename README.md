@@ -430,3 +430,9 @@ Remove added accounts from **Accounts** first, so they're signed out. Then run:
 paseo plugin remove zerosub
 rm -rf ~/.paseo/zerosub
 ```
+
+## Antigravity accounts
+
+On Linux, ZeroSub works with Paseo's built-in Antigravity provider and `agy` 1.5 or later. The CLI login uses the same environment as Paseo. To add an isolated sign-in, choose **Antigravity → Add account**, open Google's sign-in page, then paste the code it returns.
+
+Each added account runs `agy` with a private home directory and its own file-backed sign-in. Tools launched by that agent inherit the account's home. Select an account or make it the default for new agents. Existing conversations stay with their original home. Antigravity does not report the account identity through these CLI commands, so select the added account as the default and disable the CLI entry yourself if you want that arrangement. ZeroSub shows the quota buckets from `agy /usage` for reference.

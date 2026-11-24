@@ -271,7 +271,7 @@ export function UsageBar({ theme, limit, ceiling, onCeiling }: {
   theme: Theme;
   limit: UsageWindow;
   ceiling: number;
-  onCeiling(percent: number): Promise<void>;
+  onCeiling?(percent: number): Promise<void>;
 }) {
   const [draft, setDraft] = useState<number | null>(null);
   const trackWidth = useRef(0);
@@ -280,7 +280,7 @@ export function UsageBar({ theme, limit, ceiling, onCeiling }: {
   const max = draft ?? ceiling;
   const toPercent = (x: number) => Math.round(Math.min(100, Math.max(1, x / Math.max(1, trackWidth.current) * 100)));
   const save = async (value: number) => {
-    if (saving.current || value === ceiling) {
+    if (!onCeiling || saving.current || value === ceiling) {
       if (!saving.current) setDraft(null);
       return;
     }
@@ -298,6 +298,11 @@ export function UsageBar({ theme, limit, ceiling, onCeiling }: {
   const fill =
     percent >= 90 ? colors.statusDanger : percent >= 70 ? colors.statusWarning : colors.statusSuccess;
   const reset = formatResetIn(limit.resetsAt);
+  const bar = (
+    <View pointerEvents="none" style={{ height: 6, borderRadius: 3, backgroundColor: colors.surface2, overflow: "hidden" }}>
+      <View style={{ width: `${percent}%`, height: 6, backgroundColor: fill }} />
+    </View>
+  );
   return (
     <View style={{ gap: 4 }}>
       <View style={{ flexDirection: "row", flexWrap: "wrap", justifyContent: "space-between", columnGap: 8 }}>
@@ -307,68 +312,68 @@ export function UsageBar({ theme, limit, ceiling, onCeiling }: {
           {reset ? ` · resets ${reset}` : ""}
         </Text>
       </View>
-      <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-        <View
-          accessible
-          accessibilityRole="adjustable"
-          accessibilityLabel={`${limit.label} quota maximum, ${formatPercent(percent)} used`}
-          accessibilityValue={{ min: 1, max: 100, now: max, text: `${max}%` }}
-          accessibilityActions={[{ name: "increment" }, { name: "decrement" }]}
-          onAccessibilityAction={(event) => {
-            const step = event.nativeEvent.actionName === "increment" ? 1 : -1;
-            void save(Math.min(100, Math.max(1, max + step)));
-          }}
-          {...(Platform.OS === "web" ? {
-            tabIndex: 0,
-            onKeyDown: (event: { key: string; preventDefault(): void }) => {
-              let next: number;
-              switch (event.key) {
-                case "ArrowLeft":
-                case "ArrowDown": next = Math.max(1, max - 1); break;
-                case "ArrowRight":
-                case "ArrowUp": next = Math.min(100, max + 1); break;
-                case "Home": next = 1; break;
-                case "End": next = 100; break;
-                default: return;
-              }
-              event.preventDefault();
-              void save(next);
-            },
-          } : {})}
-          onLayout={(event) => { trackWidth.current = event.nativeEvent.layout.width; }}
-          onStartShouldSetResponder={() => !saving.current}
-          onResponderGrant={({ nativeEvent }) => {
-            const value = toPercent(nativeEvent.locationX);
-            drag.current = { offset: nativeEvent.pageX - nativeEvent.locationX, percent: value };
-            setDraft(value);
-          }}
-          onResponderMove={({ nativeEvent }) => {
-            if (!drag.current) return;
-            drag.current.percent = toPercent(nativeEvent.pageX - drag.current.offset);
-            setDraft(drag.current.percent);
-          }}
-          onResponderRelease={() => {
-            const value = drag.current?.percent;
-            drag.current = null;
-            if (value !== undefined) void save(value);
-          }}
-          onResponderTerminate={() => { drag.current = null; setDraft(null); }}
-          style={{ flex: 1, minHeight: 32, justifyContent: "center" }}
-        >
-          <View pointerEvents="none" style={{ height: 6, borderRadius: 3, backgroundColor: colors.surface2, overflow: "hidden" }}>
-            <View style={{ width: `${percent}%`, height: 6, backgroundColor: fill }} />
-          </View>
+      {onCeiling ? (
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
           <View
-            pointerEvents="none"
-            style={{
-              position: "absolute", left: `${max}%`, top: "50%",
-              marginLeft: -4, marginTop: -9, width: 8, height: 18, borderRadius: 4,
-              backgroundColor: colors.foreground, borderWidth: 1, borderColor: colors.surface1,
+            accessible
+            accessibilityRole="adjustable"
+            accessibilityLabel={`${limit.label} quota maximum, ${formatPercent(percent)} used`}
+            accessibilityValue={{ min: 1, max: 100, now: max, text: `${max}%` }}
+            accessibilityActions={[{ name: "increment" }, { name: "decrement" }]}
+            onAccessibilityAction={(event) => {
+              const step = event.nativeEvent.actionName === "increment" ? 1 : -1;
+              void save(Math.min(100, Math.max(1, max + step)));
             }}
-          />
+            {...(Platform.OS === "web" ? {
+              tabIndex: 0,
+              onKeyDown: (event: { key: string; preventDefault(): void }) => {
+                let next: number;
+                switch (event.key) {
+                  case "ArrowLeft":
+                  case "ArrowDown": next = Math.max(1, max - 1); break;
+                  case "ArrowRight":
+                  case "ArrowUp": next = Math.min(100, max + 1); break;
+                  case "Home": next = 1; break;
+                  case "End": next = 100; break;
+                  default: return;
+                }
+                event.preventDefault();
+                void save(next);
+              },
+            } : {})}
+            onLayout={(event) => { trackWidth.current = event.nativeEvent.layout.width; }}
+            onStartShouldSetResponder={() => !saving.current}
+            onResponderGrant={({ nativeEvent }) => {
+              const value = toPercent(nativeEvent.locationX);
+              drag.current = { offset: nativeEvent.pageX - nativeEvent.locationX, percent: value };
+              setDraft(value);
+            }}
+            onResponderMove={({ nativeEvent }) => {
+              if (!drag.current) return;
+              drag.current.percent = toPercent(nativeEvent.pageX - drag.current.offset);
+              setDraft(drag.current.percent);
+            }}
+            onResponderRelease={() => {
+              const value = drag.current?.percent;
+              drag.current = null;
+              if (value !== undefined) void save(value);
+            }}
+            onResponderTerminate={() => { drag.current = null; setDraft(null); }}
+            style={{ flex: 1, minHeight: 32, justifyContent: "center" }}
+          >
+            {bar}
+            <View
+              pointerEvents="none"
+              style={{
+                position: "absolute", left: `${max}%`, top: "50%",
+                marginLeft: -4, marginTop: -9, width: 8, height: 18, borderRadius: 4,
+                backgroundColor: colors.foreground, borderWidth: 1, borderColor: colors.surface1,
+              }}
+            />
+          </View>
+          <Text style={{ color: colors.foregroundMuted, fontSize: 12 }}>Max {max}%</Text>
         </View>
-        <Text style={{ color: colors.foregroundMuted, fontSize: 12 }}>Max {max}%</Text>
-      </View>
+      ) : <View style={{ minHeight: 16, justifyContent: "center" }}>{bar}</View>}
     </View>
   );
 }
