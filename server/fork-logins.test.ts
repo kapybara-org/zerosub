@@ -170,6 +170,7 @@ it.each([
   ["codex", "chatgpt|workspace|new@example.com"],
   ["cursor", "cursor|team|member"],
   ["grok", "grok|team|member"],
+  ["antigravity", "antigravity|new@example.com"],
 ] as const)("adds a matching %s login without moving its existing conversations", async (family, identity) => {
   const cli = { ...main, id: MAIN_ACCOUNT_ID[family], family, email: "new@example.com", identity };
   const thread = { accountId: cli.id, family, openedAt: cli.createdAt };
@@ -215,6 +216,21 @@ it.each([
   expect(restored.bindings.pinned?.accountId).toBe(cli.id);
   expect(restored.bindings.recorded?.accountId).toBe(cli.id);
   expect(fake.calls).not.toContain("logout null");
+});
+
+it("pairs existing Antigravity entries when the user selects a new default", async () => {
+  const family = "antigravity";
+  const identity = "antigravity|new@example.com";
+  const cli = { ...main, id: MAIN_ACCOUNT_ID[family], family, signedIn: true, identity };
+  const added = { ...managed("antigravity-existing", join(homes(), "antigravity-existing")), family, signedIn: true, identity };
+  await seed({ accounts: [cli, added] as never });
+  const { service, store } = start({ ...newFake(), mainSignedIn: true, identityKey: identity }, family);
+
+  await service.setDefault(fakePaseo(), added.id);
+  const state = await store.read();
+  expect(state.defaults.antigravity).toBe(added.id);
+  expect(state.accounts.find((account) => account.id === cli.id)).toMatchObject({ disabled: true, pausedFor: added.id, signedIn: true });
+  expect(state.accounts.find((account) => account.id === added.id)?.disabled).toBe(false);
 });
 
 it("does not pair ChatGPT sign-ins when the workspace could not be verified", async () => {

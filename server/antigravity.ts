@@ -1,13 +1,40 @@
 import { spawn } from "node:child_process";
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { UsageWindow } from "../shared/model";
 import { ProgressEmitter, spawnEnv, type EnvPatch, type FamilyAdapter, type Identity, type LoginHandle, type RedeemReply, type UsageRead } from "./adapter";
 import { providerCommand } from "./binaries";
 import { ANTIGRAVITY_AUTH_ENV } from "./families";
+import { readJson } from "./json-file";
 import { firstUrl, run, stripAnsi } from "./process";
 
 const unsupported = "Isolated Antigravity accounts are supported on Linux.";
 const signedOut = /please sign in|authentication required|not signed in/i;
+
+/** Only consumer OAuth establishes a match; an enterprise identity can cover several organizations. */
+export function antigravityEmail(raw: string): string | null {
+  try {
+    const auth = JSON.parse(raw) as { auth_method?: unknown; id_token_email?: unknown } | null;
+    const email = typeof auth?.id_token_email === "string" ? auth.id_token_email.trim().toLowerCase() : "";
+    return auth?.auth_method === "consumer" && /^[^\s@]+@[^\s@]+$/.test(email) ? email : null;
+  } catch {
+    return null;
+  }
+}
+
+async function signedInEmail(env: NodeJS.ProcessEnv): Promise<string | null> {
+  if (ANTIGRAVITY_AUTH_ENV.some((key) => env[key])) return null;
+  const configDir = join(env.HOME || homedir(), ".gemini", "antigravity-cli");
+  const settings = await readJson(join(configDir, "settings.json")) as { auth?: { type?: unknown }; modelProvider?: unknown } | null | undefined;
+  if (settings?.modelProvider || (settings?.auth?.type && settings.auth.type !== "oauth-personal")) return null;
+  // Use agy's current store. An SSH login and the desktop login can belong to different accounts.
+  if (env.SSH_CONNECTION || env.SSH_CLIENT || env.SSH_TTY) {
+    return antigravityEmail(await readFile(join(configDir, "antigravity-oauth-token"), "utf8"));
+  }
+  const secret = await run("secret-tool", ["lookup", "service", "gemini", "username", "antigravity"], { env, timeoutMs: 3_000 });
+  return secret.code === 0 ? antigravityEmail(secret.stdout) : null;
+}
 
 export function parseAntigravityUsage(output: string): UsageWindow[] {
   let body: unknown;
@@ -60,9 +87,11 @@ export class AntigravityAdapter implements FamilyAdapter {
 
   async identity(home: string | null): Promise<Identity> {
     const { command } = await providerCommand(this.family);
-    const result = await run(command, ["models"], { env: spawnEnv(await this.env(home), this.family), timeoutMs: 20_000 });
+    const env = spawnEnv(await this.env(home), this.family);
+    const result = await run(command, ["models"], { env, timeoutMs: 20_000 });
     if (result.code !== 0 && !signedOut.test(`${result.stdout}\n${result.stderr}`)) throw new Error("Antigravity could not check the sign-in.");
-    return { signedIn: result.code === 0, email: null, plan: null, organization: null, identity: null };
+    const email = result.code === 0 ? await signedInEmail(env).catch(() => null) : null;
+    return { signedIn: result.code === 0, email, plan: null, organization: null, identity: email && `antigravity|${email}` };
   }
 
   async usage(home: string | null): Promise<UsageRead> {

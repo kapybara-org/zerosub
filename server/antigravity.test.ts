@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { AntigravityAdapter, AntigravityLogin, parseAntigravityUsage } from "./antigravity";
+import { AntigravityAdapter, AntigravityLogin, antigravityEmail, parseAntigravityUsage } from "./antigravity";
 import { familiesFromConfig } from "./families";
 
 describe("Antigravity accounts", () => {
@@ -43,6 +43,13 @@ describe("Antigravity accounts", () => {
       await login.finished;
       await rm(home, { recursive: true });
     }
+  });
+
+  it("matches personal Google identities without retaining credential fields", () => {
+    expect(antigravityEmail('{"auth_method":"consumer","id_token_email":" Example@Google.com ","token":{}}')).toBe("example@google.com");
+    expect(antigravityEmail('{"auth_method":"enterprise","id_token_email":"example@google.com"}')).toBeNull();
+    expect(antigravityEmail('{"auth_method":"consumer","id_token_email":"invalid"}')).toBeNull();
+    expect(antigravityEmail("malformed JSON")).toBeNull();
   });
 
   it("shows quota buckets as usage and ignores disabled and malformed windows", () => {
