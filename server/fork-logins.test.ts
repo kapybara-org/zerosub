@@ -3,9 +3,11 @@ import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { Family } from "../shared/model";
 import type { FamilyAdapter, Identity, LoginHandle } from "./adapter";
 import type { FamilyResolver } from "./families";
 import type { Reopener } from "./reopen";
+import { chooseAccount } from "./routing";
 import { Service } from "./service";
 import { MAIN_ACCOUNT_ID, StateStore, type StoredState } from "./state";
 import { absentPi } from "./fakes.test-support";
@@ -41,6 +43,7 @@ const homes = () => join(root, "zerosub", "homes");
 
 interface Fake {
   mainSignedIn?: boolean;
+  identityKey?: string;
   calls: string[];
   /** Which homes `identity` reports as signed in. */
   signedIn: Set<string>;
@@ -52,11 +55,11 @@ interface Fake {
   finish: (result: { ok: boolean; message: string | null }) => void;
 }
 
-/** A Claude adapter that records what it's asked to do, and makes homes as the real one does. */
-function fakeAdapter(fake: Fake): FamilyAdapter {
+/** A sign-in adapter that records what it is asked to do and makes separate homes. */
+function fakeAdapter(fake: Fake, family: Family): FamilyAdapter {
   return {
-    family: "claude",
-    portable: true,
+    family,
+    portable: family === "claude",
     usageSpacingMs: 0,
     available: async () => ({ ok: true, detail: null }),
     prepareHome: async (home: string) => {
@@ -67,7 +70,7 @@ function fakeAdapter(fake: Fake): FamilyAdapter {
     identity: async (home: string | null): Promise<Identity> => {
       fake.calls.push(`identity ${home}`);
       const signedIn = home === null ? fake.mainSignedIn === true : fake.signedIn.has(home);
-      return { signedIn, email: signedIn ? "new@example.com" : null, plan: null, organization: null, identity: signedIn ? "personal|new@example.com" : null };
+      return { signedIn, email: signedIn ? "new@example.com" : null, plan: null, organization: null, identity: signedIn ? (fake.identityKey ?? "personal|new@example.com") : null };
     },
     api: async (home: string | null) => (home !== null && fake.keyed.has(home) ? { keyHint: "abcd", baseUrl: null } : null),
     usage: async () => ({ fetchedAt: new Date().toISOString(), windows: [], error: null, cached: false, resets: null }),
@@ -91,26 +94,26 @@ function fakeAdapter(fake: Fake): FamilyAdapter {
 }
 
 /** Paseo, with agents in the given states. */
-function fakePaseo(statuses: Record<string, string> = {}) {
+function fakePaseo(statuses: Record<string, string> = {}, family: Family = "claude") {
   return {
     agents: {
       list: async () => ({ entries: [], pageInfo: { hasMore: false, nextCursor: null } }),
       ref: (id: string) => ({
         refresh: async () =>
-          statuses[id] ? { agent: { id, provider: "claude", status: statuses[id], archivedAt: null, lastUserMessageAt: null } } : null,
+          statuses[id] ? { agent: { id, provider: family, status: statuses[id], archivedAt: null, lastUserMessageAt: null } } : null,
       }),
     },
   } as never;
 }
 
 /** A service on the registry in `$PASEO_HOME`, as the plugin makes it on (re)start. */
-function start(fake: Fake = newFake()) {
+function start(fake: Fake = newFake(), family: Family = "claude") {
   const store = new StateStore();
-  const adapter = fakeAdapter(fake);
+  const adapter = fakeAdapter(fake, family);
   const service = new Service(
-    { claude: adapter, codex: adapter, pi: absentPi() },
+    { claude: adapter, codex: adapter, pi: absentPi(), [family]: adapter },
     store,
-    { resolve: async () => ({ claude: "claude" as const }) } as unknown as FamilyResolver,
+    { resolve: async () => ({ [family]: family }) } as unknown as FamilyResolver,
     { locate: async () => null } as unknown as Reopener,
   );
   services.push(service);
@@ -161,6 +164,73 @@ it("adds a new Claude sign-in in its own home even if the CLI already uses that 
   expect(state.accounts.find((account) => account.id === main.id)).toMatchObject({ disabled: true, signedIn: true });
   expect(state.accounts.find((account) => account.id === state.defaults.claude)).toMatchObject({ kind: "managed", home, disabled: false });
   expect(fake.calls.filter((call) => call.startsWith("logout"))).toEqual([]);
+});
+
+it.each([
+  ["codex", "chatgpt|workspace|new@example.com"],
+  ["cursor", "cursor|team|member"],
+  ["grok", "grok|team|member"],
+] as const)("adds a matching %s login without moving its existing conversations", async (family, identity) => {
+  const cli = { ...main, id: MAIN_ACCOUNT_ID[family], family, email: "new@example.com", identity };
+  const thread = { accountId: cli.id, family, openedAt: cli.createdAt };
+  await seed({
+    accounts: [cli] as never,
+    bindings: { pinned: { accountId: cli.id, source: "thread", at: cli.createdAt } },
+    sessions: { recorded: thread },
+  });
+  const { service, store, fake } = start({ ...newFake(), mainSignedIn: true, identityKey: identity }, family);
+  const paseo = fakePaseo({ pinned: "idle", recorded: "idle" }, family);
+  const signIn = async (step: "done" | "failed") => {
+    const login = await service.startLogin(family, "code");
+    fake.signedIn.add(join(homes(), `${family}-${login.id}`));
+    fake.finish({ ok: true, message: null });
+    return vi.waitFor(async () => {
+      const result = (await service.view(paseo)).logins.find((entry) => entry.id === login.id);
+      expect(result?.step).toBe(step);
+      return result;
+    });
+  };
+
+  const added = (await signIn("done"))!.accountId!;
+  const paired = await store.read();
+  expect(paired.defaults[family]).toBe(added);
+  expect(paired.accounts.find((account) => account.id === cli.id)).toMatchObject({ disabled: true, pausedFor: added, signedIn: true });
+  expect(paired.accounts.find((account) => account.id === added)).toMatchObject({
+    disabled: false, home: join(homes(), added), signedIn: true,
+  });
+
+  const route = (agentId: string, reason: "create" | "resume") =>
+    chooseAccount(paired, { agentId, family, reason, now: Date.now(), autoSwitch: true, balanceNewAgents: false, portable: false, usageOf: () => null })?.account.id;
+  expect(route("new", "create")).toBe(added);
+  for (const id of ["pinned", "recorded", "never-routed"]) expect(route(id, "resume")).toBe(cli.id);
+
+  expect((await signIn("failed"))?.message).toContain("already added");
+  await service.setAccountEnabled(paseo, cli.id, true);
+  expect((await store.read()).accounts.find((account) => account.id === added)?.pausedFor).toBe(cli.id);
+  await service.setAccountEnabled(paseo, added, true);
+  await service.remove(paseo, added);
+  const restored = await store.read();
+  expect(restored.defaults[family]).toBe(cli.id);
+  expect(restored.accounts.find((account) => account.id === cli.id)).toMatchObject({ disabled: false, signedIn: true });
+  expect(restored.bindings.pinned?.accountId).toBe(cli.id);
+  expect(restored.bindings.recorded?.accountId).toBe(cli.id);
+  expect(fake.calls).not.toContain("logout null");
+});
+
+it("does not pair ChatGPT sign-ins when the workspace could not be verified", async () => {
+  const identity = "chatgpt-email|new@example.com|plus";
+  const cli = { ...main, id: MAIN_ACCOUNT_ID.codex, family: "codex" as const, email: "new@example.com", identity: "chatgpt|workspace|new@example.com" };
+  await seed({ accounts: [cli] as never });
+  const { service, store, fake } = start({ ...newFake(), mainSignedIn: true, identityKey: identity }, "codex");
+  const login = await service.startLogin("codex", "code");
+  fake.signedIn.add(join(homes(), `codex-${login.id}`));
+  fake.finish({ ok: true, message: null });
+
+  await vi.waitFor(async () => {
+    const result = (await service.view(fakePaseo())).logins.find((entry) => entry.id === login.id);
+    expect(result?.step).toBe("failed");
+  });
+  expect((await store.read()).accounts).toMatchObject([{ id: cli.id, disabled: false }]);
 });
 
 describe("signing an account in again as someone else", () => {
