@@ -1,10 +1,10 @@
 import { codexFastExpiresAt } from "../shared/codex-fast-date";
 import { capsAccount } from "../shared/format";
-import { WEEK_NEARLY_USED_PERCENT, type Usage } from "../shared/model";
+import { CODEX_FAST_METADATA_KEY, HANDOFF_ACCOUNT_METADATA_KEY, WEEK_NEARLY_USED_PERCENT, type Usage } from "../shared/model";
 import { isUsable, weeklyWindow } from "./routing";
 import type { StoredAccount } from "./state";
 
-export const CODEX_FAST_METADATA_KEY = "zerosub.codex-fast";
+export { CODEX_FAST_METADATA_KEY, HANDOFF_ACCOUNT_METADATA_KEY };
 const MAX_READING_AGE_MS = 30 * 60_000;
 
 type SpeedControl = {

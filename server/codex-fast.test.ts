@@ -6,7 +6,7 @@ import type { PluginBeforeRequests, PluginHookContext } from "@getpaseo/plugin/s
 import { setCodexFastUntil } from "../shared/rpc";
 import type { Usage } from "../shared/model";
 import type { FamilyAdapter } from "./adapter";
-import { CODEX_FAST_METADATA_KEY, type CodexSpeedState } from "./codex-fast";
+import { CODEX_FAST_METADATA_KEY, HANDOFF_ACCOUNT_METADATA_KEY, type CodexSpeedState } from "./codex-fast";
 import { WEEK_MINUTES } from "./codex";
 import { Service } from "./service";
 import { MAIN_ACCOUNT_ID, StateStore, StoredAccountSchema } from "./state";
@@ -169,6 +169,28 @@ describe("temporary Fast mode for one ChatGPT account", () => {
     await expect(service.onAgentCreate(request, context)).resolves.toMatchObject({
       config: { providerOptions: { service_tier: "fast" } },
     });
+  });
+
+  it("decides a hand-off's speed by the account it's bound to, and drops the hand-off's note", async () => {
+    const { service, context, request, store } = await setUp();
+    const handoff = (accountId: string) => ({ ...request, metadata: { [HANDOFF_ACCOUNT_METADATA_KEY]: accountId, other: "kept" } });
+
+    // The default login is opted in, but this hand-off is bound to another account.
+    await expect(service.onAgentCreate(handoff(OTHER), context)).resolves.toEqual({ ...request, metadata: { other: "kept" } });
+
+    await expect(service.onAgentCreate(handoff(MAIN), context)).resolves.toMatchObject({
+      config: { providerOptions: { service_tier: "fast" } },
+      metadata: { other: "kept", [CODEX_FAST_METADATA_KEY]: true },
+    });
+    const opted = await service.onAgentCreate(handoff(MAIN), context);
+    expect((opted as { metadata?: unknown } | undefined)?.metadata).not.toHaveProperty(HANDOFF_ACCOUNT_METADATA_KEY);
+
+    // Bound to an opted-in account, it still waits for the CLI login a failed route falls back to.
+    await store.update((draft) => {
+      draft.accounts[1]!.codexFastUntil = UNTIL;
+      delete draft.accounts[0]!.codexFastUntil;
+    });
+    await expect(service.onAgentCreate(handoff(OTHER), context)).resolves.toEqual({ ...request, metadata: { other: "kept" } });
   });
 
   it("validates the date and clears only the specified account", async () => {

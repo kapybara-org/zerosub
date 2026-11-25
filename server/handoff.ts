@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { PluginHookContext } from "@getpaseo/plugin/server";
 import type { AgentTimelineItem } from "./adapter";
+import { CODEX_FAST_METADATA_KEY, HANDOFF_ACCOUNT_METADATA_KEY } from "../shared/model";
 
 type PaseoApi = PluginHookContext["paseo"];
 
@@ -296,6 +297,20 @@ export interface ContinuationTarget {
 }
 
 /**
+ * A hand-off's options without the speed ZeroSub set on its source: the new agent starts at Standard,
+ * and its own account decides whether it runs Fast. A speed the user chose is carried over.
+ */
+function withoutManagedSpeed(
+  featureValues: Record<string, unknown>,
+  metadata: Readonly<Record<string, unknown>> | null | undefined,
+): Record<string, unknown> {
+  if (metadata?.[CODEX_FAST_METADATA_KEY] !== true) return featureValues;
+  const rest = { ...featureValues };
+  for (const key of ["service_tier", "fast_mode"]) delete rest[key];
+  return rest;
+}
+
+/**
  * Starts a new agent in the same workspace, pre-bound to another account, and hands it the
  * conversation so far. Used where a thread cannot move between accounts (Codex encrypts its
  * reasoning per ChatGPT account, so the old thread would be rejected by the new one), and to carry
@@ -308,6 +323,11 @@ export async function continueInNewAgent(options: {
   /** Why the session stopped; the first prompt names it. A promptless create needs none. */
   why?: string;
   bind(agentId: string): Promise<void>;
+  /**
+   * The account `bind` puts the new agent on, for ZeroSub's own create hook: Paseo 0.16 and later
+   * pass it there in the request's metadata, which carries no agent ID to look the binding up by.
+   */
+  accountId?: string;
   target?: ContinuationTarget;
   /** What to call the session that stopped, e.g. `Claude Code`. */
   previous?: string;
@@ -375,7 +395,14 @@ export async function continueInNewAgent(options: {
         provider: `${provider}/${model}`,
         ...(source.currentModeId ? { modeId: source.currentModeId } : {}),
         ...(source.thinkingOptionId ? { thinkingOptionId: source.thinkingOptionId } : {}),
-        ...(source.features ? { featureValues: Object.fromEntries(source.features.map((feature) => [feature.id, feature.value])) } : {}),
+        ...(source.features
+          ? {
+              featureValues: withoutManagedSpeed(
+                Object.fromEntries(source.features.map((feature) => [feature.id, feature.value])),
+                (source as { metadata?: Readonly<Record<string, unknown>> | null }).metadata,
+              ),
+            }
+          : {}),
       };
   let failed = false;
   let outcomeUnknown = false;
@@ -388,6 +415,8 @@ export async function continueInNewAgent(options: {
       ? { prompt: continuationPrompt(buildTranscript(timeline ?? []), options.why, options.previous) }
       : {}),
     labels: { [CONTINUED_FROM_LABEL]: sourceAgentId, ...(options.parentId ? { [PARENT_LABEL]: options.parentId } : {}) },
+    // An older Paseo leaves metadata out of the create; its hook can't set Fast either.
+    ...(options.accountId ? { metadata: { [HANDOFF_ACCOUNT_METADATA_KEY]: options.accountId } } : {}),
     // Paseo's creation snapshots; the client throws a failed result as a plain error.
     ...(options.onCreateRejected
       ? {

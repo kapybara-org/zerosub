@@ -89,7 +89,7 @@ import {
 import { claudeCliCredentialConflict } from "./claude";
 import { codexHandoffMode, encryptedResumeFailure, sameWorkspace, turnFailedText } from "./codex-same-conversation";
 import { CodexContinuations, MESSAGE_PREFIX, UnresolvableEpochError, fitInstructions, matchesTransfer, readUpdates, ready, sentDigestOf, snapshot, transferMarker, waitForCreated, waitForSource, type Agent } from "./continuations";
-import { CODEX_FAST_METADATA_KEY, canUseCodexFast, codexFastChoice, standardSpeed, syncCodexSpeed, type CodexSpeedCatalog, type CodexSpeedHandle, type CodexSpeedState } from "./codex-fast";
+import { CODEX_FAST_METADATA_KEY, HANDOFF_ACCOUNT_METADATA_KEY, canUseCodexFast, codexFastChoice, standardSpeed, syncCodexSpeed, type CodexSpeedCatalog, type CodexSpeedHandle, type CodexSpeedState } from "./codex-fast";
 import { CONTINUED_FROM_LABEL, PARENT_LABEL, buildTranscript, continueInNewAgent, continuationPrompt, promptInstruction, updatePrompt, type Continuation } from "./handoff";
 import { launcherDir, launcherNames, piLauncherDir, writeLaunchers, type LauncherAccount, type LauncherKind } from "./launchers";
 import { PI_ACCOUNT_FILE, codexSessionsShared, prepareClaudeHome, crossesInheritedProxy, isAccountHome, moveHome, normalizeBaseUrl, plainHttp, readPiAccount, readPiAccountForAgents, removeHome, sentInTheClear } from "./homes";
@@ -1030,8 +1030,11 @@ export class Service {
 
   // ------------------------------------------------------------------ hooks
 
-  /** Applies the temporary speed at creation before the provider starts the first turn. */
-  private async codexFastOnCreate(request: AgentCreateRequest, paseo: PaseoApi): Promise<AgentCreateRequest | undefined> {
+  /**
+   * Applies the temporary speed at creation before the provider starts the first turn. A hand-off
+   * names the account it's bound to (`handoffAccount`): only that account decides.
+   */
+  private async codexFastOnCreate(request: AgentCreateRequest, paseo: PaseoApi, handoffAccount: string | undefined): Promise<AgentCreateRequest | undefined> {
     const catalog = paseo.providers as CodexSpeedCatalog | undefined;
     if (!catalog?.listControls || !takesAgentMetadata(paseo) || (await this.families.resolve(paseo))[request.config.provider] !== "codex") return undefined;
     const state = await this.store.read();
@@ -1040,31 +1043,39 @@ export class Service {
 
     const now = Date.now();
     const canUse = (account: StoredAccount | undefined) => this.canUseFast(account, now);
+    // Every account the new agent may run on must allow Fast.
+    let accounts: (StoredAccount | undefined)[];
+    if (handoffAccount !== undefined) {
+      // A hand-off is bound to its account before it's created.
+      accounts = [findAccount(state, handoffAccount)];
+    } else {
+      // A late account decision may pick a different login when spreading, or consume a one-time
+      // pick before this opens.
+      const input: RouteInput = {
+        agentId: "",
+        family: "codex",
+        reason: "create",
+        now,
+        portable: false,
+        autoSwitch: this.prefs.autoSwitch,
+        balanceNewAgents: this.prefs.balanceNewAgents,
+        paidFallback: this.prefs.paidApiFallback,
+        autoRedeem: this.prefs.autoRedeem,
+        requested: requestedAccount(request),
+        model: config.model,
+        usageOf: (id) => this.usage.get(id),
+        pendingOf: (id) => this.pendingOn(id, now),
+      };
+      const route = chooseAccount(state, input);
+      if (this.prefs.balanceNewAgents && route?.bind?.source !== "user" && accountsOf(state, "codex").some(
+        (account) => account.signedIn && !account.disabled && !canUse(account),
+      )) return undefined;
+      accounts = [route?.account, chooseAccount(state, { ...input, allowNextPick: true })?.account];
+    }
+    // The session can fall back to the CLI login if routing fails.
     const main = mainAccount(state, "codex");
-    // The session can fall back to the CLI login if routing fails. A late account decision may
-    // also pick a different login when spreading, or consume a one-time pick before this opens.
-    const input: RouteInput = {
-      agentId: "",
-      family: "codex",
-      reason: "create",
-      now,
-      portable: false,
-      autoSwitch: this.prefs.autoSwitch,
-      balanceNewAgents: this.prefs.balanceNewAgents,
-      paidFallback: this.prefs.paidApiFallback,
-      autoRedeem: this.prefs.autoRedeem,
-      requested: requestedAccount(request),
-      model: config.model,
-      usageOf: (id) => this.usage.get(id),
-      pendingOf: (id) => this.pendingOn(id, now),
-    };
-    const route = chooseAccount(state, input);
-    if (!canUse(route?.account) || (main?.signedIn && !canUse(main))) return undefined;
-    const next = chooseAccount(state, { ...input, allowNextPick: true });
-    if (!canUse(next?.account)) return undefined;
-    if (this.prefs.balanceNewAgents && route?.bind?.source !== "user" && accountsOf(state, "codex").some(
-      (account) => account.signedIn && !account.disabled && !canUse(account),
-    )) return undefined;
+    if (main?.signedIn) accounts.push(main);
+    if (!accounts.every(canUse)) return undefined;
 
     const providerOptions = { ...config.featureValues, ...config.providerOptions };
     const provider = config.model ? `${config.provider}/${config.model}` : config.provider;
@@ -1072,9 +1083,7 @@ export class Service {
     if (speed.error || !codexFastChoice(speed) || !standardSpeed(speed)) return undefined;
     const latest = await this.store.read();
     const checkedAt = Date.now();
-    if (![route?.account, next?.account, main?.signedIn ? main : undefined].every(
-      (account) => !account || this.canUseFast(findAccount(latest, account.id), checkedAt),
-    )) return undefined;
+    if (!accounts.every((account) => this.canUseFast(findAccount(latest, account!.id), checkedAt))) return undefined;
 
     const { metadata } = request as { metadata?: Record<string, unknown> | null };
     return {
@@ -1159,18 +1168,29 @@ export class Service {
    * put it on Bedrock, and only on a Paseo that keeps metadata (0.16 and later, where the request
    * always carries it); otherwise the request is left as it is.
    */
-  async onAgentCreate(request: AgentCreateRequest, context: PluginHookContext): Promise<AgentCreateRequest | undefined> {
+  async onAgentCreate(original: AgentCreateRequest, context: PluginHookContext): Promise<AgentCreateRequest | undefined> {
     this.attach(context.paseo);
-    const codex = await this.codexFastOnCreate(request, context.paseo).catch((error: unknown) => {
+    // A hand-off's account is only for this hook: it isn't kept on the agent.
+    const { metadata: sent } = original as { metadata?: Record<string, unknown> | null };
+    const named = sent?.[HANDOFF_ACCOUNT_METADATA_KEY];
+    const handoffAccount = typeof named === "string" ? named : undefined;
+    let request = original;
+    if (sent && HANDOFF_ACCOUNT_METADATA_KEY in sent) {
+      const { [HANDOFF_ACCOUNT_METADATA_KEY]: _removed, ...rest } = sent;
+      request = { ...original, metadata: rest } as AgentCreateRequest;
+    }
+    const unchanged = request === original ? undefined : request;
+
+    const codex = await this.codexFastOnCreate(request, context.paseo, handoffAccount).catch((error: unknown) => {
       log("could not set speed for a new Codex agent", error);
       return undefined;
     });
     if (codex) return codex;
     const { metadata } = request as { metadata?: Record<string, unknown> | null };
     const modeId = request.config.modeId;
-    if (!metadata || typeof metadata !== "object" || typeof modeId !== "string" || !modeId) return undefined;
-    if (!this.prefs.paidApiFallback || !(await this.store.read()).accounts.some((account) => isBedrockAccount(account))) return undefined;
-    if ((await this.families.resolve(context.paseo))[request.config.provider] !== "claude") return undefined;
+    if (!metadata || typeof metadata !== "object" || typeof modeId !== "string" || !modeId) return unchanged;
+    if (!this.prefs.paidApiFallback || !(await this.store.read()).accounts.some((account) => isBedrockAccount(account))) return unchanged;
+    if ((await this.families.resolve(context.paseo))[request.config.provider] !== "claude") return unchanged;
     return { ...request, metadata: { ...metadata, [CREATED_MODE_METADATA_KEY]: modeId } } as AgentCreateRequest;
   }
 
@@ -2584,6 +2604,7 @@ export class Service {
       previous: PROVIDER_NAME[family],
       target: { provider, label: name, modeId },
       parentId: await this.continuations.parentFor(paseo, agentId),
+      accountId: account.id,
       bind: async (newAgentId) => {
         await this.store.update((draft) => {
           // A fork that lands on a paid stand-in (Bedrock) isn't the user's pick, even when they asked
@@ -3426,6 +3447,7 @@ export class Service {
       timeline,
       why,
       parentId: await this.continuations.parentFor(paseo, agentId),
+      accountId: target.id,
       bind: async (newAgentId) => {
         await this.store.update((draft) => {
           draft.bindings[newAgentId] = {

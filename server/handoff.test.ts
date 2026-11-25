@@ -2,6 +2,7 @@
 import type { PluginHookContext } from "@getpaseo/plugin/server";
 import { describe, expect, it } from "vitest";
 import type { AgentTimelineItem } from "./adapter";
+import { CODEX_FAST_METADATA_KEY, HANDOFF_ACCOUNT_METADATA_KEY } from "./codex-fast";
 import { buildTranscript, continuationPrompt, continueInNewAgent, keepEnds, shortenEarlierHandOff, updatePrompt } from "./handoff";
 
 const OPEN = "<previous-session>";
@@ -399,5 +400,29 @@ describe("starting the new agent", () => {
     await continueInNewAgent({ paseo, sourceAgentId: "sub", why: "its account reached its limit", parentId: "lead", bind: async () => {} });
     expect(created[0]!.request.prompt).toContain("From Lead (lead): Write the parser for the new format.");
     expect(created[0]!.request.prompt).not.toContain("[agent_message]");
+  });
+
+  it("leaves behind the Fast speed ZeroSub set, and names the account for the create hook", async () => {
+    const { paseo, created } = fake("ws-1");
+    const fastSource = (metadata: Record<string, unknown>) => (() => ({
+      refresh: async () => ({
+        agent: {
+          id: "sub", provider: "codex", model: "gpt-test", title: "Write the parser", cwd: "/repo", workspaceId: "ws-1",
+          features: [{ id: "service_tier", value: "priority" }, { id: "plan_mode", value: true }], metadata,
+        },
+      }),
+    })) as unknown as typeof paseo.agents.ref;
+
+    paseo.agents.ref = fastSource({ [CODEX_FAST_METADATA_KEY]: true });
+    await continueInNewAgent({ paseo, sourceAgentId: "sub", deferPrompt: true, accountId: "codex-other", bind: async () => {} });
+    expect(created[0]!.request.config).toMatchObject({ featureValues: { plan_mode: true } });
+    expect(created[0]!.request.config).not.toHaveProperty("featureValues.service_tier");
+    expect(created[0]!.request.metadata).toEqual({ [HANDOFF_ACCOUNT_METADATA_KEY]: "codex-other" });
+
+    // Fast the user chose themselves goes with the work.
+    paseo.agents.ref = fastSource({});
+    await continueInNewAgent({ paseo, sourceAgentId: "sub", deferPrompt: true, bind: async () => {} });
+    expect(created[1]!.request.config).toMatchObject({ featureValues: { service_tier: "priority", plan_mode: true } });
+    expect(created[1]!.request).not.toHaveProperty("metadata");
   });
 });

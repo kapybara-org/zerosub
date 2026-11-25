@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { PluginHookContext } from "@getpaseo/plugin/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentTimelineItem, FamilyAdapter } from "./adapter";
+import { CODEX_FAST_METADATA_KEY, HANDOFF_ACCOUNT_METADATA_KEY } from "./codex-fast";
 import { CodexContinuations, fitInstructions, readUpdates } from "./continuations";
 import { Service } from "./service";
 import { StateStore, StoredAccountSchema, salvageState } from "./state";
@@ -130,6 +131,18 @@ async function setup() {
 }
 
 describe("Codex account continuations", () => {
+  it("starts a hand-off from ZeroSub's Fast at Standard and names its account for the create hook", async () => {
+    const t = await setup();
+    const root = t.agents.get("root")!;
+    Object.assign(root, {
+      features: [{ type: "select", id: "service_tier", value: "priority", label: "Speed" }],
+      metadata: { [CODEX_FAST_METADATA_KEY]: true },
+    });
+    await t.switchTo("root", "b");
+    expect(t.created[0]!.config).toEqual({ provider: "codex/synthetic-model", modeId: "full-access", thinkingOptionId: "high", featureValues: {} });
+    expect((t.created[0] as { metadata?: unknown }).metadata).toEqual({ [HANDOFF_ACCOUNT_METADATA_KEY]: "b" });
+  });
+
   it("reuses A/B/A/B tabs and sends current instructions and progress without recursive transcripts", async () => {
     const t = await setup();
     const b = await t.switchTo("root", "b");

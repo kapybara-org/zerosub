@@ -546,6 +546,15 @@ export type LoginView = z.infer<typeof LoginViewSchema>;
  */
 export const ACCOUNT_METADATA_KEY = "zerosub.account";
 
+/** Agent metadata marking a Fast speed ZeroSub set, so only that speed is undone again. */
+export const CODEX_FAST_METADATA_KEY = "zerosub.codex-fast";
+
+/**
+ * Metadata on a hand-off's create naming the account it's bound to, for ZeroSub's own `agent.create`
+ * hook (which has no agent ID to look the binding up by). The hook removes it again.
+ */
+export const HANDOFF_ACCOUNT_METADATA_KEY = "zerosub.handoff-account";
+
 /**
  * Agent metadata holding the agent's own ID. Paseo doesn't tell a composer item which agent's
  * composer it sits in, only that agent's metadata, so the daemon writes the ID there and the
