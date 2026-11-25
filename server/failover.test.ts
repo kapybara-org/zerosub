@@ -4197,7 +4197,7 @@ describe("aligning agents with their accounts", () => {
 
       await service.setQuotaCeiling(HELLO, "five_hour", 100);
       await service.setQuotaCeiling(HELLO, "seven_day", 100);
-      expect((await settings()).hooks.UserPromptSubmit).toEqual([userHook]);
+      expect((await settings()).hooks.UserPromptSubmit).toEqual([userHook, { hooks: [claudePromptQuotaHook] }]);
       expect(runHook()).toBe("");
       expect(redeemReset).not.toHaveBeenCalled();
     } finally {

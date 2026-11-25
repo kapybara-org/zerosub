@@ -734,10 +734,10 @@ export class Service {
     // sign-ins too) even when they're only used from a terminal, which ZeroSub never sees start.
     for (const account of (await this.store.read()).accounts) {
       if ((account.family === "claude" || account.family === "pi") && account.kind === "managed" && account.home && !this.moving.has(account.id)) {
-        await this.publishClaudePromptQuota(account);
         await this.adapters[account.family]
           .prepareHome(account.home, this.stillHas(account))
           .catch((error: unknown) => log(`could not refresh the home of ${account.label}`, error));
+        await this.publishClaudePromptQuota(account);
       }
     }
     await this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
@@ -1240,6 +1240,7 @@ export class Service {
       this.routedAt.set(account.id, Date.now());
       if (account.kind === "managed" && home && home === account.home && !this.moving.has(account.id)) {
         await adapter.prepareHome(home, this.stillHas(account)).catch((error: unknown) => log(`could not refresh the home of ${account.label}`, error));
+        await this.publishClaudePromptQuota(account);
       }
     };
 

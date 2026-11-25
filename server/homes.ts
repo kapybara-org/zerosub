@@ -214,7 +214,7 @@ export const claudePromptQuotaHook = {
   type: "command",
   timeout: 5,
   command: `quota_file="$CLAUDE_CONFIG_DIR/${CLAUDE_PROMPT_QUOTA_FILE}"
-[ -n "$CLAUDE_CONFIG_DIR" ] && [ -r "$quota_file" ] || exit 0
+[ -n "$CLAUDE_CONFIG_DIR" ] && [ -s "$quota_file" ] || exit 0
 now=$(date +%s) || exit 0
 while IFS= read -r expires && IFS= read -r response; do
   if [ "$expires" = 0 ] || [ "$expires" -gt "$now" ] 2>/dev/null; then
