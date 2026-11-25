@@ -188,7 +188,24 @@ describe("account pills", () => {
     ]);
     // Only the pill's own text is updated: a new menu would close the one open.
     expect(pill.registration.update).toHaveBeenCalledTimes(1);
-    expect(pill.registration.update).toHaveBeenLastCalledWith({ label: "5h 24", title: "Account: work\n5h 24%", icon: "CircleUserRound" });
+    expect(pill.registration.update).toHaveBeenLastCalledWith({ label: "5h 24", title: "Claude account: work\n5h 24%", icon: "CircleUserRound" });
+  });
+
+  it("names the provider first in the tooltip, so a Claude and a ChatGPT account of the same name don't look alike", async () => {
+    // One person signed in to both. The icon is the same for every provider: Paseo shares none of its own.
+    const accounts = [
+      account("claude-work", { label: "work", isDefault: true }),
+      account("claude-home", { label: "home" }),
+      account("codex-work", { family: "codex", label: "work", isDefault: true }),
+      account("codex-home", { family: "codex", label: "home" }),
+    ];
+    const claude = await harness(view(accounts));
+    const codex = await harness(view(accounts, {}, "codex"), "codex");
+    expect(claude.face()).toMatchObject({ label: "work", title: "Claude account: work", icon: "CircleUserRound" });
+    expect(codex.face()).toMatchObject({ label: "work", title: "ChatGPT account: work", icon: "CircleUserRound" });
+    // At its limit the account keeps the alert icon, and the tooltip still names the provider.
+    codex.publish(view(accounts.map((entry) => (entry.id === "codex-work" ? { ...entry, status: "limited" as const } : entry)), {}, "codex"));
+    expect(codex.face()).toMatchObject({ title: "ChatGPT account: work", icon: "CircleAlert" });
   });
 
   it("shows the windows that stop the whole account, not one model's full window", async () => {
@@ -235,12 +252,12 @@ describe("account pills", () => {
     // The pill has room for the usage only; its tooltip has the account, then one line per window of usage.
     expect(pill.face()).toMatchObject({
       label: "5h 4 · 7d 24",
-      title: "Account: work\n5h 4% · resets in 2h40m (18:00)\n7d 24% · resets in 1d17h (Fri 09:00)\nIP: 203.0.113.7 (US)",
+      title: "Claude account: work\n5h 4% · resets in 2h40m (18:00)\n7d 24% · resets in 1d17h (Fri 09:00)\nIP: 203.0.113.7 (US)",
     });
     // The countdowns keep up as time goes by.
     vi.setSystemTime(new Date(2026, 9, 28, 15, 21));
     pill.publish(view([work, home, busy, away]));
-    expect(pill.face().title).toMatch(/^Account: work\n5h 4% · resets in 2h39m \(18:00\)\n/);
+    expect(pill.face().title).toMatch(/^Claude account: work\n5h 4% · resets in 2h39m \(18:00\)\n/);
     expect(rows(pill.items())[0]).toEqual(["work", "5h 4% ↻2h39m · 7d 24% ↻1d17h"]);
     // Under a day, the weekly window counts hours and minutes too; the 5-hour one has started again.
     vi.setSystemTime(new Date(2026, 9, 29, 15, 34));
@@ -265,7 +282,7 @@ describe("account pills", () => {
     expect(pill.face()).toMatchObject({
       label: "work → home",
       // The address is the one of the account the agent still runs on.
-      title: "Account: work, moving to home when its current turn ends\nIP: 203.0.113.7 (US)",
+      title: "Claude account: work, moving to home when its current turn ends\nIP: 203.0.113.7 (US)",
     });
   });
 
@@ -276,14 +293,14 @@ describe("account pills", () => {
     vi.mocked(pill.store.rpc).mockReturnValue(new Promise((resolve) => (answer = resolve)) as never);
     const pressed = press(pill.items(), "account-1");
     expect(pill.store.rpc).toHaveBeenCalledWith(setAgentAccount, { agentId: AGENT, accountId: "home" });
-    expect(pill.face()).toMatchObject({ label: "work → home", title: "Moving to home…" });
+    expect(pill.face()).toMatchObject({ label: "work → home", title: "Claude account: moving to home…" });
     const moved = view([account("work", { isDefault: true }), account("home")]);
     moved.agents = [{ ...moved.agents[0]!, accountId: "home", pinned: true }];
     pill.publish(moved);
     answer({ continuedIn: null, reopened: [], pending: [], deferred: [], failed: [] });
     await pressed;
     await vi.advanceTimersByTimeAsync(0);
-    expect(pill.face()).toMatchObject({ label: "home", title: "Account: home" });
+    expect(pill.face()).toMatchObject({ label: "home", title: "Claude account: home" });
   });
 
   it("says why a move from the menu didn't happen now", async () => {
@@ -346,7 +363,7 @@ describe("account pills", () => {
     pill.publish(landed);
     expect(pill.registration.update).toHaveBeenCalledTimes(2);
     const patch = pill.registration.update.mock.calls.at(-1)?.[0] as Partial<PluginButton>;
-    expect(patch).toEqual({ label: "home", title: "Account: home", icon: "CircleUserRound" });
+    expect(patch).toEqual({ label: "home", title: "Claude account: home", icon: "CircleUserRound" });
     // The check mark has moved in the menu all the same.
     expect(pill.items().find((item) => item.id === "account-1")).toMatchObject({ icon: "CircleCheck", disabled: true });
   });
@@ -387,7 +404,7 @@ describe("account pills", () => {
     const pill = await harness(view([chatgpt, api, account("max")], {}, "codex"), "codex");
     expect(pill.items().map((item) => item.id)).toContain("fork-other");
     // Only Claude accounts say where their requests come from.
-    expect(pill.face().title).toBe("Account: chatgpt");
+    expect(pill.face().title).toBe("ChatGPT account: chatgpt");
   });
 
   it("offers to continue on the other provider when only an API account of this one is ready", async () => {

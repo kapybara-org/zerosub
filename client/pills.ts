@@ -1,5 +1,6 @@
 import type { PluginButton, PluginButtonRegistration, PluginClientContext } from "@getpaseo/plugin/client";
 import {
+  accountTitle,
   canStandIn,
   capsAccount,
   egressText,
@@ -286,18 +287,19 @@ function standingOf(state: StateView, agent: TrackedAgent, inComposer: boolean):
 /**
  * The pill's label, tooltip and icon. The pill is 160 points wide at most: room for the usage, not
  * the account too, and the usage only without its percent signs (`5h 17 · 7d 37`; with them the
- * second window is cut off). So the tooltip has both: the account first (on a phone Paseo heads the menu
- * with the tooltip's first line, and only that), then a line a window counting down as the menu
- * does, and the address Anthropic sees the agent's requests come from now, as Claude Code's status
- * line shows it. Paseo updates them in place as the store polls. While a move is under way, from
- * here (`moving`) or on the daemon, the pill names both accounts instead.
+ * second window is cut off). So the tooltip has both: the provider and the account first (`Claude
+ * account: work`; on a phone Paseo heads the menu with the tooltip's first line, and only that), then
+ * a line a window counting down as the menu does, and the address Anthropic sees the agent's requests
+ * come from now, as Claude Code's status line shows it. Paseo updates them in place as the store
+ * polls. While a move is under way, from here (`moving`) or on the daemon, the pill names both
+ * accounts instead. The icon is the same for every provider (see `accountTitle`).
  */
-function faceFor(state: StateView, { accounts, route, current }: Standing, moving: Move | null): Omit<PluginButton, "behavior"> {
+function faceFor(state: StateView, { family, accounts, route, current }: Standing, moving: Move | null): Omit<PluginButton, "behavior"> {
   const now = Date.now();
   const icon = current.status === "limited" ? "CircleAlert" : "CircleUserRound";
   const target = moving && (moving.accountId ?? accounts.find((account) => account.isDefault)?.id);
   if (moving && target !== current.id && !route?.pendingAccountId) {
-    return { label: `${shortLabel(current, 12)} → ${shortLabel(moving, 12)}`, title: `Moving to ${moving.label}…`, icon };
+    return { label: `${shortLabel(current, 12)} → ${shortLabel(moving, 12)}`, title: `${accountTitle(family)}: moving to ${moving.label}…`, icon };
   }
   return { label: pillLabel(state, current, route, now), title: pillTitle(state, current, route, now), icon };
 }
