@@ -64,15 +64,19 @@ export function scopeCoversModel(scope: string, model: string | null | undefined
   return wanted.every((token) => have.has(token));
 }
 
+export function quotaCeilingReached(account: StoredAccount, window: UsageWindow, now: number): boolean {
+  const ceiling = account.quotaCeilings?.[window.id];
+  return typeof ceiling === "number" && window.usedPercent >= ceiling &&
+    (!window.resetsAt || Date.parse(window.resetsAt) > now);
+}
+
 /** Omit model to check all windows, or pass null to check account-wide windows only. */
 export function quotaCeilingHit(account: StoredAccount, usage: Usage | null | undefined, now: number, model?: string | null): UsageWindow | undefined {
   if (!account.quotaCeilings) return undefined;
-  return usage?.windows.find((window) => {
-    const ceiling = account.quotaCeilings?.[window.id];
-    return (model === undefined || capsAccount(window) || scopeCoversModel(windowScope(window), model)) &&
-      typeof ceiling === "number" && window.usedPercent >= ceiling &&
-      (!window.resetsAt || Date.parse(window.resetsAt) > now);
-  });
+  return usage?.windows.find((window) =>
+    (model === undefined || capsAccount(window) || scopeCoversModel(windowScope(window), model)) &&
+    quotaCeilingReached(account, window, now),
+  );
 }
 
 /** The account is at a limit of its own, or at the limit of a model window that covers `model`. */
