@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -95,15 +95,43 @@ describe("prepareGrokHome", () => {
       const entry = await lstat(join(home, name)).catch(() => null);
       return Boolean(entry?.isSymbolicLink()) && (await readlink(join(home, name))) === join(main, name);
     };
-    for (const name of ["config.toml", "sessions", "skills", "agent_id", "worktrees.db"]) expect(await linked(name), name).toBe(true);
+    for (const name of ["sessions", "skills", "agent_id", "worktrees.db"]) expect(await linked(name), name).toBe(true);
     for (const name of [...own, "logs", "staged"]) expect(await lstat(join(home, name)).catch(() => null), name).toBeNull();
     // `sessions` is made in the CLI login's home, so a session written on any account is there for all.
     expect((await lstat(join(main, "sessions"))).isDirectory()).toBe(true);
   });
 
+  it.skipIf(process.platform !== "linux")("copies policy sources and upgrades old links without replacing account settings", async () => {
+    const main = join(root, "grok");
+    const home = join(root, "paseo", "zerosub", "homes", "grok-a");
+    process.env.GROK_HOME = main;
+    await mkdir(join(main, "hooks"), { recursive: true });
+    await mkdir(home, { recursive: true });
+    await writeFile(join(main, "hooks", "run"), "fixture", { mode: 0o700 });
+    await symlink(join(main, "hooks"), join(home, "hooks"));
+    for (const name of ["hooks-paths", "config.toml", "trusted_folders.toml", "sandbox.toml", "bundled", "bundles"]) {
+      await writeFile(join(main, name), name);
+    }
+    await writeFile(join(home, "config.toml"), "account settings");
+
+    await prepareGrokHome(home, true);
+
+    expect((await lstat(join(home, "hooks"))).isDirectory()).toBe(true);
+    expect((await lstat(join(home, "hooks", "run"))).mode & 0o100).toBe(0o100);
+    for (const name of ["hooks-paths", "trusted_folders.toml", "sandbox.toml", "bundled", "bundles"]) {
+      expect((await lstat(join(home, name))).isFile()).toBe(true);
+      expect(await readFile(join(home, name), "utf8")).toBe(name);
+    }
+    expect(await readFile(join(home, "config.toml"), "utf8")).toBe("account settings");
+    expect(await readFile(join(main, "config.toml"), "utf8")).toBe("config.toml");
+    await writeFile(join(main, "sandbox.toml"), "new native settings");
+    await prepareGrokHome(home, true);
+    expect(await readFile(join(home, "sandbox.toml"), "utf8")).toBe("sandbox.toml");
+  });
+
   it("keeps anything that looks like a login private, whatever Grok calls it later", () => {
     for (const name of ["auth-v2.json", "oauth_tokens.json", "client_secret", "leader.log", "x.pid", "a.tmp"]) expect(grokPrivate(name), name).toBe(true);
-    for (const name of ["config.toml", "sessions", "memory-v2", "skills", "plugins", "bin"]) expect(grokPrivate(name), name).toBe(false);
+    for (const name of ["sessions", "memory-v2", "skills", "plugins", "bin"]) expect(grokPrivate(name), name).toBe(false);
   });
 
   it("never lets the CLI login's own home be deleted as an account's", async () => {
@@ -257,6 +285,13 @@ describe("Grok sign-in", () => {
     const failed = new GrokLogin(await fakeGrok("echo 'Error: access denied' >&2; exit 1"), ["login", "--oauth"], process.env);
     expect(await failed.finished).toEqual({ ok: false, message: "Error: access denied" });
   });
+  it("shows the sandbox failure that caused Grok to refuse sign-in", async () => {
+    const cause = "error: sandbox profile resolve failed: hook source path contains a symlink component";
+    const command = await fakeGrok(`printf '%s\\n' '${cause}' 'error: this sandbox could not enforce its deny list on Linux' >&2; exit 1`);
+    const login = new GrokLogin(command, ["login", "--device-auth"], process.env);
+    expect(await login.finished).toEqual({ ok: false, message: cause });
+  });
+
 });
 
 // --------------------------------------------------------------------------- the service with Grok

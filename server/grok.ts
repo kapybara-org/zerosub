@@ -196,7 +196,8 @@ export class GrokLogin extends ProgressEmitter implements LoginHandle {
         if (this.canceled) return settle({ ok: false, message: "Sign-in was canceled." });
         if (code === 0) return settle({ ok: true, message: null });
         const lines = this.output.split("\n").map((line) => line.trim()).filter(Boolean);
-        settle({ ok: false, message: lines.reverse().find((line) => /error|fail|denied|expired/i.test(line)) ?? "Sign-in did not finish." });
+        const cause = lines.find((line) => /sandbox profile resolve failed:/i.test(line));
+        settle({ ok: false, message: cause ?? lines.reverse().find((line) => /error|fail|denied|expired/i.test(line)) ?? "Sign-in did not finish." });
       });
     });
     const read = (chunk: string) => {
