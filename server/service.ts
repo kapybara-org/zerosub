@@ -101,7 +101,7 @@ import { maskProxy, normalizeProxy } from "./proxy";
 import { Reopener, hostCanReload } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
-import { canStandIn, chooseAccount, fiveHourWindow, headroomScore, isLastResort, isLimited, isPaidStandIn, isLimitedFor, isUsable, mostAvailable, paceScore, paceView, PENDING_MS, quotaCeilingHit, scopeCoversModel, weeklyWindow, withBankedReset, type Pacing, type RouteDecision, type RouteInput } from "./routing";
+import { canStandIn, chooseAccount, fiveHourWindow, headroomScore, isLastResort, isLimited, isPaidStandIn, isLimitedFor, isUsable, keepsPastLimit, mostAvailable, paceScore, paceView, PENDING_MS, quotaCeilingHit, scopeCoversModel, weeklyWindow, withBankedReset, type Pacing, type RouteDecision, type RouteInput } from "./routing";
 import {
   ALL_SOURCES,
   MAIN_ACCOUNT_ID,
@@ -1718,9 +1718,25 @@ export class Service {
     }
 
     if (!this.prefs.autoSwitch) return;
-    if (problem.kind === "limit" && keptAtLimit((await this.store.read()).bindings[agentId], account.id)) {
+    if (problem.kind === "limit" && this.keptAtLimit(await this.store.read(), agentId, account.id)) {
       // Pinned there with `allowLimited`: its work belongs on this account, so it stops where it is.
+      // The row says so, so a caller sees the stop was intended (`allowLimited`), not a lack of room.
       console.log(`[ZeroSub] ${agentId} is kept on ${account.label} past its limit; not moving it`);
+      await this.appendRow(paseo, agentId, {
+        family,
+        from: account.label,
+        to: account.label,
+        reason: "limit",
+        resetsAt,
+        continued: false,
+        continuedIn: null,
+        toFamily: null,
+        toProvider: null,
+        outcome: "stayed",
+        allowLimited: true,
+        detail: `It's pinned to ${account.label} past its limit, so ZeroSub left it there. Pick another account from the account button to carry on elsewhere.`,
+        at: new Date(now).toISOString(),
+      });
       return;
     }
     if (elsewhere) {
@@ -2234,7 +2250,11 @@ export class Service {
     const now = Date.now();
     const model = this.agentModels.get(agentId);
     const routed = this.routeFor(state, agentId, family, exhausted, paid);
-    if (routed && routed.account.id !== exhausted && !routed.skipped && isUsable(routed.account, now, model, this.usage.get(routed.account.id))) return { account: routed.account, pin: false };
+    if (routed && routed.account.id !== exhausted && !routed.skipped) {
+      const usage = this.usage.get(routed.account.id);
+      // A pin with `allowLimited` holds at a limit too: pinning the agent elsewhere would undo it.
+      if (isUsable(routed.account, now, model, usage) || keepsPastLimit(routed.account, state.bindings[agentId], now, model, usage)) return { account: routed.account, pin: false };
+    }
     const roomiest = mostAvailable(state, family, (id) => this.usage.get(id), now, new Set([exhausted]), paid, this.pacing(now), model);
     return roomiest && { account: roomiest, pin: true };
   }
@@ -2275,7 +2295,7 @@ export class Service {
           families[agent.provider] === family &&
           this.runningOn(state, agent.id, family) === accountId &&
           !(reason === "pacing" && state.bindings[agent.id]?.source === "user") &&
-          !(reason === "limit" && keptAtLimit(state.bindings[agent.id], accountId)) &&
+          !(reason === "limit" && this.keptAtLimit(state, agent.id, accountId)) &&
           (!scope || scopeCoversModel(scope, this.agentModels.get(agent.id))),
       )
       .map((agent) => agent.id);
@@ -2304,6 +2324,8 @@ export class Service {
         if (this.runningOn(latest, agentId, family) !== accountId) continue;
         // The user may have picked its account since the pass listed it.
         if (reason === "pacing" && latest.bindings[agentId]?.source === "user") continue;
+        // Or pinned it there with `allowLimited` since.
+        if (reason === "limit" && this.keptAtLimit(latest, agentId, accountId)) continue;
         let move: { account: StoredAccount; pin: boolean } | undefined;
         if (reason === "pacing") {
           // Turning either preference off stops a pass that's already running.
@@ -3372,6 +3394,12 @@ export class Service {
     return label && row.outcome === "switched" ? { ...row, to: label } : row;
   }
 
+  /** The agent is pinned to `accountId` with `allowLimited`, and the account may keep it past a limit (see `keepsPastLimit`). */
+  private keptAtLimit(state: StoredState, agentId: string, accountId: string): boolean {
+    const account = findAccount(state, accountId);
+    return !!account && keepsPastLimit(account, state.bindings[agentId], Date.now(), this.agentModels.get(agentId), this.usage.get(account.id));
+  }
+
   private atQuotaCeiling(state: StoredState, accountId: string | undefined, now: number, model?: string | null): boolean {
     const account = findAccount(state, accountId);
     return !!account && !!quotaCeilingHit(account, this.usage.get(account.id), now, model);
@@ -3990,6 +4018,7 @@ export class Service {
         pendingAccountId: pending,
         waiting: !pending ? null : this.movesWhen(state, agent, family, pending, accountId, canReopen, now),
         movable: this.adapters[family].portable || !agent.hasHistory,
+        allowLimited: binding?.allowLimited === true && binding.accountId === accountId,
         // Named, or being named as its session opened: the list read here may be from before that.
         inComposer: agent.named === true || (agent.named === false && this.naming.has(agent.id) && !this.unnamed.has(agent.id)),
       });
@@ -4473,11 +4502,9 @@ export class Service {
   /**
    * Moves one agent to an account, or back to following the default. With automatic switching on,
    * an account at its limit is refused, since the agent would be moved straight off it. A failover
-   * under way finishes first; the agent then moves to the account picked here.
-   */
-  /**
-   * Pins an agent to an account, or (`null`) lets it follow the default again. With `allowLimited`, an
-   * account at its limit is taken too, and the agent stays on it while it's limited (see `Binding`).
+   * under way finishes first; the agent then moves to the account picked here. With `allowLimited`,
+   * an account at a provider limit is taken too, and the agent stays on it while it's limited (see
+   * `Binding`); a quota maximum still refuses it. Only agents that move in place take the flag.
    */
   async setAgentAccount(
     paseo: PaseoApi,
@@ -4499,14 +4526,18 @@ export class Service {
     if (!target || target.family !== family) throw new Error("That account can't be used with this agent.");
     if (!target.signedIn) throw new Error(`${target.label} is signed out. Sign it in first.`);
     if (accountId && target.disabled) throw new Error(`${target.label} is disabled. Enable it in Accounts first.`);
-    if (accountId && this.prefs.autoSwitch && !allowLimited) {
+    // A thread that can't move in place is handed off to a new agent instead, which a pin past the
+    // limit couldn't follow: refused rather than ignored.
+    if (allowLimited && !adapter.portable) throw new Error(`${FAMILY_LABEL[family]} agents can't be kept on an account past its limit.`);
+    if (accountId && this.prefs.autoSwitch) {
       const now = Date.now();
-      if (isLimited(target, now)) throw new Error(limitedPick(target.label));
+      if (!allowLimited && isLimited(target, now)) throw new Error(limitedPick(target.label));
       // Only a limit of this agent's own model refuses it; another model's leaves the account open.
       const model = await this.modelOf(paseo, agentId);
+      // A quota maximum is the user's own ceiling, so `allowLimited` doesn't lift it.
       if (this.atQuotaCeiling(state, target.id, now, model)) throw new Error(`${target.label} reached its quota maximum. Raise it in Accounts or pick another account.`);
       const scope = Object.entries(target.modelLimits).find(([name, limit]) => Date.parse(limit.until) > now && scopeCoversModel(name, model))?.[0];
-      if (scope) throw new Error(limitedModelPick(target.label, scope));
+      if (scope && !allowLimited) throw new Error(limitedModelPick(target.label, scope));
     }
 
     if (!adapter.portable) {
@@ -6181,11 +6212,6 @@ function preferSubscriptionLogin(state: StoredState, account: StoredAccount, pee
 }
 
 /** Returns true when the CLI login's account was replaced by a different one, which drops what the slot knew of the old one's limit. */
-/** The agent is pinned to `accountId` with `allowLimited`, so a limit there doesn't move it. */
-function keptAtLimit(binding: Binding | undefined, accountId: string): boolean {
-  return binding?.allowLimited === true && binding.accountId === accountId;
-}
-
 function applyIdentity(account: StoredAccount, identity: Identity, state: StoredState): boolean {
   const handedOver = account.kind === "main" && identity.signedIn && !!account.identity && !!identity.identity && !sameAccountIdentity(account.family, account, identity);
   applyIdentityFields(account, identity, state);

@@ -144,6 +144,20 @@ describe("chooseAccount", () => {
     }
   });
 
+  it("doesn't let allowLimited lift a quota maximum", () => {
+    // 81% used under an 80% maximum: at the ceiling the user set, with no provider limit.
+    const capped = account({ id: "claude-work", quotaCeilings: { five_hour: 80 } });
+    const bindings = { "agent-1": { accountId: "claude-work", source: "user" as const, at: "x", allowLimited: true as const } };
+    const usageOf = (id: string) => (id === "claude-work" ? usage(81) : usage(10));
+    const decision = chooseAccount(stateWith([main, capped, personal], { bindings }), { ...base, reason: "resume", usageOf });
+    expect(decision?.account.id).not.toBe("claude-work");
+    expect(decision?.skipped).toMatchObject({ why: "limited" });
+    // Under the maximum, the pin holds at a provider limit.
+    const limitedUnder = { ...capped, limitedUntil: "2026-09-23T14:00:00Z" };
+    const under = chooseAccount(stateWith([main, limitedUnder, personal], { bindings }), { ...base, reason: "resume", usageOf: () => usage(70) });
+    expect(under?.account.id).toBe("claude-work");
+  });
+
   it("skips an exhausted account for the roomiest usable one", () => {
     const limited = account({ id: "claude-work", limitedUntil: "2026-09-23T14:00:00Z" });
     const state = stateWith([main, limited, personal], { defaults: { claude: "claude-work", codex: null, pi: null } });

@@ -53,6 +53,11 @@ export const SwitchRowSchema = z.object({
    * handoff, so a client that does not know the field still parses the row.
    */
   sameConversation: z.boolean().optional(),
+  /**
+   * On a `stayed` row for a `limit`: the agent is pinned to `from` with `allowLimited`, so ZeroSub
+   * left it there on purpose. Absent otherwise, and on rows from older servers.
+   */
+  allowLimited: z.literal(true).optional(),
   detail: z.string().nullable().default(null),
   at: z.string(),
 });

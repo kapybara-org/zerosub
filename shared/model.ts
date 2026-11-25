@@ -490,6 +490,11 @@ export const AgentRouteSchema = z.object({
    * continues the work in a new agent instead.
    */
   movable: z.boolean(),
+  /**
+   * The agent is pinned to `accountId` with `allowLimited` (see `zerosub.agents.account`), so a
+   * provider limit there doesn't move it. Absent from servers that don't support the option.
+   */
+  allowLimited: z.boolean().optional(),
   /** The agent started on this account because its weekly reset was near, and is still on it. */
   selectionReason: z.literal("weekly_reset").optional(),
   /**
