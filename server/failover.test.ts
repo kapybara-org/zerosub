@@ -4139,6 +4139,41 @@ describe("aligning agents with their accounts", () => {
     expect(notes[0]).toMatchObject({ from: "marketing", to: "hello", reason: "limit", outcome: "switched" });
   });
 
+  it("blocks prompts at the active account's quota maximum without spending a reset", async () => {
+    const redeemReset = vi.fn<FamilyAdapter["redeemReset"]>(async () => ({ outcome: "reset", message: "reset", left: 0 }));
+    const resetsAt = inFuture();
+    const { service, store, paseo, reopened } = await setUp(onMarketing(), hit, {
+      claude: { redeemReset },
+      usage: () => ({
+        fetchedAt: new Date().toISOString(),
+        windows: [
+          { id: "five_hour", label: "5-hour", usedPercent: 80, resetsAt },
+          { id: "weekly_fable", label: "Weekly · Fable", usedPercent: 90, resetsAt },
+        ],
+        error: null, cached: false, resets: null,
+      }),
+    });
+    service.setPreferences(preferences.schema.parse({ autoSwitch: false, autoRedeem: true }));
+    const setMaximums = (fiveHour: number) => store.update((draft) => {
+      draft.accounts.find((entry) => entry.id === MAIN)!.quotaCeilings = { five_hour: fiveHour, weekly_fable: 85 };
+    });
+    await setMaximums(80);
+    await service.refreshUsage(MAIN, true);
+    const send = (model: string) => service.checkPromptQuota({ agentId: AGENT, provider: "claude", model }, { paseo } as never);
+    await expect(send("claude-sonnet")).rejects.toThrow("5-hour (80%)");
+    await setMaximums(81);
+    await expect(send("claude-sonnet")).resolves.toBeUndefined();
+    await expect(send("claude-fable-5-2")).rejects.toThrow("Weekly · Fable (85%)");
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.parse(resetsAt) });
+    try {
+      await expect(send("claude-fable-5-2")).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(redeemReset).not.toHaveBeenCalled();
+    expect(reopened).toEqual([]);
+  });
+
   it("queues a quota-cap switch as soon as usage arrives and moves the agent after its turn", async () => {
     const redeemReset = vi.fn<FamilyAdapter["redeemReset"]>(async () => ({ outcome: "reset", message: "reset", left: 0 }));
     const { service, store, reopened, paseo, agent } = await setUp(onMarketing(), hit, {

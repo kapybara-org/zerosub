@@ -487,6 +487,7 @@ export class Service {
   private paseo: PaseoApi | null = null;
   private prefs: Preferences = DEFAULT_PREFERENCES;
   private readonly usage = new Map<string, Usage>();
+  private loadingReadings?: Promise<void>;
   /** Agents whose metadata was asked to hold their ID, so each is asked once. */
   private readonly naming = new Set<string>();
   /** Those for which that failed: their composer can't show the Account control. */
@@ -650,7 +651,10 @@ export class Service {
     if (this.started) return Promise.resolve();
     this.starting ??= (async () => {
       // The last readings show right away; fresh ones replace them as they arrive.
-      for (const [accountId, reading] of await loadReadings()) if (!this.usage.has(accountId)) this.usage.set(accountId, reading);
+      this.loadingReadings = loadReadings().then((readings) => {
+        for (const [accountId, reading] of readings) if (!this.usage.has(accountId)) this.usage.set(accountId, reading);
+      });
+      await this.loadingReadings;
       await Promise.all(FAMILIES.map((family) => this.ensureFamily(family)));
       this.started = true;
       await this.reportStrayHomes().catch(() => undefined);
@@ -1304,6 +1308,23 @@ export class Service {
     const at = Math.max(Date.now(), (this.turnAt.get(agentId) ?? 0) + 1);
     this.turnAt.set(agentId, at);
     return at;
+  }
+
+  async checkPromptQuota(
+    request: { agentId: string; provider: string; model: string | null },
+    context: PluginHookContext,
+  ): Promise<void> {
+    const family = (await this.families.resolve(context.paseo))[request.provider];
+    if (!family) return;
+    const state = await this.store.read();
+    const account = findAccount(state, this.runningOn(state, request.agentId, family));
+    if (!account?.quotaCeilings) return;
+    await this.loadingReadings;
+    const model = request.model ?? this.agentModels.get(request.agentId) ?? null;
+    const ceiling = quotaCeilingHit(account, this.usage.get(account.id), Date.now(), model);
+    if (ceiling) {
+      throw new Error(`${account.label} is at its ZeroSub maximum for ${ceiling.label} (${account.quotaCeilings[ceiling.id]}%). Wait for the window to reset, choose another account, or raise the maximum in Accounts.`);
+    }
   }
 
   /** A turn uses the account from its first token, so a long one keeps its usage fresh too. */

@@ -1,4 +1,4 @@
-import type { PluginServerContext, PluginSettingsState } from "@getpaseo/plugin/server";
+import type { PluginHookContext, PluginServerContext, PluginSettingsState } from "@getpaseo/plugin/server";
 import { AntigravityAdapter } from "./server/antigravity";
 import { ClaudeAdapter } from "./server/claude";
 import { CodexAdapter } from "./server/codex";
@@ -82,6 +82,19 @@ export default function contribute(server: PluginServerContext) {
       return undefined;
     }
   });
+
+  // Older daemons do not expose pre-send admission. Keep routing available on those hosts.
+  const promptHooks = server as PluginServerContext & {
+    addHook?: (
+      name: "agent.prompt.before",
+      handler: (input: { request: Parameters<Service["checkPromptQuota"]>[0] }, context: PluginHookContext) => Promise<void>,
+    ) => () => void;
+  };
+  try {
+    promptHooks.addHook?.("agent.prompt.before", ({ request }, context) => service.checkPromptQuota(request, context));
+  } catch (error) {
+    if (!(error instanceof Error) || error.message !== "Unknown lifecycle hook: agent.prompt.before") throw error;
+  }
 
   server.on("agent.turn_started", (event, context) => {
     void service.onTurnStarted(event.agent, context).catch(() => undefined);
