@@ -207,6 +207,23 @@ export const ACCOUNT_SETTINGS = "settings.account.json";
  */
 const GENERATED_SETTINGS = ".settings.generated.json";
 
+export const CLAUDE_PROMPT_QUOTA_FILE = ".zerosub-prompt-quota";
+
+// Read only the local decision. The hook never reads the prompt or calls a provider.
+export const claudePromptQuotaHook = {
+  type: "command",
+  timeout: 5,
+  command: `quota_file="$CLAUDE_CONFIG_DIR/${CLAUDE_PROMPT_QUOTA_FILE}"
+[ -n "$CLAUDE_CONFIG_DIR" ] && [ -s "$quota_file" ] || exit 0
+now=$(date +%s) || exit 0
+while IFS= read -r expires && IFS= read -r response; do
+  if [ "$expires" = 0 ] || [ "$expires" -gt "$now" ] 2>/dev/null; then
+    printf '%s\\n' "$response"
+    exit 0
+  fi
+done < "$quota_file"`,
+};
+
 /**
  * Per-account entries, from Claude Code's own split between configuration and state: credentials,
  * the global config (it holds `oauthAccount`), account caches, org policy, telemetry and locks.
@@ -219,6 +236,7 @@ const CLAUDE_PRIVATE = new Set([
   "settings.json",
   ACCOUNT_SETTINGS,
   GENERATED_SETTINGS,
+  CLAUDE_PROMPT_QUOTA_FILE,
   ".config.json",
   ".oauth_refresh.lock",
   ".storage-write",
@@ -373,9 +391,18 @@ async function readPiOwnObject(path: string, comments = false): Promise<Record<s
 }
 
 async function writeJsonAtomically(path: string, value: unknown): Promise<void> {
+  await writeTextAtomically(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+async function writeTextAtomically(path: string, text: string): Promise<void> {
   const temporary = `${path}.zerosub.${randomBytes(4).toString("hex")}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  await rename(temporary, path);
+  try {
+    await writeFile(temporary, text, { mode: 0o600, flag: "wx" });
+    await rename(temporary, path);
+  } catch (error) {
+    await rm(temporary, { force: true });
+    throw error;
+  }
 }
 
 /**
@@ -559,6 +586,15 @@ async function syncClaudeSettings(home: string): Promise<void> {
   // one whose bedrock.json can't be read keeps its last ones, as for overrides that don't parse.
   const bedrock = isBedrockHome(home) ? await readBedrockAccount(home) : null;
   const generatedSettings = accountSettings(main, account, inherited);
+  if (await exists(join(home, CLAUDE_PROMPT_QUOTA_FILE))) {
+    const hooks = generatedSettings.hooks;
+    if (hooks === undefined || isObject(hooks)) {
+      const submit = hooks?.UserPromptSubmit;
+      if (submit === undefined || Array.isArray(submit)) {
+        generatedSettings.hooks = { ...hooks, UserPromptSubmit: [...(submit ?? []), { hooks: [claudePromptQuotaHook] }] };
+      }
+    }
+  }
   const next = `${JSON.stringify(bedrock ? bedrockSettings(generatedSettings, bedrock) : generatedSettings, null, 2)}\n`;
   const generated = join(home, GENERATED_SETTINGS);
   if (current?.isFile() && (await readFile(target, "utf8").catch(() => null)) === next) {
@@ -936,6 +972,24 @@ export function prepareClaudeHome(home: string, force = false, wanted?: () => Pr
     await syncClaudeGlobalConfig(home);
     await syncClaudeSettings(home);
     lastSync.set(home, Date.now());
+  });
+}
+
+/** A null decision removes the guard. Undefined means this home no longer belongs to the caller. */
+export function syncClaudePromptQuota(home: string, decision: () => Promise<string | null | undefined>): Promise<void> {
+  return withHome(home, async () => {
+    const next = await decision();
+    if (next === undefined) return;
+    const path = join(home, CLAUDE_PROMPT_QUOTA_FILE);
+    const previous = await readFile(path, "utf8").catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (previous === next) return;
+    if (next === null) await rm(path, { force: true });
+    else if (await exists(home)) await writeTextAtomically(path, next);
+    else return;
+    if (previous === null || next === null) await syncClaudeSettings(home);
   });
 }
 

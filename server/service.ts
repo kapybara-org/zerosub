@@ -90,7 +90,8 @@ import { codexHandoffMode, encryptedResumeFailure, sameWorkspace, turnFailedText
 import { CodexContinuations, MESSAGE_PREFIX, UnresolvableEpochError, fitInstructions, matchesTransfer, readUpdates, ready, sentDigestOf, snapshot, transferMarker, waitForCreated, waitForSource, type Agent } from "./continuations";
 import { CONTINUED_FROM_LABEL, PARENT_LABEL, buildTranscript, continueInNewAgent, continuationPrompt, promptInstruction, updatePrompt, type Continuation } from "./handoff";
 import { launcherDir, launcherNames, piLauncherDir, writeLaunchers, type LauncherAccount, type LauncherKind } from "./launchers";
-import { PI_ACCOUNT_FILE, codexSessionsShared, prepareClaudeHome, crossesInheritedProxy, isAccountHome, moveHome, normalizeBaseUrl, plainHttp, readPiAccount, readPiAccountForAgents, removeHome, sentInTheClear } from "./homes";
+import { claudePromptQuota } from "./claude-prompt-quota";
+import { PI_ACCOUNT_FILE, codexSessionsShared, prepareClaudeHome, crossesInheritedProxy, isAccountHome, moveHome, normalizeBaseUrl, plainHttp, readPiAccount, readPiAccountForAgents, removeHome, sentInTheClear, syncClaudePromptQuota } from "./homes";
 import { Mutex } from "./json-file";
 import { detectAzureLimit, detectAzureSignOut, detectBedrockAutoModeRefusal, detectBedrockLimit, detectBedrockModelUnavailable, detectBedrockRefusal, turnRows } from "./limits";
 import { canSignInWithBrowser } from "./machine";
@@ -736,6 +737,7 @@ export class Service {
         await this.adapters[account.family]
           .prepareHome(account.home, this.stillHas(account))
           .catch((error: unknown) => log(`could not refresh the home of ${account.label}`, error));
+        await this.publishClaudePromptQuota(account);
       }
     }
     await this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
@@ -777,6 +779,7 @@ export class Service {
   private forgetReading(accountId: string): void {
     console.log(`[ZeroSub] the CLI login for ${accountId} changed hands; dropping its old usage and limit`);
     this.setUsage(accountId, null);
+    void this.store.read().then((state) => this.publishClaudePromptQuota(findAccount(state, accountId))).catch((error: unknown) => log("could not clear the previous login's prompt quota", error));
     this.usageLive.delete(accountId);
     this.usageRetryAt.delete(accountId);
     this.usageAttemptAt.delete(accountId);
@@ -1237,6 +1240,7 @@ export class Service {
       this.routedAt.set(account.id, Date.now());
       if (account.kind === "managed" && home && home === account.home && !this.moving.has(account.id)) {
         await adapter.prepareHome(home, this.stillHas(account)).catch((error: unknown) => log(`could not refresh the home of ${account.label}`, error));
+        await this.publishClaudePromptQuota(account);
       }
     };
 
@@ -1702,7 +1706,10 @@ export class Service {
         if (hit.kind === "window") {
           // The notice is the freshest word on usage: show that window full until a new reading lands.
           const shown = this.usage.get(account.id);
-          if (shown) this.setUsage(account.id, showLimit(shown, hit.resetsAt));
+          if (shown) {
+            this.setUsage(account.id, showLimit(shown, hit.resetsAt));
+            await this.publishClaudePromptQuota(account);
+          }
           // The account was just used, so its token is fresh: ask for the exact reset time.
           await withTimeout(this.refreshUsage(account.id, true), 12_000);
           const exact = this.resetFromUsage(account.id);
@@ -3830,6 +3837,7 @@ export class Service {
       else this.usageRetryAt.delete(accountId);
       const usage: Usage = { ...read, credits: read.credits ?? null };
       this.setUsage(accountId, mergeUsage(this.usage.get(accountId), usage));
+      await this.publishClaudePromptQuota(account);
       // Only a live reading may change an account's limit state.
       if (usage.windows.length === 0 || usage.error || usage.cached) {
         this.usageLive.delete(accountId);
@@ -3924,6 +3932,16 @@ export class Service {
     if (account.disabled || now - (this.renewAttemptAt.get(account.id) ?? 0) < RENEW_LOGIN_MS) return false;
     const windowLimited = account.limitKind === "window" && isLimited(account, now);
     return pastReset(this.usage.get(account.id), now) || (windowLimited && !this.usageLive.has(account.id));
+  }
+
+  private async publishClaudePromptQuota(account: StoredAccount | undefined): Promise<void> {
+    if (account?.family !== "claude" || account.kind !== "managed" || account.auth === "api" || !account.home) return;
+    const home = account.home;
+    await syncClaudePromptQuota(home, async () => {
+      const current = findAccount(await this.store.read(), account.id);
+      if (current?.home !== home) return undefined;
+      return claudePromptQuota(current, this.usage.get(current.id), Date.now());
+    }).catch((error: unknown) => log(`could not update the prompt quota for ${account.label}`, error));
   }
 
   /** Records a reading and saves the readings shortly after, so a restart shows them straight away. */
@@ -4562,7 +4580,7 @@ export class Service {
     if (!this.usage.get(accountId)?.windows.some((window) => window.id === windowId)) {
       throw new Error("That usage window is no longer available.");
     }
-    await this.store.update((draft) => {
+    const state = await this.store.update((draft) => {
       const account = findAccount(draft, accountId);
       if (!account) throw new Error("That account no longer exists.");
       if (account.family === "antigravity") throw new Error("Antigravity usage is display-only.");
@@ -4571,6 +4589,7 @@ export class Service {
       else ceilings[windowId] = percent;
       account.quotaCeilings = ceilings;
     });
+    await this.publishClaudePromptQuota(findAccount(state, accountId));
     if (this.paseo) void this.alignSessions(this.paseo).catch((error: unknown) => log("aligning agents failed", error));
   }
 
@@ -4649,6 +4668,12 @@ export class Service {
       if (login.accountId === accountId && !login.finishedAt) await this.cancelLogin(login.id);
     }
     this.setUsage(accountId, null);
+    if (account.family === "claude" && account.home) {
+      const home = account.home;
+      await syncClaudePromptQuota(home, async () =>
+        (await this.store.read()).accounts.some((entry) => entry.home === home) ? undefined : null,
+      ).catch((error: unknown) => log(`could not clear the prompt quota for ${account.label}`, error));
+    }
     this.egress.delete(accountId);
     if (isLastResort(account)) await this.apiUsage.forget(accountId).catch((error: unknown) => log(`could not forget ${account.label}'s token counts`, error));
     if (account.home && kept) {

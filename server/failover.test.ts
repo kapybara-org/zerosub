@@ -1,10 +1,12 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentTimelineItem, FamilyAdapter, Identity, LimitHit, UsageRead } from "./adapter";
 import type { FamilyResolver } from "./families";
+import { CLAUDE_PROMPT_QUOTA_FILE, claudePromptQuotaHook, prepareClaudeHome } from "./homes";
 import { detectClaudeLimit } from "./limits";
 import type { Reopener } from "./reopen";
 import type { SwitchGuard } from "./switch-guard";
@@ -4138,6 +4140,70 @@ describe("aligning agents with their accounts", () => {
     expect(state.sessions[AGENT]?.accountId).toBe(HELLO);
     expect(state.bindings[AGENT]).toMatchObject({ accountId: HELLO, source: "auto" });
     expect(notes[0]).toMatchObject({ from: "marketing", to: "hello", reason: "limit", outcome: "switched" });
+  });
+
+  it.runIf(process.platform !== "win32")("blocks prompts on a managed Claude account using its latest quota reading", async () => {
+    const home = join(root, "managed account");
+    const main = join(root, "main");
+    const previousConfig = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = main;
+    try {
+      await mkdir(main);
+      const userHook = { hooks: [{ type: "command", command: "true" }] };
+      await writeFile(join(main, "settings.json"), JSON.stringify({ hooks: { UserPromptSubmit: [userHook] } }));
+      await prepareClaudeHome(home);
+      let fiveHourUsage = 79;
+      const redeemReset = vi.fn<FamilyAdapter["redeemReset"]>(async () => ({ outcome: "reset", message: "reset", left: 0 }));
+      const { service } = await setUp({
+        ...onMarketing(),
+        accounts: [{ ...account(HELLO, "hello", "managed"), home }] as never,
+      }, hit, {
+        claude: { redeemReset },
+        usage: () => ({
+          fetchedAt: new Date().toISOString(),
+          windows: [
+            { id: "five_hour", label: "5-hour", usedPercent: fiveHourUsage, resetsAt: inFuture() },
+            { id: "seven_day", label: "Weekly", usedPercent: 85, resetsAt: inFuture() },
+            { id: "weekly_fable", label: "Weekly · Fable", usedPercent: 99, resetsAt: inFuture() },
+          ],
+          error: null, cached: false, resets: null,
+        }),
+      });
+      service.setPreferences(preferences.schema.parse({ autoSwitch: false, autoRedeem: true }));
+      await service.refreshUsage(HELLO, true);
+      await service.setQuotaCeiling(HELLO, "weekly_fable", 80);
+      await service.setQuotaCeiling(HELLO, "five_hour", 80);
+      const settings = () => readFile(join(home, "settings.json"), "utf8").then((value) => JSON.parse(value));
+      const runHook = () => {
+        const result = spawnSync("bash", ["-c", claudePromptQuotaHook.command], {
+          encoding: "utf8",
+          env: { ...process.env, CLAUDE_CONFIG_DIR: home },
+        });
+        expect(result.status).toBe(0);
+        return result.stdout;
+      };
+      expect((await settings()).hooks.UserPromptSubmit).toEqual([userHook, { hooks: [claudePromptQuotaHook] }]);
+      expect(runHook()).toBe("");
+
+      fiveHourUsage = 80;
+      await service.refreshUsage(HELLO, true);
+      await service.setQuotaCeiling(HELLO, "seven_day", 85);
+      expect(JSON.parse(runHook())).toMatchObject({ decision: "block", reason: expect.stringContaining("5-hour (80%)") });
+      const quotaFile = join(home, CLAUDE_PROMPT_QUOTA_FILE);
+      const lines = (await readFile(quotaFile, "utf8")).split("\n");
+      lines[0] = "1";
+      await writeFile(quotaFile, lines.join("\n"));
+      expect(JSON.parse(runHook())).toMatchObject({ decision: "block", reason: expect.stringContaining("Weekly (85%)") });
+
+      await service.setQuotaCeiling(HELLO, "five_hour", 100);
+      await service.setQuotaCeiling(HELLO, "seven_day", 100);
+      expect((await settings()).hooks.UserPromptSubmit).toEqual([userHook, { hooks: [claudePromptQuotaHook] }]);
+      expect(runHook()).toBe("");
+      expect(redeemReset).not.toHaveBeenCalled();
+    } finally {
+      if (previousConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = previousConfig;
+    }
   });
 
   it("queues a quota-cap switch as soon as usage arrives and moves the agent after its turn", async () => {
