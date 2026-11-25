@@ -52,6 +52,7 @@ function commandCenter(accounts: AccountView[]) {
     addSlashCommand: () => () => undefined,
   };
   const state: StateView = {
+    version: 1,
     accounts,
     agents: [],
     logins: [],

@@ -88,6 +88,7 @@ const used = (usedPercent: number): AccountView["usage"] => ({
 
 function view(accounts: AccountView[], fields: Partial<StateView> = {}): StateView {
   return {
+    version: 1,
     accounts,
     agents: [],
     logins: [],

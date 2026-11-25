@@ -6,6 +6,7 @@ import { VISIBLE_POLL_MS, createZeroSubStore, describe as describeError, type St
 
 function view(overrides: Partial<StateView> = {}): StateView {
   return {
+    version: 1,
     accounts: [],
     agents: [],
     logins: [],

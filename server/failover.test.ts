@@ -13,7 +13,8 @@ import { MAIN_ACCOUNT_ID, StateStore, type OpenCodeFork, type StoredAccount, typ
 import { buildTranscript, continuationPrompt } from "./handoff";
 import { paceScore } from "./routing";
 import { saveReadings } from "./usage";
-import type { Usage } from "../shared/model";
+import { StateViewSchema, type Usage } from "../shared/model";
+import { getState } from "../shared/rpc";
 import { preferences } from "../shared/preferences";
 import { absentPi } from "./fakes.test-support";
 
@@ -5905,5 +5906,26 @@ describe("a sign-out read while the token is being renewed", () => {
     expect(state.accounts.find((a) => a.id === HELLO)?.signedIn).toBe(false);
     expect(state.sessions[AGENT]?.accountId).toBe(MAIN);
     expect(reopened).toEqual([AGENT]);
+  });
+});
+
+describe("the state contract", () => {
+  const oneAccount = () => ({ accounts: [account(MAIN, "marketing", "main")] as never, defaults: { claude: MAIN, codex: null, pi: null }, sessions: {} });
+
+  it("serves the read-only state RPC at version 1", async () => {
+    expect(getState.name).toBe("zerosub.state");
+    expect(getState.output).toBe(StateViewSchema);
+    const { service, paseo } = await setUp(oneAccount(), () => null as never);
+    const view = await service.view(paseo as never);
+    expect(view.version).toBe(1);
+    expect(StateViewSchema.safeParse(view).success).toBe(true);
+  });
+
+  it("defaults an unversioned response to version 1 and rejects other versions", async () => {
+    const { service, paseo } = await setUp(oneAccount(), () => null as never);
+    const view = await service.view(paseo as never);
+    const { version: _dropped, ...unversioned } = view;
+    expect(StateViewSchema.parse(unversioned).version).toBe(1);
+    expect(StateViewSchema.safeParse({ ...view, version: 2 }).success).toBe(false);
   });
 });

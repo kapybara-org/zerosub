@@ -4093,6 +4093,7 @@ export class Service {
     });
 
     return {
+      version: 1 as const,
       accounts,
       agents: routes,
       logins: [...this.logins.values()].map((login) => login.view),
