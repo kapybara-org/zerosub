@@ -362,6 +362,8 @@ ZeroSub reads whether each account is signed in every 30 minutes, and again when
 
 Another plugin or script can pin an agent with `zerosub.agents.account`, as the account button does, and with `allowLimited: true` keep it on an account past that account's limit (see [Plugin contracts](#the-zerosubagentsaccount-rpc)).
 
+A plugin that stops a session at its own threshold below 100% (95% of the week, say) sees a limit coming before ZeroSub does. It can ask `zerosub.agents.move_before_limit` to move that one agent to an account it names, rather than keep the session stopped while another account has room (see [Plugin contracts](#the-zerosubagentsmove_before_limit-rpc)).
+
 Sessions ZeroSub didn't route run on your CLI login, and it counts them that way: one whose routing failed or took longer than 15 seconds, one opened while ZeroSub was off, and one of a CLI ZeroSub found unavailable where the daemon runs (Cursor on macOS or Windows, with a registry from Linux). The account button then shows the move still to come, which happens when the session next starts, or from the 30-second check once the CLI login can't work. A ChatGPT thread that has history goes back to the account it's pinned to, which holds it; one with no history yet (a new thread, or a hand-off's first open) is pinned to your CLI login instead, where its history is then written. A move ZeroSub started whose reload opened this way counts as not landed. To tell these sessions apart, ZeroSub forgets where an agent ran when the agent closes (Paseo 0.11 and later), and on startup for agents that closed while it was off. An agent that closed and opened again while ZeroSub was off still shows its earlier account until its session next opens.
 
 Paseo stops waiting for a plugin after 30 seconds. Buttons that move agents, use a reset or refresh usage answer within about 20 seconds and leave the rest running: each agent's timeline says when it has switched, and the account's card shows the refilled limits once a reset is done.
@@ -471,6 +473,54 @@ To confirm the pin before sending the agent work, read `zerosub.state`: the agen
 
 A pin made with this call is a user pick (`pinned: true` in `zerosub.state`). To hand the agent back to the default account and automatic routing, call this RPC again with `accountId: null`.
 
+### The `zerosub.agents.move_before_limit` RPC
+
+Call `zerosub.agents.move_before_limit` on the `zerosub` plugin to move one agent, between turns, to an account you name before its own account reaches its limit. It's for a plugin that stops a session at its own threshold below 100%, where ZeroSub sees no limit yet. The move is ZeroSub's own, as after a limit: the agent isn't pinned to the account (its binding is automatic), and the same guards apply.
+
+```json
+{ "agentId": "agent-1", "accountId": "claude-seat", "stopBackgroundWork": false }
+```
+
+```json
+{ "outcome": "moved", "reason": null, "retryable": false, "accountId": "claude-seat", "detail": null, "waitingFor": null, "backgroundWork": [], "stopped": [] }
+```
+
+```json
+{ "outcome": "waiting", "reason": "background_work", "retryable": true, "accountId": "claude-main", "detail": "…", "waitingFor": "background", "backgroundWork": [{ "kind": "shell", "description": "Run the test suite", "command": "npm test" }], "stopped": [] }
+```
+
+| `outcome` | Meaning |
+| --- | --- |
+| `moved` | The agent's live session runs on the account now. |
+| `already` | It ran there already. Nothing changed. |
+| `waiting` | A turn (`waitingFor: "turn"`) or background work (`"background"`, listed in `backgroundWork`) is running. Nothing changed and nothing is queued. Ask again once it ends, or with `stopBackgroundWork: true` for background work. |
+| `pending` | The reload outlasted the answer (about 20 seconds) and goes on. Read the result from `zerosub.state` or the timeline row. |
+| `refused` | Not moved. `reason` says why. |
+
+`reason` is set for `waiting` and `refused`, and is `null` otherwise. `retryable: true` means asking again as is can work later. Treat an unknown `reason` as a refusal that isn't worth retrying. Keep `detail` for display.
+
+| `reason` | Retryable | Meaning |
+| --- | --- | --- |
+| `busy_turn` | yes | A turn is running. |
+| `background_work` | yes | Background work is running. |
+| `switch_guard` | yes | It changed accounts 4 times in 10 minutes. |
+| `in_progress` | yes | Another move of this agent is under way. |
+| `reload_failed` | yes | The reload failed. The agent stays where it was, and its binding is put back. |
+| `auto_switch_off` | no | Automatic switching is off in ZeroSub. |
+| `not_open` | no | The agent is closed, archived or gone. |
+| `unsupported_provider` | no | Its conversation can't move in place: Codex, Grok, Cursor and Antigravity agents, even one whose `zerosub.state` row says `movable` because it has no history yet. Only Claude and Pi agents move. |
+| `ineligible_target` | no | The account is missing, of another provider, an API key or paid stand-in (with or without paid API fallback), signed out, disabled, at its limit or at a quota maximum. Also returned when the account reached its limit while the agent reloaded, so routing kept the agent where it was. |
+| `user_pinned` | no | The agent is pinned by the user, by `zerosub.agents.account`, or by `metadata["zerosub.account"]` at creation (that request pins a portable agent too). Release it with `zerosub.agents.account` and `accountId: null` first. |
+| `landed_elsewhere` | no | The reload worked, but routing opened the agent on another account, which `accountId` names. |
+
+`accountId` is always the account the agent's live session runs on when ZeroSub answers (`null` if it has none). To check a move later, read the agent's `zerosub.state` row. `accountId` there is where it's routed, and `pendingAccountId` is the account the live session still runs on while a move is pending (`null` once it has landed).
+
+With `stopBackgroundWork: true`, ZeroSub stops the jobs Paseo can stop, within the time left to answer, then looks at the agent again and reloads it, which ends the jobs Paseo can't stop. If a turn started meanwhile, or a job couldn't be stopped, the answer is `waiting` and the agent isn't reloaded. `stopped` lists the jobs this call ended. On `moved` and `pending` that's every job it stopped or the reload ended. On any other outcome it lists only the stops Paseo confirmed, which stay stopped. Work the daemon owns (heartbeats and its own jobs) outlives a reload: it never holds a move back and is never stopped.
+
+A move that lands adds a `zerosub-switch` row with `reason: "near_limit"`, `outcome: "switched"` and `continued: false`, naming the account it landed on in `to`. A reload that timed out adds an `outcome: "pending"` row, and the session moves when it next opens. A `pending` answer's reload adds the row it ends with: the `switched` row once it lands, or none if it failed (the binding is then put back). A move that doesn't land (`waiting`, `refused`) adds no row. Only a move that lands counts against the switch guard. If the call times out, or the answer is `pending` and no row appears, read `zerosub.state` as above before asking again.
+
+Releases without this RPC reject the call as an unknown method. Keep the agent stopped or on its account then, as before.
+
 ### The `zerosub-switch` timeline row
 
 ZeroSub records switch outcomes in the agent's timeline. The envelope has `type: "plugin"` and `kind: "zerosub-switch"`. Its `version` comes from `SWITCH_ROW_VERSION` (currently 1) and is independent of the RPC version. [SwitchRowSchema](shared/timeline.ts)
@@ -484,7 +534,7 @@ These fields in the envelope's `data` have been stable since ZeroSub 1.0.0.
 | `to` | Display label for the destination. It can be an account ID if the label is unavailable, or the provider name for an OpenCode fork. On a `stayed` row it may name the current account or an attempted destination. |
 | `toFamily` | Destination family for a continuation in another managed family, or `null` otherwise. |
 | `at` | ISO 8601 timestamp of the timeline event. |
-| `reason` | What prompted the switch or attempt, such as `limit`, `manual`, or `exhausted`. |
+| `reason` | What prompted the switch or attempt, such as `limit`, `manual`, or `exhausted`. `near_limit` (added with `zerosub.agents.move_before_limit`) means another plugin asked to move the agent before its account reached its limit, and comes with `continued: false`. |
 | `outcome` | `switched`, `pending`, `continued`, `stayed` or `reset`. |
 | `resetsAt` | ISO 8601 timestamp when the relevant limit lifts, or `null` when unknown. |
 | `continuedIn` | A continuation reference with `agentId` and `title`, or `null`. Follow the reference whenever present, including on `stayed` rows. |

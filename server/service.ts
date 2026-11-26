@@ -41,7 +41,7 @@ import {
 } from "../shared/model";
 import { capsAccount, limitedModelPick, limitedPick, windowScope } from "../shared/format";
 import { DEFAULT_CONTINUE_PROMPT, type Preferences } from "../shared/preferences";
-import type { RedeemResult, ReopenSummary } from "../shared/rpc";
+import type { BackgroundJob, MoveBeforeLimitReason, MoveBeforeLimitResult, RedeemResult, ReopenSummary } from "../shared/rpc";
 import { SWITCH_ROW_KIND, SWITCH_ROW_VERSION, type SwitchRow } from "../shared/timeline";
 import {
   applyEnv,
@@ -421,6 +421,68 @@ function busy(agent: AgentInfo): boolean {
 function hasBackgroundWork(agent: AgentInfo): boolean {
   return agent.backgroundWork > 0;
 }
+
+/** Reasons a caller can retry as they are: the agent or ZeroSub is busy, not the request wrong. */
+const RETRYABLE_MOVE_REASONS: ReadonlySet<MoveBeforeLimitReason | null> = new Set(["busy_turn", "background_work", "switch_guard", "in_progress", "reload_failed"]);
+
+/** `zerosub.agents.move_before_limit`'s reply (see the RPC). */
+type MoveBeforeLimitReply = MoveBeforeLimitResult;
+
+/** One item of Paseo's background-work list, as a plugin's agent handle returns it. */
+interface ListedWork { id: string; kind?: string; description?: string | null; command?: string; canStop?: boolean }
+interface BackgroundWorkHandle {
+  list(options?: { timeout?: number }): Promise<ListedWork[]>;
+  stop(item: ListedWork, options?: { timeout?: number }): Promise<void>;
+}
+
+/**
+ * Work the daemon itself runs for an agent, by the id prefix Paseo gives it: its own jobs (`daemon:`)
+ * and heartbeats (`heartbeat:`). It outlives a reopen.
+ */
+const DAEMON_WORK_PREFIXES = ["daemon:", "heartbeat:"];
+
+function daemonOwned(item: ListedWork): boolean {
+  const id = String(item.id);
+  return DAEMON_WORK_PREFIXES.some((prefix) => id.startsWith(prefix));
+}
+
+/** The agent's background-work handle, on a Paseo that has one; null otherwise. */
+function backgroundWorkOf(paseo: PaseoApi, agentId: string): BackgroundWorkHandle | null {
+  try {
+    const handle = (paseo.agents.ref(agentId) as { backgroundWork?: Partial<BackgroundWorkHandle> }).backgroundWork;
+    return typeof handle?.list === "function" && typeof handle.stop === "function" ? (handle as BackgroundWorkHandle) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The background work a reopen would end: Paseo's list less the daemon's own work. Null when it can't be listed. */
+async function workAReopenEnds(paseo: PaseoApi, agentId: string): Promise<ListedWork[] | null> {
+  const handle = backgroundWorkOf(paseo, agentId);
+  if (!handle) return null;
+  try {
+    const items = await handle.list({ timeout: 5_000 });
+    return Array.isArray(items) ? items.filter((item) => !daemonOwned(item)) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The jobs as the caller reads them; unnamed ones fill up to the count Paseo reported. */
+function describeWork(listed: ListedWork[] | null, count: number): BackgroundJob[] {
+  const jobs: BackgroundJob[] = (listed ?? []).map(describeJob);
+  while (listed === null && jobs.length < count) jobs.push({ kind: "other", description: null, command: null });
+  return jobs;
+}
+
+function describeJob(item: ListedWork): BackgroundJob {
+  return { kind: item.kind ?? "other", description: item.description ?? null, command: item.command ?? null };
+}
+
+/** Longest a single stop of background work is waited for. */
+const STOP_WORK_MS = 10_000;
+/** Time kept back for the reload itself when stopping background work before a move. */
+const RELOAD_RESERVE_MS = 5_000;
 
 function sameBinding(a: Binding | undefined, b: Binding | undefined): boolean {
   return a?.accountId === b?.accountId && a?.at === b?.at;
@@ -3579,9 +3641,10 @@ export class Service {
     }
     if (!latest || latest.archived || latest.status === "closed") return { outcome: "closed" };
     const now = Date.now();
-    if (busy(latest) || (unattended && hasBackgroundWork(latest)) || (background && this.recentlyActive(latest, now))) {
-      return this.defer(agentId, row, unattended);
-    }
+    // Background work holds an unattended move back. Work the daemon owns outlives the reopen, so it
+    // doesn't count once Paseo can list it.
+    const working = unattended && (await this.workingInBackground(paseo, latest)) !== null;
+    if (busy(latest) || working || (background && this.recentlyActive(latest, now))) return this.defer(agentId, row, unattended);
     const reload: Reload = { opens: 0 };
     this.reloads.set(agentId, reload);
     let result: Awaited<ReturnType<Reopener["reopen"]>>;
@@ -4707,6 +4770,179 @@ export class Service {
       account.quotaCeilings = ceilings;
     });
     if (this.paseo) void this.alignSessions(this.paseo).catch((error: unknown) => log("aligning agents failed", error));
+  }
+
+  /** The background work a reopen would end, or null when there's none (work the daemon owns doesn't count). */
+  private async workingInBackground(paseo: PaseoApi, info: AgentInfo): Promise<{ listed: ListedWork[] | null; jobs: BackgroundJob[] } | null> {
+    if (!hasBackgroundWork(info)) return null;
+    const listed = await workAReopenEnds(paseo, info.id);
+    if (listed !== null && listed.length === 0) return null;
+    return { listed, jobs: describeWork(listed, info.backgroundWork) };
+  }
+
+  /**
+   * Moves one agent, between turns, to `accountId` before its own account is at its limit (see the
+   * RPC). It's an automatic move, as after a limit: the binding is `auto`, the timeline says why, and
+   * the guards are the same. Automatic switching on, a subscription account of the agent's provider
+   * that routing could put it on by itself, a live agent whose conversation can move, not one the
+   * user pinned, and the switch guard.
+   *
+   * Nothing is written until the agent can move now: a running turn or background work answers
+   * `waiting` (retry later), and a reload that doesn't land puts the binding back. The answer comes
+   * within `REPLY_WAIT_MS`; a reload that outlasts it answers `pending` and finishes on its own.
+   */
+  async moveBeforeLimit(
+    paseo: PaseoApi,
+    agentId: string,
+    accountId: string,
+    options: { stopBackgroundWork?: boolean } = {},
+  ): Promise<MoveBeforeLimitReply> {
+    const replyBy = Date.now() + REPLY_WAIT_MS;
+    this.attach(paseo);
+    const stopWork = options.stopBackgroundWork === true;
+    let liveOn: string | null = null;
+    const reply = (outcome: MoveBeforeLimitReply["outcome"], reason: MoveBeforeLimitReason | null, detail: string | null, more: Partial<MoveBeforeLimitReply> = {}): MoveBeforeLimitReply =>
+      ({ outcome, reason, retryable: RETRYABLE_MOVE_REASONS.has(reason), accountId: liveOn, detail, waitingFor: null, backgroundWork: [], stopped: [], ...more });
+    const waitTurn = (stopped: BackgroundJob[] = []) =>
+      reply("waiting", "busy_turn", "It's in a turn. Ask again once it ends.", { waitingFor: "turn", stopped });
+    const waitWork = (jobs: BackgroundJob[], stopped: BackgroundJob[] = []) =>
+      reply("waiting", "background_work", "It has background work running. Ask again once it ends, or with stopBackgroundWork.", { waitingFor: "background", backgroundWork: jobs, stopped });
+
+    if (!this.prefs.autoSwitch) return reply("refused", "auto_switch_off", "Automatic switching is off.");
+    const info = await agentInfo(paseo, agentId);
+    if (!info || info.archived || info.status === "closed") return reply("refused", "not_open", "The agent isn't open.");
+    const family = (await this.families.resolve(paseo))[info.provider];
+    if (!family || !this.adapters[family].portable) return reply("refused", "unsupported_provider", "This agent's conversation can't change accounts in place.");
+    const state = await this.store.read();
+    const current = this.runningOn(state, agentId, family);
+    liveOn = current ?? null;
+    const target = findAccount(state, accountId);
+    const now = Date.now();
+    // A limit of one model's window rules an account out only for agents on that model.
+    await withTimeout(this.modelOf(paseo, agentId), 3_000);
+    // Only where routing could move the agent by itself: no API key or paid stand-in, under every quota maximum.
+    if (!target || target.family !== family || !canStandIn(target, now, this.agentModels.get(agentId), this.usage.get(target.id)) || isPaidStandIn(target, this.prefs.paidApiFallback)) {
+      return reply("refused", "ineligible_target", "That account can't take it now.");
+    }
+    if (current === target.id) return reply("already", null, null);
+    if (state.bindings[agentId]?.source === "user") return reply("refused", "user_pinned", "It stays on the account picked for it.");
+    if (busy(info)) return waitTurn();
+    let work = await this.workingInBackground(paseo, info);
+    if (work && !stopWork) return waitWork(work.jobs);
+    if (!this.switchGuard.allows(agentId, now)) return reply("refused", "switch_guard", "It changed accounts too often just now.");
+    const release = this.tryClaim(agentId);
+    if (!release) return reply("refused", "in_progress", "It's changing accounts already.");
+    let handedOff = false;
+    try {
+      // Stop what Paseo can stop, within the time left to answer; the reload ends the rest.
+      const stopped: BackgroundJob[] = [];
+      const handle = work ? backgroundWorkOf(paseo, agentId) : null;
+      for (const item of work?.listed ?? []) {
+        if (!item.canStop || !handle) continue;
+        const left = replyBy - Date.now() - RELOAD_RESERVE_MS;
+        if (left <= 0) break;
+        const done = await handle.stop(item, { timeout: Math.min(STOP_WORK_MS, left) }).then(() => true, (error: unknown) => {
+          log(`stopping background work of ${agentId} failed`, error);
+          return false;
+        });
+        if (done) stopped.push(describeJob(item));
+      }
+      // Stopping takes a while: a turn may have started, or new work, which the reload would cut short.
+      const fresh = await agentInfo(paseo, agentId);
+      if (!fresh || fresh.archived || fresh.status === "closed") return reply("refused", "not_open", "The agent isn't open.", { stopped });
+      if (busy(fresh)) return waitTurn(stopped);
+      work = await this.workingInBackground(paseo, fresh);
+      const unstoppable = (work?.listed ?? []).filter((item) => !item.canStop);
+      // Left running: work it couldn't stop in time, or new work. Work Paseo can't stop is ended by the reload.
+      if (work && (!stopWork || (work.listed !== null && work.listed.length > unstoppable.length))) {
+        return waitWork(work.jobs, stopped);
+      }
+      const ended = [...stopped, ...(work ? (work.listed === null ? work.jobs : unstoppable.map(describeJob)) : [])];
+
+      const seen = state.bindings[agentId];
+      let wrote: Binding | undefined;
+      await this.store.update((draft) => {
+        if (!sameBinding(draft.bindings[agentId], seen)) return;
+        wrote = { accountId: target.id, source: "auto", at: new Date().toISOString() };
+        draft.bindings[agentId] = wrote;
+      });
+      if (!wrote) {
+        const picked = (await this.store.read()).bindings[agentId]?.source === "user";
+        return picked
+          ? reply("refused", "user_pinned", "It stays on the account picked for it.", { stopped })
+          : reply("refused", "in_progress", "It's changing accounts already.", { stopped });
+      }
+      const pinned = wrote;
+      /** Puts the binding back as it was, unless something else changed it since. */
+      const restore = async () => {
+        await this.store.update((draft) => {
+          if (!sameBinding(draft.bindings[agentId], pinned)) return;
+          if (seen) draft.bindings[agentId] = seen;
+          else delete draft.bindings[agentId];
+        });
+      };
+      const row: SwitchRow = {
+        family,
+        from: findAccount(state, current)?.label ?? null,
+        to: target.label,
+        reason: "near_limit",
+        resetsAt: null,
+        continued: false,
+        continuedIn: null,
+        toFamily: null,
+        toProvider: null,
+        outcome: "switched",
+        detail: ended.length > 0 ? `${ended.length === 1 ? "Its background job was" : `Its ${ended.length} background jobs were`} stopped to move it.` : null,
+        at: new Date(now).toISOString(),
+      };
+      const hadDeferred = this.deferred.has(agentId);
+      const move = (async (): Promise<MoveBeforeLimitReply> => {
+        try {
+          // Background work was dealt with above; a turn that starts now still holds the reload back.
+          const result = await this.reopenAgent(paseo, agentId, { unattended: !stopWork });
+          const after = await this.store.read();
+          liveOn = this.runningOn(after, agentId, family) ?? liveOn;
+          if (result.outcome === "deferred") {
+            // Nothing is left waiting: the caller asks again.
+            if (!hadDeferred) this.deferred.delete(agentId);
+            await restore();
+            const latest = await agentInfo(paseo, agentId);
+            const left = latest && !busy(latest) ? await this.workingInBackground(paseo, latest) : null;
+            return left ? waitWork(left.jobs, stopped) : waitTurn(stopped);
+          }
+          if (result.outcome === "reopened" && liveOn === current) {
+            // Routing kept it where it was: the account couldn't take it by the time it reopened.
+            await restore();
+            return reply("refused", "ineligible_target", `${target.label} couldn't take it by then, so it stayed where it was.`, { stopped: ended });
+          }
+          if (result.outcome === "reopened") {
+            // Counted once it has changed accounts, wherever it landed.
+            this.switchGuard.note(agentId, Date.now());
+            this.notePlacement(liveOn ?? target.id, Date.now());
+            await this.appendRow(paseo, agentId, await this.landed(row, agentId));
+            if (liveOn === target.id) return reply("moved", null, null, { stopped: ended });
+            const there = findAccount(after, liveOn)?.label ?? liveOn;
+            return reply("refused", "landed_elsewhere", `It reopened on ${there ?? "another account"} instead: ${target.label} couldn't take it by then.`, { stopped: ended });
+          }
+          if (result.outcome === "failed" && result.timedOut) {
+            // The reload may yet open: the binding stays, and the row says the move is still to come.
+            await this.noteOutcome(paseo, agentId, row, result);
+            return reply("pending", null, "The reload is taking a while. The agent's timeline and zerosub.state say where it lands.", { stopped: ended });
+          }
+          await restore();
+          if (result.outcome === "failed") return reply("refused", "reload_failed", `It couldn't be reopened on that account: ${result.error}`, { stopped });
+          return reply("refused", "not_open", "The agent isn't open.", { stopped });
+        } finally {
+          release();
+        }
+      })();
+      handedOff = true;
+      if (await settles(move, replyBy - Date.now())) return move;
+      move.catch((error: unknown) => log(`moving ${agentId} before the limit failed`, error));
+      return reply("pending", null, "It's still moving. The agent's timeline and zerosub.state say where it lands.", { stopped: ended });
+    } finally {
+      if (!handedOff) release();
+    }
   }
 
   async rename(accountId: string, label: string): Promise<void> {
