@@ -118,11 +118,22 @@ function fakePaseo(recent: readonly Row[] | (() => Promise<{ entries: readonly R
   return { paseo, sent, notes, refetches, agent };
 }
 
+/** How a `paseo agent reload` ends. `fails after another` fails once another reload has opened a session too. */
+type ReloadEnd = "no session" | "works" | "fails" | "times out" | "fails after another";
+
+/** Reloads that end each way in turn, the last way from then on. */
+function inOrder(...ends: [ReloadEnd, ...ReloadEnd[]]): () => ReloadEnd {
+  let next = 0;
+  return () => ends[Math.min(next++, ends.length - 1)]!;
+}
+
 interface SetUpOptions {
-  /** How `paseo agent reload` ends. `fails after another` fails once another reload has opened a session too. */
-  reload?: "no session" | "works" | "fails" | "times out" | "fails after another";
+  /** How `paseo agent reload` ends: the same way every time, or as the function says for each reload of an agent. */
+  reload?: ReloadEnd | ((agentId: string) => ReloadEnd);
   /** Runs when `paseo agent reload` starts, before Paseo asks where the new session opens. */
-  reloading?: () => Promise<void>;
+  reloading?: (agentId: string) => Promise<void>;
+  /** Runs once Paseo has asked where the new session opens, while it's still closing the old one. */
+  opened?: (agentId: string) => Promise<void>;
   /** Replaces parts of the Claude adapter. */
   claude?: Partial<FamilyAdapter>;
   /** Reads turns with a real detector instead of taking every failed turn for a limit. */
@@ -145,24 +156,26 @@ async function setUp(state: Partial<StoredState>, hit: () => LimitHit, options: 
   const context = { paseo: fake.paseo } as never;
   // Paseo asks for the new session's environment before it closes the old session, so the hook has
   // run by the time `paseo agent reload` returns, even when the reload then failed.
-  const reopenedSession = () =>
-    service.onSessionOpen({ agentId: AGENT, provider: "claude", reason: "refresh", purpose: "interactive", env: {} } as never, context);
+  const reopenedSession = (id: string) =>
+    service.onSessionOpen({ agentId: id, provider: "claude", reason: "refresh", purpose: "interactive", env: {} } as never, context);
   const reopener = {
     locate: async () => "/usr/local/bin/paseo",
     reopen: async (id: string) => {
       reopened.push(id);
-      if (options.reload === "no session") return { ok: true as const };
-      await options.reloading?.();
-      await reopenedSession();
-      if (options.reload === "fails after another") {
+      const end = typeof options.reload === "function" ? options.reload(id) : options.reload;
+      if (end === "no session") return { ok: true as const };
+      await options.reloading?.(id);
+      await reopenedSession(id);
+      await options.opened?.(id);
+      if (end === "fails after another") {
         // Paseo runs one reload of an agent at a time, so the other one opened its session after this one.
-        await reopenedSession();
+        await reopenedSession(id);
         return { ok: false as const, error: "Timed out closing previous session during refresh", timedOut: false };
       }
-      if (options.reload === "fails") {
+      if (end === "fails") {
         return { ok: false as const, error: "Timed out closing previous session during refresh", timedOut: false };
       }
-      if (options.reload === "times out") return { ok: false as const, error: "Command failed: paseo agent reload", timedOut: true };
+      if (end === "times out") return { ok: false as const, error: "Command failed: paseo agent reload", timedOut: true };
       return { ok: true as const };
     },
   };
@@ -182,6 +195,8 @@ async function setUp(state: Partial<StoredState>, hit: () => LimitHit, options: 
     reopener as unknown as Reopener,
   );
   services.push(service);
+  // A reload failover tries again goes at once (see "a reload that doesn't land", which times it).
+  service.failoverReloadWaitMs = 0;
   const limitTurn = () =>
     service.onTurnEnded(
       { agent: { id: AGENT, provider: "claude" }, turnId: "t", outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never,
@@ -849,7 +864,7 @@ describe("failover", () => {
     });
   });
 
-  it("keeps an agent's session where it was when Paseo can't reload it", async () => {
+  it("keeps an agent's session where it was when Paseo can't reload it, after a few tries", async () => {
     const openedAt = "2026-09-23T07:00:00.000Z";
     const { store, reopened, notes, limitTurn } = await setUp(
       {
@@ -862,14 +877,15 @@ describe("failover", () => {
     );
     await limitTurn();
     const state = await store.read();
-    expect(reopened).toEqual([AGENT]);
+    expect(reopened).toEqual([AGENT, AGENT, AGENT, AGENT]);
     expect(state.bindings[AGENT]?.accountId).toBe(HELLO); // where it goes when its session next opens
     expect(state.sessions[AGENT]).toEqual({ accountId: MAIN, family: "claude", openedAt });
     expect(notes.at(-1)).toMatchObject({ from: "marketing", to: "hello", outcome: "pending" });
   });
 
   it("keeps the new session when the reload only ran out of time", async () => {
-    // The daemon may still finish a reload that the command-line tool stopped waiting for.
+    // The daemon may still finish a reload that the command-line tool stopped waiting for. Each try
+    // before the last takes its session back, as the next one records where the session opens.
     const { store, limitTurn } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
@@ -881,6 +897,180 @@ describe("failover", () => {
     );
     await limitTurn();
     expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+  });
+});
+
+// Paseo can fail a reload, or not answer it in time, while it's still closing the agent's old session,
+// which it goes on doing (#128).
+describe("a failover reload that doesn't land", () => {
+  const openedAt = "2026-09-23T07:00:00.000Z";
+  const OTHER = "agent-2";
+  const onMarketing = (...others: string[]) => ({
+    accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+    defaults: { claude: MAIN, codex: null, pi: null },
+    sessions: Object.fromEntries([AGENT, ...others].map((id) => [id, { accountId: MAIN, family: "claude" as const, openedAt }])),
+  });
+  const weekly = (): LimitHit => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your weekly limit" });
+  const limitedUntil = async (store: StateStore, id: string) => (await store.read()).accounts.find((entry) => entry.id === id)?.limitedUntil ?? null;
+
+  it("is tried again, and the agent carries on once it lands", async () => {
+    const { store, reopened, sent, notes, limitTurn } = await setUp(onMarketing(), weekly, { reload: inOrder("fails", "works") });
+    await limitTurn();
+    expect(reopened).toEqual([AGENT, AGENT]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(sent).toHaveLength(1);
+    // Noted once the agent is on the new account, rather than as a move still to come.
+    expect(notes).toEqual([expect.objectContaining({ from: "marketing", to: "hello", outcome: "switched", continued: true })]);
+  });
+
+  it("counts one Paseo didn't answer in time as landed once the next one confirms it", async () => {
+    // The command-line tool stopped waiting, and Paseo went on to open the session on hello.
+    const { store, reopened, sent, notes, limitTurn } = await setUp(onMarketing(), weekly, { reload: inOrder("times out", "works") });
+    await limitTurn();
+    expect(reopened).toEqual([AGENT, AGENT]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(sent).toHaveLength(1);
+    expect(notes).toEqual([expect.objectContaining({ outcome: "switched", continued: true })]);
+  });
+
+  it("waits longer before each try, and gives up after four", async () => {
+    const started: number[] = [];
+    const { service, store, sent, notes, limitTurn } = await setUp(onMarketing(), weekly, {
+      reload: "fails",
+      reloading: async () => void started.push(performance.now()),
+    });
+    service.failoverReloadWaitMs = 20;
+    await limitTurn();
+    expect(started).toHaveLength(4);
+    // 20, 40 and 80 ms at least; a timer can fire a millisecond early.
+    const waits = started.slice(1).map((at, index) => at - started[index]!);
+    expect(waits.map((wait, index) => wait >= 20 * 2 ** index - 1)).toEqual([true, true, true]);
+    const state = await store.read();
+    expect(state.sessions[AGENT]).toEqual({ accountId: MAIN, family: "claude", openedAt });
+    expect(state.bindings[AGENT]?.accountId).toBe(HELLO); // where it goes when its session next opens
+    expect(sent).toEqual([]);
+    expect(notes).toEqual([expect.objectContaining({ from: "marketing", to: "hello", outcome: "pending", continued: false })]);
+    expect(notes[0]?.detail).toBe("Reloading it didn't work: Timed out closing previous session during refresh.");
+  });
+
+  it("doesn't leave the agent counted on the new account after a try that ran out of time and ones that failed", async () => {
+    // The tries that failed would each put back the session the one before recorded: hello, where the
+    // agent never got, so marketing's next limit would be blamed on hello.
+    const { store, reopened, limitTurn } = await setUp(onMarketing(), weekly, { reload: inOrder("times out", "fails") });
+    await limitTurn();
+    expect(reopened).toHaveLength(4);
+    expect((await store.read()).sessions[AGENT]).toEqual({ accountId: MAIN, family: "claude", openedAt });
+  });
+
+  it("stops once the account the agent is leaving has room again", async () => {
+    let refilled = false;
+    const { store, reopened, sent, notes, limitTurn } = await setUp(onMarketing(), weekly, {
+      reload: "fails",
+      // While the first reload is under way, a reset refills marketing (or the user marks it available).
+      opened: async () => {
+        if (refilled) return;
+        refilled = true;
+        await store.update((draft) => {
+          const marketing = draft.accounts.find((entry) => entry.id === MAIN);
+          if (marketing) marketing.limitedUntil = null;
+        });
+      },
+    });
+    await limitTurn();
+    expect(reopened).toEqual([AGENT]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+    expect(sent).toEqual([]);
+    expect(notes).toEqual([expect.objectContaining({ to: "hello", outcome: "pending" })]);
+  });
+
+  it("stops once routing would keep the agent where it is", async () => {
+    let picked = false;
+    const { service, store, reopened, limitTurn } = await setUp(onMarketing(), weekly, {
+      reload: "fails",
+      // With automatic switching turned off, the user puts the agent back on marketing.
+      opened: async () => {
+        if (picked) return;
+        picked = true;
+        service.setPreferences(preferences.schema.parse({ autoSwitch: false }));
+        await store.update((draft) => {
+          draft.bindings[AGENT] = { accountId: MAIN, source: "user", at: new Date().toISOString() };
+        });
+      },
+    });
+    await limitTurn();
+    expect(reopened).toEqual([AGENT]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+  });
+
+  it("blames the account the agent left for a limit its old session answered with meanwhile, and carries the agent on", async () => {
+    // Paseo has asked where the new session opens, so it's recorded on hello, but the old one on
+    // marketing is still closing and answers "continue" with marketing's limit.
+    const notice = "You've hit your weekly limit · resets 3pm";
+    const recent = [
+      ...inTurn("t", { type: "assistant_message", text: notice }),
+      ...inTurn("t2", { type: "user_message", text: "continue" }, { type: "assistant_message", text: notice }),
+    ];
+    let answered: Promise<void> | undefined;
+    const { service, store, sent, notes, refetches, paseo, limitTurn } = await setUp(onMarketing(), weekly, {
+      detectLimit: detectClaudeLimit,
+      recent,
+      opened: async () => {
+        const context = { paseo } as never;
+        const read = refetches.length;
+        await service.onTurnStarted({ id: AGENT, provider: "claude" }, context);
+        answered = service.onTurnEnded({ agent: { id: AGENT, provider: "claude" }, turnId: "t2", outcome: { kind: "completed" }, timeline: [] } as never, context);
+        // It knows where the turn ran by the time it pages the turn.
+        await vi.waitFor(() => expect(refetches.length).toBeGreaterThan(read));
+      },
+    });
+    await limitTurn();
+    await answered;
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(await limitedUntil(store, HELLO)).toBeNull();
+    expect(await limitedUntil(store, MAIN)).not.toBeNull();
+    expect(sent).toHaveLength(1);
+    expect(notes).toEqual([expect.objectContaining({ from: "marketing", to: "hello", outcome: "switched", continued: true })]);
+  });
+
+  it("lets the account's other agents fail over while it's tried again", async () => {
+    // Failovers off one account take turns; trying a reload again doesn't hold up the others'.
+    let retrying = () => {};
+    const retried = new Promise<void>((resolve) => (retrying = resolve));
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let tries = 0;
+    let otherStopped: Promise<void> | undefined;
+    let stopAtLimit: (id: string) => Promise<void> = async () => undefined;
+    const reloadsOfAgent = inOrder("fails", "works");
+    const { service, store, reopened, paseo } = await setUp(onMarketing(OTHER), weekly, {
+      reload: (id) => (id === AGENT ? reloadsOfAgent() : "works"),
+      reloading: async (id) => {
+        if (id !== AGENT) return;
+        tries += 1;
+        // The other agent stops at marketing's limit too, while this one's failover has the account.
+        if (tries === 1) otherStopped = stopAtLimit(OTHER);
+        if (tries === 2) {
+          retrying();
+          await gate;
+        }
+      },
+    });
+    stopAtLimit = (id) =>
+      service.onTurnEnded({ agent: { id, provider: "claude" }, turnId: "t", outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never, { paseo } as never);
+    const agent = (await paseo.agents.ref().refresh()).agent!;
+    const other = { ...agent, id: OTHER };
+    paseo.agents.list = async () => ({ entries: [{ agent }, { agent: other }], pageInfo: { hasMore: false, nextCursor: null } });
+    const { ref } = paseo.agents;
+    paseo.agents.ref = ((id: string) => ({ ...ref(), refresh: async () => ({ agent: id === OTHER ? other : agent }) })) as typeof ref;
+
+    const stopped = stopAtLimit(AGENT);
+    await retried;
+    await otherStopped;
+    expect((await store.read()).sessions[OTHER]?.accountId).toBe(HELLO);
+    release();
+    await stopped;
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(reopened.filter((id) => id === AGENT)).toHaveLength(2);
   });
 });
 

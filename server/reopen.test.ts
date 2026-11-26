@@ -57,6 +57,8 @@ describe("reopening through the host", () => {
     const failing = (message: string) => ({ agents: { ref: () => ({ reload: async () => Promise.reject(new Error(message)) }) } });
     expect(await new Reopener().reopen("a", failing("Agent a is not loaded"))).toEqual({ ok: false, error: "Agent a is not loaded", timedOut: false });
     expect(await new Reopener().reopen("a", failing("Timeout waiting for message (60000ms)"))).toMatchObject({ ok: false, timedOut: true });
+    // Newer Paseo versions word their client's timeout this way (#128).
+    expect(await new Reopener().reopen("a", failing("No response to refresh_agent_request after 60000ms"))).toMatchObject({ ok: false, timedOut: true });
     // The daemon timing out on its own work is an answer: it failed the reload without reopening the session.
     const refused = "Timed out closing previous session during refresh requestType=refresh_agent_request code=agent_refresh_failed";
     expect(await new Reopener().reopen("a", failing(refused))).toEqual({ ok: false, error: refused, timedOut: false });
@@ -108,6 +110,12 @@ describe.skipIf(process.platform === "win32")("reading how a reload ended", () =
       error: "Failed to reload agent: Timeout waiting for message (60000ms)",
       timedOut: true,
     });
+  });
+
+  it("takes a newer CLI's word for giving up on the daemon's answer the same way", async () => {
+    // As `paseo agent reload --json` reports it, which leaves the reload to finish in the daemon (#128).
+    const reopener = await failingCli('    "message": "No response to refresh_agent_request after 60000ms"');
+    expect(await reopener.reopen("agent-1")).toMatchObject({ ok: false, timedOut: true });
   });
 
   it("takes any other failure for a reload that didn't happen", async () => {
