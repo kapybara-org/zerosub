@@ -85,8 +85,11 @@ export class Reopener {
   }
 }
 
-/** The Paseo CLI's own "no answer in time" (`DAEMON_REQUEST_TIMEOUT`), e.g. "Timeout waiting for message (60000ms)". */
-const STOPPED_WAITING = /Timeout waiting for message|DAEMON_REQUEST_TIMEOUT/;
+/**
+ * The Paseo client's own "no answer in time" (`DAEMON_REQUEST_TIMEOUT`): "Timeout waiting for message
+ * (60000ms)", or on newer Paseo versions "No response to refresh_agent_request after 60000ms".
+ */
+const STOPPED_WAITING = /Timeout waiting for message|No response to \S+ after \d+ ?ms|DAEMON_REQUEST_TIMEOUT/;
 
 function explainFailure(detail: string): string {
   if (/transport closed|cannot connect|cannot reach|password|unauthori[sz]ed|DAEMON_NOT_RUNNING/i.test(detail)) {

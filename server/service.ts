@@ -169,6 +169,12 @@ const MODE_READ_MS = 3_000;
 /** An agent whose move to an account didn't land isn't moved there again for this long. */
 const ALIGN_RETRY_MS = 30 * 60_000;
 /**
+ * How many reloads failover tries to move an agent off an account at its limit, and how long it waits
+ * before the second one, doubling before each one after that (see `retryFailover`).
+ */
+const FAILOVER_RELOADS = 4;
+const FAILOVER_RELOAD_WAIT_MS = 15_000;
+/**
  * Just after a turn starts or ends, or the user sends a message, alignment leaves the agent alone:
  * failover and waiting switches own it, and a reload would cancel a turn that is about to start.
  */
@@ -623,6 +629,8 @@ export class Service {
 
   /** Tests shorten it; see `SIGN_OUT_RECHECK_MS`. */
   signOutRecheckMs = SIGN_OUT_RECHECK_MS;
+  /** Tests shorten it; see `FAILOVER_RELOAD_WAIT_MS`. */
+  failoverReloadWaitMs = FAILOVER_RELOAD_WAIT_MS;
 
   setPreferences(prefs: Preferences): void {
     const routingChanged = prefs.autoSwitch !== this.prefs.autoSwitch || prefs.paidApiFallback !== this.prefs.paidApiFallback;
@@ -1326,9 +1334,12 @@ export class Service {
     const adapter = this.adapters[family];
     const agentId = event.agent.id;
     // The account the turn ran on, read before anything that takes a while: the agent may be moved
-    // meanwhile, and the limit is still this account's.
+    // meanwhile, and the limit is still this account's. While a reload of ours is under way, it's the
+    // account of the session that reload's record replaced: Paseo asks where the new session opens
+    // before it closes the old one, which can go on answering until then.
     const ranOn = await this.store.read();
-    const accountId = this.runningOn(ranOn, agentId, family) ?? null;
+    const { opened } = this.reloads.get(agentId) ?? {};
+    const accountId = (opened ? (opened.replaced?.accountId ?? mainAccount(ranOn, family)?.id) : this.runningOn(ranOn, agentId, family)) ?? null;
     if (accountId) this.activeAt.set(accountId, Date.now());
     // An Azure OpenAI or AWS Bedrock account fails on the API's errors, not the subscription's
     // notices, and only a failed turn's (see `detectAzureLimit` and `detectBedrockLimit`).
@@ -1616,6 +1627,8 @@ export class Service {
       release = await this.claim(agentId);
     }
     let exhausted: string | null = null;
+    // A reload failover tries again, outside the account's lock but with the agent still claimed.
+    let retry: (() => Promise<void>) | undefined;
     try {
       const state = await this.store.read();
       const account = findAccount(state, ranOn);
@@ -1626,15 +1639,16 @@ export class Service {
         return;
       }
       exhausted = account.id;
-      await this.lockFor(account.id).run(() => this.failover(paseo, agentId, family, account, timeline, problem, endedAt));
+      retry = await this.lockFor(account.id).run(() => this.failover(paseo, agentId, family, account, timeline, problem, endedAt));
     } finally {
-      release();
+      if (!retry) release();
     }
     if (exhausted && this.prefs.autoSwitch && this.adapters[family].portable) {
       void this.moveIdleAgentsOff(paseo, exhausted, family, agentId, problem.kind, problem.kind === "limit" ? problem.hit.scope : null).catch((error: unknown) =>
         log("moving idle agents failed", error),
       );
     }
+    if (retry) await retry().finally(release);
   }
 
   /** Records the limit a turn hit on `accountId`, unless a reset refilled the account just now. */
@@ -1650,6 +1664,7 @@ export class Service {
     await this.markLimited(accountId, hit.resetsAt ?? new Date(Date.now() + (hit.kind === "budget" ? BUDGET_LIMIT_MS : WINDOW_LIMIT_MS)).toISOString(), hit.kind, "turn");
   }
 
+  /** Returns what's left to do outside the account's lock: trying a reload that didn't land again (see `moveOff`). */
   private async failover(
     paseo: PaseoApi,
     agentId: string,
@@ -1658,7 +1673,7 @@ export class Service {
     timeline: readonly AgentTimelineItem[] | undefined,
     problem: Problem,
     endedAt: number,
-  ): Promise<void> {
+  ): Promise<(() => Promise<void>) | undefined> {
     const adapter = this.adapters[family];
     const now = Date.now();
     // A parked Codex tab stays stopped: its task carries on in another tab. A failed lookup must not
@@ -1848,22 +1863,8 @@ export class Service {
       // Only a Claude agent moves here. A ChatGPT hand-off's new agent counts itself as it opens.
       this.notePlacement(next.id, now);
       this.switchGuard.note(agentId, now);
-      const result = await this.reopenAgent(paseo, agentId, { settle: true });
-      const continued = result.outcome === "reopened" && this.prefs.autoContinue && (await this.untouchedSince(paseo, agentId, endedAt));
-      const row = await this.landed(
-        {
-          ...base,
-          to: next.label,
-          reason,
-          continued,
-          outcome: result.outcome === "reopened" ? "switched" : "pending",
-          detail: result.outcome === "failed" ? failureDetail(result) : this.paidNote(latest, agentId, family, next),
-        },
-        agentId,
-      );
-      await this.appendRow(paseo, agentId, row);
-      if (continued) await this.carryOn(paseo, agentId, endedAt);
-      return;
+      const row: SwitchRow = { ...base, to: next.label, reason, outcome: "switched", detail: this.paidNote(latest, agentId, family, next) };
+      return this.moveOff(paseo, agentId, family, account.id, row, endedAt);
     }
 
     // A ChatGPT thread can't move to another account; carry the work on in a new agent there.
@@ -1905,6 +1906,82 @@ export class Service {
         detail: `Couldn't continue on ${next.label}: ${describe(error)}`,
       });
     }
+  }
+
+  /**
+   * Failover's move of a Claude agent off `from`: reloads it, notes how that went, and carries it on
+   * once it has landed. A reload that doesn't land is tried again by the function this returns, which
+   * runs outside the exhausted account's lock, so the account's other agents don't wait for it.
+   */
+  private async moveOff(
+    paseo: PaseoApi,
+    agentId: string,
+    family: Family,
+    from: string,
+    row: SwitchRow,
+    endedAt: number,
+  ): Promise<(() => Promise<void>) | undefined> {
+    const result = await this.reopenAgent(paseo, agentId, { settle: true, retried: true });
+    if (result.outcome === "failed") return () => this.retryFailover(paseo, agentId, family, from, row, endedAt, result);
+    await this.noteFailover(paseo, agentId, family, row, result, endedAt);
+    return undefined;
+  }
+
+  /**
+   * Tries failover's reload again until one lands, each try a while after the last. Nothing else would
+   * move the agent soon or carry it on (alignment leaves one with background work alone, and sends no
+   * follow-up), and a later reload often lands: Paseo goes on closing the old session after a reload
+   * fails or runs out of time, and the next reload waits for that close. Only a reload that lands says
+   * where the session runs, so one that doesn't takes back the session it recorded, even one Paseo may
+   * still finish: the next one records where the session opens. An agent that looks closed or busy may
+   * be one Paseo is reopening just then, or whose old session is answering (a reload never cuts a turn
+   * short), so it's tried again too. It stops early once the account the agent is leaving can take it
+   * again (a reset refilled it, say), or routing would keep the agent there.
+   */
+  private async retryFailover(
+    paseo: PaseoApi,
+    agentId: string,
+    family: Family,
+    from: string,
+    row: SwitchRow,
+    endedAt: number,
+    failed: Extract<ReopenResult, { outcome: "failed" }>,
+  ): Promise<void> {
+    let result: ReopenResult = failed;
+    let failure = failed;
+    for (let tries = 1; tries < FAILOVER_RELOADS && result.outcome !== "reopened"; tries += 1) {
+      await delay(this.failoverReloadWaitMs * 2 ** (tries - 1));
+      const state = await this.store.read();
+      const leaving = findAccount(state, from);
+      const stays = (leaving && isUsable(leaving, Date.now(), this.agentModels.get(agentId), this.usage.get(from))) || this.targetFor(state, agentId, family, from) === from;
+      if (this.stopped || stays) break;
+      result = await this.reopenAgent(paseo, agentId, { settle: true, retried: tries + 1 < FAILOVER_RELOADS });
+      if (result.outcome === "failed") failure = result;
+    }
+    await this.noteFailover(paseo, agentId, family, row, result.outcome === "reopened" ? result : failure, endedAt);
+  }
+
+  /** Notes where failover's reload left the agent, and once it has landed, carries the agent on. */
+  private async noteFailover(paseo: PaseoApi, agentId: string, family: Family, row: SwitchRow, result: ReopenResult, endedAt: number): Promise<void> {
+    const moved = result.outcome === "reopened";
+    const since = moved && this.prefs.autoContinue ? await this.stoppedSince(paseo, agentId, family, endedAt) : null;
+    const continued = since !== null && (await this.untouchedSince(paseo, agentId, since));
+    const detail = result.outcome === "failed" ? failureDetail(result) : row.detail;
+    await this.appendRow(paseo, agentId, await this.landed({ ...row, continued, outcome: moved ? "switched" : "pending", detail }, agentId));
+    if (since !== null && continued) await this.carryOn(paseo, agentId, since);
+  }
+
+  /**
+   * The end of the turn failover's follow-up carries the agent on from: the one that stopped at the
+   * limit, when nothing has happened to the agent since, or a later one that stopped at a limit too,
+   * as one the old session answered while the agent was moving does. Null while a turn runs, or after
+   * one that ended otherwise: the agent is in use.
+   */
+  private async stoppedSince(paseo: PaseoApi, agentId: string, family: Family, endedAt: number): Promise<number | null> {
+    const latest = this.turnAt.get(agentId);
+    if (latest === endedAt) return endedAt;
+    if (latest === undefined || latest === this.turnStartedAt.get(agentId)) return null;
+    return (await this.lastTurnHitLimit(paseo, agentId, family)) === true ? latest : null;
   }
 
   /** True once per guard window for each agent and notice, so repeated skips don't flood its timeline. */
@@ -3420,12 +3497,13 @@ export class Service {
    * cancels a running turn, so the agent is looked at again right before it; a `background` move
    * (alignment's pass) then also waits for the turn of an agent that was in use a moment ago, and an
    * `unattended` one (nobody asked for it; alignment's by default) for background work to stop.
-   * Alignment carries either out once it's quiet.
+   * Alignment carries either out once it's quiet. A `retried` reload is tried again if it doesn't land
+   * (see `retryFailover`).
    */
   private async reopenAgent(
     paseo: PaseoApi,
     agentId: string,
-    options: { row?: SwitchRow | null; settle?: boolean; background?: boolean; unattended?: boolean; sameConversation?: boolean } = {},
+    options: { row?: SwitchRow | null; settle?: boolean; background?: boolean; unattended?: boolean; sameConversation?: boolean; retried?: boolean } = {},
   ): Promise<ReopenResult> {
     const { row = null, settle = false, background = false, unattended = background } = options;
     let info: AgentInfo | null;
@@ -3488,10 +3566,11 @@ export class Service {
     if (!result.ok) {
       console.warn(`[ZeroSub] could not reopen ${agentId}: ${result.error}`);
       // Paseo asks for the new session's environment before it closes the old one, so a failed reload
-      // has still recorded a session that never opened. One that ran out of time may yet open. Only
-      // this reload's own record is undone: a session opened since (another reload) stands.
+      // has still recorded a session that never opened. One that ran out of time may yet open, unless
+      // it's tried again: the next reload records where the session opens. Only this reload's own
+      // record is undone: a session opened since (another reload) stands.
       const { opened } = reload;
-      if (!result.timedOut && opened && reload.opens === 1) {
+      if ((!result.timedOut || options.retried) && opened && reload.opens === 1) {
         await this.store.update((draft) => {
           const recorded = draft.sessions[agentId];
           if (recorded?.openedAt !== opened.wrote.openedAt || recorded.accountId !== opened.wrote.accountId) return;
