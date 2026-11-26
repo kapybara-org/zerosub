@@ -491,6 +491,11 @@ export const AgentRouteSchema = z.object({
    * continues the work in a new agent instead.
    */
   movable: z.boolean(),
+  /**
+   * The agent is pinned to `accountId` with `allowLimited` (see `zerosub.agents.account`), so a
+   * provider limit there doesn't move it. Absent from servers that don't support the option.
+   */
+  allowLimited: z.boolean().optional(),
   /** The agent started on this account because its weekly reset was near, and is still on it. */
   selectionReason: z.literal("weekly_reset").optional(),
   /**
@@ -563,6 +568,8 @@ export const HANDOFF_ACCOUNT_METADATA_KEY = "zerosub.handoff-account";
 export const AGENT_METADATA_KEY = "zerosub.agent";
 
 export const StateViewSchema = z.object({
+  /** ZeroSub 1.30.0 and earlier omit the version but use the same v1 shape. */
+  version: z.literal(1).default(1),
   accounts: z.array(AccountViewSchema),
   agents: z.array(AgentRouteSchema),
   logins: z.array(LoginViewSchema),

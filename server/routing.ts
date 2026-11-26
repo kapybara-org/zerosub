@@ -83,6 +83,16 @@ export function isLimitedFor(account: StoredAccount, now: number, model?: string
   );
 }
 
+/**
+ * The agent is pinned to `account` with `allowLimited` (see `Binding`), and the account may keep it
+ * past a provider limit: it's signed in, enabled and under every quota maximum set for it. A quota
+ * maximum is the user's own ceiling, so `allowLimited` never lifts it.
+ */
+export function keepsPastLimit(account: StoredAccount, binding: Binding | undefined, now: number, model?: string | null, usage?: Usage | null): boolean {
+  return binding?.allowLimited === true && binding.accountId === account.id && account.signedIn && !account.disabled &&
+    !quotaCeilingHit(account, usage, now, model ?? null);
+}
+
 export function isUsable(account: StoredAccount, now: number, model?: string | null, usage?: Usage | null): boolean {
   return account.signedIn && !account.disabled && !isLimitedFor(account, now, model, usage);
 }
@@ -505,7 +515,9 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   let skipped: RouteDecision["skipped"] = null;
   const why = !account.signedIn ? "signed_out" : account.disabled ? "disabled" : isLimitedFor(account, input.now, input.model, input.usageOf(account.id)) ? "limited" : null;
   const mayMove = fresh || input.portable;
-  if (why && mayMove && (input.autoSwitch || why !== "limited")) {
+  // Pinned with `allowLimited`: the agent runs on this account past its limit on purpose.
+  const keepLimited = why === "limited" && account === bound && keepsPastLimit(account, binding, input.now, input.model, input.usageOf(account.id));
+  if (why && mayMove && !keepLimited && (input.autoSwitch || why !== "limited")) {
     const staying = findAccount(state, input.current);
     // A paid stand-in is only kept while no subscription account could take over from it.
     const keeps = (stand: StoredAccount) =>

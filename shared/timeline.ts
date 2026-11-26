@@ -29,6 +29,8 @@ export const SwitchRowSchema = z.object({
     "room",
     /** `from` still works but is projected past the 5-hour pacing gate; a cold idle agent moved off it. */
     "pacing",
+    /** `from` is nearly at its limit, and another plugin asked to move the agent before it gets there. */
+    "near_limit",
   ]),
   /** When the exhausted account frees up again, if known. */
   resetsAt: z.string().nullable(),
@@ -53,6 +55,11 @@ export const SwitchRowSchema = z.object({
    * handoff, so a client that does not know the field still parses the row.
    */
   sameConversation: z.boolean().optional(),
+  /**
+   * On a `stayed` row for a `limit`: the agent is pinned to `from` with `allowLimited`, so ZeroSub
+   * left it there on purpose. Absent otherwise, and on rows from older servers.
+   */
+  allowLimited: z.literal(true).optional(),
   detail: z.string().nullable().default(null),
   at: z.string(),
 });

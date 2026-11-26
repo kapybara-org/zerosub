@@ -26,6 +26,16 @@ export function mainClaudeDir(): string {
   return configured ? resolve(configured) : join(homedir(), ".claude");
 }
 
+/**
+ * Where the main login's credentials (`.credentials.json` off macOS) live: Claude Code reads
+ * `CLAUDE_SECURESTORAGE_CONFIG_DIR` first (empty for `~/.claude`), else the config directory.
+ */
+export function mainClaudeStorageDir(): string {
+  const secure = process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR;
+  if (secure !== undefined) return secure ? resolve(secure) : join(homedir(), ".claude");
+  return mainClaudeDir();
+}
+
 /** Claude keeps its global config beside the config directory unless `CLAUDE_CONFIG_DIR` is set. */
 export function mainClaudeGlobalConfig(): string {
   const configured = process.env.CLAUDE_CONFIG_DIR?.trim();

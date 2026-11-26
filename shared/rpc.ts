@@ -330,12 +330,107 @@ export const forkAgent = defineRpc({
   }),
 });
 
+/** One piece of background work an agent left running after its turn, as Paseo describes it. */
+export const BackgroundJobSchema = z.object({
+  /** Paseo's kind: `shell`, `monitor` (a watcher), or `other`. */
+  kind: z.string(),
+  description: z.string().nullable(),
+  command: z.string().nullable(),
+});
+export type BackgroundJob = z.infer<typeof BackgroundJobSchema>;
+
+/**
+ * Why `zerosub.agents.move_before_limit` didn't move the agent, for a caller to act on (`detail` is
+ * display text). Callers treat an unknown value as `refused` with nothing to retry.
+ */
+export const MoveBeforeLimitReasonSchema = z.enum([
+  /** `waiting`: a turn is running. Ask again once it ends. */
+  "busy_turn",
+  /** `waiting`: background work is running (see `backgroundWork`). Ask again once it ends, or with `stopBackgroundWork`. */
+  "background_work",
+  /** Automatic switching is off in ZeroSub's settings. */
+  "auto_switch_off",
+  /** The agent is closed, archived or gone. */
+  "not_open",
+  /** The agent's conversation can't change accounts in place (Codex, Grok, Cursor, Antigravity). */
+  "unsupported_provider",
+  /** The account is missing, of another provider, an API key or paid stand-in, or can't take the agent now. */
+  "ineligible_target",
+  /** The agent is pinned to an account by the user or `zerosub.agents.account`. */
+  "user_pinned",
+  /** It changed accounts too often in the last 10 minutes. Ask again later. */
+  "switch_guard",
+  /** Another move of this agent is under way. Ask again shortly. */
+  "in_progress",
+  /** The reload failed; the agent stays where it was. Ask again later. */
+  "reload_failed",
+  /** The reload worked, but the agent opened on another account (`accountId`): the target couldn't take it by then. */
+  "landed_elsewhere",
+]);
+export type MoveBeforeLimitReason = z.infer<typeof MoveBeforeLimitReasonSchema>;
+
+export const MoveBeforeLimitResultSchema = z.object({
+  /**
+   * `moved`: it runs on the account now. `already`: it ran there already. `waiting`: nothing changed;
+   * a turn or background work is running (`waitingFor`), so ask again later. `pending`: the reload
+   * outlasted the answer and goes on; `zerosub.state` and the timeline say where it lands.
+   * `refused`: not moved (`reason`). Releases before `reason` was added answered `waiting` for a
+   * move they left queued instead.
+   */
+  outcome: z.enum(["moved", "waiting", "already", "refused", "pending"]),
+  /** Machine-readable cause for `waiting` and `refused`; null otherwise. */
+  reason: MoveBeforeLimitReasonSchema.nullable().default(null),
+  /** Asking again as is can succeed later (see `reason`). */
+  retryable: z.boolean().default(false),
+  /** The account the agent's live session runs on when ZeroSub answered, or null when it has none. */
+  accountId: z.string().nullable().default(null),
+  /** Display text; not for matching. */
+  detail: z.string().nullable(),
+  /** For `waiting`: a running `turn` or `background` work. Null otherwise. */
+  waitingFor: z.enum(["turn", "background"]).nullable().default(null),
+  /** For `waiting` on background work: the jobs still running. */
+  backgroundWork: z.array(BackgroundJobSchema).default([]),
+  /**
+   * Background work this call ended. On `moved` and `pending`: what it stopped, and what the reload
+   * ended. Otherwise only the stops Paseo confirmed, which stay stopped though the agent didn't move.
+   */
+  stopped: z.array(BackgroundJobSchema).default([]),
+});
+export type MoveBeforeLimitResult = z.infer<typeof MoveBeforeLimitResultSchema>;
+
+/**
+ * Moves one agent, between turns, to the named account before its own account is at its limit. For a
+ * plugin that stops a session at its own threshold below 100% (where ZeroSub sees no limit yet), so
+ * it can move the session to an account with room instead of holding it. The move is ZeroSub's own,
+ * as after a limit: the agent isn't pinned to the account, and every guard of an automatic move
+ * applies. See README, Plugin contracts.
+ */
+export const moveBeforeLimit = defineRpc({
+  name: "zerosub.agents.move_before_limit",
+  input: z.object({
+    agentId: z.string(),
+    accountId: z.string(),
+    /**
+     * Move now even though the agent has background work: stop the work Paseo can stop, then reopen
+     * it (which ends the rest). Off by default: the answer is `waiting` while background work runs.
+     * Work the daemon owns (heartbeats, its own jobs) outlives a reopen and never holds one back.
+     */
+    stopBackgroundWork: z.boolean().optional(),
+  }),
+  output: MoveBeforeLimitResultSchema,
+});
+
 export const setAgentAccount = defineRpc({
   name: "zerosub.agents.account",
   input: z.object({
     agentId: z.string(),
     /** `null` makes the agent follow the default account again. */
     accountId: z.string().nullable(),
+    /**
+     * Keep the agent on `accountId` even while that account is at its limit, for an account that
+     * keeps working past it (extra usage). Needs an account; signed-out and disabled ones still swap.
+     */
+    allowLimited: z.boolean().optional(),
   }),
   output: ReopenSummarySchema,
 });

@@ -88,6 +88,7 @@ const used = (usedPercent: number): AccountView["usage"] => ({
 
 function view(accounts: AccountView[], fields: Partial<StateView> = {}): StateView {
   return {
+    version: 1,
     accounts,
     agents: [],
     logins: [],
@@ -129,6 +130,7 @@ describe("the accounts a composer without an agent offers", () => {
   it("lists the default first, as the choice that names no account, then the others", () => {
     expect(accountChoices(view([work, main, home]), "claude", undefined)).toEqual({
       icon: "CircleUserRound",
+      title: "Claude account",
       value: FOLLOW,
       options: [
         { value: FOLLOW, label: "main", description: "Default · 42% used" },
@@ -324,10 +326,16 @@ describe("the account control for an agent that doesn't exist yet", () => {
     for (const context of ["draft", "new-workspace"]) {
       const element = setUp(view([main, work]), { context, metadata: { [ACCOUNT_METADATA_KEY]: "work" } }).render();
       expect(element?.type, context).toBe("Select");
-      expect(element?.props, context).toMatchObject({ title: "Account", icon: "CircleUserRound", value: "work" });
+      expect(element?.props, context).toMatchObject({ title: "Claude account", icon: "CircleUserRound", value: "work" });
       expect((element?.props.options as { value: string }[]).map((option) => option.value), context).toEqual([FOLLOW, "work"]);
     }
     expect(setUp(view([main, work]), { context: "agent" }).render()).toBeNull();
+  });
+
+  it("is named for the provider whose accounts it lists, a profile of it included", () => {
+    const state = view([main, work, account("a", { family: "codex", isDefault: true }), account("b", { family: "codex" })]);
+    expect(setUp(state, { context: "draft", provider: "codex" }).render()?.props.title).toBe("ChatGPT account");
+    expect(setUp(state, { context: "new-workspace", provider: "claude-team" }).render()?.props.title).toBe("Claude account");
   });
 
   it("shows nothing until the accounts are known, or when there's nothing to choose", () => {
@@ -370,6 +378,7 @@ describe("the accounts a running agent's composer offers", () => {
   it("lists the agent's account first, then the others, and the Accounts screen", () => {
     expect(agentChoices(running([work, main, home]), "agent-1")).toEqual({
       icon: "CircleUserRound",
+      title: "Claude account",
       value: "main",
       options: [
         { value: "main", label: "main", description: "42% used" },
@@ -460,7 +469,7 @@ describe("the account control of a running agent", () => {
   it("shows the agent's account once the agent's metadata says which agent it is", () => {
     const element = setUp(running([main, work]), { context: "agent", metadata: named }).render();
     expect(element?.type).toBe("Select");
-    expect(element?.props).toMatchObject({ title: "Account", icon: "CircleUserRound", value: "main" });
+    expect(element?.props).toMatchObject({ title: "Claude account", icon: "CircleUserRound", value: "main" });
     // Until the daemon has written the ID there, and for an agent it doesn't route, nothing shows.
     expect(setUp(running([main, work]), { context: "agent" }).render()).toBeNull();
     expect(setUp(running([main, work]), { context: "agent", metadata: { [AGENT_METADATA_KEY]: "another-agent" } }).render()).toBeNull();
@@ -515,7 +524,7 @@ describe("a running agent's control, as the account button shows it", () => {
     expect(element.type).toBe("AccountPillButton");
     expect(element.props).toMatchObject({ agentId: "agent-1", label: "5h 42", icon: "CircleUserRound" });
     // Its tooltip is the account button's: the account, then a line for each window
-    expect((element.props.title as string).split("\n").slice(0, 2)).toEqual(["Account: main", "5h 42%"]);
+    expect((element.props.title as string).split("\n").slice(0, 2)).toEqual(["Claude account: main", "5h 42%"]);
     expect(typeof element.props.Menu).toBe("function");
     // On a phone the control is only ever in the composer's sheet: a list there, not a menu over it.
     app.compact = true;
@@ -576,12 +585,24 @@ describe("a running agent's control, as the account button shows it", () => {
     expect(thread.entries.map((entry) => entry.label)).toEqual(["a", "Continue on b", "Manage accounts…"]);
   });
 
+  it("names a ChatGPT agent's provider in the pill's tooltip and on the list, as the account button does", () => {
+    app.Combobox = "Combobox";
+    app.compact = false;
+    const state = running([account("a", { family: "codex", isDefault: true }), account("b", { family: "codex" })], { family: "codex", accountId: "a" });
+    const pill = setUp(state, { context: "agent", provider: "codex", metadata: named }).render()!;
+    expect(pill.type).toBe("AccountPillButton");
+    // Its tooltip, which is also what a screen reader reads out for it.
+    expect(pill.props).toMatchObject({ title: "ChatGPT account: a", icon: "CircleUserRound" });
+    app.compact = true;
+    expect(setUp(state, { context: "agent", provider: "codex", metadata: named }).render()?.props).toMatchObject({ title: "ChatGPT account" });
+  });
+
   it("shows as a list that can say the usage on the control, and moves the agent from it", async () => {
     app.Combobox = "Combobox";
     const { render, rpc, openSurface } = setUp(running([main, work]), { context: "agent", metadata: named });
     const element = render()!;
     expect(element.type).toBe("Combobox");
-    expect(element.props).toMatchObject({ title: "Account", icon: "CircleUserRound", value: { id: "main", label: "5h 42" } });
+    expect(element.props).toMatchObject({ title: "Claude account", icon: "CircleUserRound", value: { id: "main", label: "5h 42" } });
     const search = element.props.search as (input: { query: string }) => Promise<{ id: string }[]>;
     expect((await search({ query: "" })).map((entry) => entry.id)).toEqual(["main", "work", MANAGE]);
     expect((await search({ query: "WOR" })).map((entry) => entry.id)).toEqual(["work"]);

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   paceVerdict,
   accountSubtitle,
+  accountTitle,
   apiUsageLines,
   canStandIn,
   paidStandIn,
@@ -25,7 +26,7 @@ import {
   staleNotice,
   usageSummary,
 } from "./format";
-import { onAnthropicApi, type AccountView } from "./model";
+import { FAMILIES, onAnthropicApi, type AccountView } from "./model";
 
 const NOW = Date.parse("2026-09-23T12:00:00Z");
 
@@ -224,27 +225,42 @@ describe("staleNotice", () => {
 });
 
 describe("pillText", () => {
-  const work = { label: "work", email: "ada@example.com" };
+  const work = { label: "work", email: "ada@example.com", family: "claude" as const };
 
-  it("names the account an agent runs on", () => {
-    expect(pillText(work, null, null)).toEqual({ label: "work", title: "Account: work (ada@example.com)" });
+  it("names the provider and the account an agent runs on", () => {
+    expect(pillText(work, null, null)).toEqual({ label: "work", title: "Claude account: work (ada@example.com)" });
+    // The same name and email on a ChatGPT account reads apart from the Claude one.
+    expect(pillText({ ...work, family: "codex" }, null, null).title).toBe("ChatGPT account: work (ada@example.com)");
   });
 
   it("names both accounts while the session hasn't moved yet, and says when it will", () => {
     expect(pillText(work, { label: "lovelace@analytical.example" }, "idle")).toEqual({
       label: "lovelace@an… → work",
-      title: "Account: lovelace@analytical.example, moving to work (ada@example.com) once it's idle",
+      title: "Claude account: lovelace@analytical.example, moving to work (ada@example.com) once it's idle",
     });
     expect(pillText(work, { label: "personal" }, "turn").title).toBe(
-      "Account: personal, moving to work (ada@example.com) when its current turn ends",
+      "Claude account: personal, moving to work (ada@example.com) when its current turn ends",
     );
     expect(pillText(work, { label: "personal" }, "background").title).toBe(
-      "Account: personal, moving to work (ada@example.com) once the background work it left running stops",
+      "Claude account: personal, moving to work (ada@example.com) once the background work it left running stops",
     );
     // Not moved unattended, a reload that didn't work, or no CLI to reload with: not "once it's idle", which won't happen.
     expect(pillText(work, { label: "personal" }, "restart").title).toBe(
-      "Account: personal, moving to work (ada@example.com) when its session next starts",
+      "Claude account: personal, moving to work (ada@example.com) when its session next starts",
     );
+  });
+});
+
+describe("accountTitle", () => {
+  it("names every provider's accounts as the Accounts screen does", () => {
+    expect(Object.fromEntries(FAMILIES.map((family) => [family, accountTitle(family)]))).toEqual({
+      claude: "Claude account",
+      codex: "ChatGPT account",
+      pi: "Pi account",
+      grok: "Grok account",
+      cursor: "Cursor account",
+      antigravity: "Antigravity account",
+    });
   });
 });
 

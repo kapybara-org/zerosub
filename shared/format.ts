@@ -1,4 +1,4 @@
-import { estimateApiCost, onAnthropicApi, totalTokens, type AccountView, type PaceView, WEEK_NEARLY_USED_PERCENT, type AgentRoute, type AzureSummary, type Credits, type Egress, type ExtraUsage, type UsageWindow } from "./model";
+import { estimateApiCost, FAMILY_LABEL, onAnthropicApi, totalTokens, type AccountView, type PaceView, WEEK_NEARLY_USED_PERCENT, type AgentRoute, type AzureSummary, type Credits, type Egress, type ExtraUsage, type Family, type UsageWindow } from "./model";
 import type { ReopenSummary } from "./rpc";
 
 /** "in 2h 14m", "in 3d 4h", "now". */
@@ -177,20 +177,32 @@ const MOVES_WHEN: Record<NonNullable<AgentRoute["waiting"]>, string> = {
 };
 
 /**
- * A composer pill's label and tooltip for an agent routed to `account`. While its session still
- * runs on another account, both are named, so the pill never claims an account the agent isn't
- * using yet, and the tooltip says when the move happens.
+ * What the account button's tooltip starts with and the Account control is called for `family`'s
+ * agents: "Claude account", "ChatGPT account". A Claude and a ChatGPT account can have the same name
+ * (one person signed in to both), and Paseo (0.17) doesn't share its provider icons with plugins, so
+ * the button's icon is the same for every provider: this is what tells them apart, also when read out.
+ */
+export function accountTitle(family: Family): string {
+  return `${FAMILY_LABEL[family]} account`;
+}
+
+/**
+ * A composer pill's label and tooltip for an agent routed to `account`; the tooltip names the
+ * provider first (see `accountTitle`). While its session still runs on another account, both are
+ * named, so the pill never claims an account the agent isn't using yet, and the tooltip says when
+ * the move happens.
  */
 export function pillText(
-  account: Pick<AccountView, "label" | "email">,
+  account: Pick<AccountView, "label" | "email" | "family">,
   running: Pick<AccountView, "label"> | null,
   waiting: AgentRoute["waiting"],
 ): { label: string; title: string } {
   const named = `${account.label}${account.email && account.email !== account.label ? ` (${account.email})` : ""}`;
-  if (!running) return { label: shortLabel(account), title: `Account: ${named}` };
+  const title = accountTitle(account.family);
+  if (!running) return { label: shortLabel(account), title: `${title}: ${named}` };
   return {
     label: `${shortLabel(running, 12)} → ${shortLabel(account, 12)}`,
-    title: `Account: ${running.label}, moving to ${named} ${MOVES_WHEN[waiting ?? "idle"]}`,
+    title: `${title}: ${running.label}, moving to ${named} ${MOVES_WHEN[waiting ?? "idle"]}`,
   };
 }
 

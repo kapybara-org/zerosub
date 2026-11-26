@@ -3,7 +3,7 @@ import * as paseoClient from "@getpaseo/plugin/client";
 import * as paseoUi from "@getpaseo/plugin/client/ui";
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { View } from "react-native";
-import { accountPeak, formatCredits, formatPercent, isDisabled, paceVerdict, pillText } from "../shared/format";
+import { accountPeak, accountTitle, formatCredits, formatPercent, isDisabled, paceVerdict, pillText } from "../shared/format";
 import { ACCOUNT_METADATA_KEY, AGENT_METADATA_KEY, HAND_OFF, type AccountView, type StateView } from "../shared/model";
 import { AccountPillButton } from "./account-pill-button";
 import { watchControl } from "./control-visibility";
@@ -59,6 +59,8 @@ export interface AccountChoices {
   value: string;
   options: AccountOption[];
   icon: string;
+  /** The control's name, which Paseo shows as its label and tooltip and heads its list with: "Claude account". */
+  title: string;
 }
 
 /** Beside an agent's account in its list, when the agent started there because the account's weekly reset was near. */
@@ -102,7 +104,7 @@ export function accountChoices(state: StateView, provider: string | null, chosen
   }
   // A choice that's no longer offered (the provider changed, or its account can't take agents now) reads as none.
   const value = options.some((option) => option.value === chosen) ? (chosen as string) : FOLLOW;
-  return { value, options, icon: "CircleUserRound" };
+  return { value, options, icon: "CircleUserRound", title: accountTitle(family) };
 }
 
 /**
@@ -143,7 +145,7 @@ export function agentChoices(state: StateView, agentId: string): AccountChoices 
     options.push({ value: FOLLOW, label: fallback ? `Follow default (${fallback.label})` : "Follow default" });
   }
   options.push({ value: MANAGE, label: "Manage accounts…" });
-  return { value: current.id, options, icon: current.status === "limited" ? "CircleAlert" : "CircleUserRound" };
+  return { value: current.id, options, icon: current.status === "limited" ? "CircleAlert" : "CircleUserRound", title: accountTitle(route.family) };
 }
 
 /**
@@ -246,7 +248,7 @@ export function contributeComposerItem(client: PluginClientContext, store: ZeroS
       <View ref={ref} collapsable={false} onLayout={onLayout}>
         {face && Combobox ? (
           <Combobox
-            title="Account"
+            title={face.choices.title}
             icon={face.icon}
             value={face.value}
             search={async ({ query }) => matching(face.entries, query)}
@@ -254,7 +256,7 @@ export function contributeComposerItem(client: PluginClientContext, store: ZeroS
           />
         ) : (
           <Select
-            title="Account"
+            title={choices.title}
             icon={choices.icon}
             value={choices.value}
             options={choices.options}
@@ -279,7 +281,7 @@ export function contributeComposerItem(client: PluginClientContext, store: ZeroS
     if (!choices) return null;
     return (
       <Select
-        title="Account"
+        title={choices.title}
         icon={choices.icon}
         value={choices.value}
         options={choices.options}
