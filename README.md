@@ -116,6 +116,18 @@ That last failure puts the agent back on the previous account, in the same write
 
 On 2026-11-15, my fork continued one conversation from member A to member B of the same workspace on macOS 27.0.1 with Codex 0.167.0. That hop was a workspace credit limit, which this option still opens in a new tab. The run did not cover a second workspace or an email-only identity.
 
+### Share MCP sign-ins between Claude accounts (optional)
+
+Off by default. Claude Code keeps MCP servers' OAuth sign-ins (Linear, Notion, …) per Claude account, so an agent moved to another account finds those servers asking for a sign-in again. Turn on **Share MCP sign-ins between Claude accounts** and a server you sign in to on one Claude account works on the others too. Leave it off when your accounts sign in to the same server as different people (a work Linear on one, a personal one on another): with it on, they'd all end up with whichever sign-in is newest.
+
+- Claude Code keeps these sign-ins in `.credentials.json`, under `mcpOAuth`, beside the account's own sign-in. Every 30 seconds ZeroSub copies each server's entry between your CLI login and each added Claude account, whichever way it's newer: it holds a token and the other doesn't, or both have an expiry and it expires later. So a sign-in or a token refresh on any account reaches the others within a minute. A token saved without an expiry (the server didn't give one) only goes to accounts that have no token for that server.
+- It writes under Claude Code's own lock on that file (`.storage-write.lock`), reading the file again under it, and changes only `mcpOAuth`. The account's own Claude sign-in is never copied or changed, and an account that isn't signed in gets no `.credentials.json`.
+- A server it just brought in is dropped from that account's `mcp-needs-auth-cache.json`, so a new session uses it at once. A session already open may need `/mcp` to reconnect.
+- Signing out of a server on one account signs every account out of it. Claude Code revokes the tokens with the server, and they're the same tokens on every account; sign in again on any account and the new sign-in reaches the others. Signing in to a server again on one account revokes the old tokens too, so the other accounts can't use the server until the new sign-in reaches them.
+- Accounts holding the same token tend to refresh it together, near its expiry. With a server that replaces its refresh token on every refresh, one of them can be left with a spent token and need `/mcp` again; a server that treats a reused refresh token as stolen may sign every account out of it.
+- Turned off, nothing more is copied, and sign-ins already copied stay where they are.
+- Not on macOS, where Claude Code keeps these sign-ins in each account's Keychain entry, nor on Windows where it uses Credential Manager: only a `.credentials.json` file is read or written.
+
 ### Banked resets
 
 Some plans come with banked limit resets: ChatGPT's reset credits, and Claude Code's limit resets. When an account has any, its card shows how many are banked and when they expire, with a **Use reset** button. When an agent is stopped by a limit, its account button offers the reset too, and the agent carries on afterwards.
@@ -359,7 +371,7 @@ Sign-in runs the official CLIs:
 - Grok: `grok login --oauth`, or `grok login --device-auth` for the code.
 - Cursor: `cursor-agent login`.
 
-ZeroSub never implements OAuth itself and never copies credentials between accounts.
+ZeroSub never implements OAuth itself and never copies an account's own sign-in to another. The one thing it can carry between accounts, if you turn it on, is MCP servers' OAuth sign-ins (see [Share MCP sign-ins between Claude accounts](#share-mcp-sign-ins-between-claude-accounts-optional)).
 
 ## Privacy and security
 
@@ -379,7 +391,7 @@ ZeroSub never implements OAuth itself and never copies credentials between accou
 
 ## Limitations
 
-- **MCP servers that use OAuth** (Linear, Notion, …) store their tokens per Claude account, so sign in to them once on each account.
+- **MCP servers that use OAuth** (Linear, Notion, …) store their tokens per Claude account, so sign in to them once on each account, unless you turn on [Share MCP sign-ins between Claude accounts](#share-mcp-sign-ins-between-claude-accounts-optional) (not on macOS).
 - **A long Keychain sign-in keeps an added Claude account's folder where it is (macOS).** Added Claude accounts move out of ZeroSub's `homes/` into `~/.claude-config` (or the folder picked under the Claude accounts) with their Keychain entry, which ZeroSub copies through `security -i`'s standard input so the sign-in never shows in the process list. `security -i` takes about 4,000 characters a line, and the sign-in goes on it as hex, so an entry over about 1.9 KB can't be copied that way; Claude Code's records of MCP servers' sign-ins (`mcpOAuth`) can make it that long. Such an account keeps its folder and works as before, and its card says why. ZeroSub looks at the entry again every 30 minutes, and moves the folder once it fits.
 - **Shared settings apply to every account.** If `~/.claude/settings.json` sets an `apiKeyHelper` or API-key `env`, every account uses that key instead of its subscription. Likewise, an `[auth]` command, customer SSO (`[grok_com_config.oidc]`) or a model's own `api_key` in `~/.grok/config.toml` signs every Grok account in the same way.
 - **A Grok sign-in set in the daemon's environment** (`GROK_AUTH_PROVIDER_COMMAND`, or `GROK_OIDC_ISSUER` and `GROK_OIDC_CLIENT_ID`) is used by your CLI login only. ZeroSub clears it for added Grok accounts, so one that can only sign in that way may fail to sign in or stay signed in; ZeroSub shows a warning when it's set.
