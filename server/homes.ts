@@ -1181,12 +1181,17 @@ export async function codexSqliteHome(): Promise<string | null> {
 
 // --------------------------------------------------------------------------- Grok
 
+// Linux Grok includes these sources in its sandbox plan and rejects retargetable paths.
+const GROK_POLICY_SOURCES: readonly string[] = [
+  "hooks", "hooks-paths", "config.toml", "trusted_folders.toml", "sandbox.toml", "bundled", "bundles",
+];
+
 /**
  * Per-account entries in a Grok home: the login (`auth.json`, or a file `GROK_AUTH_PATH` names there),
  * MCP sign-ins, what Grok fetched for this account (settings, model list, experiments, the team's
  * managed config and requirements), and the running processes' own state: locks, sockets, the leader,
- * logs, crash reports and trace uploads (sent with this account's login). The rest, sessions included,
- * is shared, so an agent reopens on another account with its conversation.
+ * logs, crash reports and trace uploads (sent with this account's login). Linux also keeps real
+ * copies of the sandbox policy sources. The rest, including sessions, is shared.
  */
 const GROK_PRIVATE = new Set([
   "auth.json",
@@ -1211,6 +1216,7 @@ const GROK_PRIVATE = new Set([
 export function grokPrivate(name: string): boolean {
   return (
     GROK_PRIVATE.has(name) ||
+    (process.platform === "linux" && GROK_POLICY_SOURCES.includes(name)) ||
     isTemporary(name) ||
     /auth|credential|token|secret/i.test(name) ||
     name.startsWith("leader") ||
@@ -1219,10 +1225,37 @@ export function grokPrivate(name: string): boolean {
 }
 
 export async function prepareGrokHome(home: string, force = false): Promise<void> {
-  const last = lastSync.get(home);
-  if (!force && last && Date.now() - last < SYNC_TTL_MS) return;
-  await syncOverlay(home, { main: mainGrokHome(), shareDirs: ["sessions"], isPrivate: grokPrivate });
-  lastSync.set(home, Date.now());
+  await withHome(home, async () => {
+    const last = lastSync.get(home);
+    if (!force && last && Date.now() - last < SYNC_TTL_MS) return;
+    const main = mainGrokHome();
+    await syncOverlay(home, { main, shareDirs: ["sessions"], isPrivate: grokPrivate });
+    if (process.platform === "linux") {
+      for (const name of GROK_POLICY_SOURCES) {
+        const source = await realpath(join(main, name)).catch((error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT") return null;
+          throw error;
+        });
+        if (!source) continue;
+        const target = join(home, name);
+        const entry = await lstat(target).catch((error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT") return null;
+          throw error;
+        });
+        // Keep account-specific files and links; only convert the link made by the old overlay.
+        if (entry && (!entry.isSymbolicLink() || resolve(home, await readlink(target)) !== source)) continue;
+        const temporary = join(home, `.${randomBytes(6).toString("hex")}.tmp`);
+        try {
+          await cp(source, temporary, { recursive: true, verbatimSymlinks: true });
+          if (entry) await unlink(target);
+          await rename(temporary, target);
+        } finally {
+          await rm(temporary, { recursive: true, force: true });
+        }
+      }
+    }
+    lastSync.set(home, Date.now());
+  });
 }
 
 // --------------------------------------------------------------------------- Cursor
