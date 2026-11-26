@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { PluginHookContext } from "@getpaseo/plugin/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentTimelineItem, FamilyAdapter } from "./adapter";
+import { CODEX_FAST_METADATA_KEY, type CodexSpeedState } from "./codex-fast";
 import { detectCodexLimit, detectCodexSignOut } from "./limits";
 import type { FamilyResolver } from "./families";
 import type { Reopener } from "./reopen";
@@ -20,7 +21,12 @@ type Entry = { item: AgentTimelineItem; timestamp: string; seqStart: number; seq
 
 const LIMIT = "You've hit your usage limit. Try again at 3:45 PM.";
 const CREDITS = "Your workspace is out of credits. Add credits to continue.";
+const SPEND_CAP = "You hit your spend cap. Try again later.";
 const DECRYPT = "invalid_encrypted_content: organization_id mismatch";
+const FAST_CONTROLS = [{
+  type: "select", key: "service_tier",
+  choices: [{ value: "default", label: "Standard" }, { value: "priority", label: "Fast" }],
+}];
 
 let savedHome: string | undefined;
 let savedPaseo: string | undefined;
@@ -61,6 +67,8 @@ async function setup(options: {
   linkSessions?: boolean;
   reload?: "works" | "fails";
   autoContinue?: boolean;
+  speed?: "managed" | "manual";
+  speedWriteFails?: boolean;
 } = {}) {
   const dir = await mkdtemp(join(tmpdir(), "zerosub-same-conversation-"));
   dirs.push(dir);
@@ -75,6 +83,7 @@ async function setup(options: {
 
   const a = account("a", options.identityA ?? "chatgpt|ws|a@example.com", null, "main");
   const b = account("b", options.identityB ?? "chatgpt|ws|b@example.com", homeB, "managed");
+  if (options.speed) a.codexFastUntil = "2099-12-31";
   const store = new StateStore(join(dir, "state.json"));
   await store.update((draft) => {
     draft.accounts = [a, b];
@@ -87,16 +96,16 @@ async function setup(options: {
     };
   });
 
-  const agents = new Map<string, Snapshot>();
+  const agents = new Map<string, Snapshot & CodexSpeedState>();
   const timelines = new Map<string, Entry[]>();
   let clock = 0;
-  function addAgent(id: string, values: Partial<Snapshot> = {}) {
+  function addAgent(id: string, values: Partial<Snapshot & CodexSpeedState> = {}) {
     const agent = {
       id, provider: "codex", model: "synthetic-model", title: "Fix the build", cwd: dir, workspaceId: "workspace-1",
       status: "idle", currentModeId: "full-access", thinkingOptionId: "high", labels: {},
       features: [{ type: "toggle", id: "fast_mode", value: true, label: "Fast" }],
       archivedAt: null, lastUserMessageAt: "2026-10-01T00:00:00.000Z", pendingPermissions: [], ...values,
-    } as Snapshot;
+    } as Snapshot & CodexSpeedState;
     agents.set(id, agent);
     timelines.set(id, []);
     return agent;
@@ -107,13 +116,20 @@ async function setup(options: {
     entries.push({ item, timestamp: new Date(1_700_000_000_000 + clock++ * 1000).toISOString(), seqStart: seq, seqEnd: seq, turnId: "accepted-turn" });
     if (item.type === "user_message") agents.get(id)!.lastUserMessageAt = entries.at(-1)!.timestamp;
   }
-  addAgent("root");
+  addAgent("root", options.speed ? {
+    controls: FAST_CONTROLS,
+    options: { service_tier: "priority" },
+    metadata: options.speed === "managed" ? { [CODEX_FAST_METADATA_KEY]: true } : {},
+  } : {});
   add("root", { type: "user_message", text: "Repair the build." });
   add("root", { type: "assistant_message", text: "The parser has been repaired." });
 
   const created: Create[] = [];
   const sent: Array<{ id: string; text: string }> = [];
+  const speedEvents: Array<{ kind: "setOptions" | "send"; id: string; tier: unknown; accountId?: string }> = [];
   const notes: SwitchRow[] = [];
+  let releaseSpeedScan = () => {};
+  const speedScan = new Promise<void>((resolve) => { releaseSpeedScan = resolve; });
   const create = vi.fn(async (request: Create) => {
     created.push(request);
     addAgent(request.agentId!, { labels: request.labels, title: request.title, currentModeId: request.config.modeId ?? null, lastUserMessageAt: null });
@@ -138,10 +154,30 @@ async function setup(options: {
     workspaces: { ref: () => ({ agents: { create } }) },
     agents: {
       create,
-      list: async () => ({ entries: [...agents.values()].map((agent) => ({ agent })), pageInfo: { hasMore: false } }),
+      list: async (request?: { filter?: { includeBackground?: boolean } }) => {
+        // A slow background scan must not be needed to make the carry-on safe.
+        if (options.speed && request?.filter?.includeBackground) await speedScan;
+        return { entries: [...agents.values()].map((agent) => ({ agent })), pageInfo: { hasMore: false } };
+      },
       ref: (id: string) => ({
         refresh: async () => agents.has(id) ? { agent: structuredClone(agents.get(id)) } : null,
-        send: async (text: string) => { sent.push({ id, text }); },
+        setOptions: async (patch: { service_tier: "fast" | "default" }) => {
+          if (options.speedWriteFails) throw new Error("speed unavailable");
+          await new Promise<void>((resolve) => setTimeout(resolve, 10));
+          const agent = agents.get(id)!;
+          agent.options = { ...agent.options, ...patch, service_tier: patch.service_tier === "fast" ? "priority" : patch.service_tier };
+          speedEvents.push({ kind: "setOptions", id, tier: agent.options.service_tier });
+        },
+        setMetadata: async (patch: Record<string, unknown>) => {
+          const agent = agents.get(id)!;
+          agent.metadata = { ...agent.metadata, ...patch };
+        },
+        send: async (text: string) => {
+          const event = { kind: "send" as const, id, tier: agents.get(id)?.options?.service_tier, accountId: undefined as string | undefined };
+          speedEvents.push(event);
+          event.accountId = (await store.read()).sessions[id]?.accountId;
+          sent.push({ id, text });
+        },
         timeline: {
           refetch: (refetchOptions: Parameters<typeof refetch>[1]) => refetch(id, refetchOptions),
           append: async (item: { data: SwitchRow }) => { notes.push(item.data); },
@@ -170,7 +206,14 @@ async function setup(options: {
     env: async (home: string | null) => (home ? { CODEX_HOME: home } : {}),
     prepareHome: async () => undefined,
     identity: async () => null,
-    usage: async () => ({ fetchedAt: new Date().toISOString(), windows: [], error: null, cached: false, resets: null }),
+    usage: async () => ({
+      fetchedAt: new Date().toISOString(),
+      windows: options.speed ? [{
+        id: "secondary", label: "Weekly", minutes: 10_080, usedPercent: 20,
+        resetsAt: new Date(Date.now() + 7 * 24 * 60 * 60_000).toISOString(),
+      }] : [],
+      error: null, cached: false, resets: null,
+    }),
     redeemReset: async () => ({ outcome: "none", message: "none", left: 0 }),
   } as unknown as FamilyAdapter;
   service = new Service(
@@ -181,6 +224,7 @@ async function setup(options: {
   );
   services.push(service);
   service.setPreferences(preferences.schema.parse({ codexSameConversation: options.sameConversation === true, autoContinue: options.autoContinue }));
+  if (options.speed) await service.refreshUsage(a.id);
 
   const endTurn = (message: string, kind: "failed" | "completed" = "failed", timeline: AgentTimelineItem[] = []) => service.onTurnEnded({
     agent: { id: "root", provider: "codex" },
@@ -189,7 +233,7 @@ async function setup(options: {
     timeline,
   } as never, { paseo } as never);
 
-  return { service, store, paseo, created, sent, notes, reopened, endTurn, a, b };
+  return { service, store, paseo, created, sent, notes, reopened, endTurn, a, b, speedEvents, releaseSpeedScan };
 }
 
 describe("Codex same-conversation failover", () => {
@@ -221,6 +265,58 @@ describe("Codex same-conversation failover", () => {
     });
     expect(Object.keys(state.continuations.root?.members ?? {})).toEqual(["root"]);
     expect(t.notes.at(-1)).toMatchObject({ outcome: "switched", sameConversation: true, to: "B", continued: true });
+  });
+
+  it("uses Standard before carrying on after a spend-cap switch to an account not opted into Fast", async () => {
+    const t = await setup({ sameConversation: true, speed: "managed" });
+    try {
+      expect(t.a.codexFastUntil).toBeDefined();
+      expect(t.b.codexFastUntil).toBeUndefined();
+      expect((await t.paseo.agents.ref("root").refresh())?.agent).toMatchObject({
+        options: { service_tier: "priority" }, metadata: { [CODEX_FAST_METADATA_KEY]: true },
+      });
+      await t.endTurn(SPEND_CAP);
+      expect(t.reopened).toEqual(["root"]);
+      expect(t.created).toEqual([]);
+      expect(t.speedEvents).toEqual([
+        { kind: "setOptions", id: "root", tier: "default" },
+        { kind: "send", id: "root", tier: "default", accountId: "b" },
+      ]);
+    } finally {
+      t.releaseSpeedScan();
+    }
+  });
+
+  it("preserves user-selected Fast when switching to an account not opted into Fast", async () => {
+    const t = await setup({ sameConversation: true, speed: "manual" });
+    try {
+      expect((await t.paseo.agents.ref("root").refresh())?.agent).toMatchObject({
+        options: { service_tier: "priority" }, metadata: {},
+      });
+      await t.endTurn(SPEND_CAP);
+      expect(t.reopened).toEqual(["root"]);
+      expect(t.created).toEqual([]);
+      expect(t.speedEvents).toEqual([{ kind: "send", id: "root", tier: "priority", accountId: "b" }]);
+    } finally {
+      t.releaseSpeedScan();
+    }
+  });
+
+  it("keeps the account switch but skips carry-on when managed Fast cannot be reset", async () => {
+    const t = await setup({ sameConversation: true, speed: "managed", speedWriteFails: true });
+    try {
+      await t.endTurn(SPEND_CAP);
+      expect((await t.store.read()).sessions.root?.accountId).toBe("b");
+      expect(t.created).toEqual([]);
+      expect(t.sent).toEqual([]);
+      expect(t.notes.at(-1)).toMatchObject({
+        outcome: "switched",
+        continued: false,
+        detail: expect.stringContaining("speed unavailable"),
+      });
+    } finally {
+      t.releaseSpeedScan();
+    }
   });
 
   it("opens a new tab when the workspace is out of credits", async () => {

@@ -342,6 +342,7 @@ export class CodexContinuations {
         agentId: targetId,
         deferPrompt: true,
         parentId: destination.parent,
+        accountId: account.id,
         bind: async () => {},
       });
       // Creation can take time. A user may have started another turn or disabled the account.

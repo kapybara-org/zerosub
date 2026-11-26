@@ -17,6 +17,7 @@ import {
   redeemReset,
   removeAccount,
   renameAccount,
+  setCodexFastUntil,
   setQuotaCeiling,
   setAgentAccount,
   moveBeforeLimit,
@@ -73,13 +74,13 @@ export default function contribute(server: PluginServerContext) {
     }
   });
 
-  // A new Claude agent's mode is carried to its first session, where Paseo can't say it yet. Creating
-  // the agent never fails for this: on any error the request goes on unchanged.
+  // Set the speed for an eligible new Codex agent or carry a Claude agent's mode to its first session.
+  // On error the request goes on unchanged.
   server.before("agent.create", async ({ request }, context) => {
     try {
       return await service.onAgentCreate(request, context);
     } catch (error) {
-      console.error("[ZeroSub] could not note a new agent's mode", describe(error));
+      console.error("[ZeroSub] could not prepare a new agent's options", describe(error));
       return undefined;
     }
   });
@@ -95,8 +96,8 @@ export default function contribute(server: PluginServerContext) {
     });
   });
   // A new agent is in the next state the app reads, so its composer has its account at once.
-  server.on("agent.created", () => {
-    service.onAgentCreated();
+  server.on("agent.created", (_event, context) => {
+    service.onAgentCreated(context);
   });
   server.on("agent.archived", (event) => {
     void service.onAgentArchived(event.agent.id).catch(() => undefined);
@@ -118,6 +119,10 @@ export default function contribute(server: PluginServerContext) {
   server.handle(cancelLogin, ({ loginId }) => service.cancelLogin(loginId));
   server.handle(setQuotaCeiling, async ({ accountId, windowId, percent }) => {
     await service.setQuotaCeiling(accountId, windowId, percent);
+    return { ok: true as const };
+  });
+  server.handle(setCodexFastUntil, async ({ accountId, until }, { paseo }) => {
+    await service.setCodexFastUntil(paseo, accountId, until);
     return { ok: true as const };
   });
   server.handle(renameAccount, async ({ accountId, label }) => {

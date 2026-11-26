@@ -1,5 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
+import { CodexFastUntilSchema } from "./codex-fast-date";
 import { ApiKeyKindSchema, ApiPriceSchema, BedrockSourceSchema, FamilySchema, LoginMethodSchema, LoginViewSchema, StateViewSchema, TrafficSwitchesSchema } from "./model";
 
 export const getState = defineRpc({
@@ -42,6 +43,12 @@ export const cancelLogin = defineRpc({
 export const setQuotaCeiling = defineRpc({
   name: "zerosub.accounts.quota-ceiling",
   input: z.object({ accountId: z.string(), windowId: z.string().min(1).max(128), percent: z.number().int().min(1).max(100) }),
+  output: z.object({ ok: z.literal(true) }),
+});
+
+export const setCodexFastUntil = defineRpc({
+  name: "zerosub.accounts.codex-fast-until",
+  input: z.object({ accountId: z.string(), until: CodexFastUntilSchema }),
   output: z.object({ ok: z.literal(true) }),
 });
 

@@ -394,6 +394,7 @@ export type PaceView = z.infer<typeof PaceViewSchema>;
 export const AccountViewSchema = z.object({
   ceilingHit: z.boolean().optional(),
   quotaCeilings: z.record(z.string(), z.number().int().min(1).max(99)).optional(),
+  codexFastUntil: z.iso.date().optional(),
   id: z.string(),
   family: FamilySchema,
   label: z.string(),
@@ -549,6 +550,15 @@ export type LoginView = z.infer<typeof LoginViewSchema>;
  * (`paseo.agents.create({ metadata })`). Routing reads it once, when the agent is created.
  */
 export const ACCOUNT_METADATA_KEY = "zerosub.account";
+
+/** Agent metadata marking a Fast speed ZeroSub set, so only that speed is undone again. */
+export const CODEX_FAST_METADATA_KEY = "zerosub.codex-fast";
+
+/**
+ * Metadata on a hand-off's create naming the account it's bound to, for ZeroSub's own `agent.create`
+ * hook (which has no agent ID to look the binding up by). The hook removes it again.
+ */
+export const HANDOFF_ACCOUNT_METADATA_KEY = "zerosub.handoff-account";
 
 /**
  * Agent metadata holding the agent's own ID. Paseo doesn't tell a composer item which agent's

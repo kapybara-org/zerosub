@@ -10,6 +10,7 @@ Use several Claude, ChatGPT (Codex), Grok and Cursor subscriptions side by side 
 - **Automatic failover.** When an account hits its 5-hour or weekly limit, the agent moves to the account with the most room left and carries on. New agents skip exhausted accounts. A limit of one model's own window (Claude's **Weekly · Fable** or **Weekly · Opus**, say) only keeps agents on that model off the account: agents on other models keep using it.
 - **Live usage.** Each account shows its own 5-hour and weekly usage and when they reset, plus any ChatGPT credits or Claude extra usage. Accounts in use refresh about every minute and after each turn, and a limit shows up the moment it hits.
 - **Banked resets.** If a provider has banked limit resets on an account, you can use one from the account card or the agent's account button.
+- **Temporary Codex Fast mode.** Set an end date on the ChatGPT account whose agents should use Fast after a reset. See [Codex Fast mode](#codex-fast-mode).
 - **Set an account aside.** Disable an account for a while and its agents move to your other accounts, then come back when you enable it again.
 - **Several hosts.** Each Paseo host keeps its own accounts, and the Accounts screen says which host you're looking at.
 - **Fork to the other provider (optional).** When every Claude account is out, a stopped chat can carry on in a new ChatGPT agent, and the other way round. A stopped Claude chat can instead continue on the host's OpenCode.
@@ -136,6 +137,16 @@ Some plans come with banked limit resets: ChatGPT's reset credits, and Claude Co
 - **ChatGPT** uses Codex's own reset-credit API, the same one as `/usage` → reset in the Codex CLI. It never spends a credit while nothing is used up.
 - **Claude** uses Claude Code's limit-reset endpoint. Anthropic decides which accounts get resets; so far it reports the tested accounts as not eligible, so the button may not appear for Claude. It shows up by itself once an account has a reset.
 - **Use banked resets when every account is out** (off by default) spends one automatically, but only when every account of that provider is at its limit and the provider confirms the limit at that moment.
+
+### Codex Fast mode
+
+On Paseo 0.16 or later, open the ChatGPT subscription account's actions in **Accounts (ZeroSub)** and choose **Fast mode**. Enter a date in `YYYY-MM-DD` form. It includes the whole date in UTC. Use **Clear** to end it early. Each login has its own date, so you can opt in just the account that received a banked reset or an offer.
+
+ZeroSub enables Fast on models whose Paseo speed control offers it. It checks the account's latest usage first. Fast pauses at 90% weekly usage, when another account-wide window is full, when a quota ceiling is reached, or when current usage is unavailable. It can resume when a new reading shows room while the date is still active.
+
+Paseo applies the speed to new agents when the possible routes agree. When those routes differ, ZeroSub uses the account the agent opens on. The first turn may start at Standard in that case. Open agents take the new speed on their next turn after the update. At expiry or when you clear the date, ZeroSub restores Standard on agents it switched to Fast. ZeroSub changes agents that are at Standard and whose models offer Fast.
+
+Fast usually consumes more of the included allowance per turn. See [OpenAI's Fast mode support](https://learn.chatgpt.com/docs/agent-configuration/speed) and [usage multipliers](https://learn.chatgpt.com/docs/pricing#speed-multipliers).
 
 ### ChatGPT credits
 

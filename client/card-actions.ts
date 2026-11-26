@@ -1,11 +1,11 @@
 import { FAMILY_LABEL, type AccountView } from "../shared/model";
 import { egressText, isDisabled } from "../shared/format";
 
-export type CardActionKey = "clear" | "next" | "default" | "toggle" | "usage" | "api" | "azure" | "bedrock" | "proxy" | "sessions" | "rename" | "remove";
+export type CardActionKey = "clear" | "next" | "default" | "toggle" | "fast" | "usage" | "api" | "azure" | "bedrock" | "proxy" | "sessions" | "rename" | "remove";
 
 /** Which buttons an account's card shows, in order. The card gives each its icon, label and handler. */
 export function cardActions(
-  account: Pick<AccountView, "family" | "kind" | "auth" | "status" | "disabled" | "isDefault" | "nextAgentUntil" | "apiEditable" | "proxyEditable" | "azure" | "bedrock"> &
+  account: Pick<AccountView, "family" | "kind" | "auth" | "plan" | "status" | "disabled" | "isDefault" | "nextAgentUntil" | "apiEditable" | "proxyEditable" | "azure" | "bedrock"> &
     Partial<Pick<AccountView, "sessionsShared" | "ceilingHit">>,
 ): CardActionKey[] {
   const disabled = isDisabled(account);
@@ -18,6 +18,8 @@ export function cardActions(
   // No Pi account stands in for another, so a disabled one would still be used (see the server's
   // `setAccountEnabled`). One disabled before can still be enabled.
   if (account.family !== "pi" || disabled) keys.push("toggle");
+  // Only a ChatGPT subscription account runs Fast mode: API accounts are billed per use instead.
+  if (account.family === "codex" && account.auth === "subscription" && account.plan !== "API key" && !account.azure) keys.push("fast");
   if (account.family === "claude" && account.auth !== "api") keys.push("usage");
   // An Azure OpenAI account's endpoint, key and prices have a form of their own, and so do an AWS
   // Bedrock account's region, credentials, models and prices.

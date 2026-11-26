@@ -8,6 +8,7 @@ const claude: CardAccount = {
   family: "claude",
   kind: "managed",
   auth: "subscription",
+  plan: null,
   status: "ready",
   disabled: false,
   isDefault: false,
@@ -73,6 +74,21 @@ describe("an added Claude account's sessions button", () => {
     expect(cardActions({ ...claude, sessionsShared: true })).toContain("sessions");
     expect(cardActions({ ...claude, sessionsShared: null })).not.toContain("sessions");
     expect(cardActions(claude)).not.toContain("sessions");
+  });
+});
+
+describe("a ChatGPT account's Fast mode button", () => {
+  const codex: CardAccount = { ...claude, family: "codex", proxyEditable: false };
+
+  it("is offered on a subscription account, and on no other account", () => {
+    expect(cardActions(codex)).toContain("fast");
+    expect(cardActions({ ...codex, auth: "api", apiEditable: true })).not.toContain("fast");
+    expect(cardActions({ ...codex, kind: "main", plan: "API key" })).not.toContain("fast");
+    expect(cardActions({ ...codex, auth: "api", azure: {} as NonNullable<AccountView["azure"]> })).not.toContain("fast");
+    expect(cardActions(claude)).not.toContain("fast");
+    expect(cardActions(pi)).not.toContain("fast");
+    expect(cardActions({ ...codex, family: "grok" })).not.toContain("fast");
+    expect(cardActions({ ...codex, family: "cursor" })).not.toContain("fast");
   });
 });
 

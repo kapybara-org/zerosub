@@ -2,6 +2,7 @@ import type { ReactElement, ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AccountView, StateView } from "../shared/model";
 import { DEFAULT_CONTINUE_PROMPT, preferences, type Preferences } from "../shared/preferences";
+import { setCodexFastUntil } from "../shared/rpc";
 import { accountMenu, type MenuEntry } from "./account-menu";
 import { AccountsSurface } from "./accounts-surface";
 import { PreferencesScreen } from "./settings-screen";
@@ -422,6 +423,83 @@ describe("the accounts screen", () => {
       expect(remove.props.tooltip).toBe("Take the proxy out of ~/.claude/settings.json");
       type("http://127.0.0.1:7890");
       expect(saveDisabled(draw())).toBe(false);
+    });
+  });
+
+  describe("fast mode box", () => {
+    /** The card of the account called `label` in `family`'s section, mounted on its own. */
+    const sectionCard = (surface: () => Element, family: string, label: string) => {
+      const section = [...elements(surface())].find(
+        (element) => typeof element.type === "function" && element.type.name === "FamilySection" && element.props.family === family,
+      );
+      if (!section) throw new Error(`no ${family} section`);
+      const tree = mount(section.type as (props: unknown) => ReactNode, section.props)();
+      const entry = find(tree, (element) => typeof element.type === "function" && (element.props.account as AccountView | undefined)?.label === label);
+      return mount(entry.type as (props: unknown) => ReactNode, entry.props);
+    };
+
+    /** The Fast mode box of the ChatGPT subscription account called `home`, opened from its card. */
+    function open(until?: string) {
+      const { surface, store } = setUp({ accounts: [account("work", { isDefault: true }), account("home", { family: "codex", codexFastUntil: until })] });
+      const render = sectionCard(surface, "codex", "home");
+      (cardButton(render, "Fast mode")!.props.onPress as () => void)();
+      const modal = find(render(), (element) => typeof element.type === "function" && element.type.name === "CodexFastModal");
+      const draw = mount(modal.type as (props: unknown) => ReactNode, modal.props);
+      const input = (tree: Element) => find(tree, named("TextInput"));
+      const saveDisabled = (tree: Element) => find(tree, (element) => element.type === "Button" && element.props.label === "Save").props.disabled;
+      const type = (text: string) => (input(draw()).props.onChangeText as (text: string) => void)(text);
+      return { draw, input, saveDisabled, type, store };
+    }
+
+    it("opens with the account's date in it, saved once it's changed, through the setCodexFastUntil contract", async () => {
+      const { draw, input, saveDisabled, type, store } = open("2026-12-31");
+      expect(input(draw()).props.value).toBe("2026-12-31");
+      expect(saveDisabled(draw())).toBe(true);
+      type("2027-01-15");
+      expect(saveDisabled(draw())).toBe(false);
+      await (find(draw(), (element) => element.type === "Button" && element.props.label === "Save").props.onPress as () => Promise<void>)();
+      expect(store.rpc).toHaveBeenCalledWith(setCodexFastUntil, { accountId: "home", until: "2027-01-15" });
+      expect(paseo.toast.show).toHaveBeenCalledWith("Fast mode date saved for home", expect.anything());
+    });
+
+    it("saves only a real date, saying what one looks like", () => {
+      const { draw, saveDisabled, type } = open();
+      expect(textOf(draw())).toContain("through the end of that day in UTC when usage allows");
+      expect(textOf(draw())).toContain("uses more of the account’s included usage");
+      type("2026-02-30");
+      expect(saveDisabled(draw())).toBe(true);
+      expect(textOf(draw())).toContain("Use a real date as YYYY-MM-DD");
+      type("2026-12-31");
+      expect(saveDisabled(draw())).toBe(false);
+    });
+
+    it("clears the date with Clear, and offers no Clear while off", async () => {
+      const off = open();
+      expect([...elements(off.draw())].some((element) => element.type === "Button" && element.props.label === "Clear")).toBe(false);
+      const { draw, store } = open("2026-12-31");
+      await (find(draw(), (element) => element.type === "Button" && element.props.label === "Clear").props.onPress as () => Promise<void>)();
+      expect(store.rpc).toHaveBeenCalledWith(setCodexFastUntil, { accountId: "home", until: "" });
+      expect(paseo.toast.show).toHaveBeenCalledWith("Fast mode date cleared for home", expect.anything());
+    });
+
+    it("offers Fast mode on a ChatGPT subscription card only, naming its date there while set", () => {
+      const azure = { endpoint: "https://r.openai.azure.com/openai/v1" } as unknown as AccountView["azure"];
+      const { surface } = setUp({
+        accounts: [
+          account("work", { isDefault: true }),
+          account("chat", { family: "codex", codexFastUntil: "2099-12-31" }),
+          account("key", { family: "codex", auth: "api", azure }),
+        ],
+      });
+      const chat = sectionCard(surface, "codex", "chat");
+      const work = sectionCard(surface, "claude", "work");
+      const key = sectionCard(surface, "codex", "key");
+      expect(cardButton(chat, "Fast mode")).toBeDefined();
+      expect(cardButton(work, "Fast mode")).toBeUndefined();
+      expect(cardButton(key, "Fast mode")).toBeUndefined();
+      const badge = (render: () => Element) => [...elements(render())].find((element) => element.type === "Badge" && element.props.label === "Fast until 2099-12-31");
+      expect(badge(chat)).toBeDefined();
+      expect(badge(work)).toBeUndefined();
     });
   });
 

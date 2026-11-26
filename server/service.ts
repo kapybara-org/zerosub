@@ -7,6 +7,7 @@ import type {
   PluginLifecycleEvents,
   PluginSessionOpenRequest,
 } from "@getpaseo/plugin/server";
+import { codexFastExpiresAt } from "../shared/codex-fast-date";
 import {
   ACCOUNT_METADATA_KEY,
   AGENT_METADATA_KEY,
@@ -88,6 +89,7 @@ import {
 import { claudeCliCredentialConflict } from "./claude";
 import { codexHandoffMode, encryptedResumeFailure, sameWorkspace, turnFailedText } from "./codex-same-conversation";
 import { CodexContinuations, MESSAGE_PREFIX, UnresolvableEpochError, fitInstructions, matchesTransfer, readUpdates, ready, sentDigestOf, snapshot, transferMarker, waitForCreated, waitForSource, type Agent } from "./continuations";
+import { CODEX_FAST_METADATA_KEY, HANDOFF_ACCOUNT_METADATA_KEY, canUseCodexFast, codexFastChoice, standardSpeed, syncCodexSpeed, type CodexSpeedCatalog, type CodexSpeedHandle, type CodexSpeedState } from "./codex-fast";
 import { CONTINUED_FROM_LABEL, PARENT_LABEL, buildTranscript, continueInNewAgent, continuationPrompt, promptInstruction, updatePrompt, type Continuation } from "./handoff";
 import { launcherDir, launcherNames, piLauncherDir, writeLaunchers, type LauncherAccount, type LauncherKind } from "./launchers";
 import { PI_ACCOUNT_FILE, codexSessionsShared, prepareClaudeHome, crossesInheritedProxy, isAccountHome, moveHome, normalizeBaseUrl, plainHttp, readPiAccount, readPiAccountForAgents, removeHome, sentInTheClear, setShareMcpSignIns } from "./homes";
@@ -274,6 +276,7 @@ interface AgentInfo {
   named: boolean | null;
   /** The model the agent runs, when Paseo says (a limit of one model's own window depends on it). */
   model: string | null;
+  codexSpeed: CodexSpeedState;
 }
 
 /**
@@ -344,7 +347,8 @@ function sameForkPlace(left: Agent, right: Agent): boolean {
 
 /** `unchecked`: Paseo couldn't say how the agent was doing, so it wasn't reloaded at all. */
 type ReopenResult =
-  | { outcome: "reopened" | "deferred" | "closed" }
+  | { outcome: "reopened"; speedError?: string }
+  | { outcome: "deferred" | "closed" }
   | { outcome: "failed"; error: string; timedOut: boolean; unchecked?: boolean };
 /**
  * A move left for the end of the agent's turn: its timeline note, and whether nobody asked for it
@@ -545,7 +549,7 @@ function createdMode(request: PluginSessionOpenRequest): string | undefined {
  * The account named in a new agent's metadata: the one its composer's account control was set to
  * before the agent existed. A Paseo before 0.16 sends no metadata.
  */
-function requestedAccount(request: PluginSessionOpenRequest): string | undefined {
+function requestedAccount(request: PluginSessionOpenRequest | AgentCreateRequest): string | undefined {
   const { metadata } = request as { metadata?: Readonly<Record<string, unknown>> | null };
   const value = metadata?.[ACCOUNT_METADATA_KEY];
   return typeof value === "string" && value ? value : undefined;
@@ -555,6 +559,12 @@ export class Service {
   private readonly continuations: CodexContinuations;
   private paseo: PaseoApi | null = null;
   private prefs: Preferences = DEFAULT_PREFERENCES;
+  private syncingCodexSpeed = false;
+  private codexSpeedRescan = false;
+  private codexSpeedExpiry: ReturnType<typeof setTimeout> | undefined;
+  private readonly codexSpeedLocks = new Map<string, { mutex: Mutex; users: number }>();
+  private readonly codexReloads = new Set<string>();
+  private readonly codexReloadRescans = new Set<string>();
   private readonly usage = new Map<string, Usage>();
   /** Agents whose metadata was asked to hold their ID, so each is asked once. */
   private readonly naming = new Set<string>();
@@ -705,7 +715,9 @@ export class Service {
 
   /** Remember the plugin's SDK connection for background work (cleanup, failover). */
   attach(paseo: PaseoApi): void {
-    this.paseo ??= paseo;
+    if (this.paseo) return;
+    this.paseo = paseo;
+    this.checkCodexSpeed();
   }
 
   async start(): Promise<void> {
@@ -735,6 +747,7 @@ export class Service {
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.timer) clearInterval(this.timer);
+    clearTimeout(this.codexSpeedExpiry);
     if (this.usageSave) {
       clearTimeout(this.usageSave);
       await saveReadings(this.usage).catch(() => undefined);
@@ -813,6 +826,7 @@ export class Service {
     await this.placeHomes().catch((error: unknown) => log("moving accounts' homes failed", error));
     await this.refreshLaunchers().catch((error: unknown) => log("could not write the shell launchers", error));
     if (this.paseo) {
+      this.checkCodexSpeed();
       await this.forgetEndedSessions(this.paseo).catch((error: unknown) => log("could not check which agents closed while ZeroSub was off", error));
       void this.alignSessions(this.paseo).catch((error: unknown) => log("aligning agents failed", error));
       await this.cleanUpHomes(this.paseo);
@@ -1093,6 +1107,188 @@ export class Service {
   // ------------------------------------------------------------------ hooks
 
   /**
+   * Applies the temporary speed at creation before the provider starts the first turn. A hand-off
+   * names the account it's bound to (`handoffAccount`): only that account decides.
+   */
+  private async codexFastOnCreate(request: AgentCreateRequest, paseo: PaseoApi, handoffAccount: string | undefined): Promise<AgentCreateRequest | undefined> {
+    const catalog = paseo.providers as CodexSpeedCatalog | undefined;
+    if (!catalog?.listControls || !takesAgentMetadata(paseo) || (await this.families.resolve(paseo))[request.config.provider] !== "codex") return undefined;
+    const state = await this.store.read();
+    if (!state.accounts.some((account) => account.codexFastUntil)) return undefined;
+    const config = request.config as typeof request.config & { providerOptions?: Record<string, unknown> };
+
+    const now = Date.now();
+    const canUse = (account: StoredAccount | undefined) => this.canUseFast(account, now);
+    // Every account the new agent may run on must allow Fast.
+    let accounts: (StoredAccount | undefined)[];
+    if (handoffAccount !== undefined) {
+      // A hand-off is bound to its account before it's created.
+      accounts = [findAccount(state, handoffAccount)];
+    } else {
+      // A late account decision may pick a different login when spreading, or consume a one-time
+      // pick before this opens.
+      const input: RouteInput = {
+        agentId: "",
+        family: "codex",
+        reason: "create",
+        now,
+        portable: false,
+        autoSwitch: this.prefs.autoSwitch,
+        balanceNewAgents: this.prefs.balanceNewAgents,
+        paidFallback: this.prefs.paidApiFallback,
+        autoRedeem: this.prefs.autoRedeem,
+        requested: requestedAccount(request),
+        model: config.model,
+        usageOf: (id) => this.usage.get(id),
+        pendingOf: (id) => this.pendingOn(id, now),
+      };
+      const route = chooseAccount(state, input);
+      if (this.prefs.balanceNewAgents && route?.bind?.source !== "user" && accountsOf(state, "codex").some(
+        (account) => account.signedIn && !account.disabled && !canUse(account),
+      )) return undefined;
+      accounts = [route?.account, chooseAccount(state, { ...input, allowNextPick: true })?.account];
+    }
+    // The session can fall back to the CLI login if routing fails.
+    const main = mainAccount(state, "codex");
+    if (main?.signedIn) accounts.push(main);
+    if (!accounts.every(canUse)) return undefined;
+
+    const providerOptions = { ...config.featureValues, ...config.providerOptions };
+    const provider = config.model ? `${config.provider}/${config.model}` : config.provider;
+    const speed = await deadline(catalog.listControls({ provider, cwd: config.cwd, providerOptions }), 3_000, "Codex speed catalog timed out");
+    if (speed.error || !codexFastChoice(speed) || !standardSpeed(speed)) return undefined;
+    const latest = await this.store.read();
+    const checkedAt = Date.now();
+    if (!accounts.every((account) => this.canUseFast(findAccount(latest, account!.id), checkedAt))) return undefined;
+
+    const { metadata } = request as { metadata?: Record<string, unknown> | null };
+    return {
+      ...request,
+      config: { ...config, providerOptions: { ...providerOptions, service_tier: "fast" } },
+      metadata: { ...metadata, [CODEX_FAST_METADATA_KEY]: true },
+    } as AgentCreateRequest;
+  }
+
+  private canUseFast(account: StoredAccount | undefined, now: number): boolean {
+    return canUseCodexFast(account, account && this.usage.get(account.id), now);
+  }
+
+  /** Adjust an open agent without reloading its session. Codex reads its new speed on its next turn. */
+  private checkCodexSpeed(rescan = false): void {
+    const paseo = this.paseo;
+    if (!paseo || this.stopped) return;
+    if (this.syncingCodexSpeed) {
+      this.codexSpeedRescan ||= rescan;
+      return;
+    }
+    if (typeof (paseo.agents?.ref?.("zerosub") as CodexSpeedHandle | undefined)?.setOptions !== "function") return;
+    this.syncingCodexSpeed = true;
+    void this.syncCodexAgents(paseo)
+      .catch((error: unknown) => log("could not check Codex speed", error))
+      .finally(() => {
+        this.syncingCodexSpeed = false;
+        if (!this.codexSpeedRescan) return;
+        this.codexSpeedRescan = false;
+        this.checkCodexSpeed();
+      });
+  }
+
+  private async syncCodexAgents(paseo: PaseoApi): Promise<void> {
+    const state = await this.store.read();
+    if (this.stopped) return;
+    const now = Date.now();
+    clearTimeout(this.codexSpeedExpiry);
+    const nextExpiry = Math.min(...state.accounts.map((account) => codexFastExpiresAt(account.codexFastUntil)).filter((expiry) => expiry > now));
+    if (Number.isFinite(nextExpiry)) {
+      this.codexSpeedExpiry = setTimeout(() => this.checkCodexSpeed(true), Math.min(nextExpiry - now, 2_147_483_647));
+      this.codexSpeedExpiry.unref?.();
+    }
+    const { agents } = await listAgents(paseo, false, true);
+    const candidates = agents.filter(({ id, status, archived, codexSpeed }) =>
+      !archived && isLive(status) && (
+        codexSpeed.metadata?.[CODEX_FAST_METADATA_KEY] === true || (
+          codexFastChoice(codexSpeed) !== undefined && standardSpeed(codexSpeed) &&
+          this.canUseFast(findAccount(state, this.runningOn(state, id, "codex")), now)
+        )
+      ),
+    );
+    if (candidates.length === 0) return;
+    const families = await this.families.resolve(paseo);
+    for (const candidate of candidates) {
+      if (this.stopped) return;
+      if (families[candidate.provider] !== "codex" && candidate.codexSpeed.metadata?.[CODEX_FAST_METADATA_KEY] !== true) continue;
+      try {
+        await this.syncCodexAgent(paseo, candidate.id, families);
+      } catch (error) {
+        log(`could not set Codex speed for ${candidate.id}`, error);
+      }
+    }
+  }
+
+  /** Serialize reload and background speed changes, reading the live account inside the lock. */
+  private async syncCodexAgent(
+    paseo: PaseoApi,
+    agentId: string,
+    families: Record<string, Family>,
+    reload?: Reload,
+    wasManaged = false,
+  ): Promise<void> {
+    let lock = this.codexSpeedLocks.get(agentId);
+    if (!lock) this.codexSpeedLocks.set(agentId, (lock = { mutex: new Mutex(), users: 0 }));
+    lock.users += 1;
+    try {
+      await lock.mutex.run(async () => {
+        const agent = paseo.agents.ref(agentId);
+        const handle: CodexSpeedHandle = agent as CodexSpeedHandle;
+        const current = await agent.refresh().then((result) => result?.agent).catch((error: unknown) => {
+          if (!reload || wasManaged) throw error;
+          log(`could not refresh ${agentId} to check Codex speed`, error);
+          return undefined;
+        });
+        if (!current || current.archivedAt || !isLive(current.status) || (!reload && current.status === "initializing")) {
+          if (reload && wasManaged) throw new Error("Paseo couldn't check the reopened agent");
+          return;
+        }
+        const speed: CodexSpeedState = current as CodexSpeedState;
+        const managed = speed.metadata?.[CODEX_FAST_METADATA_KEY] === true;
+        if (reload && wasManaged && !speed.metadata) throw new Error("Paseo didn't report the agent's speed metadata");
+        if (reload && !managed) return;
+        if (typeof handle.setMetadata !== "function" || typeof handle.setOptions !== "function") {
+          if (managed && reload) throw new Error("Paseo can't update the managed Codex speed");
+          return;
+        }
+        if (managed && !speed.options) throw new Error("Paseo didn't report the managed Codex speed");
+        const latest = await this.store.read();
+        if (!reload && this.codexReloads.has(agentId)) {
+          this.codexReloadRescans.add(agentId);
+          return;
+        }
+        const session = latest.sessions[agentId];
+        if (reload && (this.unrouted.has(agentId) || !session || session.family !== "codex" ||
+          (reload.opens === 1 && (session.accountId !== reload.opened?.wrote.accountId || session.openedAt !== reload.opened.wrote.openedAt)))) {
+          throw new Error("the reopened session's account changed before its speed could be checked");
+        }
+        const account = findAccount(latest, this.runningOn(latest, agentId, "codex"));
+        const enable = families[current.provider] === "codex" && this.canUseFast(account, Date.now());
+        if (reload && enable) return;
+        const tier = speed.options?.service_tier;
+        if (managed && !enable && tier != null && tier !== "default" && tier !== "fast" && !codexFastChoice(speed)) {
+          throw new Error("Paseo didn't report the Fast speed choice");
+        }
+        await syncCodexSpeed(handle as Required<CodexSpeedHandle>, speed, enable);
+        if (reload) {
+          const after = (await this.store.read()).sessions[agentId];
+          if (this.unrouted.has(agentId) || !after || after.accountId !== session?.accountId || after.openedAt !== session.openedAt) {
+            throw new Error("the reopened session's account changed while its speed was being checked");
+          }
+        }
+      });
+    } finally {
+      if (--lock.users === 0) this.codexSpeedLocks.delete(agentId);
+    }
+  }
+
+  /**
    * Routes every provider session (create, resume, refresh, import) to the agent's account. When
    * routing fails, or `abandoned` says Paseo stopped waiting for it, Paseo opens an interactive
    * session as it asked: on the CLI login. Then nothing routing recorded for it stands.
@@ -1103,12 +1299,29 @@ export class Service {
    * put it on Bedrock, and only on a Paseo that keeps metadata (0.16 and later, where the request
    * always carries it); otherwise the request is left as it is.
    */
-  async onAgentCreate(request: AgentCreateRequest, context: PluginHookContext): Promise<AgentCreateRequest | undefined> {
+  async onAgentCreate(original: AgentCreateRequest, context: PluginHookContext): Promise<AgentCreateRequest | undefined> {
+    this.attach(context.paseo);
+    // A hand-off's account is only for this hook: it isn't kept on the agent.
+    const { metadata: sent } = original as { metadata?: Record<string, unknown> | null };
+    const named = sent?.[HANDOFF_ACCOUNT_METADATA_KEY];
+    const handoffAccount = typeof named === "string" ? named : undefined;
+    let request = original;
+    if (sent && HANDOFF_ACCOUNT_METADATA_KEY in sent) {
+      const { [HANDOFF_ACCOUNT_METADATA_KEY]: _removed, ...rest } = sent;
+      request = { ...original, metadata: rest } as AgentCreateRequest;
+    }
+    const unchanged = request === original ? undefined : request;
+
+    const codex = await this.codexFastOnCreate(request, context.paseo, handoffAccount).catch((error: unknown) => {
+      log("could not set speed for a new Codex agent", error);
+      return undefined;
+    });
+    if (codex) return codex;
     const { metadata } = request as { metadata?: Record<string, unknown> | null };
     const modeId = request.config.modeId;
-    if (!metadata || typeof metadata !== "object" || typeof modeId !== "string" || !modeId) return undefined;
-    if (!this.prefs.paidApiFallback || !(await this.store.read()).accounts.some((account) => isBedrockAccount(account))) return undefined;
-    if ((await this.families.resolve(context.paseo))[request.config.provider] !== "claude") return undefined;
+    if (!metadata || typeof metadata !== "object" || typeof modeId !== "string" || !modeId) return unchanged;
+    if (!this.prefs.paidApiFallback || !(await this.store.read()).accounts.some((account) => isBedrockAccount(account))) return unchanged;
+    if ((await this.families.resolve(context.paseo))[request.config.provider] !== "claude") return unchanged;
     return { ...request, metadata: { ...metadata, [CREATED_MODE_METADATA_KEY]: modeId } } as AgentCreateRequest;
   }
 
@@ -1522,8 +1735,12 @@ export class Service {
    * Paseo has listed a new agent. A list read between its session opening and now doesn't have it,
    * and would keep its composer without an account until the app next asks.
    */
-  onAgentCreated(): void {
+  onAgentCreated(context?: PluginHookContext): void {
     this.agentCache = null;
+    if (context) {
+      this.attach(context.paseo);
+      this.checkCodexSpeed(true);
+    }
   }
 
   async onAgentArchived(agentId: string): Promise<void> {
@@ -2047,9 +2264,11 @@ export class Service {
   /** Notes where failover's reload left the agent, and once it has landed, carries the agent on. */
   private async noteFailover(paseo: PaseoApi, agentId: string, family: Family, row: SwitchRow, result: ReopenResult, endedAt: number): Promise<void> {
     const moved = result.outcome === "reopened";
-    const since = moved && this.prefs.autoContinue ? await this.stoppedSince(paseo, agentId, family, endedAt) : null;
+    const since = moved && !result.speedError && this.prefs.autoContinue ? await this.stoppedSince(paseo, agentId, family, endedAt) : null;
     const continued = since !== null && (await this.untouchedSince(paseo, agentId, since));
-    const detail = result.outcome === "failed" ? failureDetail(result) : row.detail;
+    const detail = result.outcome === "failed" ? failureDetail(result) : result.outcome === "reopened" && result.speedError
+      ? joinDetails(row.detail, `Couldn't check Codex speed, so nothing was sent: ${result.speedError}`)
+      : row.detail;
     await this.appendRow(paseo, agentId, await this.landed({ ...row, continued, outcome: moved ? "switched" : "pending", detail }, agentId));
     if (since !== null && continued) await this.carryOn(paseo, agentId, since);
   }
@@ -2615,6 +2834,7 @@ export class Service {
       previous: PROVIDER_NAME[family],
       target: { provider, label: name, modeId },
       parentId: await this.continuations.parentFor(paseo, agentId),
+      accountId: account.id,
       bind: async (newAgentId) => {
         await this.store.update((draft) => {
           // A fork that lands on a paid stand-in (Bedrock) isn't the user's pick, even when they asked
@@ -3322,7 +3542,7 @@ export class Service {
     }
     this.switchGuard.note(agentId, Date.now());
     this.sameConversationProbe.set(agentId, { fromAccountId: account.id, toAccountId: next.id, previousBinding, members });
-    const continued = this.prefs.autoContinue && (await this.untouchedSince(paseo, agentId, endedAt));
+    const continued = !result.speedError && this.prefs.autoContinue && (await this.untouchedSince(paseo, agentId, endedAt));
     await this.appendRow(paseo, agentId, {
       ...base,
       to: next.label,
@@ -3330,6 +3550,7 @@ export class Service {
       continued,
       outcome: "switched",
       sameConversation: true,
+      detail: result.speedError ? joinDetails(base.detail, `Couldn't check Codex speed, so nothing was sent: ${result.speedError}`) : base.detail,
     });
     if (continued) await this.carryOn(paseo, agentId, endedAt);
     return true;
@@ -3457,6 +3678,7 @@ export class Service {
       timeline,
       why,
       parentId: await this.continuations.parentFor(paseo, agentId),
+      accountId: target.id,
       bind: async (newAgentId) => {
         await this.store.update((draft) => {
           draft.bindings[newAgentId] = {
@@ -3616,7 +3838,8 @@ export class Service {
     if (busy(info)) return this.defer(agentId, row, unattended);
     // Reloading an archived agent would unarchive it; a closed one routes itself when it next opens.
     if (info.archived || info.status === "closed") return { outcome: "closed" };
-    const family = (await this.families.resolve(paseo))[info.provider];
+    const families = await this.families.resolve(paseo);
+    const family = families[info.provider];
     const state = await this.store.read();
     // A thread whose session opened without ZeroSub (on the CLI login) belongs to the account it's
     // pinned to, which holds its history, so it reopens there.
@@ -3647,44 +3870,64 @@ export class Service {
     if (busy(latest) || working || (background && this.recentlyActive(latest, now))) return this.defer(agentId, row, unattended);
     const reload: Reload = { opens: 0 };
     this.reloads.set(agentId, reload);
-    let result: Awaited<ReturnType<Reopener["reopen"]>>;
+    if (family === "codex") this.codexReloads.add(agentId);
+    let rescanAfterReload = false;
     try {
-      result = await this.reopener.reopen(agentId, paseo);
+      let result: Awaited<ReturnType<Reopener["reopen"]>>;
+      try {
+        result = await this.reopener.reopen(agentId, paseo);
+      } finally {
+        this.reloads.delete(agentId);
+      }
+      if (result.ok && reload.opens === 0) {
+        result = { ok: false, error: "Paseo reported a reload but did not open a new provider session", timedOut: false };
+      }
+      if (result.ok && this.unrouted.has(agentId)) {
+        // Paseo stopped waiting for routing and reopened the session as it was (see `onSessionOpen`).
+        result = { ok: false, error: "ZeroSub couldn't pick its account in time, so it reopened on your CLI login", timedOut: false };
+      }
+      if (!result.ok) {
+        console.warn(`[ZeroSub] could not reopen ${agentId}: ${result.error}`);
+        // Paseo asks for the new session's environment before it closes the old one, so a failed reload
+        // has still recorded a session that never opened. One that ran out of time may yet open, unless
+        // it's tried again: the next reload records where the session opens. Only this reload's own
+        // record is undone: a session opened since (another reload) stands.
+        const { opened } = reload;
+        if ((!result.timedOut || options.retried) && opened && reload.opens === 1) {
+          await this.store.update((draft) => {
+            const recorded = draft.sessions[agentId];
+            if (recorded?.openedAt !== opened.wrote.openedAt || recorded.accountId !== opened.wrote.accountId) return;
+            if (opened.replaced) draft.sessions[agentId] = opened.replaced;
+            else delete draft.sessions[agentId];
+          });
+        }
+        if (!result.timedOut && family) {
+          const latest = await this.store.read();
+          const target = this.targetFor(latest, agentId, family, this.runningOn(latest, agentId, family));
+          if (target) this.failedMoves.set(agentId, target);
+        }
+        rescanAfterReload = !result.timedOut && !this.unrouted.has(agentId) && reload.opens === 1;
+        return { outcome: "failed", error: result.error, timedOut: result.timedOut };
+      }
+      rescanAfterReload = true;
+      let speedError: string | undefined;
+      if (family === "codex" && reload.opened) {
+        try {
+          await this.syncCodexAgent(paseo, agentId, families, reload, latest.codexSpeed.metadata?.[CODEX_FAST_METADATA_KEY] === true);
+        } catch (error) {
+          speedError = describe(error);
+          log(`could not check Codex speed after reopening ${agentId}`, error);
+        }
+      }
+      // A move alignment asked for has landed, so a later one to the same account isn't held back.
+      if (this.alignedAt.get(agentId)?.accountId === (await this.store.read()).sessions[agentId]?.accountId) this.alignedAt.delete(agentId);
+      return { outcome: "reopened", ...(speedError ? { speedError } : {}) };
     } finally {
-      this.reloads.delete(agentId);
-    }
-    if (result.ok && reload.opens === 0) {
-      result = { ok: false, error: "Paseo reported a reload but did not open a new provider session", timedOut: false };
-    }
-    if (result.ok && this.unrouted.has(agentId)) {
-      // Paseo stopped waiting for routing and reopened the session as it was (see `onSessionOpen`).
-      result = { ok: false, error: "ZeroSub couldn't pick its account in time, so it reopened on your CLI login", timedOut: false };
-    }
-    if (!result.ok) {
-      console.warn(`[ZeroSub] could not reopen ${agentId}: ${result.error}`);
-      // Paseo asks for the new session's environment before it closes the old one, so a failed reload
-      // has still recorded a session that never opened. One that ran out of time may yet open, unless
-      // it's tried again: the next reload records where the session opens. Only this reload's own
-      // record is undone: a session opened since (another reload) stands.
-      const { opened } = reload;
-      if ((!result.timedOut || options.retried) && opened && reload.opens === 1) {
-        await this.store.update((draft) => {
-          const recorded = draft.sessions[agentId];
-          if (recorded?.openedAt !== opened.wrote.openedAt || recorded.accountId !== opened.wrote.accountId) return;
-          if (opened.replaced) draft.sessions[agentId] = opened.replaced;
-          else delete draft.sessions[agentId];
-        });
+      if (family === "codex") {
+        this.codexReloads.delete(agentId);
+        if (this.codexReloadRescans.delete(agentId) && rescanAfterReload) this.checkCodexSpeed();
       }
-      if (!result.timedOut && family) {
-        const latest = await this.store.read();
-        const target = this.targetFor(latest, agentId, family, this.runningOn(latest, agentId, family));
-        if (target) this.failedMoves.set(agentId, target);
-      }
-      return { outcome: "failed", error: result.error, timedOut: result.timedOut };
     }
-    // A move alignment asked for has landed, so a later one to the same account isn't held back.
-    if (this.alignedAt.get(agentId)?.accountId === (await this.store.read()).sessions[agentId]?.accountId) this.alignedAt.delete(agentId);
-    return { outcome: "reopened" };
   }
 
   /**
@@ -3699,8 +3942,10 @@ export class Service {
 
   /** Notes how a move came out: where the agent landed, or that it moves when its session next starts. */
   private async noteOutcome(paseo: PaseoApi, agentId: string, row: SwitchRow, result: ReopenResult): Promise<void> {
-    if (result.outcome === "reopened") await this.appendRow(paseo, agentId, await this.landed(row, agentId));
-    else if (result.outcome === "failed") {
+    if (result.outcome === "reopened") {
+      const detail = result.speedError ? joinDetails(row.detail, `Couldn't check Codex speed: ${result.speedError}`) : row.detail;
+      await this.appendRow(paseo, agentId, await this.landed({ ...row, detail }, agentId));
+    } else if (result.outcome === "failed") {
       await this.appendRow(paseo, agentId, { ...row, outcome: "pending", detail: failureDetail(result), at: new Date().toISOString() });
     }
   }
@@ -4008,6 +4253,7 @@ export class Service {
       else this.usageRetryAt.delete(accountId);
       const usage: Usage = { ...read, credits: read.credits ?? null };
       this.setUsage(accountId, mergeUsage(this.usage.get(accountId), usage));
+      if (account.codexFastUntil) this.checkCodexSpeed(true);
       // Only a live reading may change an account's limit state.
       if (usage.windows.length === 0 || usage.error || usage.cached) {
         this.usageLive.delete(accountId);
@@ -4243,6 +4489,7 @@ export class Service {
         nextAgentUntil: nextPickUntil(state, account.id, account.family, now),
         limitedUntil: isLimited(account, now) ? account.limitedUntil : ceiling?.resetsAt ?? null,
         quotaCeilings: account.quotaCeilings,
+        codexFastUntil: account.codexFastUntil,
         ceilingHit: !!ceiling,
         usage: this.usage.get(account.id) ?? null,
         agentCount: counts.get(account.id) ?? 0,
@@ -4770,6 +5017,24 @@ export class Service {
       account.quotaCeilings = ceilings;
     });
     if (this.paseo) void this.alignSessions(this.paseo).catch((error: unknown) => log("aligning agents failed", error));
+  }
+
+  async setCodexFastUntil(paseo: PaseoApi, accountId: string, until: string): Promise<void> {
+    if (until && (!takesAgentMetadata(paseo) || !(paseo.providers as CodexSpeedCatalog | undefined)?.listControls)) {
+      throw new Error("Temporary Fast mode needs Paseo 0.16 or later.");
+    }
+    await this.store.update((draft) => {
+      const account = findAccount(draft, accountId);
+      if (!account) throw new Error("That account no longer exists.");
+      if (account.family !== "codex" || account.auth !== "subscription" || account.plan === "API key") {
+        throw new Error("Fast mode needs a ChatGPT subscription.");
+      }
+      if (until) account.codexFastUntil = until;
+      else delete account.codexFastUntil;
+    });
+    this.attach(paseo);
+    this.checkCodexSpeed(true);
+    if (until) void this.refreshUsage(accountId, true).catch((error: unknown) => log("could not refresh ChatGPT usage for Fast mode", error));
   }
 
   /** The background work a reopen would end, or null when there's none (work the daemon owns doesn't count). */
@@ -6533,6 +6798,7 @@ function applyIdentity(account: StoredAccount, identity: Identity, state: Stored
   const handedOver = account.kind === "main" && identity.signedIn && !!account.identity && !!identity.identity && !sameAccountIdentity(account.family, account, identity);
   applyIdentityFields(account, identity, state);
   if (!handedOver) return false;
+  delete account.codexFastUntil;
   account.limitedUntil = null;
   account.limitKind = null;
   account.limitedAt = null;
@@ -6599,7 +6865,7 @@ export function suggestLabel(account: StoredAccount, state: StoredState): string
 type AgentSnapshot = Awaited<ReturnType<PaseoApi["agents"]["list"]>>["entries"][number]["agent"];
 
 function toAgentInfo(agent: AgentSnapshot): AgentInfo {
-  const { metadata } = agent as { metadata?: Readonly<Record<string, unknown>> | null };
+  const { metadata, controls, options } = agent as CodexSpeedState;
   return {
     id: agent.id,
     provider: agent.provider,
@@ -6614,6 +6880,7 @@ function toAgentInfo(agent: AgentSnapshot): AgentInfo {
     modeId: agent.currentModeId ?? null,
     named: metadata ? metadata[AGENT_METADATA_KEY] === agent.id : null,
     model: agent.model ?? agent.runtimeInfo?.model ?? null,
+    codexSpeed: { metadata, controls, options },
   };
 }
 
@@ -6634,12 +6901,13 @@ function unchecked(error: unknown): ReopenResult {
 
 const MAX_PAGES = 100;
 
-async function listAgents(paseo: PaseoApi, includeArchived: boolean): Promise<{ agents: AgentInfo[]; complete: boolean }> {
+async function listAgents(paseo: PaseoApi, includeArchived: boolean, includeBackground = false): Promise<{ agents: AgentInfo[]; complete: boolean }> {
   const agents: AgentInfo[] = [];
+  const filter = { ...(includeArchived ? { includeArchived: true } : {}), ...(includeBackground ? { includeBackground: true } : {}) };
   let cursor: string | undefined;
   for (let page = 0; page < MAX_PAGES; page += 1) {
     const result = await paseo.agents.list({
-      ...(includeArchived ? { filter: { includeArchived: true } } : {}),
+      ...(includeArchived || includeBackground ? { filter } : {}),
       page: { limit: 200, ...(cursor ? { cursor } : {}) },
     });
     for (const { agent } of result.entries) agents.push(toAgentInfo(agent));
