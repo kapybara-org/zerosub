@@ -127,4 +127,32 @@ describe("describing a switch row", () => {
     const note = describeRow(row({ reason: "pacing", from: "work", to: "personal", continued: false }));
     expect(note).toBe("work is close to its 5-hour limit. Switched to personal.");
   });
+
+  it("names Antigravity when an Antigravity conversation continues in a new tab or every account is exhausted", () => {
+    const continued = describeRow(
+      row({
+        family: "antigravity",
+        reason: "limit",
+        from: "personal",
+        to: "work",
+        outcome: "continued",
+        continuedIn: { agentId: "agy-2", title: "Fix parser (continued)" },
+      }),
+    );
+    expect(continued).toBe(
+      "personal hit its usage limit. Antigravity conversations can't change accounts, so this task continues in “Fix parser (continued)” on work.",
+    );
+
+    const exhausted = describeRow(
+      row({
+        family: "antigravity",
+        reason: "exhausted",
+        from: "personal",
+        to: "personal",
+        outcome: "stayed",
+        continued: false,
+      }),
+    );
+    expect(exhausted).toBe("Every Antigravity account is at its limit. Add another account or wait.");
+  });
 });

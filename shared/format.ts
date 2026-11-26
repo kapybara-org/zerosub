@@ -115,12 +115,19 @@ export function capsAccount(window: UsageWindow): boolean {
 }
 
 /**
- * The model or surface a narrower window belongs to, lowercase: "fable" for "Weekly · Fable", else
+ * The model or surface a narrower window belongs to, lowercase: "fable" for "Weekly · Fable",
+ * "gemini" for "5-hour · Gemini Models", "claude/gpt" for "Weekly · Claude and GPT models", else
  * the window's id. It names the key of an account's `modelLimits`.
  */
 export function windowScope(window: UsageWindow): string {
-  const named = window.label.match(/^Weekly\s*·\s*(.+)$/i)?.[1]?.trim();
-  return (named || window.id).toLowerCase();
+  const named = window.label.match(/^(?:Weekly|\d+-(?:hour|day|minute))\s*·\s*(.+)$/i)?.[1]?.trim();
+  if (!named) return window.id.toLowerCase();
+  const group = named
+    .toLowerCase()
+    .replace(/\s+models$/i, "")
+    .replace(/\s+and\s+/gi, "/")
+    .trim();
+  return group || window.id.toLowerCase();
 }
 
 /** The busiest window that caps the whole account: how much room it has left for any model. */
@@ -231,7 +238,10 @@ export function limitedPick(label: string): string {
 
 /** Why an agent can't be moved onto an account whose limit for its model is reached, while others can run there. */
 export function limitedModelPick(label: string, scope: string): string {
-  const name = scope.charAt(0).toUpperCase() + scope.slice(1);
+  const name = scope
+    .split("/")
+    .map((part) => (part === "gpt" ? "GPT" : part.charAt(0).toUpperCase() + part.slice(1)))
+    .join(" / ");
   return `${label} has reached its ${name} limit, so this agent's model can't run there now. Pick another account or another model.`;
 }
 

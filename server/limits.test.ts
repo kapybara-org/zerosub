@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { AgentTimelineItem } from "./adapter";
 import {
+  detectAntigravityLimit,
+  detectAntigravitySignOut,
   detectClaudeLimit,
   detectClaudeSignOut,
   detectCodexLimit,
   detectCodexSignOut,
+  parseAntigravityReset,
   parseClaudeReset,
   parseCodexReset,
   turnRows,
@@ -329,5 +332,80 @@ describe("sign-in failures", () => {
       "Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.";
     expect(detectCodexSignOut({ outcome: failed(message), timeline: [] })).not.toBeNull();
     expect(detectCodexSignOut({ outcome: failed("stream disconnected"), timeline: [] })).toBeNull();
+  });
+
+  it("recognises Antigravity sign-in failures only on failed turns", () => {
+    expect(detectAntigravitySignOut({ outcome: failed("Authentication required"), timeline: [] })).toBe("Authentication required");
+    expect(
+      detectAntigravitySignOut({ outcome: failed("Error: Please sign in to view available models."), timeline: [] }),
+    ).toBe("Error: Please sign in to view available models.");
+    expect(
+      detectAntigravitySignOut({ outcome: failed("error getting token source: You are not logged into Antigravity."), timeline: [] }),
+    ).not.toBeNull();
+    // Completed turns with a tool/MCP authentication warning must not sign the account out.
+    expect(
+      detectAntigravitySignOut({ outcome: completed, timeline: [{ type: "error", message: "Authentication required" }] }),
+    ).toBeNull();
+    expect(detectAntigravitySignOut({ outcome: failed("stream disconnected"), timeline: [] })).toBeNull();
+  });
+});
+
+describe("detectAntigravityLimit", () => {
+  it("recognises real Paseo/agy personal quota errors, JSON reasons, and long error strings", () => {
+    // Real Paseo 0.17.3 lastError captured from agy 1.5.17.
+    const shortHit = detectAntigravityLimit(
+      { outcome: failed("Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h2m18s."), timeline: [] },
+      NOW,
+    );
+    expect(shortHit).toEqual({
+      message: "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h2m18s.",
+      kind: "window",
+      resetsAt: new Date(NOW.getTime() + (2 * 3600 + 2 * 60 + 18) * 1000).toISOString(),
+      scope: null,
+    });
+
+    // Real agy 1.5.17 ACP executor error (355 chars), plus a >400-char JSON-wrapped variant.
+    const acpError =
+      "agent executor error: generating and executing: transport error (ResourceExhausted, HTTP 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 117h23m9s.: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 117h23m9s.";
+    expect(detectAntigravityLimit({ outcome: failed(acpError), timeline: [] }, NOW)?.resetsAt).toBe(
+      new Date(NOW.getTime() + (117 * 3600 + 23 * 60 + 9) * 1000).toISOString(),
+    );
+
+    const longJsonError = `${"x".repeat(420)} {"error":{"status":"RESOURCE_EXHAUSTED","details":[{"reason": "QUOTA_EXHAUSTED"}]}} quotaResetDelay:20m58s`;
+    const jsonHit = detectAntigravityLimit({ outcome: failed(longJsonError), timeline: [] }, NOW);
+    expect(jsonHit?.resetsAt).toBe(new Date(NOW.getTime() + (20 * 60 + 58) * 1000).toISOString());
+    expect(jsonHit?.message.length).toBeLessThanOrEqual(400);
+
+    const apiReason = detectAntigravityLimit(
+      { outcome: failed("Error 429 [reason:QUOTA_EXHAUSTED quotaResetTimeStamp:2026-09-25T10:00:00Z]"), timeline: [] },
+      NOW,
+    );
+    expect(apiReason?.resetsAt).toBe("2026-09-25T10:00:00.000Z");
+  });
+
+  it("ignores completed turns, MCP tool errors, capacity 429s, and ordinary assistant prose", () => {
+    expect(detectAntigravityLimit({ outcome: failed("HTTP 429: model overloaded, retry later"), timeline: [] }, NOW)).toBeNull();
+    expect(
+      detectAntigravityLimit(
+        { outcome: completed, timeline: [{ type: "error", message: "MCP maps tool: Error 429 reason:QUOTA_EXHAUSTED" }] },
+        NOW,
+      ),
+    ).toBeNull();
+    expect(
+      detectAntigravityLimit(
+        { outcome: completed, timeline: turn("Users see Individual quota reached. Resets in 20m58s. when out of quota.") },
+        NOW,
+      ),
+    ).toBeNull();
+  });
+
+  it("parses reset durations and timestamps, treats naive timestamps as UTC, and ignores past or epoch-zero values", () => {
+    expect(parseAntigravityReset("Resets in 20m58s.", NOW)).toBe(new Date(NOW.getTime() + (20 * 60 + 58) * 1000).toISOString());
+    expect(parseAntigravityReset("Resets in 1d2h.", NOW)).toBe(new Date(NOW.getTime() + 26 * 3600 * 1000).toISOString());
+    expect(parseAntigravityReset("quotaResetDelay:45s500ms250µs", NOW)).toBe(new Date(NOW.getTime() + 45_500.25).toISOString());
+    expect(parseAntigravityReset("quotaResetTimeStamp:2026-09-25T10:00:00", NOW)).toBe("2026-09-25T10:00:00.000Z");
+    expect(parseAntigravityReset("quotaResetTimeStamp:2026-01-01T00:00:00Z", NOW)).toBeNull();
+    expect(parseAntigravityReset("quotaResetTimeStamp:1970-01-01T00:00:00Z", NOW)).toBeNull();
+    expect(parseAntigravityReset("Individual quota reached.", NOW)).toBeNull();
   });
 });

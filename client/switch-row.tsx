@@ -61,9 +61,10 @@ export function describeRow(row: SwitchRow): string {
   }
   if (row.reason === "exhausted") {
     const reset = formatResetIn(row.resetsAt);
+    const banked = row.family === "claude" || row.family === "codex" ? ", use a banked reset from the account button," : "";
     return `Every ${FAMILY_LABEL[row.family]} account is at its limit${
       reset ? `; ${row.from ?? "this one"} resets ${reset}` : ""
-    }. Add another account, use a banked reset from the account button, or wait.${row.detail ? ` ${row.detail}` : ""}`;
+    }. Add another account${banked} or wait.${row.detail ? ` ${row.detail}` : ""}`;
   }
   if (row.outcome === "reset") {
     return `${row.from ?? "This account"} hit its usage limit, so a banked reset was used. ${row.detail ?? "Limits reset."}${
@@ -78,7 +79,7 @@ export function describeRow(row: SwitchRow): string {
         return `${lead}${row.detail} This task continues in “${row.continuedIn.title}” on ${row.to}.`;
       }
       return row.continuedIn
-        ? `${lead}ChatGPT conversations can't change accounts, so this task continues in “${row.continuedIn.title}” on ${row.to}.`
+        ? `${lead}${FAMILY_LABEL[row.family]} conversations can't change accounts, so this task continues in “${row.continuedIn.title}” on ${row.to}.`
         : `${lead}Continuing on ${row.to}.`;
     case "stayed":
       return `${lead}This conversation stays on ${row.from ?? "its account"}.${row.detail ? ` ${row.detail}` : ""}`;

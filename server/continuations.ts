@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { PluginHookContext } from "@getpaseo/plugin/server";
+import { FAMILY_LABEL, type Family } from "../shared/model";
 import { sameAccountIdentity } from "./account-identity";
 import type { AgentTimelineItem } from "./adapter";
 import { buildTranscript, CONTINUED_FROM_LABEL, continueInNewAgent, keepEnds, PARENT_LABEL, promptInstruction, type Continuation } from "./handoff";
@@ -48,11 +49,24 @@ function boundTo(state: StoredState, agentId: string, accountId: string): boolea
   return state.bindings[agentId]?.accountId === accountId && (!session || session.accountId === accountId);
 }
 
+function taskProviderName(family: Family): string {
+  return family === "codex" ? "Codex" : FAMILY_LABEL[family];
+}
+
+function defaultTaskTitle(family: Family | undefined): string {
+  return `${family ? taskProviderName(family) : "Codex"} task`;
+}
+
+function agentModel(agent: Agent): string | null {
+  const model = agent.model ?? agent.runtimeInfo?.model;
+  return typeof model === "string" && model.trim() ? model.trim() : null;
+}
+
 /** The account still exists, can take work and is still signed in as the same person. */
-function stillUsable(state: StoredState, account: StoredAccount): boolean {
+function stillUsable(state: StoredState, account: StoredAccount, model?: string | null): boolean {
   const current = findAccount(state, account.id);
   // Upkeep may add the member's email to an old workspace-only Codex key during the handoff; that's the same person.
-  return current !== undefined && isUsable(current, Date.now()) &&
+  return current !== undefined && isUsable(current, Date.now(), model) &&
     (current.identity === account.identity || sameAccountIdentity(account.family, current, account)) && current.email === account.email;
 }
 
@@ -125,17 +139,19 @@ export class CodexContinuations {
    * the task continues in when that isn't this one, else null.
    */
   async continuesElsewhere(paseo: PaseoApi, agentId: string): Promise<Continuation | null> {
-    const chain = Object.values((await this.store.read()).continuations).find((entry) => entry.members[agentId]);
+    const state = await this.store.read();
+    const chain = Object.values(state.continuations).find((entry) => entry.members[agentId]);
     if (!chain) return null;
+    const family = findAccount(state, chain.members[agentId]?.accountId ?? "")?.family;
     const { pending } = chain;
     if (pending?.stage === "sending") {
       // Only a hand-off whose prompt may have reached a live tab holds the task. A failed creation
       // sent nothing, and an archived or deleted destination has been given up.
       const target = await snapshot(paseo, pending.agentId);
-      if (target && !target.archivedAt) return pending.agentId === agentId ? null : { agentId: pending.agentId, title: target.title ?? "Codex task" };
+      if (target && !target.archivedAt) return pending.agentId === agentId ? null : { agentId: pending.agentId, title: target.title ?? defaultTaskTitle(family) };
     }
     const current = await currentTab(paseo, chain, agentId);
-    return current.id === agentId ? null : { agentId: current.id, title: current.agent?.title ?? "Codex task" };
+    return current.id === agentId ? null : { agentId: current.id, title: current.agent?.title ?? defaultTaskTitle(family) };
   }
 
   /**
@@ -186,17 +202,18 @@ export class CodexContinuations {
     if (!original || original.archivedAt) throw new Error("The original agent is no longer available.");
     const { root, ancestors } = await findTask(paseo, await this.store.read(), original);
     return this.locked(root, async () => {
-      const chain = await this.openChain(root, ancestors, sourceAgentId);
+      const chain = await this.openChain(root, ancestors, sourceAgentId, target.family);
       if (!chain.members[sourceAgentId]) throw new Error("This older continuation isn't part of the active task. Switch from the task's current tab.");
       const settled = await this.settlePending(paseo, root, chain, target);
       if ("done" in settled) return settled.done;
       const { reserved } = settled;
       if (source === "auto") await checkCurrent(paseo, chain, sourceAgentId);
       const sourceAgent = await waitForSource(paseo, original, source);
+      const model = agentModel(sourceAgent);
       const state = await this.store.read();
       const account = findAccount(state, target.id);
-      if (!account || account.family !== "codex" || !isUsable(account, Date.now())) {
-        throw new Error("That ChatGPT account is no longer available. Enable it, sign in or wait for its limit to reset.");
+      if (!account || account.family !== target.family || !isUsable(account, Date.now(), model)) {
+        throw new Error(`That ${FAMILY_LABEL[target.family]} account is no longer available. Enable it, sign in or wait for its limit to reset.`);
       }
       const snapshots = await memberSnapshots(paseo, chain, sourceAgent);
       const destination = pickDestination(state, chain, snapshots, sourceAgent, account, reserved);
@@ -205,9 +222,9 @@ export class CodexContinuations {
       const messageId = reserved?.messageId ?? `${MESSAGE_PREFIX}${randomUUID()}`;
       // A retried creation has to repeat its first request exactly, parent included.
       if (!destination.agent) destination.parent = reserved ? reserved.parent : await this.parentFor(paseo, sourceAgent.id);
-      await this.confirmUnchanged(paseo, sourceAgent, destination, account);
+      await this.confirmUnchanged(paseo, sourceAgent, destination, account, model);
       await this.reserve(root, sourceAgent.id, destination, gathered, account, messageId, source);
-      return this.deliver(paseo, root, sourceAgent, destination, account, prompt, messageId, why);
+      return this.deliver(paseo, root, sourceAgent, destination, account, prompt, messageId, why, model);
     });
   }
 
@@ -222,20 +239,20 @@ export class CodexContinuations {
   }
 
   /** The task's record, created from the discovered tabs on the first switch. */
-  private async openChain(root: string, ancestors: Agent[], sourceAgentId: string): Promise<ContinuationChain> {
+  private async openChain(root: string, ancestors: Agent[], sourceAgentId: string, family: Family): Promise<ContinuationChain> {
     const existing = (await this.store.read()).continuations[root];
     if (existing) return existing;
     const next = await this.store.update((draft) => {
       const members: ContinuationChain["members"] = {};
       for (const agent of [...ancestors].reverse()) {
         // A tab with no recorded session runs on the CLI login; pin it there so reuse stays exact.
-        const account = findAccount(draft, draft.sessions[agent.id]?.accountId ?? draft.bindings[agent.id]?.accountId ?? MAIN_ACCOUNT_ID.codex);
-        if (account?.family === "codex") {
+        const account = findAccount(draft, draft.sessions[agent.id]?.accountId ?? draft.bindings[agent.id]?.accountId ?? MAIN_ACCOUNT_ID[family]);
+        if (account?.family === family) {
           members[agent.id] = member(account);
           draft.bindings[agent.id] ??= { accountId: account.id, source: "thread", at: new Date().toISOString() };
         }
       }
-      if (!members[sourceAgentId]) throw new Error("Couldn't establish this Codex thread's account. Reopen it before switching.");
+      if (!members[sourceAgentId]) throw new Error(`Couldn't establish this ${taskProviderName(family)} thread's account. Reopen it before switching.`);
       draft.continuations[root] = { activeAgentId: sourceAgentId, members };
     });
     return next.continuations[root]!;
@@ -269,7 +286,7 @@ export class CodexContinuations {
       const history = await readUpdates(paseo, pending.agentId, undefined, pending.messageId);
       if (history.entries.some((entry) => delivered(entry, pending.messageId))) {
         await this.store.update((draft) => completeHandoff(draft.continuations[root]!));
-        return { done: { agentId: agent.id, title: agent.title ?? "Codex task" } };
+        return { done: { agentId: agent.id, title: agent.title ?? defaultTaskTitle(target.family) } };
       }
     }
     if (!agent || agent.archivedAt) {
@@ -282,13 +299,19 @@ export class CodexContinuations {
   }
 
   /** Last look before reserving: nothing may have changed while the update was being read. */
-  private async confirmUnchanged(paseo: PaseoApi, sourceAgent: Agent, destination: Destination, account: StoredAccount): Promise<void> {
+  private async confirmUnchanged(
+    paseo: PaseoApi,
+    sourceAgent: Agent,
+    destination: Destination,
+    account: StoredAccount,
+    model: string | null,
+  ): Promise<void> {
     const sourceNow = await snapshot(paseo, sourceAgent.id);
     const targetNow = destination.agent && await snapshot(paseo, destination.targetId);
     const state = await this.store.read();
     const sourceOk = untouched(sourceAgent, sourceNow);
     const targetOk = !destination.agent || (untouched(destination.agent, targetNow) && boundTo(state, destination.targetId, account.id));
-    if (!sourceOk || !targetOk || !stillUsable(state, account)) {
+    if (!sourceOk || !targetOk || !stillUsable(state, account, model)) {
       throw new Error("The task or account changed during the handoff. Check the active tab and try again.");
     }
   }
@@ -329,16 +352,18 @@ export class CodexContinuations {
     prompt: string,
     messageId: string,
     why: string,
+    model: string | null,
   ): Promise<Continuation> {
     const { targetId } = destination;
     let result: Continuation;
     if (destination.agent) {
-      result = { agentId: targetId, title: destination.agent.title ?? "Codex task" };
+      result = { agentId: targetId, title: destination.agent.title ?? defaultTaskTitle(account.family) };
     } else {
       result = await continueInNewAgent({
         paseo,
         sourceAgentId: sourceAgent.id,
         why,
+        previous: taskProviderName(account.family),
         agentId: targetId,
         deferPrompt: true,
         parentId: destination.parent,
@@ -351,7 +376,7 @@ export class CodexContinuations {
       const state = await this.store.read();
       const createdOk = created !== undefined && ready(created) && samePlace(sourceAgent, created) && !created.lastUserMessageAt &&
         created.currentModeId === sourceAgent.currentModeId && boundTo(state, targetId, account.id);
-      if (!untouched(sourceAgent, sourceNow) || !createdOk || !stillUsable(state, account)) {
+      if (!untouched(sourceAgent, sourceNow) || !createdOk || !stillUsable(state, account, model)) {
         throw new Error("The task or account changed while its tab was being created. Check the active tab and retry the switch.");
       }
       await this.store.update((draft) => { draft.continuations[root]!.pending!.stage = "sending"; });
@@ -512,7 +537,8 @@ function pickDestination(
   const candidate = Object.entries(chain.members).find(([id, entry]) => {
     const agent = snapshots.get(id);
     // A tab recorded under an old workspace-only Codex key is matched by its saved email.
-    return id !== sourceAgent.id && entry.accountId === account.id && sameAccountIdentity(account.family, entry, account) &&
+    return id !== sourceAgent.id && entry.accountId === account.id &&
+      (entry.identity === account.identity || sameAccountIdentity(account.family, entry, account)) &&
       entry.email === account.email && boundTo(state, id, account.id) &&
       agent !== undefined && samePlace(sourceAgent, agent) && !agent.archivedAt && !agent.providerUnavailable;
   });

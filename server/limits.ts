@@ -53,6 +53,36 @@ const CODEX_SIGNED_OUT =
  */
 const PI_SIGNED_OUT = /"type"\s*:\s*"authentication_error"|invalid x-api-key/i;
 
+/**
+ * Antigravity's own wording for an exhausted personal quota (HTTP 429 RESOURCE_EXHAUSTED with
+ * "Individual quota reached. ... Resets in 2h2m18s." or Google API's `reason:QUOTA_EXHAUSTED` /
+ * `"reason": "QUOTA_EXHAUSTED"`). Plain capacity 429s are omitted so transient server overload
+ * never switches accounts.
+ */
+const ANTIGRAVITY_LIMITS: ReadonlyArray<RegExp> = [
+  /\bIndividual quota reached\b/i,
+  /\breason:QUOTA_EXHAUSTED\b/,
+  /"reason"\s*:\s*"QUOTA_EXHAUSTED"/,
+];
+const ANTIGRAVITY_SIGNED_OUT =
+  /Please sign in to (?:view|use|continue)|You are not logged into Antigravity|Authentication required/i;
+const ANTIGRAVITY_RESET_TIMESTAMP = /\bquotaResetTimeStamp:([^\s\]]+)/;
+const ANTIGRAVITY_RESET_DURATION = /(?:\bResets in\s+|\bquotaResetDelay:)((?:\d+(?:\.\d+)?(?:ns|us|µs|μs|ms|d|h|m|s))+)\b/i;
+const GO_DURATION_PART = /(\d+(?:\.\d+)?)(ns|us|µs|μs|ms|d|h|m|s)/gi;
+const GO_DURATION_UNIT_MS: Record<string, number> = {
+  ns: 1e-6,
+  us: 1e-3,
+  µs: 1e-3,
+  μs: 1e-3,
+  ms: 1,
+  s: 1_000,
+  m: 60_000,
+  h: 3_600_000,
+  d: 86_400_000,
+};
+const MAX_ANTIGRAVITY_ERROR = 2_000;
+const NAIVE_ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?$/;
+
 const SYSTEM_ERROR = /^\[System Error\]\s*/;
 const MAX_NOTICE = 400;
 
@@ -146,6 +176,44 @@ export function detectPiSignOut(event: TurnEvent): string | null {
 export function detectCodexSignOut(event: TurnEvent): string | null {
   for (const text of notices(event, false)) if (CODEX_SIGNED_OUT.test(text)) return firstLine(text);
   return null;
+}
+
+export function detectAntigravityLimit(event: TurnEvent, now: Date = new Date()): LimitHit | null {
+  // Only failed turns count: completed turns can contain tool/MCP Google API QUOTA_EXHAUSTED errors.
+  if (event.outcome.kind !== "failed") return null;
+  const candidates = notices(event, false);
+  const failure = clean(event.outcome.error.message);
+  if (failure.length > MAX_NOTICE) candidates.unshift(failure.slice(0, MAX_ANTIGRAVITY_ERROR));
+  for (const text of candidates) {
+    if (ANTIGRAVITY_LIMITS.some((pattern) => pattern.test(text))) {
+      return { message: firstLine(text).slice(0, MAX_NOTICE), kind: "window", resetsAt: parseAntigravityReset(text, now), scope: null };
+    }
+  }
+  return null;
+}
+
+/** A failed Antigravity turn that looks like its sign-in expired or is missing; confirmed via `identity`. */
+export function detectAntigravitySignOut(event: TurnEvent): string | null {
+  if (event.outcome.kind !== "failed") return null;
+  for (const text of notices(event, false)) if (ANTIGRAVITY_SIGNED_OUT.test(text)) return firstLine(text);
+  return null;
+}
+
+/** "Resets in 2h2m18s.", "Resets in 117h23m9s.", "quotaResetDelay:20m58s", or "quotaResetTimeStamp:<ISO>". */
+export function parseAntigravityReset(text: string, now: Date): string | null {
+  const timestamp = text.match(ANTIGRAVITY_RESET_TIMESTAMP)?.[1];
+  if (timestamp) {
+    const normalized = NAIVE_ISO.test(timestamp) ? `${timestamp}Z` : timestamp;
+    const parsed = Date.parse(normalized);
+    if (Number.isFinite(parsed) && parsed > now.getTime()) return new Date(parsed).toISOString();
+  }
+  const duration = text.match(ANTIGRAVITY_RESET_DURATION)?.[1];
+  if (!duration) return null;
+  let delayMs = 0;
+  for (const [, amount, unit] of duration.matchAll(GO_DURATION_PART)) {
+    delayMs += Number(amount) * (GO_DURATION_UNIT_MS[unit!.toLowerCase()] ?? 0);
+  }
+  return delayMs > 0 ? new Date(now.getTime() + delayMs).toISOString() : null;
 }
 
 // --------------------------------------------------------------------------- Azure OpenAI (API key)

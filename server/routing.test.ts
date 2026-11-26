@@ -987,10 +987,52 @@ describe("limits of one model's own window", () => {
     expect(scopeCoversModel("Fable", "Claude-Fable-5.2")).toBe(true);
     expect(scopeCoversModel("opus", "claude-fable-5-2")).toBe(false);
     expect(scopeCoversModel("fable", "claude-fables")).toBe(false);
+    expect(scopeCoversModel("gemini", "gemini-4-neon-high")).toBe(true);
+    expect(scopeCoversModel("gemini", "gemini-pro-orchestrator-neon")).toBe(true);
+    expect(scopeCoversModel("gemini", "claude-opus-5-5-high")).toBe(false);
+    expect(scopeCoversModel("claude/gpt", "claude-opus-5-5-high")).toBe(true);
+    expect(scopeCoversModel("claude/gpt", "gpt-oss-120b-medium")).toBe(true);
+    expect(scopeCoversModel("claude/gpt", "gemini-4-neon-high")).toBe(false);
+    expect(scopeCoversModel("claude/gpt", "claude/gpt")).toBe(true);
     expect(scopeCoversModel("fable", null)).toBe(false);
     expect(scopeCoversModel("fable", undefined)).toBe(false);
     expect(scopeCoversModel("fable", "default")).toBe(false);
     expect(scopeCoversModel("", "claude-fable-5-2")).toBe(false);
+    expect(scopeCoversModel("/", "claude-fable-5-2")).toBe(false);
+  });
+
+  it("ranks Antigravity accounts by the model group's headroom when only group windows exist", () => {
+    const mainAgy = account({ id: "antigravity-main", family: "antigravity", kind: "main", home: null });
+    const spareAgy = account({ id: "antigravity-spare", family: "antigravity" });
+    const state = stateWith([mainAgy, spareAgy], { defaults: { claude: null, codex: null, pi: null, antigravity: mainAgy.id } });
+    const usage = (gemini: number, claudeGpt: number): Usage => ({
+      fetchedAt: "2026-09-23T11:59:00Z",
+      windows: [
+        { id: "agy-gemini-models-weekly", label: "Weekly · Gemini Models", usedPercent: gemini, resetsAt: "2026-09-30T00:00:00Z" },
+        { id: "agy-claude-and-gpt-models-weekly", label: "Weekly · Claude and GPT models", usedPercent: claudeGpt, resetsAt: null },
+      ],
+      error: null,
+      cached: false,
+      resets: null,
+      credits: null,
+    });
+    const usageOf = (id: string) => (id === mainAgy.id ? usage(90, 5) : usage(20, 80));
+    expect(mostAvailable(state, "antigravity", usageOf, NOW, new Set(), false, undefined, "gemini-4-neon-high")?.id).toBe(spareAgy.id);
+    expect(mostAvailable(state, "antigravity", usageOf, NOW, new Set(), false, undefined, "claude-opus-5-5-high")?.id).toBe(mainAgy.id);
+    expect(mostAvailable(state, "antigravity", usageOf, NOW, new Set(), false, { pendingOf: () => 0 }, "gemini-4-neon-high")?.id).toBe(spareAgy.id);
+  });
+
+  it("leaves paceScore unchanged for Codex accounts with a non-5h/7d account window even when a model is passed", () => {
+    const codexDailyOnly: Usage = {
+      fetchedAt: "2026-09-23T11:59:00Z",
+      windows: [{ id: "primary", label: "1-day", usedPercent: 95, resetsAt: "2026-09-24T12:00:00Z", minutes: 1440 }],
+      error: null,
+      cached: false,
+      resets: null,
+      credits: null,
+    };
+    expect(paceScore(codexDailyOnly, 0, NOW)).toEqual({ fiveHour: 50, weekly: 0, score: 50, gated: false, weekHeld: false });
+    expect(paceScore(codexDailyOnly, 0, NOW, "gpt-5")).toEqual({ fiveHour: 50, weekly: 0, score: 50, gated: false, weekHeld: false });
   });
 
   it("limits an account only for the model it covers, and only until it expires", () => {

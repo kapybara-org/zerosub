@@ -88,7 +88,7 @@ export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurface
           />
           <SettingsSwitch
             label="Keep going after a switch"
-            hint="Sends the follow-up below so the interrupted task continues, also after you use a banked reset. Off, a ChatGPT task that hits its limit stays where it stopped, since carrying it on means starting it in another tab."
+            hint="Sends the follow-up below so the interrupted task continues, also after you use a banked reset. Off, a ChatGPT or Antigravity task that hits its limit stays where it stopped, since carrying it on means starting it in another tab."
             value={settings.values.autoContinue}
             disabled={settings.saving}
             onValueChange={(autoContinue) => save({ autoContinue })}

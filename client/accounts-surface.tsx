@@ -91,8 +91,8 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
             Keep several Claude, ChatGPT, Grok and Cursor accounts signed in, and run Pi on several Anthropic API keys. Each agent uses one;{" "}
             {state?.autoSwitch
               ? state.autoContinue
-                ? "when a Claude or ChatGPT account hits its limit, agents move to another and keep going."
-                : "when a Claude or ChatGPT account hits its limit, agents move to another and wait for you there."
+                ? "when a Claude, ChatGPT or Antigravity account hits its limit, agents move to another and keep going."
+                : "when a Claude, ChatGPT or Antigravity account hits its limit, agents move to another and wait for you there."
               : "when an account hits its limit, move its agents to another from their account button, or turn on automatic switching below."}
           </Text>
         </View>
@@ -1071,7 +1071,7 @@ function AutomationSettings({ theme, compact }: { theme: Theme; compact: boolean
           />
           <SettingsSwitch
             label="Keep going after a switch"
-            hint="Sends a short follow-up so the interrupted task continues, also after you use a banked reset. Off, a ChatGPT task that hits its limit stays where it stopped."
+            hint="Sends a short follow-up so the interrupted task continues, also after you use a banked reset. Off, a ChatGPT or Antigravity task that hits its limit stays where it stopped."
             value={settings.values.autoContinue}
             disabled={settings.saving}
             onValueChange={(autoContinue) => save({ autoContinue })}
