@@ -215,6 +215,130 @@ const inPast = () => new Date(Date.now() - 60_000).toISOString();
 const TWIN = "claude-twin";
 const signedInAs = (key: string) => ({ ...account(key, key, "managed"), identity: key, email: `${key}@example.com` });
 
+describe("a pin that allows a limited account", () => {
+  const budget = () => ({ kind: "budget" as const, resetsAt: null, message: "You're out of extra usage" });
+
+  it("refuses a limited account without allowLimited and takes it with it", async () => {
+    const { service, store, paseo } = await setUp(
+      {
+        accounts: [{ ...account(MAIN, "main", "main"), limitedUntil: inFuture(), limitKind: "window" }, account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: HELLO, codex: null, pi: null },
+        sessions: { [AGENT]: { accountId: HELLO, family: "claude", openedAt: new Date().toISOString() } },
+      },
+      budget,
+    );
+    await expect(service.setAgentAccount(paseo as never, AGENT, MAIN)).rejects.toThrow();
+    await expect(service.setAgentAccount(paseo as never, AGENT, null, { allowLimited: true })).rejects.toThrow(/Name the account/);
+    await service.setAgentAccount(paseo as never, AGENT, MAIN, { allowLimited: true });
+    expect((await store.read()).bindings[AGENT]).toMatchObject({ accountId: MAIN, source: "user", allowLimited: true });
+  });
+
+  it("leaves the agent where it is when its account hits the limit", async () => {
+    // Extra usage on the account ran out mid-turn: carrying the work on elsewhere would put it on an
+    // account the caller chose not to use.
+    const { service, store, reopened, sent, notes, paseo, limitTurn } = await setUp(
+      {
+        accounts: [account(MAIN, "main", "main"), account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: HELLO, codex: null, pi: null },
+        bindings: { [AGENT]: { accountId: MAIN, source: "user", at: new Date().toISOString(), allowLimited: true } },
+        sessions: { [AGENT]: { accountId: MAIN, family: "claude", openedAt: new Date().toISOString() } },
+      },
+      budget,
+    );
+    await limitTurn();
+    const state = await store.read();
+    expect(state.accounts.find((a) => a.id === MAIN)?.limitKind).toBe("budget");
+    expect(state.sessions[AGENT]?.accountId).toBe(MAIN);
+    expect(state.bindings[AGENT]).toMatchObject({ accountId: MAIN, allowLimited: true });
+    expect(reopened).toEqual([]);
+    expect(sent).toEqual([]);
+    // The stop is on the timeline, marked as the pin's, not as a lack of room.
+    expect(notes).toEqual([
+      expect.objectContaining({ from: "main", to: "main", reason: "limit", outcome: "stayed", continued: false, continuedIn: null, allowLimited: true }),
+    ]);
+    // And the state confirms the pin took.
+    expect((await service.view(paseo as never)).agents.find((route) => route.agentId === AGENT)).toMatchObject({ accountId: MAIN, allowLimited: true });
+  });
+
+  it("keeps the flag out of a plain pin's state and rows", async () => {
+    const { service, store, notes, paseo, limitTurn } = await setUp(
+      {
+        accounts: [account(MAIN, "main", "main"), account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: HELLO, codex: null, pi: null },
+        sessions: { [AGENT]: { accountId: MAIN, family: "claude", openedAt: new Date().toISOString() } },
+      },
+      budget,
+    );
+    await service.setAgentAccount(paseo as never, AGENT, MAIN);
+    expect((await service.view(paseo as never)).agents.find((route) => route.agentId === AGENT)?.allowLimited).toBe(false);
+    await limitTurn();
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(notes.every((note) => !("allowLimited" in note))).toBe(true);
+  });
+
+  it("keeps a quota maximum apart from a provider limit", async () => {
+    // 81% used under an 80% maximum the user set: the account is at its ceiling, not at a provider limit.
+    const { service, store, paseo } = await setUp(
+      {
+        accounts: [{ ...account(MAIN, "main", "main"), quotaCeilings: { five_hour: 80 } }, account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: HELLO, codex: null, pi: null },
+        sessions: { [AGENT]: { accountId: HELLO, family: "claude", openedAt: new Date().toISOString() } },
+      },
+      budget,
+      {
+        usage: () => ({
+          fetchedAt: new Date().toISOString(),
+          windows: [{ id: "five_hour", label: "5-hour", usedPercent: 81, resetsAt: inFuture() }],
+          error: null, cached: false, resets: null,
+        }),
+      },
+    );
+    await service.refreshUsage(MAIN, true);
+    await expect(service.setAgentAccount(paseo as never, AGENT, MAIN)).rejects.toThrow(/quota maximum/);
+    await expect(service.setAgentAccount(paseo as never, AGENT, MAIN, { allowLimited: true })).rejects.toThrow(/quota maximum/);
+    expect((await store.read()).bindings[AGENT]).toBeUndefined();
+  });
+
+  it("leaves an agent pinned past its limit to move once its account reaches a quota maximum", async () => {
+    const { service, store, notes, limitTurn } = await setUp(
+      {
+        accounts: [{ ...account(MAIN, "main", "main"), quotaCeilings: { five_hour: 80 } }, account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: HELLO, codex: null, pi: null },
+        bindings: { [AGENT]: { accountId: MAIN, source: "user", at: new Date().toISOString(), allowLimited: true } },
+        sessions: { [AGENT]: { accountId: MAIN, family: "claude", openedAt: new Date().toISOString() } },
+      },
+      budget,
+      {
+        usage: () => ({
+          fetchedAt: new Date().toISOString(),
+          windows: [{ id: "five_hour", label: "5-hour", usedPercent: 81, resetsAt: inFuture() }],
+          error: null, cached: false, resets: null,
+        }),
+      },
+    );
+    await service.refreshUsage(MAIN, true);
+    await limitTurn();
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(notes.at(-1)).toMatchObject({ from: "main", to: "hello", reason: "limit", outcome: "switched" });
+    expect(notes.at(-1)).not.toHaveProperty("allowLimited");
+  });
+
+  it("refuses the flag for an agent that can't move in place", async () => {
+    const { service, store, paseo, agent } = await setUp(
+      {
+        accounts: [{ ...account(MAIN_ACCOUNT_ID.codex, "chatgpt", "main"), family: "codex" }] as never,
+        defaults: { claude: null, codex: MAIN_ACCOUNT_ID.codex, pi: null },
+      },
+      budget,
+    );
+    agent.provider = "codex";
+    (service as unknown as { families: FamilyResolver }).families = { resolve: async () => ({ codex: "codex" as const }) } as unknown as FamilyResolver;
+    (service as unknown as { adapters: Record<string, FamilyAdapter> }).adapters.codex = { ...claudeAdapter(budget), family: "codex", portable: false } as FamilyAdapter;
+    await expect(service.setAgentAccount(paseo as never, AGENT, MAIN_ACCOUNT_ID.codex, { allowLimited: true })).rejects.toThrow(/can't be kept on an account past its limit/);
+    expect((await store.read()).bindings[AGENT]).toBeUndefined();
+  });
+});
+
 describe("one subscription, one limit", () => {
   const window = () => ({ kind: "window" as const, resetsAt: inFuture(), message: "You've hit your session limit" });
   const twinOfMain = (): StoredAccount => ({ ...account(MAIN, "main", "main"), identity: "org|x", email: "x@example.com" }) as never;
@@ -3510,6 +3634,38 @@ describe("changing the default account", () => {
     expect((await service.view(paseo)).agents.find((route) => route.agentId === "busy")?.waiting).toBe("turn");
   });
 
+  it("leaves an idle agent pinned past the limit after the pass listed it", async () => {
+    const { service, store, context, reopened } = await setUpAgents(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+        sessions: { failing: session(MAIN), quiet: session(MAIN) },
+      },
+      [
+        { id: "failing", status: "idle" },
+        { id: "quiet", status: "idle" },
+      ],
+    );
+    service.setPreferences(preferences.schema.parse({ autoSwitch: true, autoContinue: false, moveAgentsOnDefaultChange: false }));
+    const pass = vi.spyOn(service as unknown as { moveIdleAgentsOff: () => Promise<void> }, "moveIdleAgentsOff");
+    // The pin lands after the pass built its list, while it reads the agent's last turn.
+    vi.spyOn(service as unknown as { lastTurnHitLimit: (paseo: unknown, id: string) => Promise<boolean> }, "lastTurnHitLimit").mockImplementation(async (_paseo, id) => {
+      if (id === "quiet") {
+        await store.update((draft) => {
+          draft.bindings.quiet = { accountId: MAIN, source: "user", at: new Date().toISOString(), allowLimited: true };
+        });
+      }
+      return false;
+    });
+    await service.onTurnEnded({ agent: { id: "failing", provider: "claude" }, turnId: null, outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never, context);
+    await vi.waitFor(() => expect(pass).toHaveBeenCalled());
+    await pass.mock.results[0]!.value;
+    expect(reopened).not.toContain("quiet");
+    const state = await store.read();
+    expect(state.sessions.quiet?.accountId).toBe(MAIN);
+    expect(state.bindings.quiet).toMatchObject({ accountId: MAIN, allowLimited: true });
+  });
+
   it("leaves an agent with background work when moving idle agents off an account at its limit", async () => {
     const { service, store, paseo, context, reopened } = await setUpAgents(
       {
@@ -4472,6 +4628,28 @@ describe("a move asked for during a turn", () => {
     expect(state.bindings[AGENT]).toMatchObject({ accountId: WORK, source: "user" });
     expect(reopened).toEqual([AGENT]);
     expect(notes).toEqual([expect.objectContaining({ from: "marketing", to: "work", reason: "limit", outcome: "switched" })]);
+  });
+
+  it("goes where it was asked to with allowLimited, though that account is at its limit", async () => {
+    // A pin past the limit, asked for during a turn on another account: that turn's limit must not
+    // pin the agent to whichever account has the most room.
+    const state = threeAccounts();
+    (state.accounts as unknown as StoredAccount[])[2] = { ...account(WORK, "work", "managed"), limitedUntil: inFuture(), limitKind: "budget" } as never;
+    const { service, store, reopened, notes, sent, paseo, agent, limitTurn } = await setUp(state, limit);
+    agent.status = "running";
+    await service.setAgentAccount(paseo as never, AGENT, WORK, { allowLimited: true });
+    agent.status = "idle";
+    await limitTurn();
+
+    const after = await store.read();
+    expect(after.sessions[AGENT]?.accountId).toBe(WORK);
+    expect(after.bindings[AGENT]).toMatchObject({ accountId: WORK, source: "user", allowLimited: true });
+    expect(reopened).toEqual([AGENT]);
+    expect(notes).toEqual([expect.objectContaining({ from: "marketing", to: "work", reason: "limit", outcome: "switched" })]);
+    // The interrupted turn carries on there, and stays there.
+    expect(sent).toHaveLength(1);
+    expect((await service.alignSessions(paseo as never)).reopened).toEqual([]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(WORK);
   });
 
   it("happens once an agent that was only starting is idle, without a turn", async () => {

@@ -126,6 +126,38 @@ describe("chooseAccount", () => {
     expect(chooseAccount(state, { ...base, reason: "resume", usageOf: () => null })?.account.id).toBe("claude-main");
   });
 
+  it("keeps an agent pinned with allowLimited on its limited account", () => {
+    const limited = account({ id: "claude-work", limitedUntil: "2026-09-23T14:00:00Z" });
+    const bindings = { "agent-1": { accountId: "claude-work", source: "user" as const, at: "x", allowLimited: true as const } };
+    const state = stateWith([main, limited, personal], { bindings });
+    for (const reason of ["create", "refresh", "resume"] as const) {
+      const decision = chooseAccount(state, { ...base, reason, usageOf: () => usage(10) });
+      expect(decision?.account.id, reason).toBe("claude-work");
+      expect(decision?.skipped, reason).toBeNull();
+    }
+    // Without the flag the same pin is swapped, and a signed-out or disabled account is swapped either way.
+    const plain = stateWith([main, limited, personal], { bindings: { "agent-1": { accountId: "claude-work", source: "user", at: "x" } } });
+    expect(chooseAccount(plain, { ...base, reason: "resume", usageOf: () => usage(10) })?.account.id).not.toBe("claude-work");
+    for (const patch of [{ signedIn: false }, { disabled: true }]) {
+      const out = stateWith([main, { ...limited, ...patch }, personal], { bindings });
+      expect(chooseAccount(out, { ...base, reason: "resume", usageOf: () => usage(10) })?.account.id).not.toBe("claude-work");
+    }
+  });
+
+  it("doesn't let allowLimited lift a quota maximum", () => {
+    // 81% used under an 80% maximum: at the ceiling the user set, with no provider limit.
+    const capped = account({ id: "claude-work", quotaCeilings: { five_hour: 80 } });
+    const bindings = { "agent-1": { accountId: "claude-work", source: "user" as const, at: "x", allowLimited: true as const } };
+    const usageOf = (id: string) => (id === "claude-work" ? usage(81) : usage(10));
+    const decision = chooseAccount(stateWith([main, capped, personal], { bindings }), { ...base, reason: "resume", usageOf });
+    expect(decision?.account.id).not.toBe("claude-work");
+    expect(decision?.skipped).toMatchObject({ why: "limited" });
+    // Under the maximum, the pin holds at a provider limit.
+    const limitedUnder = { ...capped, limitedUntil: "2026-09-23T14:00:00Z" };
+    const under = chooseAccount(stateWith([main, limitedUnder, personal], { bindings }), { ...base, reason: "resume", usageOf: () => usage(70) });
+    expect(under?.account.id).toBe("claude-work");
+  });
+
   it("skips an exhausted account for the roomiest usable one", () => {
     const limited = account({ id: "claude-work", limitedUntil: "2026-09-23T14:00:00Z" });
     const state = stateWith([main, limited, personal], { defaults: { claude: "claude-work", codex: null, pi: null } });

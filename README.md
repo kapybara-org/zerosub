@@ -360,6 +360,8 @@ A `before("agent.session_open")` hook sets those variables for every session Pas
 
 ZeroSub reads whether each account is signed in every 30 minutes, and again when a turn fails on what looks like a sign-out ("Not logged in", a 401, or "OAuth session expired and could not be refreshed"). Every process using an account's home shares its token, and a reading taken while another process renews that token can say signed out for a moment. So when a signed-in account reads as signed out, ZeroSub reads it again 10 seconds later, and marks it signed out only if that reading agrees.
 
+Another plugin or script can pin an agent with `zerosub.agents.account`, as the account button does, and with `allowLimited: true` keep it on an account past that account's limit (see [Plugin contracts](#the-zerosubagentsaccount-rpc)).
+
 Sessions ZeroSub didn't route run on your CLI login, and it counts them that way: one whose routing failed or took longer than 15 seconds, one opened while ZeroSub was off, and one of a CLI ZeroSub found unavailable where the daemon runs (Cursor on macOS or Windows, with a registry from Linux). The account button then shows the move still to come, which happens when the session next starts, or from the 30-second check once the CLI login can't work. A ChatGPT thread that has history goes back to the account it's pinned to, which holds it; one with no history yet (a new thread, or a hand-off's first open) is pinned to your CLI login instead, where its history is then written. A move ZeroSub started whose reload opened this way counts as not landed. To tell these sessions apart, ZeroSub forgets where an agent ran when the agent closes (Paseo 0.11 and later), and on startup for agents that closed while it was off. An agent that closed and opened again while ZeroSub was off still shows its earlier account until its session next opens.
 
 Paseo stops waiting for a plugin after 30 seconds. Buttons that move agents, use a reset or refresh usage answer within about 20 seconds and leave the rest running: each agent's timeline says when it has switched, and the account's card shows the refilled limits once a reset is done.
@@ -439,6 +441,36 @@ On Paseo 0.16 and later, pass `metadata: {"zerosub.account": id}` at agent creat
 
 Consumers accept unknown `family` values and missing optional fields. The version increases only when a stable field is renamed, removed, or changes meaning.
 
+### The `zerosub.agents.account` RPC
+
+Call `zerosub.agents.account` on the `zerosub` plugin to pin an agent to an account, as the account button does, or pass `accountId: null` to let it follow the default again.
+
+```json
+{ "agentId": "agent-1", "accountId": "claude-work", "allowLimited": true }
+```
+
+`allowLimited: true` keeps the agent on that account past a provider limit, for an account that keeps working past it on extra usage. Routing doesn't swap it for another account, a limit hit mid-turn doesn't move it or carry its work on elsewhere, and moving idle agents off the account skips it. A limit stop like that adds a `zerosub-switch` row with `reason: "limit"`, `outcome: "stayed"`, `continued: false`, `continuedIn: null` and `allowLimited: true`. Without the flag a pin follows the usual rules: it refuses an account at its limit, and failover moves the agent off one.
+
+The flag doesn't lift everything:
+
+- A signed-out or disabled account is still swapped.
+- A quota maximum set in Accounts is the user's own ceiling and still applies. A pin to an account at its maximum is refused with or without the flag, and an agent pinned with the flag moves off once its account reaches the maximum.
+- Pinning the agent again without the flag, or with `accountId: null`, ends it.
+
+The call throws, and changes nothing, when:
+
+- `allowLimited` is `true` with `accountId: null`.
+- The agent is gone, or its provider uses no ZeroSub accounts.
+- The account is missing, of another family, signed out or disabled.
+- The account is at its quota maximum, or (without the flag, with automatic switching on) at its limit.
+- `allowLimited` is set for an agent whose conversation can't move in place (Codex, Grok, Cursor, Antigravity). Only Claude and Pi agents take it.
+
+The response is a `ReopenSummary`. `reopened` lists the agent once its session moved to the account. `deferred` means it's busy and moves when its turn ends. `pending` means it was still moving when ZeroSub answered (after about 20 seconds); its timeline says how that went. `failed` carries an `error` for a reload that didn't land, and the agent moves when its session next opens. `continuedIn` is only set when a conversation that can't move in place carried on in a new agent; it's always `null` for a pin with `allowLimited`. An empty summary means the agent had no live session to move. The pin is saved in every case except a throw.
+
+To confirm the pin before sending the agent work, read `zerosub.state`: the agent's `agents[]` entry has `accountId` set to the account, `pendingAccountId: null` once the live session runs on it, and `allowLimited: true`. Releases without the option don't send `allowLimited` in `agents[]`, and drop the field from the call without an error, so check for it in `zerosub.state` before relying on it. `metadata["zerosub.account"]` at creation only requests a starting account under the usual rules; follow it with this call to keep the agent there past a limit.
+
+A pin made with this call is a user pick (`pinned: true` in `zerosub.state`). To hand the agent back to the default account and automatic routing, call this RPC again with `accountId: null`.
+
 ### The `zerosub-switch` timeline row
 
 ZeroSub records switch outcomes in the agent's timeline. The envelope has `type: "plugin"` and `kind: "zerosub-switch"`. Its `version` comes from `SWITCH_ROW_VERSION` (currently 1) and is independent of the RPC version. [SwitchRowSchema](shared/timeline.ts)
@@ -458,7 +490,7 @@ These fields in the envelope's `data` have been stable since ZeroSub 1.0.0.
 | `continuedIn` | A continuation reference with `agentId` and `title`, or `null`. Follow the reference whenever present, including on `stayed` rows. |
 | `continued` | `true` only means ZeroSub sent a follow-up. This can happen on an ordinary switch that keeps the same conversation. |
 
-Treat `detail` as display text only. A row with `reason: "exhausted"` and `outcome: "stayed"` means no eligible replacement account was available in the source family.
+Treat `detail` as display text only. A row with `reason: "exhausted"` and `outcome: "stayed"` means no eligible replacement account was available in the source family. A row with `reason: "limit"`, `outcome: "stayed"` and `allowLimited: true` means the agent is pinned to that account past its limit, so ZeroSub left it there on purpose; `allowLimited` is absent on every other row.
 
 Consumers accept unknown `reason` and `family` values and missing optional fields. The row version increases only when a stable field is renamed, removed, or changes meaning.
 
