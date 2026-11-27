@@ -125,7 +125,7 @@ import {
 } from "./state";
 
 type PaseoApi = PluginHookContext["paseo"];
-type TurnEnded = PluginLifecycleEvents["agent.turn_ended"];
+type TurnEnded = Omit<PluginLifecycleEvents["agent.turn_ended"], "timeline"> & { timeline?: readonly AgentTimelineItem[] };
 
 const PROVIDER_NAME: Record<Family, string> = { claude: "Claude Code", codex: "Codex", pi: "Pi", grok: "Grok", cursor: "Cursor", antigravity: "Antigravity" };
 /** How often to read usage: accounts in use, the defaults, and the rest. Adapters space reads further. */
@@ -1639,7 +1639,7 @@ export class Service {
       }
       if (probe) this.sameConversationProbe.delete(agentId);
       // A hand-off quotes the whole conversation, not just this turn. Paseo 0.13 sends none, so the hand-off pages it.
-      const conversation = event.timeline.length > 0 ? event.timeline : undefined;
+      const conversation = event.timeline?.length ? event.timeline : undefined;
       // A model the account's region doesn't offer is that model's problem, not the account's: the
       // agent stays, and its timeline says how to fix it (see `detectBedrockModelUnavailable`).
       // Paseo refuses Claude's Auto mode on Bedrock. The account is fine: the agent's mode isn't.
@@ -1695,7 +1695,8 @@ export class Service {
    * has no message to stop at, and must not find the last turn's limit again. Paseo's
    * `[System Error]` row carries no turn id, but it repeats the failure the hook still sends.
    */
-  private async turnWithTimeline(paseo: PaseoApi, event: TurnEnded): Promise<TurnEnded> {
+  private async turnWithTimeline(paseo: PaseoApi, input: TurnEnded): Promise<TurnEnded & { timeline: readonly AgentTimelineItem[] }> {
+    const event = { ...input, timeline: input.timeline ?? [] };
     const { turnId } = event;
     if (!turnId || event.timeline.length > 0) return event;
     try {

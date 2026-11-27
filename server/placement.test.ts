@@ -455,10 +455,12 @@ describe("moving an account's home", () => {
     fake.keychain.set(from, "token");
     await seed({ accounts: [main, managed("claude-aaaaaaaaaaaa", "Work", from)], defaults: { claude: "claude-aaaaaaaaaaaa", codex: null, pi: null }, moves: { "claude-aaaaaaaaaaaa": { from, to, at: "2026-10-29T00:00:00.000Z", family: "claude" } } });
 
-    const opened = await service.onSessionOpen(
-      { agentId: "agent-1", workspaceId: null, provider: "claude", cwd: root, reason: "create", purpose: "interactive", env: {} },
-      { paseo } as never,
-    );
+    const request = {
+      agentId: "agent-1", workspaceId: null, provider: "claude", cwd: root,
+      reason: "create" as const, purpose: "interactive" as const, env: {},
+      title: null, background: false, labels: {}, metadata: {}, tools: [], mcpServers: {},
+    };
+    const opened = await service.onSessionOpen(request, { paseo } as never);
     expect(opened?.env.CLAUDE_CONFIG_DIR).toBe(to);
     expect(await homeOf(store, "claude-aaaaaaaaaaaa")).toBe(to);
     expect(await there(from)).toBe(false);
