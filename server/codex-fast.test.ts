@@ -102,7 +102,8 @@ async function setUp(agents: ReturnType<typeof live>[] = []) {
   services.push(service);
   await service.refreshUsage(MAIN);
   await service.refreshUsage(OTHER);
-  const request: PluginBeforeRequests["agent.create"] = {
+  const request: PluginBeforeRequests["agent.create"] & { workspaceId: null } = {
+    workspaceId: null,
     config: { provider: "codex", cwd: "/repo", model: "codex-test-model", featureValues: { plan_mode: true } },
   };
   return { service, context, request, store, listControls, setOptions, setMetadata, usage };

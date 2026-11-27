@@ -24,7 +24,7 @@ const CREDITS = "Your workspace is out of credits. Add credits to continue.";
 const SPEND_CAP = "You hit your spend cap. Try again later.";
 const DECRYPT = "invalid_encrypted_content: organization_id mismatch";
 const FAST_CONTROLS = [{
-  type: "select", key: "service_tier",
+  type: "select" as const, key: "service_tier", label: "Speed",
   choices: [{ value: "default", label: "Standard" }, { value: "priority", label: "Fast" }],
 }];
 
@@ -168,7 +168,7 @@ async function setup(options: {
           agent.options = { ...agent.options, ...patch, service_tier: patch.service_tier === "fast" ? "priority" : patch.service_tier };
           speedEvents.push({ kind: "setOptions", id, tier: agent.options.service_tier });
         },
-        setMetadata: async (patch: Record<string, unknown>) => {
+        setMetadata: async (patch: Record<string, true | null>) => {
           const agent = agents.get(id)!;
           agent.metadata = { ...agent.metadata, ...patch };
         },
