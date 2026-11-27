@@ -1,14 +1,11 @@
-import type { PluginLifecycleEvents, PluginTurnOutcome } from "@getpaseo/plugin/server";
+import type { PluginHookContext, PluginTurnOutcome } from "@getpaseo/plugin/server";
 import type { ApiSummary, Family, LoginMethod, LoginStep, Usage } from "../shared/model";
 import type { RedeemOutcome } from "../shared/rpc";
 import type { ApiConfig } from "./homes";
 import { providerEnv } from "./provider-env";
 
-/**
- * One timeline entry. Taken from the SDK rather than `@getpaseo/protocol`: Paseo only supplies
- * `@getpaseo/plugin` to plugins, and an npm install has no devDependencies to resolve it from.
- */
-export type AgentTimelineItem = PluginLifecycleEvents["agent.turn_ended"]["timeline"][number];
+type AgentRef = ReturnType<PluginHookContext["paseo"]["agents"]["ref"]>;
+export type AgentTimelineItem = Awaited<ReturnType<AgentRef["timeline"]["refetch"]>>["entries"][number]["item"];
 
 /** A provider's answer to a redeem request. */
 export interface RedeemReply {

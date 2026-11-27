@@ -764,7 +764,7 @@ describe("failover", () => {
     it("reads the finished turn from Paseo and still switches on a limit", async () => {
       const recent = inTurn("t1", { type: "user_message", text: "fix the bug" }, { type: "assistant_message", text: notice });
       const { service, store, reopened, notes, refetches, paseo } = await setUp(twoAccounts(), unused, { detectLimit: detectClaudeLimit, recent });
-      await service.onTurnEnded({ agent, turnId: "t1", outcome: { kind: "completed" }, timeline: [] } as never, { paseo } as never);
+      await service.onTurnEnded({ agent, turnId: "t1", outcome: { kind: "completed" } } as never, { paseo } as never);
       expect(refetches).toHaveLength(1);
       expect(refetches[0]).toMatchObject({ direction: "tail" });
       expect(refetches[0]?.limit).toBeGreaterThan(0);

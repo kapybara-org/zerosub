@@ -1,6 +1,4 @@
-import type { PluginRpcContract } from "@getpaseo/plugin";
 import type { PluginClientContext } from "@getpaseo/plugin/client";
-import type { ZodType, input as ZodInput, output as ZodOutput } from "zod";
 import { useSyncExternalStore } from "react";
 import { moveProblem } from "../shared/format";
 import type { StateView } from "../shared/model";
@@ -26,10 +24,7 @@ export interface ZeroSubStore {
   readonly current: StoreSnapshot;
   start(): void;
   stop(): void;
-  rpc<InputSchema extends ZodType, OutputSchema extends ZodType>(
-    contract: PluginRpcContract<InputSchema, OutputSchema>,
-    input: ZodInput<InputSchema>,
-  ): Promise<ZodOutput<OutputSchema>>;
+  rpc: PluginClientContext["rpc"];
   subscribe(listener: () => void): () => void;
   getSnapshot(): StoreSnapshot;
   watch(intervalMs: number): () => void;
@@ -71,17 +66,14 @@ export function createZeroSubStore(client: PluginClientContext): ZeroSubStore {
   }
 
   /** Calls a daemon handler, then refreshes state so every view sees the result. */
-  async function rpc<InputSchema extends ZodType, OutputSchema extends ZodType>(
-    contract: PluginRpcContract<InputSchema, OutputSchema>,
-    input: ZodInput<InputSchema>,
-  ): Promise<ZodOutput<OutputSchema>> {
+  const rpc: PluginClientContext["rpc"] = async (contract, input) => {
     try {
       return await client.rpc(contract, input);
     } finally {
       // A poll already in flight started before this action, so ask again once it lands.
       void refresh({ fresh: true });
     }
-  }
+  };
 
   const subscribe = (listener: () => void): (() => void) => {
     listeners.add(listener);
