@@ -1,11 +1,12 @@
 import { spawn } from "node:child_process";
-import { mkdir, readFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { UsageWindow } from "../shared/model";
 import { ProgressEmitter, spawnEnv, type EnvPatch, type FamilyAdapter, type Identity, type LimitHit, type LoginHandle, type RedeemReply, type TurnEvent, type UsageRead } from "./adapter";
 import { providerCommand } from "./binaries";
 import { ANTIGRAVITY_AUTH_ENV } from "./families";
+import { prepareAntigravityHome } from "./homes";
 import { readJson } from "./json-file";
 import { detectAntigravityLimit, detectAntigravitySignOut } from "./limits";
 import { firstUrl, run, stripAnsi } from "./process";
@@ -63,7 +64,7 @@ export function parseAntigravityUsage(output: string): UsageWindow[] {
 
 export class AntigravityAdapter implements FamilyAdapter {
   readonly family = "antigravity" as const;
-  readonly portable = false;
+  readonly portable = true;
   readonly usageSpacingMs = 5 * 60_000;
 
   async env(home: string | null): Promise<EnvPatch> {
@@ -81,9 +82,9 @@ export class AntigravityAdapter implements FamilyAdapter {
     return { ok, detail: ok ? null : "Install an agy version with ACP terminal sign-in (1.5 or later)." };
   }
 
-  async prepareHome(home: string): Promise<void> {
+  async prepareHome(home: string, wanted?: () => Promise<boolean>): Promise<void> {
     if (process.platform !== "linux") throw new Error(unsupported);
-    await mkdir(home, { recursive: true, mode: 0o700 });
+    await prepareAntigravityHome(home, wanted);
   }
 
   async identity(home: string | null): Promise<Identity> {

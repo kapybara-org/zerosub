@@ -6,8 +6,9 @@ import { preferences } from "../shared/preferences";
 import type { FamilyAdapter, Identity, UsageRead } from "./adapter";
 import { AntigravityAdapter, AntigravityLogin, antigravityEmail, antigravityModelScope, parseAntigravityUsage } from "./antigravity";
 import { absentPi } from "./fakes.test-support";
-import { familiesFromConfig } from "./families";
+import { FamilyResolver, familiesFromConfig } from "./families";
 import { detectAntigravityLimit, detectAntigravitySignOut } from "./limits";
+import type { Reopener } from "./reopen";
 import { Service } from "./service";
 import { MAIN_ACCOUNT_ID, StateStore, type StoredState } from "./state";
 
@@ -84,7 +85,7 @@ describe("Antigravity accounts", () => {
   });
 });
 
-describe("Antigravity failover and hand-off", () => {
+describe("Antigravity failover", () => {
   const MAIN = MAIN_ACCOUNT_ID.antigravity;
   const WORK = "antigravity-work";
   const AGENT = "agy-agent-1";
@@ -145,18 +146,10 @@ describe("Antigravity failover and hand-off", () => {
       draft.sessions[AGENT] = { accountId: MAIN, family: "antigravity", openedAt: "2026-09-23T07:00:00.000Z" };
     });
 
-    const created: Array<{ agentId: string; title: string; prompt?: string; labels?: Record<string, string>; config?: { provider?: string } }> = [];
-    const sent: Array<{ agentId: string; text: string; messageId?: string }> = [];
-    const notes: Array<{
-      from: string | null;
-      to: string;
-      outcome: string;
-      detail: string | null;
-      resetsAt: string | null;
-      continuedIn?: { agentId: string; title: string } | null;
-    }> = [];
+    const reopened: string[] = [];
+    const sent: string[] = [];
+    const notes: Array<{ from: string | null; to: string; outcome: string; detail: string | null; continued?: boolean }> = [];
     const agents = new Map<string, FakeAgent>();
-    const timelines = new Map<string, Array<{ seqEnd: number; turnId: string; timestamp: string; item: { type: string; text: string; clientMessageId?: string } }>>();
     const rootAgent: FakeAgent = {
       id: AGENT,
       provider: "antigravity",
@@ -170,59 +163,17 @@ describe("Antigravity failover and hand-off", () => {
       runtimeInfo: { model: options.model === undefined ? "gemini-4-neon-high" : (options.model ?? undefined) },
     };
     agents.set(AGENT, rootAgent);
-    timelines.set(AGENT, [
-      { seqEnd: 1, turnId: "t1", timestamp: "2026-09-23T07:00:00.000Z", item: { type: "user_message", text: "Fix the failing parser" } },
-      { seqEnd: 2, turnId: "t1", timestamp: "2026-09-23T07:00:01.000Z", item: { type: "assistant_message", text: "Checking parser.ts now." } },
-    ]);
-
     const paseo = {
       config: { get: async () => ({ config: { providers: {} } }) },
       providers: { listModels: async () => ({ models: [{ id: "gemini-4-neon-high", isDefault: true }] }) },
       agents: {
         list: async () => ({ entries: [...agents.values()].map((agent) => ({ agent })), pageInfo: { hasMore: false, nextCursor: null } }),
-        create: async (request: { agentId: string; title: string; prompt?: string; labels?: Record<string, string>; config?: { provider?: string } }) => {
-          created.push(request);
-          agents.set(request.agentId, {
-            id: request.agentId,
-            provider: "antigravity",
-            title: request.title,
-            status: "idle",
-            cwd: "/repo",
-            workspaceId: null,
-            archivedAt: null,
-            lastUserMessageAt: null,
-            currentModeId: "auto",
-            labels: request.labels,
-            runtimeInfo: { model: "gemini-4-neon-high" },
-          });
-          timelines.set(request.agentId, []);
-          return { agent: { id: request.agentId } };
-        },
         ref: (id: string = AGENT) => ({
           refresh: async () => ({ agent: agents.get(id) ?? null }),
-          send: async (text: string, opts?: { messageId?: string }) => {
-            sent.push({ agentId: id, text, messageId: opts?.messageId });
-            const list = timelines.get(id) ?? [];
-            const seq = (list.at(-1)?.seqEnd ?? 0) + 1;
-            const nowIso = new Date().toISOString();
-            list.push({ seqEnd: seq, turnId: `t-${seq}`, timestamp: nowIso, item: { type: "user_message", text, clientMessageId: opts?.messageId } });
-            timelines.set(id, list);
-            const target = agents.get(id);
-            if (target) target.lastUserMessageAt = nowIso;
-          },
+          send: async (text: string) => void sent.push(text),
           timeline: {
             append: async (item: { data: (typeof notes)[number] }) => void notes.push(item.data),
-            refetch: async () => {
-              const entries = timelines.get(id) ?? [];
-              return {
-                epoch: "e1",
-                window: { maxSeq: entries.at(-1)?.seqEnd ?? 0 },
-                entries,
-                hasOlder: false,
-                gap: false,
-                staleCursor: false,
-              };
-            },
+            refetch: async () => ({ entries: [] }),
           },
         }),
       },
@@ -230,7 +181,7 @@ describe("Antigravity failover and hand-off", () => {
     const adapter: FamilyAdapter = {
       ...absentPi(),
       family: "antigravity",
-      portable: false,
+      portable: true,
       usageSpacingMs: 0,
       available: async () => ({ ok: true, detail: null }),
       env: async (home) => (home ? { HOME: home, SSH_CONNECTION: "paseo" } : ({} as Record<string, string>)),
@@ -241,10 +192,21 @@ describe("Antigravity failover and hand-off", () => {
       detectLimit: detectAntigravityLimit,
       detectSignOut: detectAntigravitySignOut,
     };
+    const reopener = {
+      locate: async () => "/usr/local/bin/paseo",
+      reopen: async (id: string) => {
+        reopened.push(id);
+        await service.onSessionOpen({ agentId: id, provider: "antigravity", reason: "refresh", purpose: "interactive", env: {} } as never, { paseo } as never);
+        return { ok: true as const };
+      },
+    };
     const service = new Service(
       { claude: absentPi(), codex: absentPi(), pi: absentPi(), grok: absentPi(), cursor: absentPi(), antigravity: adapter },
       store,
+      new FamilyResolver(),
+      reopener as unknown as Reopener,
     );
+    service.failoverReloadWaitMs = 0;
     service.setPreferences(preferences.schema.parse({ autoSwitch: true, autoContinue: true }));
     service.signOutRecheckMs = 0;
 
@@ -252,11 +214,10 @@ describe("Antigravity failover and hand-off", () => {
       service,
       store,
       paseo,
-      created,
+      reopened,
       sent,
       notes,
       agents,
-      timelines,
       cleanup: async () => {
         await service.stop();
         if (previousHome === undefined) delete process.env.PASEO_HOME;
@@ -266,9 +227,9 @@ describe("Antigravity failover and hand-off", () => {
     };
   }
 
-  it("limits only the agent's model group, preserves the turn reset duration, and hands off in an Antigravity tab", async () => {
+  it("limits only the agent's model group, preserves the turn reset duration, and reopens the same agent on the other account", async () => {
     const weeklyReset = new Date(Date.now() + 5 * 86_400_000).toISOString();
-    const { service, store, paseo, created, sent, notes, cleanup } = await setUp({
+    const { service, store, paseo, reopened, sent, notes, cleanup } = await setUp({
       model: "gemini-4-neon-high",
       usage: () => ({
         fetchedAt: new Date().toISOString(),
@@ -305,14 +266,10 @@ describe("Antigravity failover and hand-off", () => {
       expect(untilMs).toBeLessThan(Date.parse(weeklyReset) - 86_400_000);
       expect(personal.modelLimits["claude/gpt"]).toBeUndefined();
 
-      expect(created).toHaveLength(1);
-      expect(created[0]?.title).toBe("Build parser (continued)");
-      expect(sent[0]?.text).toContain("its Antigravity account (personal) reached its usage limit");
-      expect(sent[0]?.text).not.toContain("ChatGPT");
-      expect(sent[0]?.text).not.toContain("Codex");
-      expect(state.bindings[created[0]!.agentId]?.accountId).toBe(WORK);
-      expect(Object.keys(state.continuations)).toHaveLength(1);
-      expect(notes[0]).toMatchObject({ from: "personal", to: "work", outcome: "continued" });
+      expect(reopened).toEqual([AGENT]);
+      expect(state.sessions[AGENT]?.accountId).toBe(WORK);
+      expect(sent).toEqual([preferences.schema.parse({}).continuePrompt]);
+      expect(notes[0]).toMatchObject({ from: "personal", to: "work", outcome: "switched", continued: true });
     } finally {
       await cleanup();
     }
@@ -382,56 +339,13 @@ describe("Antigravity failover and hand-off", () => {
     }
   });
 
-  it("prevents duplicate tabs on repeated manual switches and follow-up failover turns on the parked source tab", async () => {
-    const { service, paseo, created, sent, notes, cleanup } = await setUp();
+  it("moves the same agent to the chosen account when switched by hand", async () => {
+    const { service, store, paseo, reopened, notes, cleanup } = await setUp();
     try {
-      const first = await service.setAgentAccount(paseo as never, AGENT, WORK);
-      expect(created).toHaveLength(1);
-      expect(sent).toHaveLength(1);
-      expect(first.continuedIn?.agentId).toBe(created[0]!.agentId);
-      expect(sent[0]?.text).toContain('you moved the work to your Antigravity account "work"');
-
-      // Picking the same account a second time reuses the existing tab instead of creating a second one.
-      const second = await service.setAgentAccount(paseo as never, AGENT, WORK);
-      expect(created).toHaveLength(1);
-      expect(second.continuedIn?.agentId).toBe(first.continuedIn?.agentId);
-
-      // A limit hit on the parked source tab notes the existing continuation instead of opening another tab.
-      await service.onTurnEnded(
-        {
-          agent: { id: AGENT, provider: "antigravity" },
-          turnId: "t2",
-          outcome: { kind: "failed", error: { message: "Individual quota reached. Resets in 2h." } },
-          timeline: [{ type: "user_message", text: "Try again" }],
-        } as never,
-        { paseo } as never,
-      );
-      expect(created).toHaveLength(1);
-      expect(notes.at(-1)?.outcome).toBe("stayed");
-      expect(notes.at(-1)?.detail).toContain("Build parser (continued)");
-    } finally {
-      await cleanup();
-    }
-  });
-
-  it("creates only one tab when manual switch and failover race on the same Antigravity agent", async () => {
-    const { service, paseo, created, notes, cleanup } = await setUp();
-    try {
-      const [manual] = await Promise.all([
-        service.setAgentAccount(paseo as never, AGENT, WORK),
-        service.onTurnEnded(
-          {
-            agent: { id: AGENT, provider: "antigravity" },
-            turnId: "t1",
-            outcome: { kind: "failed", error: { message: "Individual quota reached. Resets in 2h." } },
-            timeline: [{ type: "user_message", text: "Fix it" }],
-          } as never,
-          { paseo } as never,
-        ),
-      ]);
-      expect(created).toHaveLength(1);
-      expect(manual.continuedIn?.agentId).toBe(created[0]!.agentId);
-      expect(notes.some((note) => note.outcome === "continued" && note.continuedIn?.agentId === created[0]!.agentId)).toBe(true);
+      await service.setAgentAccount(paseo as never, AGENT, WORK);
+      expect(reopened).toEqual([AGENT]);
+      expect((await store.read()).sessions[AGENT]?.accountId).toBe(WORK);
+      expect(notes.at(-1)).toMatchObject({ from: "personal", to: "work", outcome: "switched" });
     } finally {
       await cleanup();
     }
@@ -543,9 +457,9 @@ describe("Antigravity failover and hand-off", () => {
     }
   });
 
-  it("hands off an Antigravity conversation when the account signs out", async () => {
+  it("reopens an Antigravity conversation on the other account when its account signs out", async () => {
     let mainSignedIn = false;
-    const { service, store, paseo, created, sent, cleanup } = await setUp({
+    const { service, store, paseo, reopened, cleanup } = await setUp({
       identity: (home) => ({
         signedIn: home ? true : mainSignedIn,
         email: home ? "work@example.com" : mainSignedIn ? "personal@example.com" : null,
@@ -564,49 +478,10 @@ describe("Antigravity failover and hand-off", () => {
         } as never,
         { paseo } as never,
       );
-      await vi.waitFor(() => expect(sent).toHaveLength(1));
-      expect(created).toHaveLength(1);
-      expect((await store.read()).accounts.find((entry) => entry.id === MAIN)?.signedIn).toBe(false);
-      expect(sent[0]?.text).toContain("its Antigravity account (personal) was signed out");
-    } finally {
-      await cleanup();
-    }
-  });
-
-  it("reuses the task's Antigravity tab even when the account has no personal identity", async () => {
-    const { service, store, paseo, created, sent, cleanup } = await setUp({
-      identity: () => ({
-        signedIn: true,
-        email: null,
-        plan: null,
-        organization: null,
-        identity: null,
-      }),
-    });
-    try {
-      await store.update((draft) => {
-        for (const entry of draft.accounts) {
-          entry.identity = null;
-          entry.email = null;
-        }
-      });
-      const first = await service.setAgentAccount(paseo as never, AGENT, WORK);
-      const workTab = first.continuedIn!.agentId;
-      expect(created).toHaveLength(1);
-      // In real Paseo, opening the new tab triggers interactive session.open and records its live session on WORK.
-      await service.onSessionOpen(
-        { agentId: workTab, provider: "antigravity", purpose: "interactive", reason: "create", cwd: "/repo" } as never,
-        { paseo } as never,
-      );
-
-      const back = await service.setAgentAccount(paseo as never, workTab, MAIN);
-      expect(back.continuedIn?.agentId).toBe(AGENT);
-      expect(created).toHaveLength(1);
-
-      const again = await service.setAgentAccount(paseo as never, AGENT, WORK);
-      expect(again.continuedIn?.agentId).toBe(workTab);
-      expect(created).toHaveLength(1);
-      expect(sent).toHaveLength(3);
+      await vi.waitFor(() => expect(reopened).toEqual([AGENT]));
+      const state = await store.read();
+      expect(state.accounts.find((entry) => entry.id === MAIN)?.signedIn).toBe(false);
+      expect(state.sessions[AGENT]?.accountId).toBe(WORK);
     } finally {
       await cleanup();
     }

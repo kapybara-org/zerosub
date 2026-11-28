@@ -128,21 +128,7 @@ describe("describing a switch row", () => {
     expect(note).toBe("work is close to its 5-hour limit. Switched to personal.");
   });
 
-  it("names Antigravity when an Antigravity conversation continues in a new tab or every account is exhausted", () => {
-    const continued = describeRow(
-      row({
-        family: "antigravity",
-        reason: "limit",
-        from: "personal",
-        to: "work",
-        outcome: "continued",
-        continuedIn: { agentId: "agy-2", title: "Fix parser (continued)" },
-      }),
-    );
-    expect(continued).toBe(
-      "personal hit its usage limit. Antigravity conversations can't change accounts, so this task continues in “Fix parser (continued)” on work.",
-    );
-
+  it("leaves out the banked reset when every Antigravity account is exhausted", () => {
     const exhausted = describeRow(
       row({
         family: "antigravity",

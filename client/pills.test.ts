@@ -582,7 +582,7 @@ describe("the account button on a Grok or Cursor conversation", () => {
   beforeEach(() => void vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
-  function staying(family: "grok" | "cursor" | "codex" | "antigravity"): StateView {
+  function staying(family: "grok" | "cursor" | "codex"): StateView {
     const state = view([account("work", { family, isDefault: true }), account("home", { family })]);
     return {
       ...state,
@@ -606,14 +606,12 @@ describe("the account button on a Grok or Cursor conversation", () => {
     });
   }
 
-  for (const family of ["codex", "antigravity"] as const) {
-    it(`offers a ${family} conversation's continuation in another tab`, async () => {
-      const pill = await harness(staying(family), family);
-      const items = pill.items();
-      expect(titles(items)).toContain("Continue on home");
-      expect(items.map((item) => item.id)).not.toContain("stays");
-    });
-  }
+  it("still offers a ChatGPT conversation's continuation in another tab", async () => {
+    const pill = await harness(staying("codex"), "codex");
+    const items = pill.items();
+    expect(titles(items)).toContain("Continue on home");
+    expect(items.map((item) => item.id)).not.toContain("stays");
+  });
 });
 
 describe("the OpenCode entry", () => {

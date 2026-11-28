@@ -1071,7 +1071,7 @@ function AutomationSettings({ theme, compact }: { theme: Theme; compact: boolean
           />
           <SettingsSwitch
             label="Keep going after a switch"
-            hint="Sends a short follow-up so the interrupted task continues, also after you use a banked reset. Off, a ChatGPT or Antigravity task that hits its limit stays where it stopped."
+            hint="Sends a short follow-up so the interrupted task continues, also after you use a banked reset. Off, a ChatGPT task that hits its limit stays where it stopped."
             value={settings.values.autoContinue}
             disabled={settings.saving}
             onValueChange={(autoContinue) => save({ autoContinue })}

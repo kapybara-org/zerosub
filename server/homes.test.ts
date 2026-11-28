@@ -10,6 +10,7 @@ import {
   mergeSettings,
   mergeShared,
   normalizeBaseUrl,
+  prepareAntigravityHome,
   prepareClaudeHome,
   prepareCodexHome,
   readAccountApi,
@@ -21,6 +22,7 @@ import {
   writeAccountProxy,
   writeJsonAtomically,
 } from "./homes";
+import { mainAntigravityDir } from "./paths";
 import { isAzureHome, writeAzureAccount } from "./azure";
 import { preferences } from "../shared/preferences";
 
@@ -30,6 +32,7 @@ const saved = {
   CLAUDE_SECURESTORAGE_CONFIG_DIR: process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR,
   CODEX_HOME: process.env.CODEX_HOME,
   PASEO_HOME: process.env.PASEO_HOME,
+  HOME: process.env.HOME,
   ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
   ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
   ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN,
@@ -642,6 +645,64 @@ describe("prepareCodexHome", () => {
     await mkdir(home, { recursive: true });
     await symlink(elsewhere, join(home, "sessions"));
     expect(await codexSessionsShared(home, null)).toBe(false);
+  });
+});
+
+describe("prepareAntigravityHome", () => {
+  const data = (home: string) => join(home, ".gemini", "antigravity-cli");
+
+  /** Points the CLI login's home into the test's folder, so the real `~/.gemini` is never touched. */
+  function paths() {
+    process.env.HOME = join(root, "login");
+    const main = mainAntigravityDir();
+    expect(main.startsWith(root)).toBe(true);
+    return { main, home: join(root, "homes", "antigravity-a") };
+  }
+
+  it("shares only conversations and brain with the CLI login's", async () => {
+    const { main, home } = paths();
+    await mkdir(main, { recursive: true });
+    await writeFile(join(main, "antigravity-oauth-token"), "secret");
+    await writeFile(join(main, "settings.json"), "{}");
+    await prepareAntigravityHome(home);
+    expect(await isLinkTo(join(data(home), "conversations"), await realpath(join(main, "conversations")))).toBe(true);
+    expect(await isLinkTo(join(data(home), "brain"), await realpath(join(main, "brain")))).toBe(true);
+    expect((await readdir(data(home))).sort()).toEqual(["brain", "conversations"]);
+    // Again changes nothing.
+    await prepareAntigravityHome(home);
+    expect((await readdir(data(home))).sort()).toEqual(["brain", "conversations"]);
+  });
+
+  it("moves an account's own conversations into main's, keeping a same-named one of main's, and a backup only of what stayed", async () => {
+    const { main, home } = paths();
+    await mkdir(join(data(home), "conversations"), { recursive: true });
+    await mkdir(join(data(home), "brain", "abc"), { recursive: true });
+    await mkdir(join(main, "conversations"), { recursive: true });
+    await writeFile(join(data(home), "conversations", "abc.db"), "account");
+    await writeFile(join(data(home), "conversations", "same.db"), "account");
+    await writeFile(join(data(home), "brain", "abc", "plan.md"), "plan");
+    await writeFile(join(main, "conversations", "same.db"), "main");
+    const inode = (await stat(join(data(home), "conversations", "abc.db"))).ino;
+    await prepareAntigravityHome(home);
+
+    expect(await isLinkTo(join(data(home), "conversations"), await realpath(join(main, "conversations")))).toBe(true);
+    expect(await isLinkTo(join(data(home), "brain"), await realpath(join(main, "brain")))).toBe(true);
+    // Moved, not copied: the file a running process has open is the one in main's folder.
+    expect((await stat(join(main, "conversations", "abc.db"))).ino).toBe(inode);
+    expect(await readFile(join(main, "conversations", "same.db"), "utf8")).toBe("main");
+    expect(await readFile(join(main, "brain", "abc", "plan.md"), "utf8")).toBe("plan");
+    // Only the folder with an entry that stayed is kept, and only with that entry.
+    const backups = (await readdir(data(home))).filter((name) => name.includes(".bak-"));
+    expect(backups).toHaveLength(1);
+    expect(backups[0]).toMatch(/^conversations\.bak-/);
+    expect(await readdir(join(data(home), backups[0]!))).toEqual(["same.db"]);
+    expect(await readFile(join(data(home), backups[0]!, "same.db"), "utf8")).toBe("account");
+  });
+
+  it("refuses a home that is no longer wanted", async () => {
+    const { home } = paths();
+    await expect(prepareAntigravityHome(home, async () => false)).rejects.toThrow("no longer exists");
+    expect(await lstat(home).catch(() => null)).toBeNull();
   });
 });
 

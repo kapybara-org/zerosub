@@ -7,7 +7,7 @@ import { BEDROCK_FILE, bedrockSettings, isBedrockHome, readBedrockAccount } from
 import { Mutex, readJson } from "./json-file";
 import { NO_PROXY_KEYS, PROXY_KEYS, REQUIRED_NO_PROXY, bypassesProxy, maskProxy, noProxyFromEnv, proxyFromEnv, withClaudeNoProxy, withRequiredNoProxy, withoutClaudeDomains, withoutDomains } from "./proxy";
 import { providerEnv } from "./provider-env";
-import { homesDir, isOwnHome, mainClaudeDir, mainClaudeGlobalConfig, mainClaudeStorageDir, mainCodexHome, mainConfigHome, mainCursorConfigDir, mainGrokHome, mainPiDir } from "./paths";
+import { homesDir, isOwnHome, mainAntigravityDir, mainClaudeDir, mainClaudeGlobalConfig, mainClaudeStorageDir, mainCodexHome, mainConfigHome, mainCursorConfigDir, mainGrokHome, mainPiDir } from "./paths";
 
 /**
  * A managed account home is a real directory holding that account's own credentials and account
@@ -1064,28 +1064,72 @@ export async function claudeSessionsShared(home: string): Promise<boolean> {
 export function shareClaudeSessions(home: string, share: boolean, wanted?: () => Promise<boolean>): Promise<void> {
   return withHome(home, async () => {
     await stillWanted(wanted);
-    const sessions = join(home, "sessions");
-    const main = join(mainClaudeDir(), "sessions");
     await mkdir(home, { recursive: true, mode: 0o700 });
-    await mkdir(main, { recursive: true, mode: 0o700 });
-    const target = await realpath(main);
-    const current = await lstat(sessions).catch(() => null);
-    const linked = current?.isSymbolicLink() ? (await realpath(sessions).catch(() => null)) === target : false;
-    if (current?.isSymbolicLink() && !linked) throw new Error(`${sessions} is a link to another folder. Remove it by hand first.`);
-    if (share) {
-      if (linked) return;
-      if (current && !current.isDirectory()) throw new Error(`${sessions} isn't a folder. Remove it by hand first.`);
-      if (current && !(await rmdir(sessions).then(() => true, () => false))) {
-        await cp(sessions, target, { recursive: true, verbatimSymlinks: true, preserveTimestamps: true, force: false, errorOnExist: false });
-        await rename(sessions, `${sessions}.bak-${new Date().toISOString().replace(/[:.]/g, "-")}`);
-      }
-      await symlink(target, sessions, process.platform === "win32" ? "junction" : undefined);
-    } else {
-      if (!linked) return;
-      await unlink(sessions);
-      await mkdir(sessions, { mode: 0o700 });
+    await shareFolder(join(home, "sessions"), join(mainClaudeDir(), "sessions"), share);
+  });
+}
+
+/**
+ * Makes `path` a link to `main` (or, unshared, an empty folder again), under the home's lock. A folder
+ * that was there has its contents copied into main's first, a file of the same name there staying as
+ * it is, and is kept beside the link as `<path>.bak-<time>`.
+ */
+async function shareFolder(path: string, main: string, share: boolean): Promise<void> {
+  await mkdir(main, { recursive: true, mode: 0o700 });
+  const target = await realpath(main);
+  const current = await lstat(path).catch(() => null);
+  const linked = current?.isSymbolicLink() ? (await realpath(path).catch(() => null)) === target : false;
+  if (current?.isSymbolicLink() && !linked) throw new Error(`${path} is a link to another folder. Remove it by hand first.`);
+  if (share) {
+    if (linked) return;
+    if (current && !current.isDirectory()) throw new Error(`${path} isn't a folder. Remove it by hand first.`);
+    if (current && !(await rmdir(path).then(() => true, () => false))) {
+      await cp(path, target, { recursive: true, verbatimSymlinks: true, preserveTimestamps: true, force: false, errorOnExist: false });
+      await rename(path, `${path}.bak-${new Date().toISOString().replace(/[:.]/g, "-")}`);
+    }
+    await symlink(target, path, process.platform === "win32" ? "junction" : undefined);
+  } else {
+    if (!linked) return;
+    await unlink(path);
+    await mkdir(path, { mode: 0o700 });
+  }
+}
+
+// --------------------------------------------------------------------------- Antigravity
+
+/**
+ * An added Antigravity account's `HOME`: `agy` keeps each conversation in `conversations` and `brain`
+ * under `.gemini/antigravity-cli`. Those two are main's (the CLI login's) so an agent reloaded on
+ * another account finds its conversation; the token, settings and caches stay the account's own.
+ */
+export function prepareAntigravityHome(home: string, wanted?: () => Promise<boolean>): Promise<void> {
+  return withHome(home, async () => {
+    await stillWanted(wanted);
+    const data = join(home, ".gemini", "antigravity-cli");
+    await mkdir(data, { recursive: true, mode: 0o700 });
+    for (const name of ["conversations", "brain"]) {
+      const folder = join(data, name);
+      const main = join(mainAntigravityDir(), name);
+      await moveInto(folder, main);
+      await shareFolder(folder, main, true);
     }
   });
+}
+
+/**
+ * Moves what a real folder holds into main's, a name main has already staying where it is. A running
+ * `agy` keeps writing to a file it has open, whichever folder holds it; a copy would leave it writing
+ * to the backup. An entry that can't be renamed across disks is left for `shareFolder` to copy.
+ */
+async function moveInto(folder: string, main: string): Promise<void> {
+  if (!(await lstat(folder).catch(() => null))?.isDirectory()) return;
+  await mkdir(main, { recursive: true, mode: 0o700 });
+  for (const name of await readdir(folder)) {
+    if (await lstat(join(main, name)).catch(() => null)) continue;
+    await rename(join(folder, name), join(main, name)).catch((error) => {
+      if (error?.code !== "EXDEV") throw error;
+    });
+  }
 }
 
 // --------------------------------------------------------------------------- Codex

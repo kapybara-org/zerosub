@@ -2190,12 +2190,11 @@ export class Service {
       return;
     }
     const paid = isPaidStandIn(next, this.prefs.paidApiFallback);
-    const label = FAMILY_LABEL[family];
     const why =
       (reason === "limit"
-        ? `its ${label} account (${account.label}) reached its usage limit`
-        : `its ${label} account (${account.label}) was signed out`) +
-      (paid ? ` and every other ${label} account is out too, so it moved to Azure OpenAI (${next.label}, a paid API billed per token)` : "");
+        ? `its ChatGPT account (${account.label}) reached its usage limit`
+        : `its ChatGPT account (${account.label}) was signed out`) +
+      (paid ? ` and every other ChatGPT account is out too, so it moved to Azure OpenAI (${next.label}, a paid API billed per token)` : "");
     try {
       const continuation = await this.continueElsewhere(paseo, agentId, next, why, timeline, "auto");
       this.switchGuard.note(agentId, now);
@@ -3700,13 +3699,12 @@ export class Service {
     timeline: readonly AgentTimelineItem[] | undefined,
     source: "auto" | "user",
   ): Promise<Continuation> {
-    if (target.family === "codex" || target.family === "antigravity") return this.continuations.continue(paseo, agentId, target, why, source);
+    if (target.family === "codex") return this.continuations.continue(paseo, agentId, target, why, source);
     return continueInNewAgent({
       paseo,
       sourceAgentId: agentId,
       timeline,
       why,
-      previous: PROVIDER_NAME[target.family],
       parentId: await this.continuations.parentFor(paseo, agentId),
       accountId: target.id,
       bind: async (newAgentId) => {
@@ -4985,7 +4983,7 @@ export class Service {
             paseo,
             agentId,
             target,
-            `you moved the work to your ${FAMILY_LABEL[family]} account "${target.label}"`,
+            `you moved the work to your ChatGPT account "${target.label}"`,
             undefined,
             "user",
           ));

@@ -79,7 +79,7 @@ export function describeRow(row: SwitchRow): string {
         return `${lead}${row.detail} This task continues in “${row.continuedIn.title}” on ${row.to}.`;
       }
       return row.continuedIn
-        ? `${lead}${FAMILY_LABEL[row.family]} conversations can't change accounts, so this task continues in “${row.continuedIn.title}” on ${row.to}.`
+        ? `${lead}ChatGPT conversations can't change accounts, so this task continues in “${row.continuedIn.title}” on ${row.to}.`
         : `${lead}Continuing on ${row.to}.`;
     case "stayed":
       return `${lead}This conversation stays on ${row.from ?? "its account"}.${row.detail ? ` ${row.detail}` : ""}`;
