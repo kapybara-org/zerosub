@@ -1,4 +1,4 @@
-import { accountPeak, capsAccount, windowScope } from "../shared/format";
+import { accountPeak, capsAccount, peakUsage, windowScope } from "../shared/format";
 import { isAzureAccount, isBedrockAccount, onAnthropicApi, PACE_GATE_PERCENT, WEEK_NEARLY_USED_PERCENT, type Family, type PaceView, type Usage, type UsageWindow } from "../shared/model";
 import { FIVE_HOUR_MINUTES, WEEK_MINUTES } from "./codex";
 import {
@@ -52,16 +52,16 @@ function tokens(text: string): string[] {
 }
 
 /**
- * Whether a model limit's scope ("fable") covers a model id ("claude-fable-5-2"): every word of the
- * scope is a word of the model. An unknown or default model is covered by nothing, so it's never
- * kept off an account for a limit of one model.
+ * Whether a model limit's scope ("fable", or a `/`-separated model group like "claude/gpt") covers
+ * a model id ("claude-fable-5-2", "gpt-oss-120b-medium"): every word of any `/`-branch is a word
+ * of the model. An unknown or default model is covered by nothing, so it's never kept off an
+ * account for a limit of one model.
  */
 export function scopeCoversModel(scope: string, model: string | null | undefined): boolean {
   if (!model || model.toLowerCase() === "default") return false;
-  const wanted = tokens(scope);
-  if (wanted.length === 0) return false;
   const have = new Set(tokens(model));
-  return wanted.every((token) => have.has(token));
+  const branches = scope.split("/").map(tokens).filter((branch) => branch.length > 0);
+  return branches.length > 0 && branches.some((wanted) => wanted.every((token) => have.has(token)));
 }
 
 /** Omit model to check all windows, or pass null to check account-wide windows only. */
@@ -145,14 +145,21 @@ export function keyOnAnthropicApi(account: StoredAccount): boolean {
 /**
  * Lower is better. Unknown usage ranks in the middle so a known-quiet account wins over a mystery.
  * A full window of one model only, such as "Weekly · Opus", leaves the account its room for the rest.
- * A window whose reset has passed since the reading starts again empty, so an account that just
- * reset ranks by what it has left, not by the full window its last reading showed.
+ * When a provider reports only model-group windows (Antigravity), the busiest window covering `model`
+ * stands in for the account peak. A window whose reset has passed since the reading starts again
+ * empty, so an account that just reset ranks by what it has left, not by the full window its last
+ * reading showed.
  */
-export function headroomScore(usage: Usage | null | undefined, now = Date.now()): number {
+export function headroomScore(usage: Usage | null | undefined, now = Date.now(), model?: string | null): number {
   const windows = usage?.windows.map((window) =>
     window.resetsAt && Date.parse(window.resetsAt) <= now ? { ...window, usedPercent: 0 } : window);
   const peak = windows ? accountPeak(windows) : null;
-  return peak ? peak.usedPercent : 50;
+  if (peak) return peak.usedPercent;
+  if (windows && model) {
+    const scoped = peakUsage(windows.filter((window) => scopeCoversModel(windowScope(window), model)));
+    if (scoped) return scoped.usedPercent;
+  }
+  return 50;
 }
 
 /** The 5-hour window: Codex says how long its windows are, Claude's is known by id. */
@@ -194,13 +201,14 @@ export function weeklyWindow(usage: Usage): UsageWindow | undefined {
 }
 
 /** Lower is better. Combines the 5-hour projection and the weekly pace; see the README. */
-export function paceScore(usage: Usage | null | undefined, pending: number, now: number): PaceScore {
+export function paceScore(usage: Usage | null | undefined, pending: number, now: number, model?: string | null): PaceScore {
   const fiveCharge = PENDING_FIVE_HOUR_PERCENT * pending;
   const weekCharge = PENDING_WEEKLY_PERCENT * pending;
   const short = usage ? fiveHourWindow(usage) : undefined;
   const long = usage ? weeklyWindow(usage) : undefined;
   if (!usage || usage.windows.length === 0 || (!short && !long)) {
-    const fiveHour = UNKNOWN_SCORE + fiveCharge;
+    const base = model && accountPeak(usage?.windows ?? []) === null ? headroomScore(usage, now, model) : UNKNOWN_SCORE;
+    const fiveHour = base + fiveCharge;
     return { fiveHour, weekly: 0, score: fiveHour, gated: fiveHour >= FIVE_HOUR_GATE_PERCENT, weekHeld: false };
   }
   const parsed = Date.parse(usage.fetchedAt);
@@ -290,8 +298,8 @@ export function mostAvailable(
     subscriptions.length > 0 || !paidFallback ? subscriptions : open.filter((account) => isPaidStandIn(account, paidFallback) && isUsable(account, now, model, usageOf(account.id)));
   const rank = (account: StoredAccount) => {
     const usage = usageOf(account.id);
-    const score = headroomScore(usage, now);
-    const pace = pacing ? paceScore(usage, pacing.pendingOf(account.id), now) : undefined;
+    const score = headroomScore(usage, now, model);
+    const pace = pacing ? paceScore(usage, pacing.pendingOf(account.id), now, model) : undefined;
     return [
       score >= 100 ? 2 : (pace ? pace.gated || pace.weekHeld : fiveHourGated(usage, now)) ? 1 : 0,
       pace ? pace.score : score,

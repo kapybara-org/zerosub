@@ -47,6 +47,11 @@ export function mainCodexHome(): string {
   return configured ? resolve(configured) : join(homedir(), ".codex");
 }
 
+/** Antigravity's data folder under the CLI login's home: `~/.gemini/antigravity-cli`. */
+export function mainAntigravityDir(): string {
+  return join(homedir(), ".gemini", "antigravity-cli");
+}
+
 /** Grok Build's home: `GROK_HOME` in the daemon's environment, else `~/.grok`. */
 export function mainGrokHome(): string {
   const configured = process.env.GROK_HOME?.trim();

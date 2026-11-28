@@ -1,12 +1,14 @@
 import { spawn } from "node:child_process";
-import { mkdir, readFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { UsageWindow } from "../shared/model";
-import { ProgressEmitter, spawnEnv, type EnvPatch, type FamilyAdapter, type Identity, type LoginHandle, type RedeemReply, type UsageRead } from "./adapter";
+import { ProgressEmitter, spawnEnv, type EnvPatch, type FamilyAdapter, type Identity, type LimitHit, type LoginHandle, type RedeemReply, type TurnEvent, type UsageRead } from "./adapter";
 import { providerCommand } from "./binaries";
 import { ANTIGRAVITY_AUTH_ENV } from "./families";
+import { prepareAntigravityHome } from "./homes";
 import { readJson } from "./json-file";
+import { detectAntigravityLimit, detectAntigravitySignOut } from "./limits";
 import { firstUrl, run, stripAnsi } from "./process";
 
 const unsupported = "Isolated Antigravity accounts are supported on Linux.";
@@ -55,14 +57,14 @@ export function parseAntigravityUsage(output: string): UsageWindow[] {
     if (!key) continue;
     const id = `agy-${key}-${span.toLowerCase()}`;
     const resets = Date.parse(reset ?? "");
-    windows.set(id, { id, label: `${span} · ${group}`, usedPercent: 100 - left, resetsAt: Number.isFinite(resets) ? new Date(resets).toISOString() : null });
+    windows.set(id, { id, label: `${span} · ${group}`, usedPercent: 100 - left, resetsAt: Number.isFinite(resets) && resets > 0 ? new Date(resets).toISOString() : null });
   }
   return [...windows.values()];
 }
 
 export class AntigravityAdapter implements FamilyAdapter {
   readonly family = "antigravity" as const;
-  readonly portable = false;
+  readonly portable = true;
   readonly usageSpacingMs = 5 * 60_000;
 
   async env(home: string | null): Promise<EnvPatch> {
@@ -80,9 +82,9 @@ export class AntigravityAdapter implements FamilyAdapter {
     return { ok, detail: ok ? null : "Install an agy version with ACP terminal sign-in (1.5 or later)." };
   }
 
-  async prepareHome(home: string): Promise<void> {
+  async prepareHome(home: string, wanted?: () => Promise<boolean>): Promise<void> {
     if (process.platform !== "linux") throw new Error(unsupported);
-    await mkdir(home, { recursive: true, mode: 0o700 });
+    await prepareAntigravityHome(home, wanted);
   }
 
   async identity(home: string | null): Promise<Identity> {
@@ -118,8 +120,22 @@ export class AntigravityAdapter implements FamilyAdapter {
     return { outcome: "none", message: "Antigravity has no banked resets in ZeroSub.", left: null };
   }
 
-  detectLimit(): null { return null; }
-  detectSignOut(): null { return null; }
+  detectLimit(event: TurnEvent): LimitHit | null {
+    return detectAntigravityLimit(event);
+  }
+
+  detectSignOut(event: TurnEvent): string | null {
+    return detectAntigravitySignOut(event);
+  }
+}
+
+/** Fallback quota-bucket scope for an Antigravity model when no usage reading has named its group yet. */
+export function antigravityModelScope(model: string | null | undefined): string | null {
+  if (!model || model.toLowerCase() === "default") return null;
+  const words = new Set(model.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean));
+  if (words.has("gemini")) return "gemini";
+  if (words.has("claude") || words.has("gpt")) return "claude/gpt";
+  return null;
 }
 
 export class AntigravityLogin extends ProgressEmitter implements LoginHandle {

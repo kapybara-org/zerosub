@@ -476,7 +476,7 @@ The call throws, and changes nothing, when:
 - The agent is gone, or its provider uses no ZeroSub accounts.
 - The account is missing, of another family, signed out or disabled.
 - The account is at its quota maximum, or (without the flag, with automatic switching on) at its limit.
-- `allowLimited` is set for an agent whose conversation can't move in place (Codex, Grok, Cursor, Antigravity). Only Claude and Pi agents take it.
+- `allowLimited` is set for an agent whose conversation can't move in place (Codex, Grok, Cursor). Only Claude, Pi and Antigravity agents take it.
 
 The response is a `ReopenSummary`. `reopened` lists the agent once its session moved to the account. `deferred` means it's busy and moves when its turn ends. `pending` means it was still moving when ZeroSub answered (after about 20 seconds); its timeline says how that went. `failed` carries an `error` for a reload that didn't land, and the agent moves when its session next opens. `continuedIn` is only set when a conversation that can't move in place carried on in a new agent; it's always `null` for a pin with `allowLimited`. An empty summary means the agent had no live session to move. The pin is saved in every case except a throw.
 
@@ -519,7 +519,7 @@ Call `zerosub.agents.move_before_limit` on the `zerosub` plugin to move one agen
 | `reload_failed` | yes | The reload failed. The agent stays where it was, and its binding is put back. |
 | `auto_switch_off` | no | Automatic switching is off in ZeroSub. |
 | `not_open` | no | The agent is closed, archived or gone. |
-| `unsupported_provider` | no | Its conversation can't move in place: Codex, Grok, Cursor and Antigravity agents, even one whose `zerosub.state` row says `movable` because it has no history yet. Only Claude and Pi agents move. |
+| `unsupported_provider` | no | Its conversation can't move in place: Codex, Grok and Cursor agents, even one whose `zerosub.state` row says `movable` because it has no history yet. Only Claude, Pi and Antigravity agents move. |
 | `ineligible_target` | no | The account is missing, of another provider, an API key or paid stand-in (with or without paid API fallback), signed out, disabled, at its limit or at a quota maximum. Also returned when the account reached its limit while the agent reloaded, so routing kept the agent where it was. |
 | `user_pinned` | no | The agent is pinned by the user, by `zerosub.agents.account`, or by `metadata["zerosub.account"]` at creation (that request pins a portable agent too). Release it with `zerosub.agents.account` and `accountId: null` first. |
 | `landed_elsewhere` | no | The reload worked, but routing opened the agent on another account, which `accountId` names. |
@@ -593,4 +593,4 @@ rm -rf ~/.paseo/zerosub
 
 On Linux, ZeroSub works with Paseo's built-in Antigravity provider and `agy` 1.5 or later. The CLI login uses the same environment as Paseo. To add an isolated sign-in, choose **Antigravity → Add account**, open Google's sign-in page, then paste the code it returns.
 
-Each added account runs `agy` with a private home directory and its own file-backed sign-in. Tools launched by that agent inherit the account's home. Select an account or make it the default for new agents. Existing conversations stay with their original home. When the same personal Google sign-in is identified in both entries, ZeroSub pauses one for new agents, as it does for Claude. For an existing pair, make the entry you want the default. Desktop identity detection uses Linux Secret Service via `secret-tool` (provided by `libsecret-tools` on Debian and Ubuntu). ZeroSub shows the quota buckets from `agy /usage` for reference.
+Each added account runs `agy` with a private home directory and its own file-backed sign-in. Tools launched by that agent inherit the account's home. Select an account or make it the default for new agents. Conversations are shared between the CLI login and added accounts (only `conversations` and `brain` under `~/.gemini/antigravity-cli`; sign-ins, settings and caches stay per account), so switching from the account button, or automatic failover past a quota limit or sign-out, reopens the same conversation on the other account. When the same personal Google sign-in is identified in both entries, ZeroSub pauses one for new agents, as it does for Claude. For an existing pair, make the entry you want the default. Desktop identity detection uses Linux Secret Service via `secret-tool` (provided by `libsecret-tools` on Debian and Ubuntu). ZeroSub shows the quota buckets from `agy /usage` and limits only the exhausted model group (such as Gemini Models or Claude and GPT models) on that account when the agent's model is known (otherwise the account is marked limited until the reported reset).

@@ -86,6 +86,7 @@ import {
   type BedrockHost,
   type RegionSource,
 } from "./bedrock";
+import { antigravityModelScope } from "./antigravity";
 import { claudeCliCredentialConflict } from "./claude";
 import { codexHandoffMode, encryptedResumeFailure, sameWorkspace, turnFailedText } from "./codex-same-conversation";
 import { CodexContinuations, MESSAGE_PREFIX, UnresolvableEpochError, fitInstructions, matchesTransfer, readUpdates, ready, sentDigestOf, snapshot, transferMarker, waitForCreated, waitForSource, type Agent } from "./continuations";
@@ -1658,7 +1659,11 @@ export class Service {
         if (this.deferred.has(agentId)) await this.finishDeferred(context.paseo, agentId, family);
         return;
       }
-      const hit = azure ? detectAzureLimit(turn) : bedrock ? detectBedrockLimit(turn) : adapter.detectLimit(turn);
+      const rawHit = azure ? detectAzureLimit(turn) : bedrock ? detectBedrockLimit(turn) : adapter.detectLimit(turn);
+      const hit =
+        rawHit && family === "antigravity" && rawHit.kind === "window" && !rawHit.scope
+          ? await this.scopeAntigravityHit(context.paseo, agentId, accountId, rawHit)
+          : rawHit;
       const bedrockRefusal = bedrock ? detectBedrockRefusal(turn) : null;
       const refusal = azure ? detectAzureSignOut(turn) : bedrock ? (bedrockRefusal?.message ?? null) : adapter.detectSignOut(turn);
       const problem: Problem | null = hit
@@ -1987,10 +1992,14 @@ export class Service {
         this.rememberScope(agentId, hit.scope);
         await this.markModelLimited(account.id, hit.scope, resetsAt, "turn");
         await withTimeout(this.refreshUsage(account.id, true), 12_000);
-        const exact = this.resetFromUsage(account.id, hit.scope);
-        if (exact && Date.parse(exact) > now) {
-          resetsAt = exact;
-          await this.markModelLimited(account.id, hit.scope, exact, "turn");
+        // Antigravity's turn error already reports the exact duration until reset; keep it so a nearly-full
+        // sibling window (e.g. weekly at 99% during a 5-hour hit) cannot stretch the limit.
+        if (family !== "antigravity" || !hit.resetsAt) {
+          const exact = this.resetFromUsage(account.id, hit.scope, family === "antigravity" ? 100 : 99);
+          if (exact && Date.parse(exact) > now) {
+            resetsAt = exact;
+            await this.markModelLimited(account.id, hit.scope, exact, "turn");
+          }
         }
         console.log(`[ZeroSub] ${account.label} hit its ${hit.scope} limit (agent ${agentId}): ${hit.message}`);
       } else {
@@ -2001,10 +2010,12 @@ export class Service {
           if (shown) this.setUsage(account.id, showLimit(shown, hit.resetsAt));
           // The account was just used, so its token is fresh: ask for the exact reset time.
           await withTimeout(this.refreshUsage(account.id, true), 12_000);
-          const exact = this.resetFromUsage(account.id);
-          if (exact && Date.parse(exact) > now) {
-            resetsAt = exact;
-            await this.markLimited(account.id, exact, "window", "turn");
+          if (family !== "antigravity" || !hit.resetsAt) {
+            const exact = this.resetFromUsage(account.id, undefined, family === "antigravity" ? 100 : 99);
+            if (exact && Date.parse(exact) > now) {
+              resetsAt = exact;
+              await this.markLimited(account.id, exact, "window", "turn");
+            }
           }
         }
         console.log(`[ZeroSub] ${account.label} hit a ${hit.kind} limit (agent ${agentId}): ${hit.message}`);
@@ -2499,10 +2510,10 @@ export class Service {
   }
 
   /** The reset time of the window that is full, from the freshest live usage reading. */
-  private resetFromUsage(accountId: string, scope?: string): string | null {
+  private resetFromUsage(accountId: string, scope?: string, minPercent = 99): string | null {
     const usage = this.usage.get(accountId);
     if (!usage || usage.cached) return null;
-    const full = usage.windows.filter((window) => window.usedPercent >= 99 && window.resetsAt);
+    const full = usage.windows.filter((window) => window.usedPercent >= minPercent && window.resetsAt);
     // A limit of one model's own window is lifted by that window alone.
     if (scope) {
       const own = full.filter((window) => !capsAccount(window) && scopeCoversModel(scope, windowScope(window)));
@@ -3460,7 +3471,7 @@ export class Service {
     const info = await lookUpAgent(paseo, agentId);
     if (!info || info.archived) throw new Error("That agent is no longer available.");
     const family = (await this.families.resolve(paseo))[info.provider];
-    if (!family) throw new Error(`${info.provider} agents don't use Claude, ChatGPT, Grok or Cursor subscription accounts.`);
+    if (!family) throw new Error(`${info.provider} agents don't use Claude, ChatGPT, Grok, Cursor or Antigravity subscription accounts.`);
     if (info.status === "running" || info.status === "initializing") {
       throw new Error("This agent is working right now. Wait for its turn to finish, then continue it elsewhere.");
     }
@@ -3661,6 +3672,23 @@ export class Service {
     await this.adapters.codex.prepareHome(account.home, this.stillHas(account)).catch((error: unknown) =>
       log(`could not refresh the home of ${account.label}`, error),
     );
+  }
+
+  /** Resolves the model-group scope for an Antigravity turn limit from the agent's model (or sole full bucket). */
+  private async scopeAntigravityHit(paseo: PaseoApi, agentId: string, accountId: string | null | undefined, hit: LimitHit): Promise<LimitHit> {
+    const windows = accountId ? this.usage.get(accountId)?.windows : undefined;
+    const model = await deadline(this.modelOf(paseo, agentId), 3_000, "model lookup timed out").catch(() => null);
+    const known = model && model.toLowerCase() !== "default" ? model : null;
+    if (known) {
+      const matched = windows?.find((window) => !capsAccount(window) && scopeCoversModel(windowScope(window), known));
+      const scope = matched ? windowScope(matched) : antigravityModelScope(known);
+      if (scope) return { ...hit, scope };
+    }
+    if (windows) {
+      const fullScopes = new Set(windows.filter((window) => !capsAccount(window) && window.usedPercent >= 100).map(windowScope));
+      if (fullScopes.size === 1) return { ...hit, scope: [...fullScopes][0]! };
+    }
+    return hit;
   }
 
   private async continueElsewhere(
@@ -4286,7 +4314,7 @@ export class Service {
       const settled = account.limitedAt ? now - Date.parse(account.limitedAt) > LIMIT_TRUST_MS : true;
       const fromReading = account.limitSource === "reading";
       const watched = usage.windows.filter(capsAccount);
-      const roomy = (creditsCover && fromReading) || Math.max(...watched.map((window) => window.usedPercent)) < 90;
+      const roomy = (creditsCover && fromReading) || (watched.length > 0 && Math.max(...watched.map((window) => window.usedPercent)) < 90);
       if (!cutOff && account.limitedUntil && account.limitKind === "window" && settled && roomy) {
         await this.store.update((draft) => {
           const target = findAccount(draft, accountId);
@@ -4307,7 +4335,14 @@ export class Service {
    * again (under 90%) lifts a limit a reading set, or a turn's once it has settled. Past ones are dropped.
    */
   private async noteModelWindows(accountId: string, windows: readonly UsageWindow[], now: number): Promise<void> {
-    const own = windows.filter((window) => !capsAccount(window));
+    const byScope = new Map<string, UsageWindow[]>();
+    for (const window of windows) {
+      if (capsAccount(window)) continue;
+      const scope = windowScope(window);
+      const list = byScope.get(scope) ?? [];
+      list.push(window);
+      byScope.set(scope, list);
+    }
     const apply = (limits: StoredAccount["modelLimits"]): boolean => {
       let changed = false;
       for (const [scope, limit] of Object.entries(limits)) {
@@ -4315,14 +4350,16 @@ export class Service {
         delete limits[scope];
         changed = true;
       }
-      for (const window of own) {
-        const scope = windowScope(window);
+      for (const [scope, group] of byScope) {
         const held = limits[scope];
-        if (window.usedPercent >= 100 && window.resetsAt && Date.parse(window.resetsAt) > now) {
-          if (held) continue;
-          limits[scope] = { until: window.resetsAt, at: new Date(now).toISOString(), source: "reading" };
-          changed = true;
-        } else if (held && window.usedPercent < 90 && (held.source === "reading" || now - Date.parse(held.at) > LIMIT_TRUST_MS)) {
+        const full = group.filter((window) => window.usedPercent >= 100 && window.resetsAt && Date.parse(window.resetsAt) > now);
+        if (full.length > 0) {
+          const latest = full.sort((a, b) => Date.parse(b.resetsAt!) - Date.parse(a.resetsAt!))[0]!.resetsAt!;
+          if (!held || (held.source === "reading" && Date.parse(latest) > Date.parse(held.until))) {
+            limits[scope] = { until: latest, at: new Date(now).toISOString(), source: "reading" };
+            changed = true;
+          }
+        } else if (held && group.every((window) => window.usedPercent < 90) && (held.source === "reading" || now - Date.parse(held.at) > LIMIT_TRUST_MS)) {
           delete limits[scope];
           changed = true;
         }
@@ -4910,7 +4947,7 @@ export class Service {
     const info = await lookUpAgent(paseo, agentId);
     if (!info) throw new Error("That agent is no longer available.");
     const family = (await this.families.resolve(paseo))[info.provider];
-    if (!family) throw new Error(`${info.provider} agents don't use Claude, ChatGPT, Grok or Cursor subscription accounts.`);
+    if (!family) throw new Error(`${info.provider} agents don't use Claude, ChatGPT, Grok, Cursor or Antigravity subscription accounts.`);
     const adapter = this.adapters[family];
     const state = await this.store.read();
     const target = accountId ? findAccount(state, accountId) : defaultAccount(state, family);
@@ -5010,7 +5047,7 @@ export class Service {
     await this.store.update((draft) => {
       const account = findAccount(draft, accountId);
       if (!account) throw new Error("That account no longer exists.");
-      if (account.family === "antigravity") throw new Error("Antigravity usage is display-only.");
+      if (account.family === "antigravity") throw new Error("Quota maximums aren't supported for Antigravity accounts.");
       const ceilings = { ...account.quotaCeilings };
       if (percent === 100) delete ceilings[windowId];
       else ceilings[windowId] = percent;

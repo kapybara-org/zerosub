@@ -127,4 +127,18 @@ describe("describing a switch row", () => {
     const note = describeRow(row({ reason: "pacing", from: "work", to: "personal", continued: false }));
     expect(note).toBe("work is close to its 5-hour limit. Switched to personal.");
   });
+
+  it("leaves out the banked reset when every Antigravity account is exhausted", () => {
+    const exhausted = describeRow(
+      row({
+        family: "antigravity",
+        reason: "exhausted",
+        from: "personal",
+        to: "personal",
+        outcome: "stayed",
+        continued: false,
+      }),
+    );
+    expect(exhausted).toBe("Every Antigravity account is at its limit. Add another account or wait.");
+  });
 });

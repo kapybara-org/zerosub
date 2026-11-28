@@ -41,10 +41,10 @@ export function shownFamilies(accounts: readonly { family: Family }[]): Family[]
 
 /**
  * For a provider whose conversations can't change accounts in place: one with history carries on in a
- * new agent on the account picked for it (Codex's). False for Grok, Cursor and Antigravity, which stay on their
- * account until moving them is known to work; only new agents follow a pick or the default.
+ * new agent on the account picked for it (Codex's). Claude, Pi and Antigravity move in place. False for Grok and
+ * Cursor, which stay on their account until moving them is known to work; only new agents follow a pick or the default.
  */
-export const HAND_OFF: Record<Family, boolean> = { claude: true, codex: true, pi: true, grok: false, cursor: false, antigravity: false };
+export const HAND_OFF: Record<Family, boolean> = { claude: true, codex: true, pi: true, grok: false, cursor: false, antigravity: true };
 
 /** Stands for a proxy's password (or a user name with none) wherever the proxy is shown. */
 export const HIDDEN = "•••";
