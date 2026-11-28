@@ -400,6 +400,8 @@ describe("windowScope and limitedModelPick", () => {
     expect(windowScope({ id: "agy-gemini-models-5-hour", label: "5-hour · Gemini Models", usedPercent: 100, resetsAt: null })).toBe("gemini");
     expect(windowScope({ id: "agy-claude-and-gpt-models-weekly", label: "Weekly · Claude and GPT models", usedPercent: 0, resetsAt: null })).toBe("claude/gpt");
     expect(windowScope({ id: "agy-claude-and-gpt-models-5-hour", label: "5-hour · Claude and GPT models", usedPercent: 0, resetsAt: null })).toBe("claude/gpt");
+    expect(windowScope({ id: "weekly_opus_and_sonnet_models", label: "Weekly · Opus and Sonnet models", usedPercent: 0, resetsAt: null })).toBe("opus and sonnet models");
+    expect(windowScope({ id: "five_hour_x", label: "5-hour · Something", usedPercent: 0, resetsAt: null })).toBe("five_hour_x");
     expect(limitedModelPick("work", "fable")).toContain("Fable limit");
     expect(limitedModelPick("work", "gemini")).toContain("Gemini limit");
     expect(limitedModelPick("work", "claude/gpt")).toContain("Claude / GPT limit");

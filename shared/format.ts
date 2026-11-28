@@ -114,16 +114,22 @@ export function capsAccount(window: UsageWindow): boolean {
   return ACCOUNT_WINDOWS.has(window.id);
 }
 
+/** Id prefix of the windows `parseAntigravityUsage` builds. */
+const ANTIGRAVITY_WINDOW_ID = /^agy-/;
+
 /**
- * The model or surface a narrower window belongs to, lowercase: "fable" for "Weekly · Fable",
- * "gemini" for "5-hour · Gemini Models", "claude/gpt" for "Weekly · Claude and GPT models", else
- * the window's id. It names the key of an account's `modelLimits`.
+ * The model or surface a narrower window belongs to, lowercase: "fable" for "Weekly · Fable", else
+ * the window's id. It names the key of an account's `modelLimits`. Only Antigravity's model-group
+ * windows are grouped ("gemini", "claude/gpt"); Claude's scope names come from Anthropic and key saved limits.
  */
 export function windowScope(window: UsageWindow): string {
+  if (!ANTIGRAVITY_WINDOW_ID.test(window.id)) {
+    const named = window.label.match(/^Weekly\s*·\s*(.+)$/i)?.[1]?.trim();
+    return (named || window.id).toLowerCase();
+  }
   const named = window.label.match(/^(?:Weekly|\d+-(?:hour|day|minute))\s*·\s*(.+)$/i)?.[1]?.trim();
-  if (!named) return window.id.toLowerCase();
   const group = named
-    .toLowerCase()
+    ?.toLowerCase()
     .replace(/\s+models$/i, "")
     .replace(/\s+and\s+/gi, "/")
     .trim();
