@@ -132,9 +132,22 @@ export function grokCommand(entry: Record<string, unknown> | undefined): string 
 }
 
 /**
+ * Whether a provider entry starts its CLI inside a sandbox, through the `sandbox-run` wrapper that
+ * the Workspace Sandbox plugin writes into its `<provider>-sandbox` profiles. Account homes are host
+ * folders the sandbox doesn't have, so pointing such a session at one signs it out.
+ */
+function runsInSandbox(entry: Record<string, unknown> | undefined): boolean {
+  const command = entry?.command;
+  if (!Array.isArray(command)) return false;
+  const [binary] = command as unknown[];
+  return typeof binary === "string" && basename(binary) === "sandbox-run";
+}
+
+/**
  * Maps Paseo provider IDs to the family they run on: the built-in `claude`, `codex` and `pi`
- * providers, custom profiles that extend them without their own credentials, and custom ACP providers
- * that run Grok Build or Cursor's agent (see `ACP_COMMANDS`) without their own credentials.
+ * providers, custom profiles that extend them without their own credentials and don't run in a
+ * sandbox (see `runsInSandbox`), and custom ACP providers that run Grok Build or Cursor's agent
+ * (see `ACP_COMMANDS`) without their own credentials.
  */
 export function familiesFromConfig(providers: Record<string, unknown> | undefined): Record<string, Family> {
   const result: Record<string, Family> = {};
@@ -149,7 +162,7 @@ export function familiesFromConfig(providers: Record<string, unknown> | undefine
     const entry = asRecord(value);
     const base = entry?.extends;
     if (!isFamily(base)) continue;
-    if (bringsOwnAuth(base, asRecord(entry?.env))) continue;
+    if (bringsOwnAuth(base, asRecord(entry?.env)) || runsInSandbox(entry)) continue;
     if (base === "antigravity" && (!(base in result) || entry?.enabled === false || hasOwnAntigravityCommand(entry))) continue;
     result[id] = base;
   }
